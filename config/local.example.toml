@@ -6,7 +6,6 @@ git_binary = "git"
 git_timeout_seconds = 120
 max_git_output_bytes = 16777216
 session_ttl_seconds = 3600
-cached_ref_max_staleness_seconds = 300
 rate_limit_per_minute = 120
 allowed_upstream_hosts = ["github.com"]
 

@@ -1060,6 +1060,7 @@ dependencies = [
  "chrono",
  "git-cache-core",
  "git-cache-domain",
+ "git-cache-worker",
  "http 1.4.0",
  "serde",
  "serde_json",
@@ -1077,7 +1078,9 @@ dependencies = [
  "clap",
  "git-cache-core",
  "git-cache-disk",
+ "git-cache-domain",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1101,6 +1104,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1108,12 +1112,15 @@ dependencies = [
 name = "git-cache-domain"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "git-cache-core",
  "git-cache-disk",
  "git-cache-git",
  "git-cache-objectstore",
+ "git-cache-worker",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",

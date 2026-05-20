@@ -18,8 +18,6 @@ pub struct AppConfig {
     pub max_git_output_bytes: usize,
     pub object_store: ObjectStoreConfig,
     pub session_ttl_seconds: u64,
-    #[serde(default = "default_cached_ref_max_staleness_seconds")]
-    pub cached_ref_max_staleness_seconds: u64,
     #[serde(default)]
     pub upstream_auth_token_env: Option<String>,
     #[serde(default = "default_rate_limit_per_minute")]
@@ -77,10 +75,6 @@ impl AppConfig {
             )?,
             object_store: ObjectStoreConfig::Local { root: object_root },
             session_ttl_seconds: parse_env_u64("GIT_CACHE_SESSION_TTL_SECONDS", 3600)?,
-            cached_ref_max_staleness_seconds: parse_env_u64(
-                "GIT_CACHE_CACHED_REF_MAX_STALENESS_SECONDS",
-                default_cached_ref_max_staleness_seconds(),
-            )?,
             upstream_auth_token_env: std::env::var("GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV").ok(),
             rate_limit_per_minute: parse_env_u32(
                 "GIT_CACHE_RATE_LIMIT_PER_MINUTE",
@@ -128,10 +122,6 @@ fn default_git_timeout_seconds() -> u64 {
 
 fn default_max_git_output_bytes() -> usize {
     16 * 1024 * 1024
-}
-
-fn default_cached_ref_max_staleness_seconds() -> u64 {
-    300
 }
 
 fn default_rate_limit_per_minute() -> u32 {

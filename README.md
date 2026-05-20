@@ -4,7 +4,7 @@ Read-only Git fetch cache for GitHub-style upstreams. The service keeps object s
 
 ## What Works
 
-- `POST /v1/materialize` for exact commits, strict branches, strict default branch, and bounded-staleness cached branch/default requests.
+- `POST /v1/materialize` for exact commits, strict branches, and strict default branch requests.
 - Known-complete exact commits are served from cache without contacting upstream.
 - Strict branch/default requests verify upstream with `git ls-remote` before serving.
 - Session URLs expose pinned synthetic refs through `git-upload-pack`.
