@@ -25,6 +25,8 @@ pub struct AppConfig {
     #[serde(default = "default_allowed_upstream_hosts")]
     pub allowed_upstream_hosts: Vec<String>,
     pub disk: DiskConfig,
+    #[serde(default)]
+    pub git_remote: GitRemoteConfig,
 }
 
 impl AppConfig {
@@ -85,6 +87,7 @@ impl AppConfig {
                 quota_bytes: parse_env_u64("GIT_CACHE_DISK_QUOTA_BYTES", 10 * 1024 * 1024 * 1024)?,
                 min_free_bytes: parse_env_u64("GIT_CACHE_DISK_MIN_FREE_BYTES", 1024 * 1024 * 1024)?,
             },
+            git_remote: GitRemoteConfig::default(),
         })
     }
 }
@@ -106,6 +109,40 @@ pub enum ObjectStoreConfig {
 pub struct DiskConfig {
     pub quota_bytes: u64,
     pub min_free_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRemoteConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_branch_ref_check")]
+    pub branch_ref_check: BranchRefCheck,
+    #[serde(default = "default_true")]
+    pub commit_read_through: bool,
+}
+
+impl Default for GitRemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            branch_ref_check: BranchRefCheck::Always,
+            commit_read_through: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchRefCheck {
+    Always,
+}
+
+fn default_branch_ref_check() -> BranchRefCheck {
+    BranchRefCheck::Always
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_allowed_upstream_hosts() -> Vec<String> {

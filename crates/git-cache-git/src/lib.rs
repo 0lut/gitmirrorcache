@@ -1,10 +1,12 @@
 use git_cache_core::{GitCacheError, Result};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -166,6 +168,224 @@ impl Git {
         .await
     }
 
+    /// Run `git ls-remote --heads --symref <remote>` and return a map of
+    /// `refs/heads/<branch>` → commit SHA, plus the optional default branch name.
+    pub async fn ls_remote_heads(
+        &self,
+        remote: &str,
+    ) -> Result<LsRemoteResult> {
+        let output = self
+            .run(None, ["ls-remote", "--heads", "--symref", remote])
+            .await
+            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
+        })?;
+
+        let mut refs = HashMap::new();
+        let mut default_branch: Option<String> = None;
+
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
+                if let Some((branch, target)) = rest.split_once('\t') {
+                    if target == "HEAD" {
+                        default_branch = Some(branch.to_string());
+                    }
+                }
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() == 2 {
+                let sha = parts[0].trim();
+                let ref_name = parts[1].trim();
+                if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                    refs.insert(branch.to_string(), sha.to_string());
+                }
+            }
+        }
+
+        Ok(LsRemoteResult {
+            refs,
+            default_branch,
+        })
+    }
+
+    /// Resolve the default branch via `git ls-remote --symref <remote> HEAD`.
+    pub async fn ls_remote_default_branch(&self, remote: &str) -> Result<String> {
+        let output = self
+            .run(None, ["ls-remote", "--symref", remote, "HEAD"])
+            .await
+            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
+        })?;
+
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
+                if let Some((branch, head)) = rest.split_once('\t') {
+                    if head == "HEAD" {
+                        return Ok(branch.to_string());
+                    }
+                }
+            }
+        }
+
+        Err(GitCacheError::UpstreamUnavailable(
+            "upstream did not advertise a symbolic HEAD".into(),
+        ))
+    }
+
+    pub async fn update_ref(
+        &self,
+        repo_dir: &Path,
+        ref_name: &str,
+        sha: &str,
+    ) -> Result<GitOutput> {
+        reject_ref_arg(ref_name, "ref")?;
+        self.run(Some(repo_dir), ["update-ref", ref_name, sha])
+            .await
+    }
+
+    pub async fn symbolic_ref(
+        &self,
+        repo_dir: &Path,
+        name: &str,
+        target: &str,
+    ) -> Result<GitOutput> {
+        self.run(Some(repo_dir), ["symbolic-ref", name, target])
+            .await
+    }
+
+    pub async fn set_config(
+        &self,
+        repo_dir: &Path,
+        key: &str,
+        value: &str,
+    ) -> Result<GitOutput> {
+        self.run(Some(repo_dir), ["config", "--local", key, value])
+            .await
+    }
+
+    /// Spawn `git upload-pack --stateless-rpc .` and return the child process
+    /// for streaming. The caller is responsible for writing stdin, reading
+    /// stdout, and waiting on the child.
+    pub async fn upload_pack_spawn(
+        &self,
+        repo_dir: &Path,
+        request_body: &[u8],
+    ) -> Result<UploadPackProcess> {
+        let mut command = Command::new(&self.binary);
+        command
+            .args(["upload-pack", "--stateless-rpc", "."])
+            .env_clear()
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false")
+            .env("HOME", "/nonexistent")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(repo_dir)
+            .kill_on_drop(true);
+
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+
+        let mut child = command.spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(request_body).await?;
+            stdin.shutdown().await?;
+        }
+
+        let stderr = child.stderr.take();
+        let stdout = child.stdout.take().ok_or_else(|| {
+            GitCacheError::Validation("failed to capture upload-pack stdout".into())
+        })?;
+
+        Ok(UploadPackProcess {
+            child,
+            stdout: Box::pin(stdout),
+            stderr,
+            timeout: self.timeout,
+            stderr_limit: self.output_limit,
+        })
+    }
+
+    /// Spawn `git upload-pack --stateless-rpc --advertise-refs .` and return
+    /// stdout for streaming.
+    pub async fn upload_pack_advertise_refs_spawn(
+        &self,
+        repo_dir: &Path,
+    ) -> Result<UploadPackProcess> {
+        let mut command = Command::new(&self.binary);
+        command
+            .args(["upload-pack", "--stateless-rpc", "--advertise-refs", "."])
+            .env_clear()
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false")
+            .env("HOME", "/nonexistent")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(repo_dir)
+            .kill_on_drop(true);
+
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+
+        let mut child = command.spawn()?;
+        let stderr = child.stderr.take();
+        let stdout = child.stdout.take().ok_or_else(|| {
+            GitCacheError::Validation("failed to capture upload-pack stdout".into())
+        })?;
+
+        Ok(UploadPackProcess {
+            child,
+            stdout: Box::pin(stdout),
+            stderr,
+            timeout: self.timeout,
+            stderr_limit: self.output_limit,
+        })
+    }
+
+    pub async fn fetch_refs(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        refspecs: &[String],
+    ) -> Result<GitOutput> {
+        let mut args: Vec<String> = vec![
+            "fetch".to_string(),
+            "--no-tags".to_string(),
+            "--".to_string(),
+            remote_url.to_string(),
+        ];
+        args.extend(refspecs.iter().cloned());
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.run(Some(repo_dir), args_ref)
+            .await
+            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))
+    }
+
     async fn check_branch_name(&self, branch: &str) -> Result<()> {
         self.run(None, ["check-ref-format", "--branch", branch])
             .await?;
@@ -313,6 +533,53 @@ fn reject_revision_arg(value: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct LsRemoteResult {
+    pub refs: HashMap<String, String>,
+    pub default_branch: Option<String>,
+}
+
+pub struct UploadPackProcess {
+    pub child: Child,
+    pub stdout: Pin<Box<dyn AsyncRead + Send>>,
+    stderr: Option<tokio::process::ChildStderr>,
+    timeout: Duration,
+    stderr_limit: usize,
+}
+
+impl UploadPackProcess {
+    /// Wait for the child to finish and check for errors.
+    /// Consumes remaining stderr.
+    pub async fn wait(mut self) -> Result<()> {
+        let stderr_fut = async {
+            if let Some(stderr) = self.stderr.take() {
+                read_bounded(stderr, self.stderr_limit, "stderr").await
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let wait_fut = async { self.child.wait().await.map_err(GitCacheError::from) };
+        let (stderr, status) =
+            timeout(self.timeout, async { tokio::try_join!(stderr_fut, wait_fut) })
+                .await
+                .map_err(|_| {
+                    GitCacheError::Timeout(format!(
+                        "upload-pack exceeded {:?}",
+                        self.timeout
+                    ))
+                })??;
+
+        if !status.success() {
+            let stderr_text = String::from_utf8_lossy(&stderr);
+            return Err(GitCacheError::Validation(format!(
+                "upload-pack exited with status {}: {stderr_text}",
+                status.code().unwrap_or(-1)
+            )));
+        }
+        Ok(())
+    }
 }
 
 async fn read_bounded<R>(mut reader: R, max_bytes: usize, stream_name: &str) -> Result<Vec<u8>>
