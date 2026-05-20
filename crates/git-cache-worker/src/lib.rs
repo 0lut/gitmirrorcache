@@ -782,6 +782,161 @@ mod tests {
         UpdateCoordinator::new(executor, Arc::new(InMemoryRepoLeaseManager::new()))
     }
 
+    // ── UpdateTarget::from_selector tests ─────────────────────────
+
+    #[test]
+    fn from_selector_branch() {
+        let selector = branch("main");
+        let target = UpdateTarget::from_selector(&selector);
+        assert_eq!(target, UpdateTarget::Branch(BranchName::parse("main").unwrap()));
+    }
+
+    #[test]
+    fn from_selector_default_branch() {
+        let target = UpdateTarget::from_selector(&Selector::DefaultBranch);
+        assert_eq!(target, UpdateTarget::DefaultBranch);
+    }
+
+    #[test]
+    fn from_selector_commit() {
+        let commit = CommitSha::parse("a".repeat(40)).unwrap();
+        let target = UpdateTarget::from_selector(&Selector::Commit(commit.clone()));
+        assert_eq!(target, UpdateTarget::Commit(commit));
+    }
+
+    #[test]
+    fn from_selector_short_commit() {
+        let short = ShortCommitSha::parse("abcdef12").unwrap();
+        let target = UpdateTarget::from_selector(&Selector::ShortCommit(short.clone()));
+        assert_eq!(target, UpdateTarget::ShortCommit(short));
+    }
+
+    // ── UpdateTarget::from_event_ref tests ──────────────────────────
+
+    #[test]
+    fn from_event_ref_parses_branch() {
+        let target = UpdateTarget::from_event_ref("refs/heads/main").unwrap();
+        assert_eq!(
+            target,
+            UpdateTarget::Branch(BranchName::parse("main").unwrap())
+        );
+    }
+
+    #[test]
+    fn from_event_ref_parses_tag_as_ref() {
+        let target = UpdateTarget::from_event_ref("refs/tags/v1").unwrap();
+        assert_eq!(target, UpdateTarget::Ref("refs/tags/v1".to_string()));
+    }
+
+    // ── validate_event_ref tests ────────────────────────────────────
+
+    #[test]
+    fn validate_event_ref_rejects_empty() {
+        assert!(validate_event_ref("").is_err());
+    }
+
+    #[test]
+    fn validate_event_ref_rejects_control_chars() {
+        assert!(validate_event_ref("refs/heads/\x01bad").is_err());
+    }
+
+    #[test]
+    fn validate_event_ref_rejects_backslash() {
+        assert!(validate_event_ref("refs\\heads\\main").is_err());
+    }
+
+    #[test]
+    fn validate_event_ref_rejects_dot_dot() {
+        assert!(validate_event_ref("refs/heads/../main").is_err());
+    }
+
+    #[test]
+    fn validate_event_ref_rejects_ending_lock() {
+        assert!(validate_event_ref("refs/heads/main.lock").is_err());
+    }
+
+    // ── UpdateHint::into_request tests ──────────────────────────────
+
+    #[test]
+    fn cron_hint_into_request() {
+        let hint = UpdateHint::Cron {
+            repo: repo(),
+            selector: branch("main"),
+        };
+        let request = hint.into_request().unwrap();
+        assert_eq!(request.source, UpdateSource::Cron);
+        assert_eq!(
+            request.target,
+            UpdateTarget::Branch(BranchName::parse("main").unwrap())
+        );
+    }
+
+    #[test]
+    fn read_through_hint_into_request() {
+        let hint = UpdateHint::ReadThrough {
+            repo: repo(),
+            selector: Selector::DefaultBranch,
+        };
+        let request = hint.into_request().unwrap();
+        assert_eq!(request.source, UpdateSource::ReadThrough);
+        assert_eq!(request.target, UpdateTarget::DefaultBranch);
+    }
+
+    #[test]
+    fn event_hint_into_request() {
+        let hint = UpdateHint::Event {
+            repo: repo(),
+            ref_name: "refs/heads/main".to_string(),
+        };
+        let request = hint.into_request().unwrap();
+        assert_eq!(request.source, UpdateSource::Event);
+        assert_eq!(
+            request.target,
+            UpdateTarget::Branch(BranchName::parse("main").unwrap())
+        );
+    }
+
+    // ── CronUpdateConfig::try_new tests ─────────────────────────────
+
+    #[test]
+    fn cron_config_rejects_zero_interval() {
+        let result = CronUpdateConfig::try_new(Duration::ZERO, vec![]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cron_config_accepts_nonzero_interval() {
+        let config = CronUpdateConfig::try_new(Duration::from_secs(10), vec![]).unwrap();
+        assert_eq!(config.interval, Duration::from_secs(10));
+        assert!(!config.run_immediately);
+    }
+
+    // ── EventHint::new tests ────────────────────────────────────────
+
+    #[test]
+    fn event_hint_new_accepts_valid_ref() {
+        let hint = EventHint::new(repo(), "refs/heads/main").unwrap();
+        assert_eq!(hint.ref_name, "refs/heads/main");
+    }
+
+    #[test]
+    fn event_hint_new_rejects_invalid_ref() {
+        assert!(EventHint::new(repo(), "").is_err());
+        assert!(EventHint::new(repo(), "refs/heads/../main").is_err());
+    }
+
+    // ── StopHandle/StopSignal tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn stop_handle_triggers_stop_signal() {
+        let (handle, mut signal) = stop_channel();
+        handle.stop();
+        // cancelled() should return immediately after stop
+        tokio::time::timeout(Duration::from_millis(100), signal.cancelled())
+            .await
+            .expect("cancelled should resolve after stop");
+    }
+
     #[tokio::test]
     async fn dedupes_concurrent_updates_for_same_repo_and_ref() {
         let executor = Arc::new(RecordingExecutor::new(true));

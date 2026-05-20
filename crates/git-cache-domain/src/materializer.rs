@@ -1306,6 +1306,166 @@ mod tests {
         );
     }
 
+    // ── Additional repo_from_git_path tests ────────────────────────
+
+    #[test]
+    fn repo_from_git_path_rejects_no_dot_git() {
+        assert!(repo_from_git_path("github.com/org/repo").is_err());
+    }
+
+    #[test]
+    fn repo_from_git_path_rejects_gitfoo_suffix() {
+        assert!(repo_from_git_path("github.com/org/repo.gitfoo").is_err());
+    }
+
+    #[test]
+    fn repo_from_git_path_with_info_refs_suffix() {
+        let key = repo_from_git_path("github.com/org/repo.git/info/refs").unwrap();
+        assert_eq!(key.as_str(), "github.com/org/repo");
+    }
+
+    #[test]
+    fn repo_from_git_path_with_upload_pack_suffix() {
+        let key = repo_from_git_path("github.com/org/repo.git/git-upload-pack").unwrap();
+        assert_eq!(key.as_str(), "github.com/org/repo");
+    }
+
+    #[test]
+    fn repo_from_git_path_bare_dot_git() {
+        let key = repo_from_git_path("github.com/org/repo.git").unwrap();
+        assert_eq!(key.as_str(), "github.com/org/repo");
+    }
+
+    // ── validate_host tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn validate_host_accepts_allowed_host() {
+        let fixture = GitFixture::new();
+        let state = fixture.state();
+        let materializer = Materializer::new(Arc::new(state));
+        assert!(materializer
+            .validate_host(&RepoKey::parse("github.com/org/repo").unwrap())
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_host_rejects_unlisted_host() {
+        let fixture = GitFixture::new();
+        let state = fixture.state();
+        let materializer = Materializer::new(Arc::new(state));
+        assert!(materializer
+            .validate_host(&RepoKey::parse("evil.com/org/repo").unwrap())
+            .is_err());
+    }
+
+    // ── upstream_url tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upstream_url_with_upstream_root_set() {
+        let fixture = GitFixture::new();
+        let state = fixture.state();
+        let materializer = Materializer::new(Arc::new(state));
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let url = materializer.upstream_url(&repo).unwrap();
+        // With upstream_root set, it should be a local path
+        assert!(url.contains("github.com/org/repo.git"));
+    }
+
+    #[tokio::test]
+    async fn upstream_url_without_upstream_root() {
+        let fixture = GitFixture::new();
+        let mut state = fixture.state();
+        state.config.upstream_root = None;
+        let materializer = Materializer::new(Arc::new(state));
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let url = materializer.upstream_url(&repo).unwrap();
+        assert_eq!(url, "https://github.com/org/repo.git");
+    }
+
+    // ── default_manifest_key and bundle_key tests ────────────────────
+
+    #[test]
+    fn default_manifest_key_produces_expected_path() {
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        assert_eq!(
+            default_manifest_key(&repo),
+            "repos/github.com/org/repo/manifests/refs/default.json"
+        );
+    }
+
+    #[test]
+    fn bundle_key_produces_expected_path() {
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let gen = GenerationId::new();
+        let key = bundle_key(&repo, gen);
+        assert!(key.starts_with("repos/github.com/org/repo/generations/"));
+        assert!(key.ends_with("/base.bundle"));
+    }
+
+    // ── synthesize_ref_advertisement tests ───────────────────────────
+
+    #[test]
+    fn synthesize_ref_advertisement_contains_head_and_refs() {
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: Some("main".to_string()),
+            all_upstream: {
+                let mut m = HashMap::new();
+                m.insert("main".to_string(), "a".repeat(40));
+                m.insert("develop".to_string(), "b".repeat(40));
+                m
+            },
+        };
+        let output = synthesize_ref_advertisement(&comparison);
+        let text = String::from_utf8_lossy(&output);
+
+        assert!(text.contains("HEAD"));
+        assert!(text.contains("refs/heads/main"));
+        assert!(text.contains("refs/heads/develop"));
+        assert!(text.ends_with("0000"));
+    }
+
+    #[test]
+    fn synthesize_ref_advertisement_valid_pkt_line_format() {
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: Some("main".to_string()),
+            all_upstream: {
+                let mut m = HashMap::new();
+                m.insert("main".to_string(), "c".repeat(40));
+                m
+            },
+        };
+        let output = synthesize_ref_advertisement(&comparison);
+
+        // First 4 bytes are hex length
+        assert!(output.len() >= 4);
+        let first_len_str = std::str::from_utf8(&output[..4]).unwrap();
+        let first_len: usize = usize::from_str_radix(first_len_str, 16).unwrap();
+        assert!(first_len > 4);
+
+        // Ends with flush packet
+        assert!(output.ends_with(b"0000"));
+    }
+
+    #[test]
+    fn synthesize_ref_advertisement_contains_capability_line() {
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: Some("main".to_string()),
+            all_upstream: {
+                let mut m = HashMap::new();
+                m.insert("main".to_string(), "d".repeat(40));
+                m
+            },
+        };
+        let output = synthesize_ref_advertisement(&comparison);
+        let text = String::from_utf8_lossy(&output);
+
+        assert!(text.contains("multi_ack"));
+        assert!(text.contains("agent=git-cache/1.0"));
+    }
+
     #[test]
     fn repo_from_git_path_accepts_smart_http_suffixes() {
         assert_eq!(

@@ -265,4 +265,187 @@ mod tests {
         assert!(ShortCommitSha::parse("a".repeat(40)).is_err());
         assert!(ShortCommitSha::parse("a".repeat(64)).is_err());
     }
+
+    // ── Additional RepoKey correctness tests ─────────────────────────
+
+    #[test]
+    fn repo_key_valid_standard() {
+        let key = RepoKey::parse("github.com/org/repo").unwrap();
+        assert_eq!(key.host(), "github.com");
+        assert_eq!(key.owner(), "org");
+        assert_eq!(key.name(), "repo");
+        assert_eq!(key.as_str(), "github.com/org/repo");
+    }
+
+    #[test]
+    fn repo_key_valid_with_dots_dashes_underscores() {
+        assert!(RepoKey::parse("my-host.io/my_org/my-repo").is_ok());
+        assert!(RepoKey::parse("a.b.c/d-e/f_g").is_ok());
+    }
+
+    #[test]
+    fn repo_key_rejects_empty() {
+        assert!(RepoKey::parse("").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_too_few_segments() {
+        assert!(RepoKey::parse("github.com/org").is_err());
+        assert!(RepoKey::parse("github.com").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_too_many_segments() {
+        assert!(RepoKey::parse("github.com/org/repo/extra").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_special_chars() {
+        assert!(RepoKey::parse("github.com/org/rep@o").is_err());
+        assert!(RepoKey::parse("github.com/org/rep o").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_dot_dot_segments() {
+        assert!(RepoKey::parse("github.com/../repo").is_err());
+        assert!(RepoKey::parse("github.com/org/..").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_single_dot_segments() {
+        assert!(RepoKey::parse("github.com/./repo").is_err());
+        assert!(RepoKey::parse("./org/repo").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_leading_slash() {
+        assert!(RepoKey::parse("/github.com/org/repo").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_trailing_slash() {
+        assert!(RepoKey::parse("github.com/org/repo/").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_backslash() {
+        assert!(RepoKey::parse("github.com\\org/repo").is_err());
+    }
+
+    #[test]
+    fn repo_key_rejects_nul_byte() {
+        assert!(RepoKey::parse("github.com/org/re\0po").is_err());
+    }
+
+    #[test]
+    fn repo_key_display_round_trips() {
+        let key = RepoKey::parse("github.com/org/repo").unwrap();
+        let reparsed = RepoKey::parse(key.to_string()).unwrap();
+        assert_eq!(key, reparsed);
+    }
+
+    #[test]
+    fn repo_key_local_bare_path() {
+        let key = RepoKey::parse("github.com/org/repo").unwrap();
+        assert_eq!(key.local_bare_path(), "github.com/org/repo.git");
+    }
+
+    #[test]
+    fn repo_key_serde_round_trip() {
+        let key = RepoKey::parse("github.com/org/repo").unwrap();
+        let json = serde_json::to_string(&key).unwrap();
+        assert_eq!(json, r#""github.com/org/repo""#);
+        let parsed: RepoKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, key);
+    }
+
+    #[test]
+    fn repo_key_serde_rejects_invalid() {
+        assert!(serde_json::from_str::<RepoKey>(r#""invalid""#).is_err());
+    }
+
+    // ── Additional CommitSha correctness tests ───────────────────────
+
+    #[test]
+    fn commit_sha_valid_40_hex() {
+        let sha = CommitSha::parse("a".repeat(40)).unwrap();
+        assert_eq!(sha.as_str(), "a".repeat(40));
+    }
+
+    #[test]
+    fn commit_sha_mixed_case_normalizes_to_lowercase() {
+        let mixed = "aAbBcCdDeEfF".repeat(4).chars().take(40).collect::<String>();
+        assert_eq!(mixed.len(), 40);
+        let sha = CommitSha::parse(&mixed).unwrap();
+        assert!(sha.as_str().chars().all(|c| c.is_ascii_lowercase()));
+    }
+
+    #[test]
+    fn commit_sha_rejects_too_short() {
+        assert!(CommitSha::parse("a".repeat(39)).is_err());
+    }
+
+    #[test]
+    fn commit_sha_rejects_too_long() {
+        assert!(CommitSha::parse("a".repeat(41)).is_err());
+    }
+
+    #[test]
+    fn commit_sha_rejects_non_hex() {
+        let mut bad = "a".repeat(39);
+        bad.push('g');
+        assert!(CommitSha::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn commit_sha_rejects_empty() {
+        assert!(CommitSha::parse("").is_err());
+    }
+
+    #[test]
+    fn commit_sha_display_round_trips() {
+        let sha = CommitSha::parse("b".repeat(40)).unwrap();
+        let reparsed = CommitSha::parse(sha.to_string()).unwrap();
+        assert_eq!(sha, reparsed);
+    }
+
+    // ── Additional ShortCommitSha correctness tests ──────────────────
+
+    #[test]
+    fn short_commit_sha_valid_4_chars() {
+        assert!(ShortCommitSha::parse("abcd").is_ok());
+    }
+
+    #[test]
+    fn short_commit_sha_valid_39_chars() {
+        assert!(ShortCommitSha::parse("a".repeat(39)).is_ok());
+    }
+
+    #[test]
+    fn short_commit_sha_rejects_less_than_4() {
+        assert!(ShortCommitSha::parse("abc").is_err());
+        assert!(ShortCommitSha::parse("ab").is_err());
+        assert!(ShortCommitSha::parse("a").is_err());
+    }
+
+    #[test]
+    fn short_commit_sha_rejects_full_40_chars() {
+        assert!(ShortCommitSha::parse("a".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn short_commit_sha_rejects_non_hex() {
+        assert!(ShortCommitSha::parse("ghijklmn").is_err());
+    }
+
+    #[test]
+    fn short_commit_sha_normalizes_to_lowercase() {
+        let sha = ShortCommitSha::parse("ABCDEF12").unwrap();
+        assert_eq!(sha.as_str(), "abcdef12");
+    }
+
+    #[test]
+    fn short_commit_sha_rejects_empty() {
+        assert!(ShortCommitSha::parse("").is_err());
+    }
 }
