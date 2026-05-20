@@ -13,6 +13,7 @@ git-cache-core = { path = "../git-cache-core" }
 git-cache-disk = { path = "../git-cache-disk" }
 git-cache-git = { path = "../git-cache-git" }
 git-cache-objectstore = { path = "../git-cache-objectstore" }
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

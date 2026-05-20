@@ -39,6 +39,8 @@ pub trait ObjectStore: Send + Sync {
     async fn put(&self, key: &str, value: Bytes) -> Result<()>;
     async fn put_if_absent(&self, key: &str, value: Bytes) -> Result<bool>;
     async fn exists(&self, key: &str) -> Result<bool>;
+    async fn delete(&self, key: &str) -> Result<()>;
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
 pub(crate) fn validate_key(key: &str) -> Result<()> {

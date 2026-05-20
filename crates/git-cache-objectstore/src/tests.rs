@@ -82,6 +82,72 @@ fn session_manifest(repo: &RepoKey) -> SessionManifest {
 }
 
 #[tokio::test]
+async fn delete_existing_key_removes_it() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    store
+        .put("data/item.json", Bytes::from("content"))
+        .await
+        .unwrap();
+    assert!(store.exists("data/item.json").await.unwrap());
+
+    store.delete("data/item.json").await.unwrap();
+    assert!(!store.exists("data/item.json").await.unwrap());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn delete_nonexistent_key_is_noop() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    store.delete("does/not/exist.json").await.unwrap();
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn list_prefix_returns_matching_keys() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    store
+        .put("sessions/a.json", Bytes::from("a"))
+        .await
+        .unwrap();
+    store
+        .put("sessions/b.json", Bytes::from("b"))
+        .await
+        .unwrap();
+    store
+        .put("sessions/sub/c.json", Bytes::from("c"))
+        .await
+        .unwrap();
+    store
+        .put("other/d.json", Bytes::from("d"))
+        .await
+        .unwrap();
+
+    let mut keys = store.list_prefix("sessions/").await.unwrap();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "sessions/a.json",
+            "sessions/b.json",
+            "sessions/sub/c.json",
+        ]
+    );
+
+    let empty = store.list_prefix("nonexistent/").await.unwrap();
+    assert!(empty.is_empty());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
 async fn put_if_absent_is_conditional() {
     let root = temp_root();
     let store = LocalObjectStore::new(&root);
