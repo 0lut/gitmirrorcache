@@ -269,7 +269,8 @@ impl Git {
         key: &str,
         value: &str,
     ) -> Result<GitOutput> {
-        self.run(Some(repo_dir), ["config", "--local", key, value])
+        reject_config_key(key)?;
+        self.run(Some(repo_dir), ["config", "--local", "--", key, value])
             .await
     }
 
@@ -536,6 +537,15 @@ fn reject_revision_arg(value: &str) -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+fn reject_config_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.starts_with('-') || key.contains('\0') {
+        return Err(GitCacheError::Validation(format!(
+            "invalid config key argument: {key:?}"
+        )));
+    }
     Ok(())
 }
 
