@@ -393,7 +393,6 @@ mod tests {
                 root: tmp.path().join("objects"),
             },
             session_ttl_seconds: 3600,
-            cached_ref_max_staleness_seconds: 300,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             allowed_upstream_hosts: vec!["github.com".into()],
