@@ -1175,10 +1175,20 @@ pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u
 pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u8> {
     let mut out = Vec::new();
 
-    let symref = comparison
+    // Sort refs for deterministic output.
+    let mut refs: Vec<(&String, &String)> = comparison.all_upstream.iter().collect();
+    refs.sort_by_key(|(name, _)| name.as_str());
+
+    // Only advertise symref when the default branch is actually present in
+    // the upstream refs. A symref pointing at a non-existent ref confuses
+    // git clients during clone.
+    let resolved_default = comparison
         .default_branch
-        .as_deref()
-        .map(|b| format!(" symref=HEAD:refs/heads/{b}"))
+        .as_ref()
+        .and_then(|b| comparison.all_upstream.get(b).map(|sha| (b.as_str(), sha.as_str())));
+
+    let symref = resolved_default
+        .map(|(b, _)| format!(" symref=HEAD:refs/heads/{b}"))
         .unwrap_or_default();
 
     let caps = format!(
@@ -1188,25 +1198,13 @@ pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u
          object-format=sha1 agent=git-cache/1.0"
     );
 
-    // Sort refs for deterministic output.
-    let mut refs: Vec<(&String, &String)> = comparison.all_upstream.iter().collect();
-    refs.sort_by_key(|(name, _)| name.as_str());
-
     // HEAD line (first ref includes capabilities).
     let mut first_ref_used_for_caps = false;
-    if let Some(default_branch) = &comparison.default_branch {
-        if let Some(sha) = comparison.all_upstream.get(default_branch) {
-            let line = format!("{sha} HEAD\0{caps}\n");
-            pkt_line(&mut out, &line);
-        } else if let Some((name, sha)) = refs.first() {
-            // default_branch set but absent from upstream: first sorted ref
-            // carries capabilities so the advertisement is still valid.
-            let line = format!("{sha} refs/heads/{name}\0{caps}\n");
-            pkt_line(&mut out, &line);
-            first_ref_used_for_caps = true;
-        }
+    if let Some((_, sha)) = resolved_default {
+        let line = format!("{sha} HEAD\0{caps}\n");
+        pkt_line(&mut out, &line);
     } else if let Some((name, sha)) = refs.first() {
-        // No default branch at all: first sorted ref carries capabilities.
+        // No usable default branch: first sorted ref carries capabilities.
         let line = format!("{sha} refs/heads/{name}\0{caps}\n");
         pkt_line(&mut out, &line);
         first_ref_used_for_caps = true;
@@ -1778,5 +1776,33 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn synth_no_symref_when_default_branch_absent_from_refs() {
+        let sha = "a".repeat(40);
+        let comp = UpstreamRefComparison {
+            changed: HashMap::new(),
+            all_upstream: HashMap::from([("feature".to_string(), sha.clone())]),
+            default_branch: Some("main".to_string()),
+        };
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        // Capability line must exist (the \0 delimiter).
+        assert!(
+            text.contains('\0'),
+            "capability line missing when default_branch is absent from refs"
+        );
+
+        // symref must NOT reference a branch that isn't in the advertisement.
+        assert!(
+            !text.contains("symref=HEAD:refs/heads/main"),
+            "symref must not reference absent default_branch; got: {text}"
+        );
+
+        // The ref that IS present should still appear.
+        assert!(text.contains("refs/heads/feature"));
+        assert!(output.ends_with(b"0000"));
     }
 }
