@@ -27,7 +27,10 @@ impl Materializer {
         Self { state }
     }
 
-    pub async fn materialize(&self, request: MaterializeRequest) -> CoreResult<MaterializeResponse> {
+    pub async fn materialize(
+        &self,
+        request: MaterializeRequest,
+    ) -> CoreResult<MaterializeResponse> {
         self.validate_host(&request.repo)?;
         match request.selector {
             Selector::Commit(commit) => self.materialize_commit(request.repo, commit).await,
@@ -45,26 +48,36 @@ impl Materializer {
         }
     }
 
+    pub async fn materialize_after_upstream_validation(
+        &self,
+        request: MaterializeRequest,
+    ) -> CoreResult<MaterializeResponse> {
+        self.validate_host(&request.repo)?;
+        match request.selector {
+            Selector::Branch(branch) => {
+                self.materialize_branch_from_manifest(request.repo, &branch)
+                    .await
+            }
+            Selector::DefaultBranch => {
+                self.materialize_default_branch_from_manifest(request.repo)
+                    .await
+            }
+            _ => self.materialize(request).await,
+        }
+    }
+
     pub async fn materialize_short_commit(
         &self,
         repo: RepoKey,
         short_commit: ShortCommitSha,
     ) -> CoreResult<MaterializeResponse> {
         let repo_dir = self.ensure_repo_dir(&repo).await?;
-        if let Ok(commit) = self.resolve_short_commit(&repo_dir, &short_commit).await {
-            if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
-                if manifest.complete {
-                    self.hydrate_commit(&manifest).await?;
-                    return self
-                        .create_session(repo, commit, MaterializeSource::CacheVerified)
-                        .await;
-                }
-            }
-        }
-
         self.fetch_all_refs(&repo, &repo_dir).await?;
-        let commit = self.resolve_short_commit(&repo_dir, &short_commit).await?;
-        self.materialize_commit(repo, commit).await
+        let commit = self
+            .resolve_short_commit_from_upstream_refs(&repo_dir, &short_commit)
+            .await?;
+        self.materialize_verified_commit(repo, commit, MaterializeSource::GithubVerified)
+            .await
     }
 
     pub async fn materialize_commit(
@@ -90,36 +103,44 @@ impl Materializer {
             )));
         }
 
+        self.materialize_verified_commit(repo, commit, MaterializeSource::GithubVerified)
+            .await
+    }
+
+    async fn materialize_verified_commit(
+        &self,
+        repo: RepoKey,
+        commit: CommitSha,
+        source: MaterializeSource,
+    ) -> CoreResult<MaterializeResponse> {
+        if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
+            if manifest.complete {
+                self.hydrate_commit(&manifest).await?;
+                return self.create_session(repo, commit, source).await;
+            }
+        }
+
+        let repo_dir = self.ensure_repo_dir(&repo).await?;
+        if !self.commit_exists(&repo_dir, &commit).await {
+            return Err(GitCacheError::NotFound(format!(
+                "verified commit `{commit}` is missing from the local repo"
+            )));
+        }
+
         let generation = self
             .publish_generation(&repo, &repo_dir, &commit, None)
             .await?;
         debug!(%repo, %commit, %generation, "published generation for exact commit");
-        self.create_session(repo, commit, MaterializeSource::GithubVerified)
-            .await
+        self.create_session(repo, commit, source).await
     }
 
     pub async fn materialize_branch(
         &self,
         repo: RepoKey,
         branch: BranchName,
-        mode: RequestMode,
+        _mode: RequestMode,
         default_branch: bool,
     ) -> CoreResult<MaterializeResponse> {
-        if mode == RequestMode::Cached {
-            if let Some(ref_manifest) = self.get_branch_manifest(&repo, &branch).await? {
-                if self.ref_is_fresh(&ref_manifest) {
-                    self.hydrate_ref(&ref_manifest).await?;
-                    return self
-                        .create_session(repo, ref_manifest.commit, MaterializeSource::CacheVerified)
-                        .await;
-                }
-            }
-
-            return Err(GitCacheError::UpstreamUnavailable(format!(
-                "cached branch `{branch}` is unavailable or stale"
-            )));
-        }
-
         let commit = self.ensure_branch(&repo, &branch, default_branch).await?;
         self.create_session(repo, commit, MaterializeSource::GithubVerified)
             .await
@@ -175,23 +196,8 @@ impl Materializer {
     pub async fn materialize_default_branch(
         &self,
         repo: RepoKey,
-        mode: RequestMode,
+        _mode: RequestMode,
     ) -> CoreResult<MaterializeResponse> {
-        if mode == RequestMode::Cached {
-            if let Some(ref_manifest) = self.get_default_manifest(&repo).await? {
-                if self.ref_is_fresh(&ref_manifest) {
-                    self.hydrate_ref(&ref_manifest).await?;
-                    return self
-                        .create_session(repo, ref_manifest.commit, MaterializeSource::CacheVerified)
-                        .await;
-                }
-            }
-
-            return Err(GitCacheError::UpstreamUnavailable(
-                "cached default branch is unavailable or stale".into(),
-            ));
-        }
-
         let commit = self.ensure_default_branch(&repo).await?;
         self.create_session(repo, commit, MaterializeSource::GithubVerified)
             .await
@@ -467,6 +473,35 @@ impl Materializer {
         read_commit_manifest(&*self.state.store, repo, commit).await
     }
 
+    async fn materialize_branch_from_manifest(
+        &self,
+        repo: RepoKey,
+        branch: &BranchName,
+    ) -> CoreResult<MaterializeResponse> {
+        let manifest = self
+            .get_branch_manifest(&repo, branch)
+            .await?
+            .ok_or_else(|| {
+                GitCacheError::NotFound(format!("branch `{branch}` manifest missing"))
+            })?;
+        self.hydrate_ref(&manifest).await?;
+        self.create_session(repo, manifest.commit, MaterializeSource::GithubVerified)
+            .await
+    }
+
+    async fn materialize_default_branch_from_manifest(
+        &self,
+        repo: RepoKey,
+    ) -> CoreResult<MaterializeResponse> {
+        let manifest = self
+            .get_default_manifest(&repo)
+            .await?
+            .ok_or_else(|| GitCacheError::NotFound("default branch manifest missing".into()))?;
+        self.hydrate_ref(&manifest).await?;
+        self.create_session(repo, manifest.commit, MaterializeSource::GithubVerified)
+            .await
+    }
+
     async fn get_branch_manifest(
         &self,
         repo: &RepoKey,
@@ -536,6 +571,63 @@ impl Materializer {
         CommitSha::parse(output)
     }
 
+    async fn resolve_short_commit_from_upstream_refs(
+        &self,
+        repo_dir: &FsPath,
+        short_commit: &ShortCommitSha,
+    ) -> CoreResult<CommitSha> {
+        let commit = self.resolve_short_commit(repo_dir, short_commit).await?;
+        if self
+            .commit_reachable_from_upstream_refs(repo_dir, &commit)
+            .await?
+        {
+            return Ok(commit);
+        }
+
+        Err(GitCacheError::NotFound(format!(
+            "short commit `{short_commit}` was not found in freshly fetched upstream refs"
+        )))
+    }
+
+    async fn commit_reachable_from_upstream_refs(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> CoreResult<bool> {
+        let output = self
+            .state
+            .git
+            .run(
+                Some(repo_dir),
+                [
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/cache/upstream/heads",
+                ],
+            )
+            .await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
+        })?;
+
+        for ref_name in text.lines().filter(|line| !line.trim().is_empty()) {
+            if self
+                .state
+                .git
+                .run(
+                    Some(repo_dir),
+                    ["merge-base", "--is-ancestor", commit.as_str(), ref_name],
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
     pub async fn fetch_all_refs(&self, repo: &RepoKey, repo_dir: &FsPath) -> CoreResult<()> {
         let remote = self.upstream_url(repo)?;
         self.state
@@ -545,6 +637,7 @@ impl Materializer {
                 [
                     "fetch",
                     "--no-tags",
+                    "--prune",
                     &remote,
                     "+refs/heads/*:refs/cache/upstream/heads/*",
                 ],
@@ -655,12 +748,6 @@ impl Materializer {
             .join(format!("{session_id}.git"))
     }
 
-    fn ref_is_fresh(&self, manifest: &RefManifest) -> bool {
-        let max_age =
-            ChronoDuration::seconds(self.state.config.cached_ref_max_staleness_seconds as i64);
-        Utc::now() - manifest.verified_at <= max_age
-    }
-
     pub fn validate_host(&self, repo: &RepoKey) -> CoreResult<()> {
         if self
             .state
@@ -723,12 +810,10 @@ impl Materializer {
             let session_dir = self.session_repo_path(manifest.id);
             if session_dir.exists() {
                 let dir = session_dir.clone();
-                if let Err(err) = tokio::task::spawn_blocking(move || {
-                    std::fs::remove_dir_all(dir)
-                })
-                .await
-                .map_err(|err| GitCacheError::Io(std::io::Error::other(err)))
-                .and_then(|r| r.map_err(GitCacheError::Io))
+                if let Err(err) = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir))
+                    .await
+                    .map_err(|err| GitCacheError::Io(std::io::Error::other(err)))
+                    .and_then(|r| r.map_err(GitCacheError::Io))
                 {
                     errors.push(format!(
                         "failed to remove session dir `{}`: {err}",
@@ -781,9 +866,7 @@ impl UpdateExecutor for MaterializerExecutor {
                     .await?;
             }
             UpdateTarget::DefaultBranch => {
-                materializer
-                    .ensure_default_branch(&request.repo)
-                    .await?;
+                materializer.ensure_default_branch(&request.repo).await?;
             }
             UpdateTarget::Commit(commit) => {
                 materializer
@@ -977,7 +1060,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn short_commit_selector_uses_cached_full_commit_after_resolution() {
+    async fn short_commit_selector_revalidates_even_when_commit_is_cached() {
         let fixture = GitFixture::new();
         let state = fixture.state();
         let materializer = Materializer::new(Arc::new(state));
@@ -1001,8 +1084,42 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(short_response.source, MaterializeSource::CacheVerified);
+        assert_eq!(short_response.source, MaterializeSource::GithubVerified);
         assert_eq!(short_response.commit, branch_response.commit);
+    }
+
+    #[tokio::test]
+    async fn short_commit_selector_requires_upstream_even_when_cached() {
+        let fixture = GitFixture::new();
+        let state = fixture.state();
+        let materializer = Materializer::new(Arc::new(state));
+
+        let branch_response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let short = ShortCommitSha::parse(&branch_response.commit.as_str()[..8]).unwrap();
+
+        stdfs::rename(
+            fixture.upstream_path(),
+            fixture.tmp.path().join("offline.git"),
+        )
+        .unwrap();
+
+        let error = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::ShortCommit(short),
+                mode: RequestMode::Cached,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GitCacheError::UpstreamUnavailable(_)));
     }
 
     #[tokio::test]
@@ -1024,7 +1141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_branch_and_default_require_upstream() {
+    async fn branch_and_default_selectors_require_upstream_for_all_modes() {
         let fixture = GitFixture::new();
         let state = fixture.state();
         let materializer = Materializer::new(Arc::new(state));
@@ -1049,6 +1166,28 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GitCacheError::UpstreamUnavailable(_)));
+
+        let error = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Cached,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GitCacheError::UpstreamUnavailable(_)));
+
+        let error = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::DefaultBranch,
+                mode: RequestMode::Cached,
             })
             .await
             .unwrap_err();
@@ -1093,6 +1232,35 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn short_commit_selector_rejects_unreachable_stale_local_commit() {
+        let fixture = GitFixture::new();
+        let state = fixture.state();
+        let materializer = Materializer::new(Arc::new(state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let replacement = fixture.replace_history_and_push("replacement");
+        let stale_short = short_prefix_not_matching(&first.commit, &replacement);
+
+        let error = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::ShortCommit(stale_short),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, GitCacheError::NotFound(_)));
     }
 
     #[tokio::test]
@@ -1222,9 +1390,26 @@ mod tests {
             CommitSha::parse(git_stdout(&self.work_path(), ["rev-parse", "HEAD"])).unwrap()
         }
 
+        pub fn replace_history_and_push(&self, contents: &str) -> CommitSha {
+            run_git(&self.work_path(), ["checkout", "--orphan", "replacement"]);
+            stdfs::write(self.work_path().join("README.md"), format!("{contents}\n")).unwrap();
+            run_git(&self.work_path(), ["add", "README.md"]);
+            run_git(&self.work_path(), ["commit", "-m", contents]);
+            run_git(&self.work_path(), ["branch", "-M", "main"]);
+            run_git(&self.work_path(), ["push", "--force", "origin", "main"]);
+            CommitSha::parse(git_stdout(&self.work_path(), ["rev-parse", "HEAD"])).unwrap()
+        }
+
         pub fn head_commit(&self) -> CommitSha {
             CommitSha::parse(git_stdout(&self.work_path(), ["rev-parse", "HEAD"])).unwrap()
         }
+    }
+
+    fn short_prefix_not_matching(commit: &CommitSha, other: &CommitSha) -> ShortCommitSha {
+        let length = (8..40)
+            .find(|length| &commit.as_str()[..*length] != &other.as_str()[..*length])
+            .unwrap();
+        ShortCommitSha::parse(&commit.as_str()[..length]).unwrap()
     }
 
     fn run_git<I, S>(cwd: &FsPath, args: I)

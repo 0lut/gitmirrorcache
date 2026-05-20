@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, RequestMode, Result as CoreResult, Selector,
+    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
 };
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
 use git_cache_domain::{AppState, Materializer, MaterializerExecutor};
@@ -107,14 +107,12 @@ async fn materialize(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
-    let mut request = request;
-
     let use_coordinator = matches!(
         request.selector,
         Selector::Branch(_) | Selector::DefaultBranch
     );
 
-    if use_coordinator {
+    let verified_by_coordinator = if use_coordinator {
         let outcome = state
             .coordinator
             .read_through(request.repo.clone(), request.selector.clone())
@@ -133,20 +131,23 @@ async fn materialize(
                     .fetch_add(1, Ordering::Relaxed);
                 return Err(error.into());
             }
-            Ok(_) => {
-                // Coordinator already did fetch+publish; use Cached mode so
-                // materialize just creates a session from the fresh local data
-                // without hitting upstream again.
-                // TODO: this causes the response `source` field to report
-                // CacheVerified instead of GithubVerified. Fix by propagating
-                // the verification source from the coordinator outcome.
-                request.mode = RequestMode::Cached;
-            }
+            Ok(_) => {}
         }
-    }
+        true
+    } else {
+        false
+    };
 
     let materializer = Materializer::new(Arc::clone(&state.domain));
-    match materializer.materialize(request).await {
+    let result = if verified_by_coordinator {
+        materializer
+            .materialize_after_upstream_validation(request)
+            .await
+    } else {
+        materializer.materialize(request).await
+    };
+
+    match result {
         Ok(response) => Ok(Json(response).into_response()),
         Err(error) => {
             state
@@ -216,12 +217,14 @@ async fn git_session(
             .metrics
             .upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
-        advertise_refs(&state.domain, &session_repo).await.map(|output| {
-            let mut framed = Vec::with_capacity(output.len() + 34);
-            framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
-            framed.extend_from_slice(&output);
-            git_response("application/x-git-upload-pack-advertisement", framed)
-        })
+        advertise_refs(&state.domain, &session_repo)
+            .await
+            .map(|output| {
+                let mut framed = Vec::with_capacity(output.len() + 34);
+                framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
+                framed.extend_from_slice(&output);
+                git_response("application/x-git-upload-pack-advertisement", framed)
+            })
     } else if method == Method::POST && path.ends_with("/git-upload-pack") {
         state
             .metrics
