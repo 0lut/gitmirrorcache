@@ -363,11 +363,7 @@ impl Materializer {
         }
 
         self.state.git.fsck(repo_dir).await?;
-        let generation = GenerationId(
-            Utc::now()
-                .timestamp_nanos_opt()
-                .unwrap_or_else(|| Utc::now().timestamp_millis() * 1_000_000) as u64,
-        );
+        let generation = GenerationId::new();
         let bundle_key = bundle_key(repo, generation);
 
         let reservation = self.state.disk.reserve(1024 * 1024 * 64)?;

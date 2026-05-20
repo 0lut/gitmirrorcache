@@ -2,13 +2,26 @@ use crate::repo::{CommitSha, RepoKey};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct GenerationId(pub u64);
+pub struct GenerationId(pub Uuid);
+
+impl GenerationId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for GenerationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl fmt::Display for GenerationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:06}", self.0)
+        write!(f, "{}", self.0)
     }
 }
 
