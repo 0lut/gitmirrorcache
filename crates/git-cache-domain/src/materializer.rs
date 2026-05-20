@@ -2406,6 +2406,16 @@ mod tests {
         // output feature and terminate.
         assert!(text.contains("refs/heads/feature"));
         assert!(output.ends_with(b"0000"));
+
+        // BUG: When default_branch is set but absent from upstream refs,
+        // the capability line (\0-delimited) is never emitted. Git clients
+        // expect at least one ref line to carry capabilities. This assert
+        // documents the bug — it will start passing once the source is fixed.
+        // See: synthesize_ref_advertisement outer if-let vs else-if fallback.
+        assert!(
+            text.contains('\0'),
+            "capability line missing when default_branch is absent from refs (known bug)"
+        );
     }
 
     #[test]

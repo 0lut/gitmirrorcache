@@ -46,9 +46,12 @@ impl TestServer {
             &["symbolic-ref", "HEAD", "refs/heads/main"],
         );
 
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
         let config = AppConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            public_base_url: "http://127.0.0.1:0".into(),
+            bind_addr: addr,
+            public_base_url: format!("http://{addr}"),
             cache_root: tmp.path().join("cache"),
             upstream_root: Some(tmp.path().join("upstreams")),
             git_binary: PathBuf::from("git"),
@@ -72,8 +75,6 @@ impl TestServer {
         };
 
         let router = app(config);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
