@@ -133,6 +133,7 @@ impl Materializer {
         branch: &BranchName,
         default_branch: bool,
     ) -> CoreResult<CommitSha> {
+        self.validate_host(repo)?;
         let upstream_commit = self.ls_remote_branch(repo, branch).await?;
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
@@ -199,6 +200,7 @@ impl Materializer {
     /// Resolve, fetch and publish the default branch without creating a session.
     /// Returns the verified commit SHA.
     pub async fn ensure_default_branch(&self, repo: &RepoKey) -> CoreResult<CommitSha> {
+        self.validate_host(repo)?;
         let branch = self.resolve_default_branch(repo).await?;
         self.ensure_branch(repo, &branch, true).await
     }
