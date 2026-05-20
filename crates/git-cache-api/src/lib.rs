@@ -506,7 +506,9 @@ impl From<GitCacheError> for ApiError {
             GitCacheError::Validation(_) => StatusCode::BAD_REQUEST,
             GitCacheError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GitCacheError::Conflict(_) => StatusCode::CONFLICT,
-            GitCacheError::Io(_) | GitCacheError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            GitCacheError::Internal(_)
+            | GitCacheError::Io(_)
+            | GitCacheError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         Self {
