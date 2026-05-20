@@ -13,10 +13,11 @@ use git_cache_objectstore::{
 };
 use git_cache_worker::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tracing::debug;
+use tracing::{debug, info};
 
 pub struct Materializer {
     state: Arc<AppState>,
@@ -761,6 +762,251 @@ impl Materializer {
         ))
     }
 
+    // ── Direct Git Remote (read-through) domain methods ───────────────
+
+    /// Compare the upstream branch advertisement against local cache state.
+    /// Returns a map of branches that are missing or have a different SHA
+    /// locally, plus the upstream default branch name.
+    pub async fn compare_upstream_refs(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<UpstreamRefComparison> {
+        let upstream_url = self.upstream_url(repo)?;
+        let ls = self.state.git.ls_remote_heads(&upstream_url).await?;
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+
+        let mut changed: HashMap<String, String> = HashMap::new();
+
+        for (branch, upstream_sha) in &ls.refs {
+            let local_ref = format!("refs/heads/{branch}");
+            let local_sha = self.state.git.rev_parse(&repo_dir, &local_ref).await.ok();
+            if local_sha.as_deref() != Some(upstream_sha.as_str()) {
+                changed.insert(branch.clone(), upstream_sha.clone());
+            }
+        }
+
+        Ok(UpstreamRefComparison {
+            changed,
+            default_branch: ls.default_branch,
+            all_upstream: ls.refs,
+        })
+    }
+
+    /// Fetch only the branches that changed (from compare_upstream_refs),
+    /// update both internal cache refs and public refs, and publish manifests.
+    pub async fn fetch_changed_refs(
+        &self,
+        repo: &RepoKey,
+        comparison: &UpstreamRefComparison,
+    ) -> CoreResult<()> {
+        if comparison.changed.is_empty() {
+            return Ok(());
+        }
+
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let upstream_url = self.upstream_url(repo)?;
+
+        let refspecs: Vec<String> = comparison
+            .changed
+            .keys()
+            .map(|branch| {
+                format!(
+                    "+refs/heads/{branch}:refs/cache/upstream/heads/{branch}"
+                )
+            })
+            .collect();
+
+        self.state
+            .git
+            .fetch_refs(&repo_dir, &upstream_url, &refspecs)
+            .await?;
+
+        self.state.git.fsck(&repo_dir).await?;
+
+        for (branch, upstream_sha) in &comparison.changed {
+            let commit = CommitSha::parse(upstream_sha.as_str())?;
+            let branch_name = BranchName::parse(branch.as_str())?;
+
+            self.publish_generation(repo, &repo_dir, &commit, Some(branch_name))
+                .await?;
+
+            self.state
+                .git
+                .update_ref(
+                    &repo_dir,
+                    &format!("refs/heads/{branch}"),
+                    upstream_sha,
+                )
+                .await?;
+        }
+
+        if let Some(default_branch) = &comparison.default_branch {
+            self.state
+                .git
+                .symbolic_ref(
+                    &repo_dir,
+                    "HEAD",
+                    &format!("refs/heads/{default_branch}"),
+                )
+                .await?;
+
+            if let Some(sha) = comparison.all_upstream.get(default_branch) {
+                let commit = CommitSha::parse(sha.as_str())?;
+                self.put_default_manifest(repo, &commit).await?;
+            }
+        }
+
+        info!(
+            %repo,
+            changed_count = comparison.changed.len(),
+            "fetched and published changed refs"
+        );
+
+        Ok(())
+    }
+
+    /// Ensure the local bare repo is ready to serve refs for the direct Git
+    /// remote. This compares upstream, fetches changes, and configures the
+    /// repo with the right Git config for serving.
+    pub async fn ensure_repo_advertisable(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<PathBuf> {
+        self.validate_host(repo)?;
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+
+        self.configure_served_repo(&repo_dir).await?;
+
+        let comparison = self.compare_upstream_refs(repo).await?;
+
+        if !comparison.changed.is_empty() {
+            self.fetch_changed_refs(repo, &comparison).await?;
+        } else if comparison.default_branch.is_some() {
+            // Even if no branches changed, ensure default branch HEAD symref
+            // is set and public refs are in sync.
+            self.sync_public_refs(repo, &comparison).await?;
+        }
+
+        Ok(repo_dir)
+    }
+
+    /// Sync public refs from the current upstream advertisement without
+    /// fetching (used when all branches already match).
+    pub async fn sync_public_refs(
+        &self,
+        repo: &RepoKey,
+        comparison: &UpstreamRefComparison,
+    ) -> CoreResult<()> {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+
+        for (branch, sha) in &comparison.all_upstream {
+            let ref_name = format!("refs/heads/{branch}");
+            let local = self.state.git.rev_parse(&repo_dir, &ref_name).await.ok();
+            if local.as_deref() != Some(sha.as_str()) {
+                self.state
+                    .git
+                    .update_ref(&repo_dir, &ref_name, sha)
+                    .await?;
+            }
+        }
+
+        if let Some(default_branch) = &comparison.default_branch {
+            self.state
+                .git
+                .symbolic_ref(
+                    &repo_dir,
+                    "HEAD",
+                    &format!("refs/heads/{default_branch}"),
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure all wanted OIDs are available locally. For each want:
+    /// - If the object exists in the local repo, skip.
+    /// - If the commit is known in object-store manifests, hydrate.
+    /// - If unknown and commit_read_through is enabled, fetch from upstream.
+    /// - Otherwise, fail.
+    pub async fn ensure_wants_available(
+        &self,
+        repo: &RepoKey,
+        wants: &[String],
+    ) -> CoreResult<()> {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+
+        for want_sha in wants {
+            let commit = match CommitSha::parse(want_sha.as_str()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            if self.commit_exists(&repo_dir, &commit).await {
+                continue;
+            }
+
+            if let Some(manifest) = self.get_commit_manifest(repo, &commit).await? {
+                if manifest.complete {
+                    self.hydrate_commit(&manifest).await?;
+                    continue;
+                }
+            }
+
+            if self.state.config.git_remote.commit_read_through {
+                info!(%repo, %commit, "read-through fetch for unknown commit");
+                let upstream_url = self.upstream_url(repo)?;
+                self.state
+                    .git
+                    .run(
+                        Some(&repo_dir),
+                        ["fetch", "--no-tags", &upstream_url, commit.as_str()],
+                    )
+                    .await
+                    .map_err(|err| {
+                        GitCacheError::NotFound(format!(
+                            "commit `{commit}` could not be fetched from upstream: {err}"
+                        ))
+                    })?;
+
+                if !self.commit_exists(&repo_dir, &commit).await {
+                    return Err(GitCacheError::NotFound(format!(
+                        "commit `{commit}` not found after upstream fetch"
+                    )));
+                }
+
+                self.publish_generation(repo, &repo_dir, &commit, None)
+                    .await?;
+            } else {
+                return Err(GitCacheError::NotFound(format!(
+                    "commit `{commit}` is not available and read-through is disabled"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Configure a bare repo for serving via the direct Git remote:
+    /// - `uploadpack.allowAnySHA1InWant=true`
+    /// - `uploadpack.hideRefs=refs/cache`
+    /// - `transfer.hideRefs=refs/cache`
+    pub async fn configure_served_repo(&self, repo_dir: &FsPath) -> CoreResult<()> {
+        self.state
+            .git
+            .set_config(repo_dir, "uploadpack.allowAnySHA1InWant", "true")
+            .await?;
+        self.state
+            .git
+            .set_config(repo_dir, "uploadpack.hideRefs", "refs/cache")
+            .await?;
+        self.state
+            .git
+            .set_config(repo_dir, "transfer.hideRefs", "refs/cache")
+            .await?;
+        Ok(())
+    }
+
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
         let keys = self.state.store.list_prefix("repos/").await?;
         let session_keys: Vec<String> = keys
@@ -826,6 +1072,13 @@ impl Materializer {
 pub struct SessionCleanupReport {
     pub sessions_removed: usize,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpstreamRefComparison {
+    pub changed: HashMap<String, String>,
+    pub default_branch: Option<String>,
+    pub all_upstream: HashMap<String, String>,
 }
 
 pub struct MaterializerExecutor {
