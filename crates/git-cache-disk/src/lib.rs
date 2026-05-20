@@ -1,3 +1,7 @@
+pub mod async_disk;
+
+pub use async_disk::AsyncDiskManager;
+
 use git_cache_core::{GitCacheError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};

@@ -1,5 +1,5 @@
 use git_cache_core::{AppConfig, GitCacheError, ObjectStoreConfig, Result as CoreResult};
-use git_cache_disk::DiskManager;
+use git_cache_disk::{AsyncDiskManager, DiskManager};
 use git_cache_git::Git;
 use git_cache_objectstore::{LocalObjectStore, ObjectStore};
 use std::sync::Arc;
@@ -10,7 +10,7 @@ pub struct AppState {
     pub config: AppConfig,
     pub store: Arc<dyn ObjectStore>,
     pub git: Git,
-    pub disk: DiskManager,
+    pub disk: AsyncDiskManager,
 }
 
 impl AppState {
@@ -41,7 +41,7 @@ impl AppState {
             config,
             store,
             git,
-            disk,
+            disk: AsyncDiskManager::new(disk),
         })
     }
 }
