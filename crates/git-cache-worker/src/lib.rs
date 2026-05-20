@@ -1206,4 +1206,216 @@ mod tests {
 
         eprintln!("cron tick_once: {job_count} jobs completed in {elapsed:?}");
     }
+
+    // ── Contention Tests ─────────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct PanicExecutor;
+
+    #[async_trait]
+    impl UpdateExecutor for PanicExecutor {
+        async fn update(&self, _request: UpdateRequest) -> Result<()> {
+            panic!("executor panicked intentionally");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inflight_dedup_thundering_herd() {
+        let executor = Arc::new(RecordingExecutor::new(true));
+        let coord = coordinator(Arc::clone(&executor));
+
+        let first = tokio::spawn({
+            let c = coord.clone();
+            async move { c.read_through(repo(), branch("main")).await }
+        });
+        executor.wait_started().await;
+
+        let mut joiners = Vec::new();
+        for _ in 0..99 {
+            let c = coord.clone();
+            joiners.push(tokio::spawn(async move {
+                c.read_through(repo(), branch("main")).await
+            }));
+        }
+
+        tokio::task::yield_now().await;
+        assert_eq!(executor.calls(), 1, "executor called exactly once");
+
+        executor.release_one();
+        let first_result = first.await.unwrap().unwrap();
+        assert_eq!(first_result.disposition, UpdateDisposition::Updated);
+
+        for handle in joiners {
+            let outcome = handle.await.unwrap().unwrap();
+            assert_eq!(outcome.disposition, UpdateDisposition::Updated);
+            assert_eq!(outcome.key, first_result.key);
+        }
+
+        assert_eq!(executor.calls(), 1, "still exactly one executor call");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mixed_inflight_and_new_requests() {
+        let executor = Arc::new(RecordingExecutor::new(true));
+        let coord = coordinator(Arc::clone(&executor));
+
+        let main_task = tokio::spawn({
+            let c = coord.clone();
+            async move { c.read_through(repo(), branch("main")).await }
+        });
+        executor.wait_started().await;
+
+        // Same repo+branch should join inflight.
+        let join_task = tokio::spawn({
+            let c = coord.clone();
+            async move { c.read_through(repo(), branch("main")).await }
+        });
+
+        // Same repo, different branch should get LeaseBusy.
+        let busy_result = coord.read_through(repo(), branch("release")).await.unwrap();
+        assert_eq!(busy_result.disposition, UpdateDisposition::LeaseBusy);
+
+        executor.release_one();
+        let main_result = main_task.await.unwrap().unwrap();
+        let join_result = join_task.await.unwrap().unwrap();
+
+        assert_eq!(main_result.disposition, UpdateDisposition::Updated);
+        assert_eq!(join_result.disposition, UpdateDisposition::Updated);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rapid_fire_different_repos() {
+        let executor = Arc::new(RecordingExecutor::new(false));
+        let coord = UpdateCoordinator::new(
+            executor as Arc<dyn UpdateExecutor>,
+            Arc::new(InMemoryRepoLeaseManager::new()),
+        );
+
+        let handles: Vec<_> = (0..50)
+            .map(|i| {
+                let c = coord.clone();
+                let repo = RepoKey::parse(format!("github.com/org/repo-{i}")).unwrap();
+                tokio::spawn(async move { c.read_through(repo, branch("main")).await })
+            })
+            .collect();
+
+        for handle in handles {
+            let outcome = handle.await.unwrap().unwrap();
+            assert_eq!(outcome.disposition, UpdateDisposition::Updated);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lease_release_and_immediate_reacquire() {
+        let executor = Arc::new(RecordingExecutor::new(false));
+        let coord = coordinator(Arc::clone(&executor));
+
+        let first = coord.read_through(repo(), branch("main")).await.unwrap();
+        assert_eq!(first.disposition, UpdateDisposition::Updated);
+        assert_eq!(executor.calls(), 1);
+
+        let second = coord.read_through(repo(), branch("main")).await.unwrap();
+        assert_eq!(second.disposition, UpdateDisposition::Updated);
+        assert_eq!(executor.calls(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn executor_panic_does_not_deadlock_waiters() {
+        let executor = Arc::new(PanicExecutor);
+        let coord = UpdateCoordinator::new(
+            executor as Arc<dyn UpdateExecutor>,
+            Arc::new(InMemoryRepoLeaseManager::new()),
+        );
+
+        let handle1 = tokio::spawn({
+            let c = coord.clone();
+            async move { c.read_through(repo(), branch("main")).await }
+        });
+
+        let handle2 = tokio::spawn({
+            let c = coord.clone();
+            async move { c.read_through(repo(), branch("main")).await }
+        });
+
+        let timeout_result = timeout(Duration::from_secs(5), async {
+            let r1 = handle1.await;
+            let r2 = handle2.await;
+            (r1, r2)
+        })
+        .await;
+
+        // The test passes if we don't deadlock (timeout doesn't fire).
+        // At least one will see a panic or error propagated.
+        assert!(
+            timeout_result.is_ok(),
+            "coordinator must not deadlock on executor panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_hint_channel_backpressure() {
+        let (sender, mut receiver) = event_hint_channel(2);
+
+        sender
+            .submit(EventHint::new(repo(), "refs/heads/main").unwrap())
+            .await
+            .unwrap();
+        sender
+            .submit(EventHint::new(repo(), "refs/heads/dev").unwrap())
+            .await
+            .unwrap();
+
+        // Channel is full (capacity 2). A third send should not complete
+        // immediately (it blocks). We verify by trying with a timeout.
+        let send_task = tokio::spawn({
+            let sender = sender.clone();
+            async move {
+                sender
+                    .submit(EventHint::new(repo(), "refs/heads/feat").unwrap())
+                    .await
+            }
+        });
+
+        // Give it a moment — it should be blocked.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!send_task.is_finished(), "send should be blocked by backpressure");
+
+        // Drain one message.
+        let _ = receiver.next_hint().await.unwrap();
+
+        // Now the blocked sender should complete.
+        let result = timeout(Duration::from_secs(2), send_task).await;
+        assert!(result.is_ok(), "send should complete after drain");
+        result.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cron_and_read_through_contention() {
+        let executor = Arc::new(RecordingExecutor::new(true));
+        let coord = coordinator(Arc::clone(&executor));
+        let cron_config = CronUpdateConfig::try_new(
+            Duration::from_millis(1),
+            vec![CronJob::new(repo(), branch("main"))],
+        )
+        .unwrap()
+        .with_run_immediately(true);
+
+        let cron_loop = CronUpdateLoop::new(coord.clone(), cron_config);
+
+        // Start cron in background.
+        let (stop, stop_signal) = stop_channel();
+        let cron_task = tokio::spawn(cron_loop.run_until(stop_signal));
+
+        // Wait for cron to start its first update.
+        executor.wait_started().await;
+
+        // Attempt a read_through for the same repo — should get LeaseBusy
+        // because cron holds the repo lease.
+        let read_result = coord.read_through(repo(), branch("release")).await.unwrap();
+        assert_eq!(read_result.disposition, UpdateDisposition::LeaseBusy);
+
+        executor.release_one();
+        stop.stop();
+        let _ = timeout(Duration::from_secs(2), cron_task).await;
+    }
 }
