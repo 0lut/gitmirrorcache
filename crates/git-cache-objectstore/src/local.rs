@@ -87,6 +87,43 @@ impl ObjectStore for LocalObjectStore {
             Err(err) => Err(err.into()),
         }
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let path = self.object_path(key)?;
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let base = self.root.join(prefix);
+        let mut keys = Vec::new();
+
+        if !matches!(fs::metadata(&base).await, Ok(m) if m.is_dir()) {
+            return Ok(keys);
+        }
+
+        let mut stack = vec![base.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut entries = fs::read_dir(&dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let ft = entry.file_type().await?;
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() {
+                    if let Ok(rel) = path.strip_prefix(&self.root) {
+                        keys.push(rel.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+
+        keys.sort();
+        Ok(keys)
+    }
 }
 
 fn parent_dir(path: &Path) -> Result<&Path> {

@@ -10,6 +10,7 @@ use git_cache_objectstore::{
     read_session_manifest, write_json, write_ref_manifest, write_session_manifest,
     GenerationPublish, PublishManifests,
 };
+use serde::Serialize;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -666,6 +667,74 @@ impl Materializer {
             repo.name()
         ))
     }
+
+    pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
+        let keys = self.state.store.list_prefix("repos/").await?;
+        let session_keys: Vec<String> = keys
+            .into_iter()
+            .filter(|k| k.contains("/manifests/sessions/") && k.ends_with(".json"))
+            .collect();
+
+        let mut sessions_removed: usize = 0;
+        let mut errors: Vec<String> = Vec::new();
+        let now = Utc::now();
+
+        for key in session_keys {
+            let manifest: Option<SessionManifest> = match read_json(&*self.state.store, &key).await
+            {
+                Ok(m) => m,
+                Err(err) => {
+                    errors.push(format!("failed to read `{key}`: {err}"));
+                    continue;
+                }
+            };
+
+            let Some(manifest) = manifest else {
+                continue;
+            };
+
+            if manifest.expires_at >= now {
+                continue;
+            }
+
+            let session_dir = self.session_repo_path(manifest.id);
+            if session_dir.exists() {
+                let dir = session_dir.clone();
+                if let Err(err) = tokio::task::spawn_blocking(move || {
+                    std::fs::remove_dir_all(dir)
+                })
+                .await
+                .map_err(|err| GitCacheError::Io(std::io::Error::other(err)))
+                .and_then(|r| r.map_err(GitCacheError::Io))
+                {
+                    errors.push(format!(
+                        "failed to remove session dir `{}`: {err}",
+                        session_dir.display()
+                    ));
+                    continue;
+                }
+            }
+
+            if let Err(err) = self.state.store.delete(&key).await {
+                errors.push(format!("failed to delete manifest `{key}`: {err}"));
+                continue;
+            }
+
+            sessions_removed += 1;
+            debug!(session_id = %manifest.id, "cleaned up expired session");
+        }
+
+        Ok(SessionCleanupReport {
+            sessions_removed,
+            errors,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCleanupReport {
+    pub sessions_removed: usize,
+    pub errors: Vec<String>,
 }
 
 pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u8>> {

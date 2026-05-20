@@ -126,6 +126,70 @@ impl ObjectStore for S3ObjectStore {
             Err(err) => Err(s3_error("head", &s3_key, err)),
         }
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let s3_key = self.s3_key(key)?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+            .map_err(|err| s3_error("delete", &s3_key, err))?;
+        Ok(())
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let s3_prefix = if self.prefix.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{}/{}", self.prefix, prefix)
+        };
+
+        let mut keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&s3_prefix);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let output = request
+                .send()
+                .await
+                .map_err(|err| s3_error("list", &s3_prefix, err))?;
+
+            if let Some(contents) = output.contents {
+                for object in contents {
+                    if let Some(full_key) = object.key {
+                        let relative = if self.prefix.is_empty() {
+                            full_key
+                        } else {
+                            full_key
+                                .strip_prefix(&format!("{}/", self.prefix))
+                                .unwrap_or(&full_key)
+                                .to_string()
+                        };
+                        keys.push(relative);
+                    }
+                }
+            }
+
+            if output.is_truncated == Some(true) {
+                continuation_token = output.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+
+        Ok(keys)
+    }
 }
 
 fn normalize_prefix(prefix: String) -> Result<String> {
