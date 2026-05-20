@@ -406,3 +406,135 @@ async fn rejects_traversal_keys() {
 
     let _ = fs::remove_dir_all(root).await;
 }
+
+// ── Additional object store key validation tests ─────────────────
+
+#[test]
+fn validate_key_accepts_valid_relative_paths() {
+    assert!(validate_key("repos/github.com/org/repo/manifest.json").is_ok());
+    assert!(validate_key("a/b/c").is_ok());
+    assert!(validate_key("simple.txt").is_ok());
+}
+
+#[test]
+fn validate_key_rejects_empty() {
+    assert!(validate_key("").is_err());
+}
+
+#[test]
+fn validate_key_rejects_leading_slash() {
+    assert!(validate_key("/repos/test").is_err());
+}
+
+#[test]
+fn validate_key_rejects_trailing_slash() {
+    assert!(validate_key("repos/test/").is_err());
+}
+
+#[test]
+fn validate_key_rejects_backslash() {
+    assert!(validate_key("repos\\test").is_err());
+}
+
+#[test]
+fn validate_key_rejects_nul_byte() {
+    assert!(validate_key("repos/te\0st").is_err());
+}
+
+#[test]
+fn validate_key_rejects_dot_dot_segments() {
+    assert!(validate_key("repos/../secret").is_err());
+    assert!(validate_key("..").is_err());
+}
+
+#[test]
+fn validate_key_rejects_single_dot_segments() {
+    assert!(validate_key("repos/./test").is_err());
+    assert!(validate_key(".").is_err());
+}
+
+#[test]
+fn validate_key_rejects_double_slash_empty_segments() {
+    assert!(validate_key("repos//test").is_err());
+}
+
+#[tokio::test]
+async fn put_if_absent_first_write_returns_true() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    let result = store
+        .put_if_absent("unique/key.json", Bytes::from("data"))
+        .await
+        .unwrap();
+    assert!(result);
+
+    let _ = fs::remove_dir_all(&root).await;
+}
+
+#[tokio::test]
+async fn put_if_absent_duplicate_returns_false() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    store
+        .put_if_absent("dup/key.json", Bytes::from("first"))
+        .await
+        .unwrap();
+    let second = store
+        .put_if_absent("dup/key.json", Bytes::from("second"))
+        .await
+        .unwrap();
+    assert!(!second);
+
+    let data = store.get("dup/key.json").await.unwrap().unwrap();
+    assert_eq!(data, Bytes::from("first"));
+
+    let _ = fs::remove_dir_all(&root).await;
+}
+
+#[tokio::test]
+async fn ref_manifest_absent_or_matches_matching_content() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+    let repo = repo();
+    let gen_id = test_generation_id();
+    let reference = ref_manifest_with_gen(&repo, gen_id);
+
+    assert!(
+        write_ref_manifest_if_absent_or_matches(&store, &reference)
+            .await
+            .unwrap()
+    );
+    // Same content → not an error, returns false (already exists)
+    assert!(
+        !write_ref_manifest_if_absent_or_matches(&store, &reference)
+            .await
+            .unwrap()
+    );
+
+    let _ = fs::remove_dir_all(&root).await;
+}
+
+#[tokio::test]
+async fn ref_manifest_absent_or_matches_conflicting_content() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+    let repo = repo();
+    let gen_id = test_generation_id();
+    let reference = ref_manifest_with_gen(&repo, gen_id);
+
+    write_ref_manifest_if_absent_or_matches(&store, &reference)
+        .await
+        .unwrap();
+
+    let mut conflicting = reference;
+    conflicting.commit = commit('b');
+    assert!(
+        write_ref_manifest_if_absent_or_matches(&store, &conflicting)
+            .await
+            .is_err()
+    );
+
+    let _ = fs::remove_dir_all(&root).await;
+}

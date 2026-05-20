@@ -865,4 +865,165 @@ mod tests {
         fs::create_dir_all(&repo_dir).expect("repo dir");
         fs::write(repo_dir.join("objects.pack"), vec![0u8; bytes]).expect("repo file");
     }
+
+    // ── Additional DiskManager correctness tests ─────────────────────
+
+    #[test]
+    fn new_and_status_returns_sensible_defaults() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        let status = manager.status().expect("status");
+
+        assert_eq!(status.quota_bytes, 10_000);
+        assert_eq!(status.reserved_bytes, 0);
+        assert_eq!(status.repo_count, 0);
+        assert_eq!(status.protected_repo_count, 0);
+        assert_eq!(status.locked_repo_count, 0);
+    }
+
+    #[test]
+    fn reserve_succeeds_within_quota() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+
+        let reservation = manager.reserve(100).expect("reserve");
+        assert_eq!(reservation.bytes(), 100);
+
+        let status = manager.status().expect("status");
+        assert_eq!(status.reserved_bytes, 100);
+    }
+
+    #[test]
+    fn reserve_fails_when_exceeding_quota() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 50, 0);
+
+        // Fill up with a repo file first
+        write_repo_file(&manager, "big.git", 50);
+        manager.record_repo_access("big.git").expect("access");
+        manager
+            .set_repo_protected("big.git", true)
+            .expect("protect");
+
+        let err = manager.reserve(10).expect_err("should be full");
+        assert!(matches!(err, GitCacheError::DiskFull(_)));
+    }
+
+    #[test]
+    fn temp_path_is_under_root() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+
+        let reservation = manager.reserve(64).expect("reserve");
+        let temp = reservation.temp_path();
+        assert!(temp.starts_with(root.path()));
+        assert!(temp.to_str().unwrap().contains("tmp"));
+    }
+
+    #[test]
+    fn record_repo_access_creates_index_entry() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "test.git", 10);
+
+        manager.record_repo_access("test.git").expect("access");
+
+        let status = manager.status().expect("status");
+        assert_eq!(status.repo_count, 1);
+    }
+
+    #[test]
+    fn record_repo_access_updates_existing_entry() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "test.git", 10);
+
+        manager.record_repo_access("test.git").expect("first");
+        std::thread::sleep(Duration::from_millis(2));
+        manager.record_repo_access("test.git").expect("second");
+
+        let status = manager.status().expect("status");
+        assert_eq!(status.repo_count, 1);
+    }
+
+    #[test]
+    fn lock_repo_increments_locked_count() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "lock.git", 10);
+        manager.record_repo_access("lock.git").expect("access");
+
+        let lock = manager.lock_repo("lock.git").expect("lock");
+        let status = manager.status().expect("status");
+        assert_eq!(status.locked_repo_count, 1);
+
+        drop(lock);
+        let status = manager.status().expect("status after drop");
+        assert_eq!(status.locked_repo_count, 0);
+    }
+
+    #[test]
+    fn set_repo_protected_marks_repo() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "prot.git", 10);
+        manager.record_repo_access("prot.git").expect("access");
+
+        manager
+            .set_repo_protected("prot.git", true)
+            .expect("protect");
+        let status = manager.status().expect("status");
+        assert_eq!(status.protected_repo_count, 1);
+
+        manager
+            .set_repo_protected("prot.git", false)
+            .expect("unprotect");
+        let status = manager.status().expect("status");
+        assert_eq!(status.protected_repo_count, 0);
+    }
+
+    #[test]
+    fn lru_eviction_evicts_oldest_non_protected_non_locked() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 500, 0);
+
+        write_repo_file(&manager, "oldest.git", 200);
+        manager.record_repo_access("oldest.git").expect("oldest");
+        std::thread::sleep(Duration::from_millis(2));
+
+        write_repo_file(&manager, "middle.git", 200);
+        manager.record_repo_access("middle.git").expect("middle");
+        std::thread::sleep(Duration::from_millis(2));
+
+        write_repo_file(&manager, "newest.git", 200);
+        manager.record_repo_access("newest.git").expect("newest");
+
+        // Need room → oldest should be evicted first
+        let _reservation = manager.reserve(100).expect("reserve");
+
+        assert!(!manager.repos_dir().join("oldest.git").exists());
+        assert!(manager.repos_dir().join("newest.git").exists());
+    }
+
+    #[test]
+    fn multiple_locks_tracked_correctly() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "multi.git", 10);
+        manager.record_repo_access("multi.git").expect("access");
+
+        let lock1 = manager.lock_repo("multi.git").expect("lock1");
+        let lock2 = manager.lock_repo("multi.git").expect("lock2");
+
+        let status = manager.status().expect("status");
+        assert_eq!(status.locked_repo_count, 1);
+
+        drop(lock1);
+        let status = manager.status().expect("status after drop1");
+        assert_eq!(status.locked_repo_count, 1);
+
+        drop(lock2);
+        let status = manager.status().expect("status after drop2");
+        assert_eq!(status.locked_repo_count, 0);
+    }
 }

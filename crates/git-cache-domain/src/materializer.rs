@@ -1306,6 +1306,166 @@ mod tests {
         );
     }
 
+    // ── Additional repo_from_git_path tests ────────────────────────
+
+    #[test]
+    fn repo_from_git_path_rejects_no_dot_git() {
+        assert!(repo_from_git_path("github.com/org/repo").is_err());
+    }
+
+    #[test]
+    fn repo_from_git_path_rejects_gitfoo_suffix() {
+        assert!(repo_from_git_path("github.com/org/repo.gitfoo").is_err());
+    }
+
+    #[test]
+    fn repo_from_git_path_with_info_refs_suffix() {
+        let key = repo_from_git_path("github.com/org/repo.git/info/refs").unwrap();
+        assert_eq!(key.as_str(), "github.com/org/repo");
+    }
+
+    #[test]
+    fn repo_from_git_path_with_upload_pack_suffix() {
+        let key = repo_from_git_path("github.com/org/repo.git/git-upload-pack").unwrap();
+        assert_eq!(key.as_str(), "github.com/org/repo");
+    }
+
+    #[test]
+    fn repo_from_git_path_bare_dot_git() {
+        let key = repo_from_git_path("github.com/org/repo.git").unwrap();
+        assert_eq!(key.as_str(), "github.com/org/repo");
+    }
+
+    // ── validate_host tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn validate_host_accepts_allowed_host() {
+        let fixture = GitFixture::new();
+        let state = fixture.state();
+        let materializer = Materializer::new(Arc::new(state));
+        assert!(materializer
+            .validate_host(&RepoKey::parse("github.com/org/repo").unwrap())
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_host_rejects_unlisted_host() {
+        let fixture = GitFixture::new();
+        let state = fixture.state();
+        let materializer = Materializer::new(Arc::new(state));
+        assert!(materializer
+            .validate_host(&RepoKey::parse("evil.com/org/repo").unwrap())
+            .is_err());
+    }
+
+    // ── upstream_url tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn upstream_url_with_upstream_root_set() {
+        let fixture = GitFixture::new();
+        let state = fixture.state();
+        let materializer = Materializer::new(Arc::new(state));
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let url = materializer.upstream_url(&repo).unwrap();
+        // With upstream_root set, it should be a local path
+        assert!(url.contains("github.com/org/repo.git"));
+    }
+
+    #[tokio::test]
+    async fn upstream_url_without_upstream_root() {
+        let fixture = GitFixture::new();
+        let mut state = fixture.state();
+        state.config.upstream_root = None;
+        let materializer = Materializer::new(Arc::new(state));
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let url = materializer.upstream_url(&repo).unwrap();
+        assert_eq!(url, "https://github.com/org/repo.git");
+    }
+
+    // ── default_manifest_key and bundle_key tests ────────────────────
+
+    #[test]
+    fn default_manifest_key_produces_expected_path() {
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        assert_eq!(
+            default_manifest_key(&repo),
+            "repos/github.com/org/repo/manifests/refs/default.json"
+        );
+    }
+
+    #[test]
+    fn bundle_key_produces_expected_path() {
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let gen = GenerationId::new();
+        let key = bundle_key(&repo, gen);
+        assert!(key.starts_with("repos/github.com/org/repo/generations/"));
+        assert!(key.ends_with("/base.bundle"));
+    }
+
+    // ── synthesize_ref_advertisement tests ───────────────────────────
+
+    #[test]
+    fn synthesize_ref_advertisement_contains_head_and_refs() {
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: Some("main".to_string()),
+            all_upstream: {
+                let mut m = HashMap::new();
+                m.insert("main".to_string(), "a".repeat(40));
+                m.insert("develop".to_string(), "b".repeat(40));
+                m
+            },
+        };
+        let output = synthesize_ref_advertisement(&comparison);
+        let text = String::from_utf8_lossy(&output);
+
+        assert!(text.contains("HEAD"));
+        assert!(text.contains("refs/heads/main"));
+        assert!(text.contains("refs/heads/develop"));
+        assert!(text.ends_with("0000"));
+    }
+
+    #[test]
+    fn synthesize_ref_advertisement_valid_pkt_line_format() {
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: Some("main".to_string()),
+            all_upstream: {
+                let mut m = HashMap::new();
+                m.insert("main".to_string(), "c".repeat(40));
+                m
+            },
+        };
+        let output = synthesize_ref_advertisement(&comparison);
+
+        // First 4 bytes are hex length
+        assert!(output.len() >= 4);
+        let first_len_str = std::str::from_utf8(&output[..4]).unwrap();
+        let first_len: usize = usize::from_str_radix(first_len_str, 16).unwrap();
+        assert!(first_len > 4);
+
+        // Ends with flush packet
+        assert!(output.ends_with(b"0000"));
+    }
+
+    #[test]
+    fn synthesize_ref_advertisement_contains_capability_line() {
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: Some("main".to_string()),
+            all_upstream: {
+                let mut m = HashMap::new();
+                m.insert("main".to_string(), "d".repeat(40));
+                m
+            },
+        };
+        let output = synthesize_ref_advertisement(&comparison);
+        let text = String::from_utf8_lossy(&output);
+
+        assert!(text.contains("multi_ack"));
+        assert!(text.contains("agent=git-cache/1.0"));
+    }
+
     #[test]
     fn repo_from_git_path_accepts_smart_http_suffixes() {
         assert_eq!(
@@ -1626,6 +1786,167 @@ mod tests {
         assert!(!advertised.contains("git-receive-pack"));
     }
 
+    // ── Contention Tests ─────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_materialize_same_branch() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Arc::new(Materializer::new(state));
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let m = Arc::clone(&materializer);
+                let repo = fixture.repo.clone();
+                tokio::spawn(async move {
+                    m.materialize(MaterializeRequest {
+                        repo,
+                        selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                        mode: RequestMode::Strict,
+                    })
+                    .await
+                })
+            })
+            .collect();
+
+        let mut commits = Vec::new();
+        for handle in handles {
+            let result = handle.await.unwrap();
+            if let Ok(response) = result {
+                commits.push(response.commit);
+            }
+        }
+
+        assert!(!commits.is_empty(), "at least one materialize must succeed");
+        let first = &commits[0];
+        for c in &commits {
+            assert_eq!(c, first, "all successful materializations return same commit");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_session_creation_unique_ids() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Arc::new(Materializer::new(state));
+
+        // First materialize to ensure commit is available.
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let commit = response.commit;
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let m = Arc::clone(&materializer);
+                let repo = fixture.repo.clone();
+                let c = commit.clone();
+                tokio::spawn(async move {
+                    m.create_session(repo, c, MaterializeSource::CacheVerified)
+                        .await
+                })
+            })
+            .collect();
+
+        let mut session_refs = Vec::new();
+        for handle in handles {
+            let response = handle.await.unwrap().unwrap();
+            session_refs.push(response.ref_name);
+        }
+
+        assert_eq!(session_refs.len(), 10);
+        // All session IDs must be unique.
+        let unique: std::collections::HashSet<_> = session_refs.iter().collect();
+        assert_eq!(unique.len(), 10, "all session IDs should be unique");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_cleanup_no_double_delete() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Arc::new(Materializer::new(Arc::clone(&state)));
+
+        // Create some sessions to clean up.
+        for _ in 0..5 {
+            let _ = materializer
+                .materialize(MaterializeRequest {
+                    repo: fixture.repo.clone(),
+                    selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                    mode: RequestMode::Strict,
+                })
+                .await;
+        }
+
+        // Spawn 3 concurrent cleanup tasks.
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let m = Arc::clone(&materializer);
+                tokio::spawn(async move { m.cleanup_expired_sessions().await })
+            })
+            .collect();
+
+        for handle in handles {
+            // Should not panic or return an error from double-delete.
+            let result = handle.await.unwrap();
+            assert!(result.is_ok(), "cleanup should succeed: {:?}", result.err());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_during_upstream_change() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Arc::new(Materializer::new(state));
+
+        // Capture the original commit BEFORE pushing a new one.
+        let original_commit = fixture.head_commit();
+
+        // Start a materialize.
+        let m1 = Arc::clone(&materializer);
+        let repo1 = fixture.repo.clone();
+        let first_handle = tokio::spawn(async move {
+            m1.materialize(MaterializeRequest {
+                repo: repo1,
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+        });
+
+        // Push a new commit upstream while the first materialize is running.
+        let new_commit = fixture.commit_and_push("mid-flight change");
+
+        let first_result = first_handle.await.unwrap();
+        // First should succeed with either the old or new commit.
+        match first_result {
+            Ok(resp) => {
+                assert!(
+                    resp.commit == original_commit || resp.commit == new_commit,
+                    "should return a valid commit"
+                );
+            }
+            Err(_) => {
+                // Conflict during fetch is acceptable (branch moved).
+            }
+        }
+
+        // Second materialize should see the new commit.
+        let resp = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.commit, new_commit);
+    }
+
     pub struct GitFixture {
         pub tmp: TempDir,
         pub repo: RepoKey,
@@ -1640,8 +1961,8 @@ mod tests {
             fixture
         }
 
-        pub fn state(&self) -> AppState {
-            AppState::try_new(AppConfig {
+        pub fn state_config(&self) -> AppConfig {
+            AppConfig {
                 bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
                 public_base_url: "http://127.0.0.1:0".into(),
                 cache_root: self.cache_root(),
@@ -1661,8 +1982,11 @@ mod tests {
                     min_free_bytes: 0,
                 },
                 git_remote: Default::default(),
-            })
-            .unwrap()
+            }
+        }
+
+        pub fn state(&self) -> AppState {
+            AppState::try_new(self.state_config()).unwrap()
         }
 
         pub fn cache_root(&self) -> PathBuf {
@@ -1738,7 +2062,7 @@ mod tests {
 
     fn short_prefix_not_matching(commit: &CommitSha, other: &CommitSha) -> ShortCommitSha {
         let length = (8..40)
-            .find(|length| &commit.as_str()[..*length] != &other.as_str()[..*length])
+            .find(|length| commit.as_str()[..*length] != other.as_str()[..*length])
             .unwrap();
         ShortCommitSha::parse(&commit.as_str()[..length]).unwrap()
     }
@@ -1804,5 +2128,368 @@ mod tests {
         // The ref that IS present should still appear.
         assert!(text.contains("refs/heads/feature"));
         assert!(output.ends_with(b"0000"));
+    }
+
+    // ── Performance tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_repeated_materialize_same_branch() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let iterations = 10;
+
+        let first_start = std::time::Instant::now();
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let first_elapsed = first_start.elapsed();
+
+        let mut subsequent_total = std::time::Duration::ZERO;
+        for _ in 1..iterations {
+            let start = std::time::Instant::now();
+            let response = materializer
+                .materialize(MaterializeRequest {
+                    repo: fixture.repo.clone(),
+                    selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                    mode: RequestMode::Strict,
+                })
+                .await
+                .unwrap();
+            subsequent_total += start.elapsed();
+            assert_eq!(response.commit, first.commit);
+        }
+
+        let avg_subsequent = subsequent_total / (iterations - 1) as u32;
+        eprintln!(
+            "repeated materialize: first={first_elapsed:?}, avg_subsequent={avg_subsequent:?} ({} calls)",
+            iterations - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_creation_throughput() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let session_count = 20;
+
+        // First materialize to ensure branch is cached.
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let commit = response.commit;
+
+        let start = std::time::Instant::now();
+        let mut sessions = Vec::new();
+        for _ in 0..session_count {
+            let session = materializer
+                .create_session(
+                    fixture.repo.clone(),
+                    commit.clone(),
+                    MaterializeSource::CacheVerified,
+                )
+                .await
+                .unwrap();
+            sessions.push(session);
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(sessions.len(), session_count);
+        // Verify each session has a unique ref.
+        let refs: std::collections::HashSet<_> =
+            sessions.iter().map(|s| s.ref_name.clone()).collect();
+        assert_eq!(refs.len(), session_count, "each session should have a unique ref");
+
+        let avg = elapsed / session_count as u32;
+        eprintln!(
+            "session creation: {session_count} sessions in {elapsed:?}, avg={avg:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 60,
+            "session creation too slow: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_sessions_performance() {
+        let fixture = GitFixture::new();
+        let config = AppConfig {
+            session_ttl_seconds: 0, // Expire immediately.
+            ..fixture.state_config()
+        };
+        let state = Arc::new(AppState::try_new(config).unwrap());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let session_count = 50;
+
+        // Create sessions that will expire immediately (ttl=0).
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..session_count {
+            materializer
+                .create_session(
+                    fixture.repo.clone(),
+                    response.commit.clone(),
+                    MaterializeSource::CacheVerified,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Give a brief moment for the expiry to kick in.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let start = std::time::Instant::now();
+        let report = materializer.cleanup_expired_sessions().await.unwrap();
+        let elapsed = start.elapsed();
+
+        eprintln!(
+            "cleanup_expired_sessions: removed={}, errors={}, {elapsed:?} for {session_count} sessions",
+            report.sessions_removed,
+            report.errors.len()
+        );
+
+        // All sessions should be expired and cleaned up (ttl=0).
+        // We allow some margin since timing isn't precise.
+        assert!(
+            report.sessions_removed > 0,
+            "expected some sessions to be cleaned up"
+        );
+        assert!(
+            elapsed.as_secs() < 30,
+            "cleanup too slow: {elapsed:?}"
+        );
+    }
+
+    // ── synthesize_ref_advertisement unit tests ─────────────────────────
+
+    fn make_comparison(
+        refs: &[(&str, &str)],
+        default_branch: Option<&str>,
+    ) -> UpstreamRefComparison {
+        UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: default_branch.map(|s| s.to_string()),
+            all_upstream: refs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn parse_pkt_lines(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
+        let mut offset = 0;
+        while offset + 4 <= data.len() {
+            let hex = std::str::from_utf8(&data[offset..offset + 4]).unwrap();
+            let len = usize::from_str_radix(hex, 16).unwrap();
+            if len == 0 {
+                offset += 4;
+                continue;
+            }
+            assert!(len >= 4);
+            assert!(offset + len <= data.len());
+            lines.push(data[offset + 4..offset + len].to_vec());
+            offset += len;
+        }
+        lines
+    }
+
+    #[test]
+    fn synth_single_branch() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("main", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains(&format!("{sha} HEAD")));
+        assert!(text.contains("refs/heads/main"));
+        assert!(output.ends_with(b"0000"));
+    }
+
+    #[test]
+    fn synth_multiple_branches_sorted() {
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let sha_c = "c".repeat(40);
+        let sha_d = "d".repeat(40);
+        let sha_e = "e".repeat(40);
+        let comp = make_comparison(
+            &[
+                ("zeta", &sha_e),
+                ("alpha", &sha_a),
+                ("main", &sha_c),
+                ("beta", &sha_b),
+                ("gamma", &sha_d),
+            ],
+            Some("main"),
+        );
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        // All branches should appear.
+        for name in &["alpha", "beta", "gamma", "main", "zeta"] {
+            assert!(
+                text.contains(&format!("refs/heads/{name}")),
+                "missing branch {name}"
+            );
+        }
+
+        // Extract branch names from pkt-line data.
+        // Each ref line is: "{sha} refs/heads/{name}\n" (no NUL separator).
+        // The HEAD/capabilities line is: "{sha} HEAD\0{caps}\n" — skip it.
+        let pkt_lines = parse_pkt_lines(&output);
+        let mut branch_names: Vec<String> = Vec::new();
+        for pkt in &pkt_lines {
+            let line_str = String::from_utf8_lossy(pkt);
+            // Skip capability lines (they contain NUL).
+            if line_str.contains('\0') {
+                continue;
+            }
+            if let Some(rest) = line_str.split("refs/heads/").nth(1) {
+                let name = rest.trim().to_string();
+                if !name.is_empty() {
+                    branch_names.push(name);
+                }
+            }
+        }
+        let mut sorted = branch_names.clone();
+        sorted.sort();
+        assert_eq!(branch_names, sorted);
+    }
+
+    #[test]
+    fn synth_no_default_branch_uses_first_sorted() {
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let comp = make_comparison(&[("beta", &sha_b), ("alpha", &sha_a)], None);
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        // First line should be the first sorted branch with capabilities.
+        let lines = parse_pkt_lines(&output);
+        let first_line = String::from_utf8_lossy(&lines[0]);
+        assert!(
+            first_line.contains("refs/heads/alpha"),
+            "first line should be alpha (first sorted): {first_line}"
+        );
+        assert!(
+            first_line.contains('\0'),
+            "first line should contain capability separator"
+        );
+
+        assert!(text.contains("refs/heads/beta"));
+    }
+
+    #[test]
+    fn synth_default_branch_not_in_refs() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("feature", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        // "main" is set as default but not in all_upstream. Should still
+        // output feature and terminate.
+        assert!(text.contains("refs/heads/feature"));
+        assert!(output.ends_with(b"0000"));
+
+        // BUG: When default_branch is set but absent from upstream refs,
+        // the capability line (\0-delimited) is never emitted. Git clients
+        // expect at least one ref line to carry capabilities. This assert
+        // documents the bug — it will start passing once the source is fixed.
+        // See: synthesize_ref_advertisement outer if-let vs else-if fallback.
+        assert!(
+            text.contains('\0'),
+            "capability line missing when default_branch is absent from refs (known bug)"
+        );
+    }
+
+    #[test]
+    fn synth_pkt_line_length_correctness() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("main", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+
+        let mut offset = 0;
+        while offset + 4 <= output.len() {
+            let hex = std::str::from_utf8(&output[offset..offset + 4]).unwrap();
+            let len = usize::from_str_radix(hex, 16).unwrap();
+            if len == 0 {
+                offset += 4;
+                continue;
+            }
+            assert!(
+                len >= 4,
+                "pkt-line at offset {offset} has invalid length {len}"
+            );
+            assert!(
+                offset + len <= output.len(),
+                "pkt-line at offset {offset} extends beyond data"
+            );
+            // Verify the 4-char hex prefix matches actual line length.
+            let actual_data_len = len - 4;
+            let actual_data = &output[offset + 4..offset + len];
+            assert_eq!(
+                actual_data.len(),
+                actual_data_len,
+                "pkt-line length mismatch"
+            );
+            offset += len;
+        }
+    }
+
+    #[test]
+    fn synth_capability_string_contents() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("main", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        for cap in &[
+            "multi_ack",
+            "thin-pack",
+            "side-band-64k",
+            "no-done",
+            "object-format=sha1",
+        ] {
+            assert!(text.contains(cap), "missing capability: {cap}");
+        }
+    }
+
+    #[test]
+    fn synth_symref_capability() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("main", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        assert!(
+            text.contains("symref=HEAD:refs/heads/main"),
+            "missing symref capability"
+        );
+    }
+
+    #[test]
+    fn synth_empty_refs() {
+        let comp = make_comparison(&[], None);
+        let output = synthesize_ref_advertisement(&comp);
+        assert_eq!(output, b"0000");
     }
 }

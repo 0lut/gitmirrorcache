@@ -1153,6 +1153,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "toml",
  "uuid",
@@ -1162,6 +1163,7 @@ dependencies = [
 name = "git-cache-disk"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "git-cache-core",
  "serde",
  "serde_json",
@@ -1207,9 +1209,11 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "chrono",
+ "futures",
  "git-cache-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
