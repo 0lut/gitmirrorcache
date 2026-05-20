@@ -91,6 +91,20 @@ async fn materialize(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
+    handle_materialize_request(&state, request).await
+}
+
+async fn resolve(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<MaterializeRequest>,
+) -> Result<Response, ApiError> {
+    handle_materialize_request(&state, request).await
+}
+
+async fn handle_materialize_request(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+) -> Result<Response, ApiError> {
     if !state.rate_limiter.check() {
         state
             .metrics
@@ -157,15 +171,6 @@ async fn materialize(
             Err(error.into())
         }
     }
-}
-
-async fn resolve(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<MaterializeRequest>,
-) -> Result<Response, ApiError> {
-    let materializer = Materializer::new(Arc::clone(&state.domain));
-    let response = materializer.materialize(request).await?;
-    Ok(Json(response).into_response())
 }
 
 async fn git_session(
