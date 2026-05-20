@@ -137,6 +137,9 @@ async fn materialize(
                 // Coordinator already did fetch+publish; use Cached mode so
                 // materialize just creates a session from the fresh local data
                 // without hitting upstream again.
+                // TODO: this causes the response `source` field to report
+                // CacheVerified instead of GithubVerified. Fix by propagating
+                // the verification source from the coordinator outcome.
                 request.mode = RequestMode::Cached;
             }
         }
