@@ -168,14 +168,16 @@ impl Git {
         .await
     }
 
-    /// Run `git ls-remote --heads --symref <remote>` and return a map of
+    /// Run `git ls-remote --symref <remote>` and return a map of
     /// `refs/heads/<branch>` → commit SHA, plus the optional default branch name.
+    /// We intentionally omit `--heads` so that the HEAD symref annotation is
+    /// included in the output, and filter to `refs/heads/*` in memory.
     pub async fn ls_remote_heads(
         &self,
         remote: &str,
     ) -> Result<LsRemoteResult> {
         let output = self
-            .run(None, ["ls-remote", "--heads", "--symref", remote])
+            .run(None, ["ls-remote", "--symref", remote])
             .await
             .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
 
@@ -255,7 +257,9 @@ impl Git {
         name: &str,
         target: &str,
     ) -> Result<GitOutput> {
-        self.run(Some(repo_dir), ["symbolic-ref", name, target])
+        reject_ref_arg(name, "symbolic-ref name")?;
+        reject_ref_arg(target, "symbolic-ref target")?;
+        self.run(Some(repo_dir), ["symbolic-ref", "--", name, target])
             .await
     }
 

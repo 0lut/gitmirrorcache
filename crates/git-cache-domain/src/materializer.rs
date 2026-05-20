@@ -1312,6 +1312,7 @@ mod tests {
                     quota_bytes: 1024 * 1024 * 1024,
                     min_free_bytes: 0,
                 },
+                git_remote: Default::default(),
             })
             .unwrap()
         }
