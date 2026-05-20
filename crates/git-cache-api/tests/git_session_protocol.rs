@@ -31,9 +31,15 @@ impl TestServer {
         std::fs::create_dir_all(upstream_bare.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&upstream_work).unwrap();
 
-        run_git(tmp.path(), &["init", "--bare", upstream_bare.to_str().unwrap()]);
+        run_git(
+            tmp.path(),
+            &["init", "--bare", upstream_bare.to_str().unwrap()],
+        );
         run_git(&upstream_work, &["init"]);
-        run_git(&upstream_work, &["config", "user.email", "test@example.com"]);
+        run_git(
+            &upstream_work,
+            &["config", "user.email", "test@example.com"],
+        );
         run_git(&upstream_work, &["config", "user.name", "Test"]);
         std::fs::write(upstream_work.join("README.md"), "initial\n").unwrap();
         run_git(&upstream_work, &["add", "README.md"]);
@@ -44,10 +50,7 @@ impl TestServer {
             &["remote", "add", "origin", upstream_bare.to_str().unwrap()],
         );
         run_git(&upstream_work, &["push", "origin", "main"]);
-        run_git(
-            &upstream_bare,
-            &["symbolic-ref", "HEAD", "refs/heads/main"],
-        );
+        run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         let config = AppConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -104,7 +107,11 @@ impl TestServer {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -114,7 +121,11 @@ fn run_git(cwd: &Path, args: &[&str]) {
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed: {}",

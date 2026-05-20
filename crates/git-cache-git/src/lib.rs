@@ -172,10 +172,7 @@ impl Git {
     /// `refs/heads/<branch>` → commit SHA, plus the optional default branch name.
     /// We intentionally omit `--heads` so that the HEAD symref annotation is
     /// included in the output, and filter to `refs/heads/*` in memory.
-    pub async fn ls_remote_heads(
-        &self,
-        remote: &str,
-    ) -> Result<LsRemoteResult> {
+    pub async fn ls_remote_heads(&self, remote: &str) -> Result<LsRemoteResult> {
         reject_remote_url(remote)?;
         let output = self
             .run(None, ["ls-remote", "--symref", "--", remote])
@@ -266,12 +263,7 @@ impl Git {
             .await
     }
 
-    pub async fn set_config(
-        &self,
-        repo_dir: &Path,
-        key: &str,
-        value: &str,
-    ) -> Result<GitOutput> {
+    pub async fn set_config(&self, repo_dir: &Path, key: &str, value: &str) -> Result<GitOutput> {
         reject_config_key(key)?;
         reject_nul(value, "config value")?;
         self.run(Some(repo_dir), ["config", "--local", "--", key, value])
@@ -610,15 +602,13 @@ impl UploadPackProcess {
             }
         };
         let wait_fut = async { self.child.wait().await.map_err(GitCacheError::from) };
-        let (stderr, status) =
-            timeout(self.timeout, async { tokio::try_join!(stderr_fut, wait_fut) })
-                .await
-                .map_err(|_| {
-                    GitCacheError::Timeout(format!(
-                        "upload-pack exceeded {:?}",
-                        self.timeout
-                    ))
-                })??;
+        let (stderr, status) = timeout(self.timeout, async {
+            tokio::try_join!(stderr_fut, wait_fut)
+        })
+        .await
+        .map_err(|_| {
+            GitCacheError::Timeout(format!("upload-pack exceeded {:?}", self.timeout))
+        })??;
 
         if !status.success() {
             let stderr_text = String::from_utf8_lossy(&stderr);

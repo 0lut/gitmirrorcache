@@ -28,9 +28,15 @@ impl TestServer {
         std::fs::create_dir_all(upstream_bare.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&upstream_work).unwrap();
 
-        run_git(tmp.path(), &["init", "--bare", upstream_bare.to_str().unwrap()]);
+        run_git(
+            tmp.path(),
+            &["init", "--bare", upstream_bare.to_str().unwrap()],
+        );
         run_git(&upstream_work, &["init"]);
-        run_git(&upstream_work, &["config", "user.email", "test@example.com"]);
+        run_git(
+            &upstream_work,
+            &["config", "user.email", "test@example.com"],
+        );
         run_git(&upstream_work, &["config", "user.name", "Test"]);
         std::fs::write(upstream_work.join("README.md"), "initial\n").unwrap();
         run_git(&upstream_work, &["add", "README.md"]);
@@ -41,10 +47,7 @@ impl TestServer {
             &["remote", "add", "origin", upstream_bare.to_str().unwrap()],
         );
         run_git(&upstream_work, &["push", "origin", "main"]);
-        run_git(
-            &upstream_bare,
-            &["symbolic-ref", "HEAD", "refs/heads/main"],
-        );
+        run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -91,15 +94,16 @@ impl TestServer {
     }
 
     fn upload_pack_url(&self, repo: &str) -> String {
-        format!(
-            "http://{}/git/{}.git/git-upload-pack",
-            self.addr, repo
-        )
+        format!("http://{}/git/{}.git/git-upload-pack", self.addr, repo)
     }
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -172,11 +176,13 @@ async fn ref_advertisement_contains_capabilities() {
         .await
         .unwrap();
 
-    for cap in &["multi_ack", "thin-pack", "side-band-64k", "object-format=sha1"] {
-        assert!(
-            body.contains(cap),
-            "missing capability: {cap}"
-        );
+    for cap in &[
+        "multi_ack",
+        "thin-pack",
+        "side-band-64k",
+        "object-format=sha1",
+    ] {
+        assert!(body.contains(cap), "missing capability: {cap}");
     }
 }
 
@@ -245,7 +251,14 @@ async fn upload_pack_post_returns_pack_data() {
     let url_clone = url.clone();
     tokio::task::spawn_blocking(move || {
         let output = Command::new("git")
-            .args(["clone", "--no-tags", "--branch", "main", &url_clone, &clone_dir_str])
+            .args([
+                "clone",
+                "--no-tags",
+                "--branch",
+                "main",
+                &url_clone,
+                &clone_dir_str,
+            ])
             .output()
             .unwrap();
         assert!(

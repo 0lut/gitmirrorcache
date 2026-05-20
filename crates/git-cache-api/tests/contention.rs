@@ -32,9 +32,15 @@ impl TestServer {
         std::fs::create_dir_all(upstream_bare.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&upstream_work).unwrap();
 
-        run_git(tmp.path(), &["init", "--bare", upstream_bare.to_str().unwrap()]);
+        run_git(
+            tmp.path(),
+            &["init", "--bare", upstream_bare.to_str().unwrap()],
+        );
         run_git(&upstream_work, &["init"]);
-        run_git(&upstream_work, &["config", "user.email", "test@example.com"]);
+        run_git(
+            &upstream_work,
+            &["config", "user.email", "test@example.com"],
+        );
         run_git(&upstream_work, &["config", "user.name", "Test"]);
         std::fs::write(upstream_work.join("README.md"), "initial\n").unwrap();
         run_git(&upstream_work, &["add", "README.md"]);
@@ -45,10 +51,7 @@ impl TestServer {
             &["remote", "add", "origin", upstream_bare.to_str().unwrap()],
         );
         run_git(&upstream_work, &["push", "origin", "main"]);
-        run_git(
-            &upstream_bare,
-            &["symbolic-ref", "HEAD", "refs/heads/main"],
-        );
+        run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         // Bind first to discover the real port.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -105,7 +108,11 @@ impl TestServer {
     }
 
     fn commit_and_push(&self, contents: &str) -> String {
-        std::fs::write(self.upstream_work.join("README.md"), format!("{contents}\n")).unwrap();
+        std::fs::write(
+            self.upstream_work.join("README.md"),
+            format!("{contents}\n"),
+        )
+        .unwrap();
         run_git(&self.upstream_work, &["add", "README.md"]);
         run_git(&self.upstream_work, &["commit", "-m", contents]);
         run_git(&self.upstream_work, &["push", "--force", "origin", "main"]);
@@ -114,7 +121,11 @@ impl TestServer {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -124,7 +135,11 @@ fn run_git(cwd: &Path, args: &[&str]) {
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -302,7 +317,14 @@ async fn clone_push_advance_race() {
     let clone1 = server.tmp.path().join("adv-clone1");
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone1.to_str().unwrap()],
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone1.to_str().unwrap(),
+        ],
     )
     .await;
     let first_head = git_stdout_async(&clone1, &["rev-parse", "HEAD"]).await;
@@ -315,7 +337,14 @@ async fn clone_push_advance_race() {
     let clone2 = server.tmp.path().join("adv-clone2");
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone2.to_str().unwrap()],
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone2.to_str().unwrap(),
+        ],
     )
     .await;
     let second_head = git_stdout_async(&clone2, &["rev-parse", "HEAD"]).await;

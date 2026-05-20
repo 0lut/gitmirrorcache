@@ -61,9 +61,7 @@ pub struct SessionManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{
-        CommitManifest, GenerationId, GenerationManifest, RefManifest,
-    };
+    use crate::manifest::{CommitManifest, GenerationId, GenerationManifest, RefManifest};
 
     // ── SessionId tests ──────────────────────────────────────────────
 

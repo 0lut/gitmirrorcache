@@ -90,7 +90,11 @@ async fn concurrent_put_if_absent_exactly_one_wins() {
         .collect();
 
     let winners: Vec<_> = results.iter().filter(|(_, won)| *won).collect();
-    assert_eq!(winners.len(), 1, "exactly one task should win put_if_absent");
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one task should win put_if_absent"
+    );
 
     let winner_idx = winners[0].0;
     let stored = store.get("race/winner.dat").await.unwrap().unwrap();
@@ -175,16 +179,10 @@ async fn concurrent_list_prefix_during_writes_is_consistent() {
         for _ in 0..50 {
             let keys = reader_store.list_prefix("prefix/").await.unwrap();
             // Filter to final keys (ignore temp files from atomic writes).
-            let final_keys: Vec<_> = keys
-                .iter()
-                .filter(|k| !k.contains(".tmp"))
-                .collect();
+            let final_keys: Vec<_> = keys.iter().filter(|k| !k.contains(".tmp")).collect();
             observed_sizes.push(final_keys.len());
             for key in &final_keys {
-                assert!(
-                    key.starts_with("prefix/item-"),
-                    "unexpected key: {key}"
-                );
+                assert!(key.starts_with("prefix/item-"), "unexpected key: {key}");
             }
             tokio::task::yield_now().await;
         }
@@ -196,7 +194,10 @@ async fn concurrent_list_prefix_during_writes_is_consistent() {
 
     // Sizes should be in [0, 20].
     for &size in &sizes {
-        assert!(size <= 20, "list should never return more items than written");
+        assert!(
+            size <= 20,
+            "list should never return more items than written"
+        );
     }
 }
 
@@ -315,7 +316,11 @@ async fn lease_acquisition_contention_exactly_one_acquires() {
         .collect();
 
     let acquired: Vec<_> = results.iter().filter(|r| r.is_some()).collect();
-    assert_eq!(acquired.len(), 1, "exactly one task should acquire the lease");
+    assert_eq!(
+        acquired.len(),
+        1,
+        "exactly one task should acquire the lease"
+    );
 
     let not_acquired: Vec<_> = results.iter().filter(|r| r.is_none()).collect();
     assert_eq!(not_acquired.len(), 19);

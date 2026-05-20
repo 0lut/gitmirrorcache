@@ -29,9 +29,15 @@ impl TestServer {
         std::fs::create_dir_all(upstream_bare.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&upstream_work).unwrap();
 
-        run_git(tmp.path(), &["init", "--bare", upstream_bare.to_str().unwrap()]);
+        run_git(
+            tmp.path(),
+            &["init", "--bare", upstream_bare.to_str().unwrap()],
+        );
         run_git(&upstream_work, &["init"]);
-        run_git(&upstream_work, &["config", "user.email", "test@example.com"]);
+        run_git(
+            &upstream_work,
+            &["config", "user.email", "test@example.com"],
+        );
         run_git(&upstream_work, &["config", "user.name", "Test"]);
         std::fs::write(upstream_work.join("README.md"), "initial\n").unwrap();
         run_git(&upstream_work, &["add", "README.md"]);
@@ -42,10 +48,7 @@ impl TestServer {
             &["remote", "add", "origin", upstream_bare.to_str().unwrap()],
         );
         run_git(&upstream_work, &["push", "origin", "main"]);
-        run_git(
-            &upstream_bare,
-            &["symbolic-ref", "HEAD", "refs/heads/main"],
-        );
+        run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -95,7 +98,11 @@ impl TestServer {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -211,9 +218,7 @@ async fn test_sequential_clone_throughput() {
     }
 
     let avg = elapsed / clone_count;
-    eprintln!(
-        "sequential clone: {clone_count} clones in {elapsed:?}, avg={avg:?}"
-    );
+    eprintln!("sequential clone: {clone_count} clones in {elapsed:?}, avg={avg:?}");
     assert!(
         elapsed.as_secs() < 120,
         "sequential clone too slow: {elapsed:?}"
@@ -240,12 +245,7 @@ async fn test_rate_limiter_throughput() {
     let mut other_count = 0u32;
 
     for _ in 0..total_requests {
-        let resp = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
+        let resp = client.post(&url).json(&body).send().await.unwrap();
 
         match resp.status().as_u16() {
             429 => rate_limited_count += 1,

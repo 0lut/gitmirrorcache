@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use git_cache_core::{AppConfig, BranchName, CommitSha, MaterializeRequest, RequestMode, Selector, ShortCommitSha};
+use git_cache_core::{
+    AppConfig, BranchName, CommitSha, MaterializeRequest, RequestMode, Selector, ShortCommitSha,
+};
 use git_cache_disk::DiskManager;
 use git_cache_domain::{AppState, Materializer};
 use std::sync::Arc;

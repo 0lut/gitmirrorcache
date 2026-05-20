@@ -34,7 +34,10 @@ fn test_reservation_rapid_cycle() {
     );
 
     let status = dm.status().unwrap();
-    assert_eq!(status.reserved_bytes, 0, "all reservations should be released");
+    assert_eq!(
+        status.reserved_bytes, 0,
+        "all reservations should be released"
+    );
 }
 
 // ── 2. Concurrent reservations ───────────────────────────────────────────
@@ -71,9 +74,7 @@ async fn test_concurrent_reservations() {
         status.reserved_bytes
     );
 
-    eprintln!(
-        "concurrent reservations: {concurrent_tasks} tasks in {elapsed:?}"
-    );
+    eprintln!("concurrent reservations: {concurrent_tasks} tasks in {elapsed:?}");
     assert!(
         elapsed.as_secs() < 30,
         "concurrent reservations too slow: {elapsed:?}"
@@ -203,9 +204,7 @@ async fn test_async_concurrent_reservations() {
         "all async reservations should be released"
     );
 
-    eprintln!(
-        "async concurrent reservations: {concurrent_tasks} tasks in {elapsed:?}"
-    );
+    eprintln!("async concurrent reservations: {concurrent_tasks} tasks in {elapsed:?}");
     assert!(
         elapsed.as_secs() < 60,
         "async concurrent reservations too slow: {elapsed:?}"

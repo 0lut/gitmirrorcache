@@ -317,10 +317,8 @@ impl UpdateCoordinator {
 
         debug!(?key, "starting update");
         let coordinator = self.clone();
-        let join_result = tokio::spawn(async move {
-            coordinator.execute_with_lease(request).await
-        })
-        .await;
+        let join_result =
+            tokio::spawn(async move { coordinator.execute_with_lease(request).await }).await;
 
         let result = match join_result {
             Ok(r) => r,
@@ -332,9 +330,7 @@ impl UpdateCoordinator {
             }
             Err(join_err) => {
                 warn!(?key, %join_err, "update task cancelled");
-                Err(GitCacheError::Internal(
-                    "update task cancelled".into(),
-                ))
+                Err(GitCacheError::Internal("update task cancelled".into()))
             }
         };
 
@@ -788,7 +784,10 @@ mod tests {
     fn from_selector_branch() {
         let selector = branch("main");
         let target = UpdateTarget::from_selector(&selector);
-        assert_eq!(target, UpdateTarget::Branch(BranchName::parse("main").unwrap()));
+        assert_eq!(
+            target,
+            UpdateTarget::Branch(BranchName::parse("main").unwrap())
+        );
     }
 
     #[test]
@@ -1095,9 +1094,7 @@ mod tests {
             assert_eq!(outcome.disposition, UpdateDisposition::Updated);
         }
 
-        eprintln!(
-            "high-volume dedup: {concurrent_calls} callers, 1 executor call, {elapsed:?}"
-        );
+        eprintln!("high-volume dedup: {concurrent_calls} callers, 1 executor call, {elapsed:?}");
     }
 
     #[tokio::test]
@@ -1115,9 +1112,7 @@ mod tests {
                 let coordinator = coordinator.clone();
                 let branch_name = branch_name.clone();
                 handles.push(tokio::spawn(async move {
-                    coordinator
-                        .read_through(repo(), branch(&branch_name))
-                        .await
+                    coordinator.read_through(repo(), branch(&branch_name)).await
                 }));
             }
         }
@@ -1378,7 +1373,10 @@ mod tests {
 
         // Give it a moment — it should be blocked.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!send_task.is_finished(), "send should be blocked by backpressure");
+        assert!(
+            !send_task.is_finished(),
+            "send should be blocked by backpressure"
+        );
 
         // Drain one message.
         let _ = receiver.next_hint().await.unwrap();

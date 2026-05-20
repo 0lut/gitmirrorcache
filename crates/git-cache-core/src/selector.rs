@@ -319,8 +319,7 @@ mod tests {
     #[test]
     fn selector_rejects_multiple_fields() {
         assert!(
-            serde_json::from_str::<Selector>(r#"{"branch":"main","default_branch":true}"#)
-                .is_err()
+            serde_json::from_str::<Selector>(r#"{"branch":"main","default_branch":true}"#).is_err()
         );
     }
 

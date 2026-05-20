@@ -3,12 +3,15 @@ use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use futures::Stream;
 use git_cache_core::{
     AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
 };
-use futures::Stream;
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
-use git_cache_domain::{AppState, Materializer, MaterializerExecutor, synthesize_ref_advertisement};
+pub use git_cache_domain::AppState as DomainAppState;
+use git_cache_domain::{
+    synthesize_ref_advertisement, AppState, Materializer, MaterializerExecutor,
+};
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
@@ -20,7 +23,6 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
-pub use git_cache_domain::AppState as DomainAppState;
 
 pub fn app(config: AppConfig) -> Router {
     app_result(config).expect("failed to initialize git-cache-api")
@@ -306,9 +308,7 @@ async fn git_repo(
 
     if method == Method::GET
         && path.ends_with("/info/refs")
-        && query
-            .get("service")
-            .is_some_and(|s| s == "git-upload-pack")
+        && query.get("service").is_some_and(|s| s == "git-upload-pack")
     {
         state
             .metrics
@@ -367,10 +367,7 @@ async fn git_repo(
                 };
                 Response::builder()
                     .status(StatusCode::OK)
-                    .header(
-                        header::CONTENT_TYPE,
-                        "application/x-git-upload-pack-result",
-                    )
+                    .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
                     .header(header::CACHE_CONTROL, "no-cache")
                     .body(Body::from_stream(guarded))
                     .expect("git upload-pack response")
@@ -506,9 +503,9 @@ impl From<GitCacheError> for ApiError {
             GitCacheError::Validation(_) => StatusCode::BAD_REQUEST,
             GitCacheError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             GitCacheError::Conflict(_) => StatusCode::CONFLICT,
-            GitCacheError::Internal(_)
-            | GitCacheError::Io(_)
-            | GitCacheError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            GitCacheError::Internal(_) | GitCacheError::Io(_) | GitCacheError::Json(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
 
         Self {
