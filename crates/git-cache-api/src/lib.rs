@@ -6,16 +6,20 @@ use axum::{Json, Router};
 use git_cache_core::{
     AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
 };
+use futures::Stream;
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
-use git_cache_domain::{AppState, Materializer, MaterializerExecutor};
+use git_cache_domain::{AppState, Materializer, MaterializerExecutor, synthesize_ref_advertisement};
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-
+use tokio::io::AsyncRead;
+use tokio_util::io::ReaderStream;
 pub use git_cache_domain::AppState as DomainAppState;
 
 pub fn app(config: AppConfig) -> Router {
@@ -23,15 +27,21 @@ pub fn app(config: AppConfig) -> Router {
 }
 
 pub fn app_result(config: AppConfig) -> CoreResult<Router> {
+    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new(config)?);
 
-    Ok(Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/v1/materialize", post(materialize))
         .route("/v1/resolve", post(resolve))
-        .route("/git/session/{session_id}/{*repo_path}", any(git_session))
-        .with_state(state))
+        .route("/git/session/{session_id}/{*repo_path}", any(git_session));
+
+    if git_remote_enabled {
+        router = router.route("/git/{*repo_path}", any(git_repo));
+    }
+
+    Ok(router.with_state(state))
 }
 
 #[derive(Clone)]
@@ -70,7 +80,9 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
         "git_cache_materialize_total {}\n\
          git_cache_materialize_errors_total {}\n\
          git_cache_git_upload_pack_total {}\n\
-         git_cache_rate_limited_total {}\n",
+         git_cache_rate_limited_total {}\n\
+         git_cache_git_remote_refs_total {}\n\
+         git_cache_git_remote_upload_pack_total {}\n",
         state.metrics.materialize_total.load(Ordering::Relaxed),
         state
             .metrics
@@ -78,6 +90,11 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
             .load(Ordering::Relaxed),
         state.metrics.upload_pack_total.load(Ordering::Relaxed),
         state.metrics.rate_limited_total.load(Ordering::Relaxed),
+        state.metrics.git_remote_refs_total.load(Ordering::Relaxed),
+        state
+            .metrics
+            .git_remote_upload_pack_total
+            .load(Ordering::Relaxed),
     );
 
     Response::builder()
@@ -250,6 +267,162 @@ async fn git_session(
     }
 }
 
+/// Direct Git remote handler: `/git/{host}/{owner}/{repo}.git/...`
+///
+/// This is the read-through handler that makes the cache behave like a normal
+/// Git remote. No prior `/v1/materialize` call is needed.
+async fn git_repo(
+    State(state): State<Arc<ApiState>>,
+    Path(repo_path): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    let path = uri.path();
+
+    // Reject git-receive-pack (push) requests.
+    if path.contains("git-receive-pack")
+        || query
+            .get("service")
+            .is_some_and(|s| s == "git-receive-pack")
+    {
+        return ApiError::from(GitCacheError::Unsupported(
+            "git-receive-pack is disabled".into(),
+        ))
+        .into_response();
+    }
+
+    let repo = match repo_from_git_path(&repo_path) {
+        Ok(repo) => repo,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+
+    let materializer = Materializer::new(Arc::clone(&state.domain));
+
+    if let Err(error) = materializer.validate_host(&repo) {
+        return ApiError::from(error).into_response();
+    }
+
+    if method == Method::GET
+        && path.ends_with("/info/refs")
+        && query
+            .get("service")
+            .is_some_and(|s| s == "git-upload-pack")
+    {
+        state
+            .metrics
+            .git_remote_refs_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Fetch upstream refs via ls-remote and synthesize the pkt-line
+        // response directly.  No objects are fetched — the repo may not
+        // even exist locally yet.  Objects are fetched lazily when the
+        // client actually issues an upload-pack POST.
+        let comparison = match materializer.upstream_refs(&repo).await {
+            Ok(c) => c,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
+
+        let output = synthesize_ref_advertisement(&comparison);
+        let mut framed = Vec::with_capacity(output.len() + 34);
+        framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
+        framed.extend_from_slice(&output);
+        git_response("application/x-git-upload-pack-advertisement", framed)
+    } else if method == Method::POST && path.ends_with("/git-upload-pack") {
+        state
+            .metrics
+            .git_remote_upload_pack_total
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Parse want lines from the pkt-line request body.
+        let wants = parse_want_lines(&body);
+
+        // Ensure all wanted objects are available.
+        if !wants.is_empty() {
+            if let Err(error) = materializer.ensure_wants_available(&repo, &wants).await {
+                return ApiError::from(error).into_response();
+            }
+        }
+
+        let repo_dir = match materializer.ensure_repo_dir(&repo).await {
+            Ok(dir) => dir,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
+
+        // Ensure repo is configured for serving.
+        if let Err(error) = materializer.configure_served_repo(&repo_dir).await {
+            return ApiError::from(error).into_response();
+        }
+
+        // Stream the upload-pack response. We keep the child process alive
+        // for the duration of the HTTP response by moving it into the stream.
+        match state.domain.git.upload_pack_spawn(&repo_dir, &body).await {
+            Ok(process) => {
+                let child = process.child;
+                let reader_stream = ReaderStream::new(process.stdout);
+                let guarded = ChildGuardStream {
+                    inner: reader_stream,
+                    _child: child,
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/x-git-upload-pack-result",
+                    )
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::from_stream(guarded))
+                    .expect("git upload-pack response")
+            }
+            Err(error) => ApiError::from(error).into_response(),
+        }
+    } else {
+        ApiError::from(GitCacheError::Unsupported(format!(
+            "unsupported git request: {method} {path}"
+        )))
+        .into_response()
+    }
+}
+
+/// Parse `want <oid>` lines from a Git pkt-line formatted upload-pack request.
+fn parse_want_lines(body: &[u8]) -> Vec<String> {
+    let mut wants = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= body.len() {
+        let hex = match std::str::from_utf8(&body[offset..offset + 4]) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        let pkt_len = match usize::from_str_radix(hex, 16) {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        if pkt_len == 0 {
+            offset += 4;
+            continue;
+        }
+        if pkt_len < 4 || offset + pkt_len > body.len() {
+            break;
+        }
+
+        let line = &body[offset + 4..offset + pkt_len];
+        if let Ok(line_str) = std::str::from_utf8(line) {
+            let line_str = line_str.trim();
+            if let Some(rest) = line_str.strip_prefix("want ") {
+                let oid = rest.split_whitespace().next().unwrap_or("");
+                if !oid.is_empty() {
+                    wants.push(oid.to_string());
+                }
+            }
+        }
+
+        offset += pkt_len;
+    }
+    wants
+}
+
 fn git_response(content_type: &'static str, output: Vec<u8>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -271,6 +444,8 @@ struct Metrics {
     materialize_errors_total: AtomicU64,
     upload_pack_total: AtomicU64,
     rate_limited_total: AtomicU64,
+    git_remote_refs_total: AtomicU64,
+    git_remote_upload_pack_total: AtomicU64,
 }
 
 struct RateLimiter {
@@ -360,6 +535,22 @@ impl IntoResponse for ApiError {
 
 pub fn empty_body() -> Body {
     Body::empty()
+}
+
+/// Wraps a `ReaderStream` and holds a child process handle to keep the process
+/// alive for the duration of the HTTP response body stream.
+struct ChildGuardStream<R: AsyncRead + Unpin> {
+    inner: ReaderStream<R>,
+    _child: tokio::process::Child,
+}
+
+impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_next(cx)
+    }
 }
 
 #[cfg(test)]
