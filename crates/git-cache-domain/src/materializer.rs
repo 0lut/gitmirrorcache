@@ -806,10 +806,17 @@ impl Materializer {
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let upstream_url = self.upstream_url(repo)?;
 
-        let refspecs: Vec<String> = comparison
-            .changed
-            .keys()
-            .map(|branch| {
+        // Validate all branch names and SHAs from network before passing to git.
+        let mut validated: Vec<(BranchName, CommitSha)> = Vec::new();
+        for (branch, sha) in &comparison.changed {
+            let branch_name = BranchName::parse(branch.as_str())?;
+            let commit = CommitSha::parse(sha.as_str())?;
+            validated.push((branch_name, commit));
+        }
+
+        let refspecs: Vec<String> = validated
+            .iter()
+            .map(|(branch, _)| {
                 format!(
                     "+refs/heads/{branch}:refs/cache/upstream/heads/{branch}"
                 )
@@ -823,49 +830,47 @@ impl Materializer {
 
         self.state.git.fsck(&repo_dir).await?;
 
-        for (branch, upstream_sha) in &comparison.changed {
-            let cache_ref = format!("refs/cache/upstream/heads/{branch}");
+        for (branch_name, expected_commit) in &validated {
+            let cache_ref = format!("refs/cache/upstream/heads/{branch_name}");
             let fetched_sha = match self.state.git.rev_parse(&repo_dir, &cache_ref).await {
                 Ok(sha) => sha,
                 Err(_) => {
-                    warn!(%repo, branch, "skipping branch: ref not found after fetch (upstream may have moved)");
+                    warn!(%repo, %branch_name, "skipping branch: ref not found after fetch (upstream may have moved)");
                     continue;
                 }
             };
 
-            if fetched_sha.as_str() != upstream_sha {
+            if fetched_sha.as_str() != expected_commit.as_str() {
                 warn!(
-                    %repo, branch,
-                    expected = upstream_sha,
+                    %repo, %branch_name,
+                    expected = expected_commit.as_str(),
                     fetched = fetched_sha.as_str(),
                     "skipping branch: upstream moved during fetch"
                 );
                 continue;
             }
 
-            let commit = CommitSha::parse(upstream_sha.as_str())?;
-            let branch_name = BranchName::parse(branch.as_str())?;
-
-            self.publish_generation(repo, &repo_dir, &commit, Some(branch_name))
+            self.publish_generation(repo, &repo_dir, expected_commit, Some(branch_name.clone()))
                 .await?;
 
             self.state
                 .git
                 .update_ref(
                     &repo_dir,
-                    &format!("refs/heads/{branch}"),
-                    upstream_sha,
+                    &format!("refs/heads/{branch_name}"),
+                    expected_commit.as_str(),
                 )
                 .await?;
         }
 
         if let Some(default_branch) = &comparison.default_branch {
+            let db = BranchName::parse(default_branch.as_str())?;
             self.state
                 .git
                 .symbolic_ref(
                     &repo_dir,
                     "HEAD",
-                    &format!("refs/heads/{default_branch}"),
+                    &format!("refs/heads/{db}"),
                 )
                 .await?;
 
@@ -877,7 +882,7 @@ impl Materializer {
 
         info!(
             %repo,
-            changed_count = comparison.changed.len(),
+            changed_count = validated.len(),
             "fetched and published changed refs"
         );
 
@@ -930,12 +935,13 @@ impl Materializer {
         }
 
         if let Some(default_branch) = &comparison.default_branch {
+            let db = BranchName::parse(default_branch.as_str())?;
             self.state
                 .git
                 .symbolic_ref(
                     &repo_dir,
                     "HEAD",
-                    &format!("refs/heads/{default_branch}"),
+                    &format!("refs/heads/{db}"),
                 )
                 .await?;
         }
@@ -979,7 +985,7 @@ impl Materializer {
                     .git
                     .run(
                         Some(&repo_dir),
-                        ["fetch", "--no-tags", &upstream_url, commit.as_str()],
+                        ["fetch", "--no-tags", "--", &upstream_url, commit.as_str()],
                     )
                     .await
                     .map_err(|err| {
