@@ -1193,19 +1193,27 @@ pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u
     refs.sort_by_key(|(name, _)| name.as_str());
 
     // HEAD line (first ref includes capabilities).
+    let mut first_ref_used_for_caps = false;
     if let Some(default_branch) = &comparison.default_branch {
         if let Some(sha) = comparison.all_upstream.get(default_branch) {
             let line = format!("{sha} HEAD\0{caps}\n");
             pkt_line(&mut out, &line);
+        } else if let Some((name, sha)) = refs.first() {
+            // default_branch set but absent from upstream: first sorted ref
+            // carries capabilities so the advertisement is still valid.
+            let line = format!("{sha} refs/heads/{name}\0{caps}\n");
+            pkt_line(&mut out, &line);
+            first_ref_used_for_caps = true;
         }
     } else if let Some((name, sha)) = refs.first() {
-        // No default branch: first sorted ref carries capabilities.
+        // No default branch at all: first sorted ref carries capabilities.
         let line = format!("{sha} refs/heads/{name}\0{caps}\n");
         pkt_line(&mut out, &line);
+        first_ref_used_for_caps = true;
     }
 
     // Ref lines (skip the first if it was already emitted as the capability carrier).
-    let skip_first = comparison.default_branch.is_none() && !refs.is_empty();
+    let skip_first = first_ref_used_for_caps;
     for (i, (name, sha)) in refs.iter().enumerate() {
         if skip_first && i == 0 {
             continue;

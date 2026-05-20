@@ -20,6 +20,8 @@ pub enum GitCacheError {
     Conflict(String),
     #[error("not implemented yet: {0}")]
     NotImplemented(String),
+    #[error("internal error: {0}")]
+    Internal(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]

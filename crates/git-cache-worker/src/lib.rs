@@ -316,7 +316,28 @@ impl UpdateCoordinator {
         }
 
         debug!(?key, "starting update");
-        let result = self.execute_with_lease(request).await;
+        let coordinator = self.clone();
+        let join_result = tokio::spawn(async move {
+            coordinator.execute_with_lease(request).await
+        })
+        .await;
+
+        let result = match join_result {
+            Ok(r) => r,
+            Err(join_err) if join_err.is_panic() => {
+                warn!(?key, "executor panicked during update");
+                Err(GitCacheError::Internal(
+                    "executor panicked during update".into(),
+                ))
+            }
+            Err(join_err) => {
+                warn!(?key, %join_err, "update task cancelled");
+                Err(GitCacheError::Internal(
+                    "update task cancelled".into(),
+                ))
+            }
+        };
+
         inflight.complete(result_to_shared(&result)).await;
         self.remove_inflight(&key, &inflight).await;
         result
