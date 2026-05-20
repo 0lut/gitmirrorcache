@@ -8,7 +8,7 @@ use git_cache_core::{
 };
 use futures::Stream;
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
-use git_cache_domain::{AppState, Materializer, MaterializerExecutor};
+use git_cache_domain::{AppState, Materializer, MaterializerExecutor, synthesize_ref_advertisement};
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
@@ -315,21 +315,20 @@ async fn git_repo(
             .git_remote_refs_total
             .fetch_add(1, Ordering::Relaxed);
 
-        let repo_dir = match materializer.ensure_repo_advertisable(&repo).await {
-            Ok(dir) => dir,
+        // Fetch upstream refs via ls-remote and synthesize the pkt-line
+        // response directly.  No objects are fetched — the repo may not
+        // even exist locally yet.  Objects are fetched lazily when the
+        // client actually issues an upload-pack POST.
+        let comparison = match materializer.upstream_refs(&repo).await {
+            Ok(c) => c,
             Err(error) => return ApiError::from(error).into_response(),
         };
 
-        // Use buffered advertise-refs (output is small: just ref lines).
-        match advertise_refs(&state.domain, &repo_dir).await {
-            Ok(output) => {
-                let mut framed = Vec::with_capacity(output.len() + 34);
-                framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
-                framed.extend_from_slice(&output);
-                git_response("application/x-git-upload-pack-advertisement", framed)
-            }
-            Err(error) => ApiError::from(error).into_response(),
-        }
+        let output = synthesize_ref_advertisement(&comparison);
+        let mut framed = Vec::with_capacity(output.len() + 34);
+        framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
+        framed.extend_from_slice(&output);
+        git_response("application/x-git-upload-pack-advertisement", framed)
     } else if method == Method::POST && path.ends_with("/git-upload-pack") {
         state
             .metrics

@@ -72,7 +72,9 @@ class GitRemotePublicRepoTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.tmp = Path(tempfile.mkdtemp(prefix="git-cache-remote-public-"))
+        base = Path(os.environ.get("TEST_TMPDIR", tempfile.gettempdir()))
+        base.mkdir(parents=True, exist_ok=True)
+        cls.tmp = Path(tempfile.mkdtemp(prefix="git-cache-remote-public-", dir=base))
         cls.port = free_port()
         cls.base_url = f"http://127.0.0.1:{cls.port}"
         cls.cache_root = cls.tmp / "cache"
@@ -90,7 +92,7 @@ rate_limit_per_minute = 0
 allowed_upstream_hosts = ["github.com"]
 
 [object_store]
-type = "local"
+kind = "local"
 root = "{cls.object_root}"
 
 [disk]
@@ -106,9 +108,13 @@ commit_read_through = true
 
         run(["cargo", "build", "-p", "git-cache-api"])
 
+        git_tmp = cls.tmp / "git-tmp"
+        git_tmp.mkdir(parents=True, exist_ok=True)
+
         env = os.environ.copy()
         env["RUST_LOG"] = "info"
         env["GIT_CACHE_CONFIG"] = str(config_path)
+        env["TMPDIR"] = str(git_tmp)
         cls.server = subprocess.Popen(
             [str(REPO_ROOT / "target/debug/git-cache-api")],
             cwd=REPO_ROOT,
@@ -203,6 +209,17 @@ commit_read_through = true
         output = run(
             ["git", "ls-remote", "--heads", f"https://github.com/{owner_repo}.git", branch]
         )
+        # ls-remote may return multiple lines when the pattern matches
+        # more than one ref (e.g. "master" matches both refs/heads/master
+        # and refs/heads/devel/rust/master).  Pick the exact match.
+        target_ref = f"refs/heads/{branch}"
+        for line in output.strip().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == target_ref:
+                sha = parts[0]
+                self.assertEqual(len(sha), 40, f"bad sha from upstream ls-remote: {sha!r}")
+                return sha
+        # Fallback: first line
         sha = output.strip().split()[0]
         self.assertEqual(len(sha), 40, f"bad sha from upstream ls-remote: {sha!r}")
         return sha
@@ -212,7 +229,15 @@ commit_read_through = true
         upstream_sha = self._upstream_head(repo, branch)
 
         output = run(["git", "ls-remote", "--heads", url, branch])
-        cache_sha = output.strip().split()[0]
+        target_ref = f"refs/heads/{branch}"
+        cache_sha = None
+        for line in output.strip().splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == target_ref:
+                cache_sha = parts[0]
+                break
+        if cache_sha is None:
+            cache_sha = output.strip().split()[0]
         self.assertEqual(len(cache_sha), 40, f"bad sha from cache ls-remote: {cache_sha!r}")
 
         self.assertEqual(

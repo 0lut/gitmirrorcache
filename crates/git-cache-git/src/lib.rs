@@ -254,6 +254,30 @@ impl Git {
             .await
     }
 
+    /// Write a ref directly to the filesystem without requiring the target
+    /// object to exist in the object database.  This is used during the
+    /// advertise-refs phase so we can set up refs from upstream ls-remote
+    /// data without fetching the actual objects first.
+    ///
+    /// The caller MUST validate `ref_name` (e.g. via `BranchName::parse`)
+    /// and `sha` (e.g. via `CommitSha::parse`) before calling this method.
+    pub async fn write_ref_file(
+        &self,
+        repo_dir: &Path,
+        ref_name: &str,
+        sha: &str,
+    ) -> Result<()> {
+        reject_ref_arg(ref_name, "ref")?;
+        reject_revision_arg(sha)?;
+
+        let ref_path = repo_dir.join(ref_name);
+        if let Some(parent) = ref_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&ref_path, format!("{sha}\n")).await?;
+        Ok(())
+    }
+
     pub async fn symbolic_ref(
         &self,
         repo_dir: &Path,

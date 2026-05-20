@@ -889,29 +889,23 @@ impl Materializer {
         Ok(())
     }
 
-    /// Ensure the local bare repo is ready to serve refs for the direct Git
-    /// remote. This compares upstream, fetches changes, and configures the
-    /// repo with the right Git config for serving.
-    pub async fn ensure_repo_advertisable(
+    /// Fetch the upstream ref advertisement for a repo without downloading
+    /// any objects.  Returns the structured ref data so the API layer can
+    /// synthesize the pkt-line response directly, avoiding the need to
+    /// materialise objects just for ls-remote.
+    pub async fn upstream_refs(
         &self,
         repo: &RepoKey,
-    ) -> CoreResult<PathBuf> {
+    ) -> CoreResult<UpstreamRefComparison> {
         self.validate_host(repo)?;
-        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let upstream_url = self.upstream_url(repo)?;
+        let ls = self.state.git.ls_remote_heads(&upstream_url).await?;
 
-        self.configure_served_repo(&repo_dir).await?;
-
-        let comparison = self.compare_upstream_refs(repo).await?;
-
-        if !comparison.changed.is_empty() {
-            self.fetch_changed_refs(repo, &comparison).await?;
-        } else if comparison.default_branch.is_some() {
-            // Even if no branches changed, ensure default branch HEAD symref
-            // is set and public refs are in sync.
-            self.sync_public_refs(repo, &comparison).await?;
-        }
-
-        Ok(repo_dir)
+        Ok(UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: ls.default_branch,
+            all_upstream: ls.refs,
+        })
     }
 
     /// Sync public refs from the current upstream advertisement without
@@ -999,6 +993,15 @@ impl Materializer {
                         "commit `{commit}` not found after upstream fetch"
                     )));
                 }
+
+                // Create a ref so that `bundle create --all` has something
+                // to include.  We use refs/cache/ which is hidden from
+                // clients by configure_served_repo.
+                let cache_ref = format!("refs/cache/commits/{commit}");
+                self.state
+                    .git
+                    .update_ref(&repo_dir, &cache_ref, commit.as_str())
+                    .await?;
 
                 self.publish_generation(repo, &repo_dir, &commit, None)
                     .await?;
@@ -1162,6 +1165,63 @@ pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u
         .upload_pack_advertise_refs(repo, state.config.max_git_output_bytes)
         .await?
         .stdout)
+}
+
+/// Build a pkt-line formatted ref advertisement from upstream ref data.
+///
+/// This produces the same output as `git upload-pack --advertise-refs` but
+/// without requiring the objects to exist locally.  The capability set
+/// matches what a standard git 2.x upload-pack would emit.
+pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    let symref = comparison
+        .default_branch
+        .as_deref()
+        .map(|b| format!(" symref=HEAD:refs/heads/{b}"))
+        .unwrap_or_default();
+
+    let caps = format!(
+        "multi_ack thin-pack side-band side-band-64k ofs-delta \
+         shallow deepen-since deepen-not deepen-relative no-progress \
+         include-tag multi_ack_detailed no-done{symref} \
+         object-format=sha1 agent=git-cache/1.0"
+    );
+
+    // Sort refs for deterministic output.
+    let mut refs: Vec<(&String, &String)> = comparison.all_upstream.iter().collect();
+    refs.sort_by_key(|(name, _)| name.as_str());
+
+    // HEAD line (first ref includes capabilities).
+    if let Some(default_branch) = &comparison.default_branch {
+        if let Some(sha) = comparison.all_upstream.get(default_branch) {
+            let line = format!("{sha} HEAD\0{caps}\n");
+            pkt_line(&mut out, &line);
+        }
+    } else if let Some((name, sha)) = refs.first() {
+        // No default branch: first sorted ref carries capabilities.
+        let line = format!("{sha} refs/heads/{name}\0{caps}\n");
+        pkt_line(&mut out, &line);
+    }
+
+    // Ref lines.
+    for (name, sha) in &refs {
+        let line = format!("{sha} refs/heads/{name}\n");
+        pkt_line(&mut out, &line);
+    }
+
+    // HEAD as a separate non-capability line (if default branch set).
+    // Already emitted as the first capability line above, so only emit
+    // ref lines here.
+
+    out.extend_from_slice(b"0000");
+    out
+}
+
+fn pkt_line(out: &mut Vec<u8>, data: &str) {
+    let len = 4 + data.len();
+    out.extend_from_slice(format!("{len:04x}").as_bytes());
+    out.extend_from_slice(data.as_bytes());
 }
 
 pub async fn upload_pack(
