@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct Materializer {
     state: Arc<AppState>,
@@ -824,6 +824,25 @@ impl Materializer {
         self.state.git.fsck(&repo_dir).await?;
 
         for (branch, upstream_sha) in &comparison.changed {
+            let cache_ref = format!("refs/cache/upstream/heads/{branch}");
+            let fetched_sha = match self.state.git.rev_parse(&repo_dir, &cache_ref).await {
+                Ok(sha) => sha,
+                Err(_) => {
+                    warn!(%repo, branch, "skipping branch: ref not found after fetch (upstream may have moved)");
+                    continue;
+                }
+            };
+
+            if fetched_sha.as_str() != upstream_sha {
+                warn!(
+                    %repo, branch,
+                    expected = upstream_sha,
+                    fetched = fetched_sha.as_str(),
+                    "skipping branch: upstream moved during fetch"
+                );
+                continue;
+            }
+
             let commit = CommitSha::parse(upstream_sha.as_str())?;
             let branch_name = BranchName::parse(branch.as_str())?;
 
