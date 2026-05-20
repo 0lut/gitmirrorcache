@@ -15,5 +15,12 @@ anyhow.workspace = true
 clap.workspace = true
 git-cache-core = { path = "../git-cache-core" }
 git-cache-disk = { path = "../git-cache-disk" }
+git-cache-domain = { path = "../git-cache-domain" }
+git-cache-git = { path = "../git-cache-git" }
+git-cache-objectstore = { path = "../git-cache-objectstore" }
+serde.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
+[dev-dependencies]
+assert_cmd = "2"
