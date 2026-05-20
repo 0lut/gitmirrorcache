@@ -1903,6 +1903,9 @@ mod tests {
         let state = Arc::new(fixture.state());
         let materializer = Arc::new(Materializer::new(state));
 
+        // Capture the original commit BEFORE pushing a new one.
+        let original_commit = fixture.head_commit();
+
         // Start a materialize.
         let m1 = Arc::clone(&materializer);
         let repo1 = fixture.repo.clone();
@@ -1923,7 +1926,7 @@ mod tests {
         match first_result {
             Ok(resp) => {
                 assert!(
-                    resp.commit == fixture.head_commit() || resp.commit == new_commit,
+                    resp.commit == original_commit || resp.commit == new_commit,
                     "should return a valid commit"
                 );
             }
