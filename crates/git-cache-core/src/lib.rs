@@ -8,7 +8,7 @@ pub mod session;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use config::{AppConfig, DiskConfig, ObjectStoreConfig};
+pub use config::{AppConfig, BranchRefCheck, DiskConfig, GitRemoteConfig, ObjectStoreConfig};
 pub use error::{GitCacheError, Result};
 pub use manifest::{CommitManifest, GenerationId, GenerationManifest, RefManifest};
 pub use repo::{CommitSha, RepoKey, ShortCommitSha};
