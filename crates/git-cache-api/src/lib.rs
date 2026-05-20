@@ -614,4 +614,81 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
+
+    // ── parse_want_lines contract tests ─────────────────────────────────
+
+    fn make_pkt_line(data: &str) -> Vec<u8> {
+        let len = 4 + data.len();
+        format!("{len:04x}{data}").into_bytes()
+    }
+
+    #[test]
+    fn parse_want_standard_line() {
+        let sha = "a".repeat(40);
+        let line = format!("want {sha}\n");
+        let body = make_pkt_line(&line);
+        let wants = parse_want_lines(&body);
+        assert_eq!(wants, vec![sha]);
+    }
+
+    #[test]
+    fn parse_want_with_capabilities() {
+        let sha = "b".repeat(40);
+        let line = format!("want {sha} multi_ack thin-pack\n");
+        let body = make_pkt_line(&line);
+        let wants = parse_want_lines(&body);
+        assert_eq!(wants, vec![sha]);
+    }
+
+    #[test]
+    fn parse_want_multiple_wants() {
+        let sha1 = "a".repeat(40);
+        let sha2 = "b".repeat(40);
+        let mut body = make_pkt_line(&format!("want {sha1}\n"));
+        body.extend(make_pkt_line(&format!("want {sha2}\n")));
+        body.extend(b"0000");
+        body.extend(b"0009done\n");
+        let wants = parse_want_lines(&body);
+        assert_eq!(wants, vec![sha1, sha2]);
+    }
+
+    #[test]
+    fn parse_want_flush_in_middle_is_skipped() {
+        let sha1 = "a".repeat(40);
+        let sha2 = "c".repeat(40);
+        let mut body = make_pkt_line(&format!("want {sha1}\n"));
+        body.extend(b"0000");
+        body.extend(make_pkt_line(&format!("want {sha2}\n")));
+        let wants = parse_want_lines(&body);
+        assert_eq!(wants, vec![sha1, sha2]);
+    }
+
+    #[test]
+    fn parse_want_invalid_pkt_length_stops_gracefully() {
+        let body = b"zzzzbogus data here";
+        let wants = parse_want_lines(body);
+        assert!(wants.is_empty());
+    }
+
+    #[test]
+    fn parse_want_empty_body() {
+        let wants = parse_want_lines(b"");
+        assert!(wants.is_empty());
+    }
+
+    #[test]
+    fn parse_want_non_want_lines_ignored() {
+        let mut body = make_pkt_line("have aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+        body.extend(make_pkt_line("done\n"));
+        let wants = parse_want_lines(&body);
+        assert!(wants.is_empty());
+    }
+
+    #[test]
+    fn parse_want_truncated_packet_stops_gracefully() {
+        // Length says 50 bytes but body is shorter.
+        let body = b"0032want short\n";
+        let wants = parse_want_lines(body);
+        assert!(wants.is_empty());
+    }
 }

@@ -1732,7 +1732,7 @@ mod tests {
 
     fn short_prefix_not_matching(commit: &CommitSha, other: &CommitSha) -> ShortCommitSha {
         let length = (8..40)
-            .find(|length| &commit.as_str()[..*length] != &other.as_str()[..*length])
+            .find(|length| commit.as_str()[..*length] != other.as_str()[..*length])
             .unwrap();
         ShortCommitSha::parse(&commit.as_str()[..length]).unwrap()
     }
@@ -1770,5 +1770,210 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    // ── synthesize_ref_advertisement unit tests ─────────────────────────
+
+    fn make_comparison(
+        refs: &[(&str, &str)],
+        default_branch: Option<&str>,
+    ) -> UpstreamRefComparison {
+        UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: default_branch.map(|s| s.to_string()),
+            all_upstream: refs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn parse_pkt_lines(data: &[u8]) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
+        let mut offset = 0;
+        while offset + 4 <= data.len() {
+            let hex = std::str::from_utf8(&data[offset..offset + 4]).unwrap();
+            let len = usize::from_str_radix(hex, 16).unwrap();
+            if len == 0 {
+                offset += 4;
+                continue;
+            }
+            assert!(len >= 4);
+            assert!(offset + len <= data.len());
+            lines.push(data[offset + 4..offset + len].to_vec());
+            offset += len;
+        }
+        lines
+    }
+
+    #[test]
+    fn synth_single_branch() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("main", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains(&format!("{sha} HEAD")));
+        assert!(text.contains("refs/heads/main"));
+        assert!(output.ends_with(b"0000"));
+    }
+
+    #[test]
+    fn synth_multiple_branches_sorted() {
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let sha_c = "c".repeat(40);
+        let sha_d = "d".repeat(40);
+        let sha_e = "e".repeat(40);
+        let comp = make_comparison(
+            &[
+                ("zeta", &sha_e),
+                ("alpha", &sha_a),
+                ("main", &sha_c),
+                ("beta", &sha_b),
+                ("gamma", &sha_d),
+            ],
+            Some("main"),
+        );
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        // All branches should appear.
+        for name in &["alpha", "beta", "gamma", "main", "zeta"] {
+            assert!(
+                text.contains(&format!("refs/heads/{name}")),
+                "missing branch {name}"
+            );
+        }
+
+        // Extract branch names from pkt-line data.
+        // Each ref line is: "{sha} refs/heads/{name}\n" (no NUL separator).
+        // The HEAD/capabilities line is: "{sha} HEAD\0{caps}\n" — skip it.
+        let pkt_lines = parse_pkt_lines(&output);
+        let mut branch_names: Vec<String> = Vec::new();
+        for pkt in &pkt_lines {
+            let line_str = String::from_utf8_lossy(pkt);
+            // Skip capability lines (they contain NUL).
+            if line_str.contains('\0') {
+                continue;
+            }
+            if let Some(rest) = line_str.split("refs/heads/").nth(1) {
+                let name = rest.trim().to_string();
+                if !name.is_empty() {
+                    branch_names.push(name);
+                }
+            }
+        }
+        let mut sorted = branch_names.clone();
+        sorted.sort();
+        assert_eq!(branch_names, sorted);
+    }
+
+    #[test]
+    fn synth_no_default_branch_uses_first_sorted() {
+        let sha_a = "a".repeat(40);
+        let sha_b = "b".repeat(40);
+        let comp = make_comparison(&[("beta", &sha_b), ("alpha", &sha_a)], None);
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        // First line should be the first sorted branch with capabilities.
+        let lines = parse_pkt_lines(&output);
+        let first_line = String::from_utf8_lossy(&lines[0]);
+        assert!(
+            first_line.contains("refs/heads/alpha"),
+            "first line should be alpha (first sorted): {first_line}"
+        );
+        assert!(
+            first_line.contains('\0'),
+            "first line should contain capability separator"
+        );
+
+        assert!(text.contains("refs/heads/beta"));
+    }
+
+    #[test]
+    fn synth_default_branch_not_in_refs() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("feature", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        // "main" is set as default but not in all_upstream. Should still
+        // output feature and terminate.
+        assert!(text.contains("refs/heads/feature"));
+        assert!(output.ends_with(b"0000"));
+    }
+
+    #[test]
+    fn synth_pkt_line_length_correctness() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("main", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+
+        let mut offset = 0;
+        while offset + 4 <= output.len() {
+            let hex = std::str::from_utf8(&output[offset..offset + 4]).unwrap();
+            let len = usize::from_str_radix(hex, 16).unwrap();
+            if len == 0 {
+                offset += 4;
+                continue;
+            }
+            assert!(
+                len >= 4,
+                "pkt-line at offset {offset} has invalid length {len}"
+            );
+            assert!(
+                offset + len <= output.len(),
+                "pkt-line at offset {offset} extends beyond data"
+            );
+            // Verify the 4-char hex prefix matches actual line length.
+            let actual_data_len = len - 4;
+            let actual_data = &output[offset + 4..offset + len];
+            assert_eq!(
+                actual_data.len(),
+                actual_data_len,
+                "pkt-line length mismatch"
+            );
+            offset += len;
+        }
+    }
+
+    #[test]
+    fn synth_capability_string_contents() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("main", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        for cap in &[
+            "multi_ack",
+            "thin-pack",
+            "side-band-64k",
+            "no-done",
+            "object-format=sha1",
+        ] {
+            assert!(text.contains(cap), "missing capability: {cap}");
+        }
+    }
+
+    #[test]
+    fn synth_symref_capability() {
+        let sha = "a".repeat(40);
+        let comp = make_comparison(&[("main", &sha)], Some("main"));
+        let output = synthesize_ref_advertisement(&comp);
+        let text = String::from_utf8_lossy(&output);
+
+        assert!(
+            text.contains("symref=HEAD:refs/heads/main"),
+            "missing symref capability"
+        );
+    }
+
+    #[test]
+    fn synth_empty_refs() {
+        let comp = make_comparison(&[], None);
+        let output = synthesize_ref_advertisement(&comp);
+        assert_eq!(output, b"0000");
     }
 }
