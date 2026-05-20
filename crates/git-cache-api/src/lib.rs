@@ -4,10 +4,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult,
+    AppConfig, GitCacheError, MaterializeRequest, RequestMode, Result as CoreResult, Selector,
 };
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
-use git_cache_domain::{AppState, Materializer};
+use git_cache_domain::{AppState, Materializer, MaterializerExecutor};
+use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -36,6 +37,7 @@ pub fn app_result(config: AppConfig) -> CoreResult<Router> {
 #[derive(Clone)]
 struct ApiState {
     domain: Arc<AppState>,
+    coordinator: UpdateCoordinator,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -44,8 +46,12 @@ impl ApiState {
     fn try_new(config: AppConfig) -> CoreResult<Self> {
         let rate_limiter = RateLimiter::new(config.rate_limit_per_minute);
         let domain = Arc::new(AppState::try_new(config)?);
+        let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
+        let leases = Arc::new(InMemoryRepoLeaseManager::new());
+        let coordinator = UpdateCoordinator::new(executor, leases);
         Ok(Self {
             domain,
+            coordinator,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
         })
@@ -100,6 +106,45 @@ async fn materialize(
         .metrics
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
+
+    let mut request = request;
+
+    let use_coordinator = matches!(
+        request.selector,
+        Selector::Branch(_) | Selector::DefaultBranch
+    );
+
+    if use_coordinator {
+        let outcome = state
+            .coordinator
+            .read_through(request.repo.clone(), request.selector.clone())
+            .await;
+        match outcome {
+            Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
+                return Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "update in progress, retry later".into(),
+                });
+            }
+            Err(error) => {
+                state
+                    .metrics
+                    .materialize_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error.into());
+            }
+            Ok(_) => {
+                // Coordinator already did fetch+publish; use Cached mode so
+                // materialize just creates a session from the fresh local data
+                // without hitting upstream again.
+                // TODO: this causes the response `source` field to report
+                // CacheVerified instead of GithubVerified. Fix by propagating
+                // the verification source from the coordinator outcome.
+                request.mode = RequestMode::Cached;
+            }
+        }
+    }
+
     let materializer = Materializer::new(Arc::clone(&state.domain));
     match materializer.materialize(request).await {
         Ok(response) => Ok(Json(response).into_response()),

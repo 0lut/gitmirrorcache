@@ -1,4 +1,5 @@
 use crate::state::AppState;
+use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use git_cache_core::{
     BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest, GitCacheError,
@@ -10,6 +11,7 @@ use git_cache_objectstore::{
     read_session_manifest, write_json, write_ref_manifest, write_session_manifest,
     GenerationPublish, PublishManifests,
 };
+use git_cache_worker::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use serde::Serialize;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -118,14 +120,28 @@ impl Materializer {
             )));
         }
 
-        let upstream_commit = self.ls_remote_branch(&repo, &branch).await?;
-        let repo_dir = self.ensure_repo_dir(&repo).await?;
+        let commit = self.ensure_branch(&repo, &branch, default_branch).await?;
+        self.create_session(repo, commit, MaterializeSource::GithubVerified)
+            .await
+    }
+
+    /// Fetch and publish a branch from upstream without creating a session.
+    /// Returns the verified commit SHA.
+    pub async fn ensure_branch(
+        &self,
+        repo: &RepoKey,
+        branch: &BranchName,
+        default_branch: bool,
+    ) -> CoreResult<CommitSha> {
+        self.validate_host(repo)?;
+        let upstream_commit = self.ls_remote_branch(repo, branch).await?;
+        let repo_dir = self.ensure_repo_dir(repo).await?;
         let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
         self.state
             .git
             .fetch_branch(
                 &repo_dir,
-                &self.upstream_url(&repo)?,
+                &self.upstream_url(repo)?,
                 branch.as_str(),
                 &local_ref,
             )
@@ -146,15 +162,14 @@ impl Materializer {
         }
 
         self.state.git.fsck(&repo_dir).await?;
-        self.publish_generation(&repo, &repo_dir, &commit, Some(branch.clone()))
+        self.publish_generation(repo, &repo_dir, &commit, Some(branch.clone()))
             .await?;
 
         if default_branch {
-            self.put_default_manifest(&repo, &commit).await?;
+            self.put_default_manifest(repo, &commit).await?;
         }
 
-        self.create_session(repo, commit, MaterializeSource::GithubVerified)
-            .await
+        Ok(commit)
     }
 
     pub async fn materialize_default_branch(
@@ -177,9 +192,17 @@ impl Materializer {
             ));
         }
 
-        let branch = self.resolve_default_branch(&repo).await?;
-        self.materialize_branch(repo, branch, RequestMode::Strict, true)
+        let commit = self.ensure_default_branch(&repo).await?;
+        self.create_session(repo, commit, MaterializeSource::GithubVerified)
             .await
+    }
+
+    /// Resolve, fetch and publish the default branch without creating a session.
+    /// Returns the verified commit SHA.
+    pub async fn ensure_default_branch(&self, repo: &RepoKey) -> CoreResult<CommitSha> {
+        self.validate_host(repo)?;
+        let branch = self.resolve_default_branch(repo).await?;
+        self.ensure_branch(repo, &branch, true).await
     }
 
     pub async fn create_session(
@@ -735,6 +758,58 @@ impl Materializer {
 pub struct SessionCleanupReport {
     pub sessions_removed: usize,
     pub errors: Vec<String>,
+}
+
+pub struct MaterializerExecutor {
+    state: Arc<AppState>,
+}
+
+impl MaterializerExecutor {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl UpdateExecutor for MaterializerExecutor {
+    async fn update(&self, request: UpdateRequest) -> CoreResult<()> {
+        let materializer = Materializer::new(Arc::clone(&self.state));
+        match request.target {
+            UpdateTarget::Branch(ref branch) => {
+                materializer
+                    .ensure_branch(&request.repo, branch, false)
+                    .await?;
+            }
+            UpdateTarget::DefaultBranch => {
+                materializer
+                    .ensure_default_branch(&request.repo)
+                    .await?;
+            }
+            UpdateTarget::Commit(commit) => {
+                materializer
+                    .materialize_commit(request.repo, commit)
+                    .await?;
+            }
+            UpdateTarget::ShortCommit(commit) => {
+                materializer
+                    .materialize_short_commit(request.repo, commit)
+                    .await?;
+            }
+            UpdateTarget::Ref(ref ref_name) => {
+                if let Some(branch_str) = ref_name.strip_prefix("refs/heads/") {
+                    let branch = BranchName::parse(branch_str)?;
+                    materializer
+                        .ensure_branch(&request.repo, &branch, false)
+                        .await?;
+                } else {
+                    return Err(GitCacheError::Unsupported(format!(
+                        "unsupported update target ref: {ref_name}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u8>> {
