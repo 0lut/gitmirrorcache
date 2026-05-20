@@ -1,0 +1,19 @@
+bind_addr = "127.0.0.1:8080"
+public_base_url = "http://127.0.0.1:8080"
+cache_root = "./cache"
+upstream_root = "./tmp/upstreams"
+git_binary = "git"
+git_timeout_seconds = 120
+max_git_output_bytes = 16777216
+session_ttl_seconds = 3600
+cached_ref_max_staleness_seconds = 300
+rate_limit_per_minute = 120
+allowed_upstream_hosts = ["github.com"]
+
+[object_store]
+kind = "local"
+root = "./tmp/object-store"
+
+[disk]
+quota_bytes = 10737418240
+min_free_bytes = 1073741824

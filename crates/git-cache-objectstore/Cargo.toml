@@ -1,0 +1,24 @@
+[package]
+name = "git-cache-objectstore"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+git-cache-core = { path = "../git-cache-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+aws-sdk-s3 = { version = "1", optional = true }
+
+[features]
+default = []
+s3 = ["dep:aws-sdk-s3"]
+
+[dev-dependencies]
+uuid.workspace = true

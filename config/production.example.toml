@@ -1,0 +1,21 @@
+bind_addr = "0.0.0.0:8080"
+public_base_url = "https://git-cache.internal"
+cache_root = "/cache"
+git_binary = "git"
+git_timeout_seconds = 120
+max_git_output_bytes = 16777216
+session_ttl_seconds = 3600
+cached_ref_max_staleness_seconds = 300
+upstream_auth_token_env = "GITHUB_TOKEN"
+rate_limit_per_minute = 120
+allowed_upstream_hosts = ["github.com"]
+
+[object_store]
+kind = "s3"
+bucket = "git-cache"
+prefix = "repos"
+endpoint = "https://s3.amazonaws.com"
+
+[disk]
+quota_bytes = 1099511627776
+min_free_bytes = 107374182400
