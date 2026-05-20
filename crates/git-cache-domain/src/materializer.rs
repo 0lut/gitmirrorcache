@@ -591,6 +591,7 @@ impl Materializer {
         repo_dir: &FsPath,
         commit: &CommitSha,
     ) -> CoreResult<bool> {
+        let contains = format!("--contains={}", commit.as_str());
         let output = self
             .state
             .git
@@ -599,6 +600,7 @@ impl Materializer {
                 [
                     "for-each-ref",
                     "--format=%(refname)",
+                    contains.as_str(),
                     "refs/cache/upstream/heads",
                 ],
             )
@@ -606,23 +608,7 @@ impl Materializer {
         let text = String::from_utf8(output.stdout).map_err(|err| {
             GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
         })?;
-
-        for ref_name in text.lines().filter(|line| !line.trim().is_empty()) {
-            if self
-                .state
-                .git
-                .run(
-                    Some(repo_dir),
-                    ["merge-base", "--is-ancestor", commit.as_str(), ref_name],
-                )
-                .await
-                .is_ok()
-            {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
+        Ok(text.lines().any(|line| !line.trim().is_empty()))
     }
 
     pub async fn fetch_all_refs(&self, repo: &RepoKey, repo_dir: &FsPath) -> CoreResult<()> {
