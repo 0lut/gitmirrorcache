@@ -76,8 +76,13 @@ impl Materializer {
         let commit = self
             .resolve_short_commit_from_upstream_refs(&repo_dir, &short_commit)
             .await?;
-        self.materialize_verified_commit(repo, commit, MaterializeSource::GithubVerified)
-            .await
+        self.materialize_existing_local_commit(
+            repo,
+            &repo_dir,
+            commit,
+            MaterializeSource::GithubVerified,
+        )
+        .await
     }
 
     pub async fn materialize_commit(
@@ -103,32 +108,24 @@ impl Materializer {
             )));
         }
 
-        self.materialize_verified_commit(repo, commit, MaterializeSource::GithubVerified)
-            .await
+        self.materialize_existing_local_commit(
+            repo,
+            &repo_dir,
+            commit,
+            MaterializeSource::GithubVerified,
+        )
+        .await
     }
 
-    async fn materialize_verified_commit(
+    async fn materialize_existing_local_commit(
         &self,
         repo: RepoKey,
+        repo_dir: &FsPath,
         commit: CommitSha,
         source: MaterializeSource,
     ) -> CoreResult<MaterializeResponse> {
-        if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
-            if manifest.complete {
-                self.hydrate_commit(&manifest).await?;
-                return self.create_session(repo, commit, source).await;
-            }
-        }
-
-        let repo_dir = self.ensure_repo_dir(&repo).await?;
-        if !self.commit_exists(&repo_dir, &commit).await {
-            return Err(GitCacheError::NotFound(format!(
-                "verified commit `{commit}` is missing from the local repo"
-            )));
-        }
-
         let generation = self
-            .publish_generation(&repo, &repo_dir, &commit, None)
+            .publish_generation(&repo, repo_dir, &commit, None)
             .await?;
         debug!(%repo, %commit, %generation, "published generation for exact commit");
         self.create_session(repo, commit, source).await
