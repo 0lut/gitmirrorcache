@@ -13,6 +13,7 @@ bytes.workspace = true
 chrono.workspace = true
 git-cache-core = { path = "../git-cache-core" }
 git-cache-domain = { path = "../git-cache-domain" }
+git-cache-worker = { path = "../git-cache-worker" }
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true

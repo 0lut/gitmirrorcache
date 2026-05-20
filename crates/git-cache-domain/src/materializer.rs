@@ -1,4 +1,5 @@
 use crate::state::AppState;
+use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use git_cache_core::{
     BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest, GitCacheError,
@@ -10,6 +11,7 @@ use git_cache_objectstore::{
     read_session_manifest, write_json, write_ref_manifest, write_session_manifest,
     GenerationPublish, PublishManifests,
 };
+use git_cache_worker::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use serde::Serialize;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -735,6 +737,47 @@ impl Materializer {
 pub struct SessionCleanupReport {
     pub sessions_removed: usize,
     pub errors: Vec<String>,
+}
+
+pub struct MaterializerExecutor {
+    state: Arc<AppState>,
+}
+
+impl MaterializerExecutor {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl UpdateExecutor for MaterializerExecutor {
+    async fn update(&self, request: UpdateRequest) -> CoreResult<()> {
+        let selector = match request.target {
+            UpdateTarget::Branch(branch) => Selector::Branch(branch),
+            UpdateTarget::DefaultBranch => Selector::DefaultBranch,
+            UpdateTarget::Commit(commit) => Selector::Commit(commit),
+            UpdateTarget::ShortCommit(commit) => Selector::ShortCommit(commit),
+            UpdateTarget::Ref(ref_name) => {
+                if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                    Selector::Branch(BranchName::parse(branch)?)
+                } else {
+                    return Err(GitCacheError::Unsupported(format!(
+                        "unsupported update target ref: {ref_name}"
+                    )));
+                }
+            }
+        };
+
+        let materializer = Materializer::new(Arc::clone(&self.state));
+        materializer
+            .materialize(MaterializeRequest {
+                repo: request.repo,
+                selector,
+                mode: RequestMode::Strict,
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u8>> {
