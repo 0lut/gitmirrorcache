@@ -653,3 +653,244 @@ where
         output.extend_from_slice(&buffer[..bytes_read]);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── reject_ref_arg tests ────────────────────────────────────────
+
+    #[test]
+    fn reject_ref_arg_rejects_empty() {
+        assert!(reject_ref_arg("", "ref").is_err());
+    }
+
+    #[test]
+    fn reject_ref_arg_rejects_leading_dash() {
+        assert!(reject_ref_arg("-evil", "ref").is_err());
+        assert!(reject_ref_arg("--flag", "ref").is_err());
+    }
+
+    #[test]
+    fn reject_ref_arg_rejects_colon() {
+        assert!(reject_ref_arg("HEAD:path", "ref").is_err());
+    }
+
+    #[test]
+    fn reject_ref_arg_rejects_nul() {
+        assert!(reject_ref_arg("ref\0name", "ref").is_err());
+    }
+
+    #[test]
+    fn reject_ref_arg_accepts_valid() {
+        assert!(reject_ref_arg("refs/heads/main", "ref").is_ok());
+        assert!(reject_ref_arg("feature/test", "ref").is_ok());
+    }
+
+    // ── reject_revision_arg tests ───────────────────────────────────
+
+    #[test]
+    fn reject_revision_arg_rejects_empty() {
+        assert!(reject_revision_arg("").is_err());
+    }
+
+    #[test]
+    fn reject_revision_arg_rejects_leading_dash() {
+        assert!(reject_revision_arg("-evil").is_err());
+    }
+
+    #[test]
+    fn reject_revision_arg_rejects_nul() {
+        assert!(reject_revision_arg("rev\0ision").is_err());
+    }
+
+    #[test]
+    fn reject_revision_arg_allows_colon() {
+        assert!(reject_revision_arg("HEAD:path").is_ok());
+    }
+
+    #[test]
+    fn reject_revision_arg_accepts_valid() {
+        assert!(reject_revision_arg("abc123").is_ok());
+        assert!(reject_revision_arg("HEAD^{commit}").is_ok());
+    }
+
+    // ── reject_config_key tests ─────────────────────────────────────
+
+    #[test]
+    fn reject_config_key_rejects_empty() {
+        assert!(reject_config_key("").is_err());
+    }
+
+    #[test]
+    fn reject_config_key_rejects_leading_dash() {
+        assert!(reject_config_key("-bad").is_err());
+    }
+
+    #[test]
+    fn reject_config_key_rejects_nul() {
+        assert!(reject_config_key("key\0val").is_err());
+    }
+
+    #[test]
+    fn reject_config_key_allows_equals() {
+        assert!(reject_config_key("key=value").is_ok());
+    }
+
+    // ── reject_remote_url tests ─────────────────────────────────────
+
+    #[test]
+    fn reject_remote_url_rejects_empty() {
+        assert!(reject_remote_url("").is_err());
+    }
+
+    #[test]
+    fn reject_remote_url_rejects_leading_dash() {
+        assert!(reject_remote_url("-evil").is_err());
+    }
+
+    #[test]
+    fn reject_remote_url_rejects_nul() {
+        assert!(reject_remote_url("url\0bad").is_err());
+    }
+
+    #[test]
+    fn reject_remote_url_accepts_valid() {
+        assert!(reject_remote_url("https://github.com/org/repo.git").is_ok());
+        assert!(reject_remote_url("/path/to/repo").is_ok());
+    }
+
+    // ── reject_refspec tests ────────────────────────────────────────
+
+    #[test]
+    fn reject_refspec_rejects_empty() {
+        assert!(reject_refspec("").is_err());
+    }
+
+    #[test]
+    fn reject_refspec_rejects_nul() {
+        assert!(reject_refspec("spec\0bad").is_err());
+    }
+
+    #[test]
+    fn reject_refspec_allows_leading_plus() {
+        assert!(reject_refspec("+refs/heads/main:refs/heads/main").is_ok());
+    }
+
+    #[test]
+    fn reject_refspec_allows_colon() {
+        assert!(reject_refspec("refs/heads/main:refs/remotes/origin/main").is_ok());
+    }
+
+    // ── reject_nul tests ────────────────────────────────────────────
+
+    #[test]
+    fn reject_nul_rejects_nul_byte() {
+        assert!(reject_nul("hello\0world", "value").is_err());
+    }
+
+    #[test]
+    fn reject_nul_accepts_clean_string() {
+        assert!(reject_nul("hello world", "value").is_ok());
+    }
+
+    // ── Public method rejection of dash-prefixed arguments ──────────
+
+    fn test_git() -> Git {
+        Git::default_with_timeout(Duration::from_secs(1))
+    }
+
+    #[tokio::test]
+    async fn fetch_branch_rejects_dash_branch() {
+        let git = test_git();
+        assert!(git
+            .fetch_branch(Path::new("/unused"), "url", "-evil", "refs/cache/test")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_branch_rejects_dash_local_ref() {
+        let git = test_git();
+        assert!(git
+            .fetch_branch(Path::new("/unused"), "url", "main", "--evil")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn rev_parse_rejects_dash_rev() {
+        let git = test_git();
+        assert!(git.rev_parse(Path::new("/unused"), "--evil").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bundle_create_rejects_dash_rev() {
+        let git = test_git();
+        assert!(git
+            .bundle_create(Path::new("/unused"), Path::new("/unused"), "-evil")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn update_ref_rejects_dash_ref_name() {
+        let git = test_git();
+        assert!(git
+            .update_ref(Path::new("/unused"), "-evil", "abc123")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn symbolic_ref_rejects_dash_name() {
+        let git = test_git();
+        assert!(git
+            .symbolic_ref(Path::new("/unused"), "--evil", "refs/heads/main")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn set_config_rejects_dash_key() {
+        let git = test_git();
+        assert!(git
+            .set_config(Path::new("/unused"), "--evil", "value")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn ls_remote_heads_rejects_dash_url() {
+        let git = test_git();
+        assert!(git.ls_remote_heads("-evil").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ls_remote_default_branch_rejects_dash_url() {
+        let git = test_git();
+        assert!(git.ls_remote_default_branch("-evil").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refs_rejects_dash_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_refs(Path::new("/unused"), "-evil", &[])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refs_rejects_nul_in_refspec() {
+        let git = test_git();
+        assert!(git
+            .fetch_refs(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &["bad\0spec".to_string()]
+            )
+            .await
+            .is_err());
+    }
+}

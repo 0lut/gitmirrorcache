@@ -191,3 +191,103 @@ fn parse_env_usize(name: &str, default: usize) -> crate::Result<usize> {
         Err(_) => Ok(default),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn from_path_parses_valid_toml() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+bind_addr = "127.0.0.1:9090"
+public_base_url = "http://localhost:9090"
+cache_root = "/tmp/cache"
+git_timeout_seconds = 60
+session_ttl_seconds = 1800
+rate_limit_per_minute = 500
+
+[object_store]
+kind = "local"
+root = "/tmp/objects"
+
+[disk]
+quota_bytes = 5368709120
+min_free_bytes = 1073741824
+"#
+        )
+        .unwrap();
+
+        let config = AppConfig::from_path(tmp.path()).unwrap();
+        assert_eq!(config.bind_addr.port(), 9090);
+        assert_eq!(config.cache_root, PathBuf::from("/tmp/cache"));
+        assert_eq!(config.git_timeout_seconds, 60);
+        assert_eq!(config.session_ttl_seconds, 1800);
+        assert_eq!(config.rate_limit_per_minute, 500);
+    }
+
+    #[test]
+    fn from_path_uses_defaults_for_omitted_fields() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"
+bind_addr = "0.0.0.0:8080"
+public_base_url = "http://example.com"
+cache_root = "/cache"
+session_ttl_seconds = 3600
+
+[object_store]
+kind = "local"
+root = "/objects"
+
+[disk]
+quota_bytes = 1000000
+min_free_bytes = 100000
+"#
+        )
+        .unwrap();
+
+        let config = AppConfig::from_path(tmp.path()).unwrap();
+        assert_eq!(config.git_binary, PathBuf::from("git"));
+        assert_eq!(config.git_timeout_seconds, 120);
+        assert_eq!(config.rate_limit_per_minute, 120);
+        assert_eq!(config.max_git_output_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn git_remote_config_default_values() {
+        let config = GitRemoteConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.branch_ref_check, BranchRefCheck::Always);
+        assert!(config.commit_read_through);
+    }
+
+    #[test]
+    fn git_remote_config_serde_round_trip() {
+        let config = GitRemoteConfig {
+            enabled: true,
+            branch_ref_check: BranchRefCheck::Always,
+            commit_read_through: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: GitRemoteConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn from_path_rejects_invalid_toml() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "this is not valid toml ===").unwrap();
+        assert!(AppConfig::from_path(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn default_allowed_hosts_includes_github() {
+        let hosts = default_allowed_upstream_hosts();
+        assert!(hosts.contains(&"github.com".to_string()));
+    }
+}
