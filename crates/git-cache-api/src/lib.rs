@@ -300,6 +300,10 @@ async fn git_repo(
 
     let materializer = Materializer::new(Arc::clone(&state.domain));
 
+    if let Err(error) = materializer.validate_host(&repo) {
+        return ApiError::from(error).into_response();
+    }
+
     if method == Method::GET
         && path.ends_with("/info/refs")
         && query
