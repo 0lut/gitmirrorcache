@@ -176,8 +176,9 @@ impl Git {
         &self,
         remote: &str,
     ) -> Result<LsRemoteResult> {
+        reject_remote_url(remote)?;
         let output = self
-            .run(None, ["ls-remote", "--symref", remote])
+            .run(None, ["ls-remote", "--symref", "--", remote])
             .await
             .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
 
@@ -216,8 +217,9 @@ impl Git {
 
     /// Resolve the default branch via `git ls-remote --symref <remote> HEAD`.
     pub async fn ls_remote_default_branch(&self, remote: &str) -> Result<String> {
+        reject_remote_url(remote)?;
         let output = self
-            .run(None, ["ls-remote", "--symref", remote, "HEAD"])
+            .run(None, ["ls-remote", "--symref", "--", remote, "HEAD"])
             .await
             .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
 
@@ -247,7 +249,8 @@ impl Git {
         sha: &str,
     ) -> Result<GitOutput> {
         reject_ref_arg(ref_name, "ref")?;
-        self.run(Some(repo_dir), ["update-ref", ref_name, sha])
+        reject_revision_arg(sha)?;
+        self.run(Some(repo_dir), ["update-ref", "--", ref_name, sha])
             .await
     }
 
@@ -270,6 +273,7 @@ impl Git {
         value: &str,
     ) -> Result<GitOutput> {
         reject_config_key(key)?;
+        reject_nul(value, "config value")?;
         self.run(Some(repo_dir), ["config", "--local", "--", key, value])
             .await
     }
@@ -378,6 +382,10 @@ impl Git {
         remote_url: &str,
         refspecs: &[String],
     ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        for refspec in refspecs {
+            reject_refspec(refspec)?;
+        }
         let mut args: Vec<String> = vec![
             "fetch".to_string(),
             "--no-tags".to_string(),
@@ -544,6 +552,33 @@ fn reject_config_key(key: &str) -> Result<()> {
     if key.is_empty() || key.starts_with('-') || key.contains('\0') {
         return Err(GitCacheError::Validation(format!(
             "invalid config key argument: {key:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_remote_url(url: &str) -> Result<()> {
+    if url.is_empty() || url.starts_with('-') || url.contains('\0') {
+        return Err(GitCacheError::Validation(format!(
+            "invalid remote URL argument: {url:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_refspec(refspec: &str) -> Result<()> {
+    if refspec.is_empty() || refspec.contains('\0') {
+        return Err(GitCacheError::Validation(format!(
+            "invalid refspec argument: {refspec:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_nul(value: &str, kind: &str) -> Result<()> {
+    if value.contains('\0') {
+        return Err(GitCacheError::Validation(format!(
+            "invalid {kind} argument: contains NUL byte"
         )));
     }
     Ok(())
