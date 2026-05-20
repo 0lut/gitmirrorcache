@@ -4,6 +4,7 @@ members = [
     "crates/git-cache-cli",
     "crates/git-cache-core",
     "crates/git-cache-disk",
+    "crates/git-cache-domain",
     "crates/git-cache-git",
     "crates/git-cache-objectstore",
     "crates/git-cache-worker",
