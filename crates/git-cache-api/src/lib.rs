@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
+    AppConfig, GitCacheError, MaterializeRequest, RequestMode, Result as CoreResult, Selector,
 };
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
 use git_cache_domain::{AppState, Materializer, MaterializerExecutor};
@@ -107,6 +107,8 @@ async fn materialize(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
+    let mut request = request;
+
     let use_coordinator = matches!(
         request.selector,
         Selector::Branch(_) | Selector::DefaultBranch
@@ -131,7 +133,12 @@ async fn materialize(
                     .fetch_add(1, Ordering::Relaxed);
                 return Err(error.into());
             }
-            Ok(_) => {}
+            Ok(_) => {
+                // Coordinator already did fetch+publish; use Cached mode so
+                // materialize just creates a session from the fresh local data
+                // without hitting upstream again.
+                request.mode = RequestMode::Cached;
+            }
         }
     }
 
