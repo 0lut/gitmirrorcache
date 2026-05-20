@@ -879,4 +879,155 @@ mod tests {
             .unwrap()
             .unwrap();
     }
+
+    // ── Performance tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_high_volume_deduplication() {
+        let executor = Arc::new(RecordingExecutor::new(true));
+        let coordinator = coordinator(Arc::clone(&executor));
+        let concurrent_calls = 100;
+
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..concurrent_calls {
+            let coordinator = coordinator.clone();
+            handles.push(tokio::spawn(async move {
+                coordinator.read_through(repo(), branch("main")).await
+            }));
+        }
+
+        // Wait for the executor to start, then release.
+        executor.wait_started().await;
+        tokio::task::yield_now().await;
+        executor.release_one();
+
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            outcomes.push(handle.await.unwrap().unwrap());
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            executor.calls(),
+            1,
+            "expected exactly 1 executor call for {concurrent_calls} concurrent requests, got {}",
+            executor.calls()
+        );
+
+        for outcome in &outcomes {
+            assert_eq!(outcome.disposition, UpdateDisposition::Updated);
+        }
+
+        eprintln!(
+            "high-volume dedup: {concurrent_calls} callers, 1 executor call, {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mixed_key_throughput() {
+        let executor = Arc::new(RecordingExecutor::new(false));
+        let coordinator = coordinator(Arc::clone(&executor));
+        let keys_count = 10;
+        let requests_per_key = 5;
+
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for k in 0..keys_count {
+            let branch_name = format!("branch-{k}");
+            for _ in 0..requests_per_key {
+                let coordinator = coordinator.clone();
+                let branch_name = branch_name.clone();
+                handles.push(tokio::spawn(async move {
+                    coordinator
+                        .read_through(repo(), branch(&branch_name))
+                        .await
+                }));
+            }
+        }
+
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            outcomes.push(handle.await.unwrap().unwrap());
+        }
+        let elapsed = start.elapsed();
+
+        // With no hold, each key should be processed. Some dedup may occur.
+        let calls = executor.calls();
+        assert!(
+            calls >= keys_count && calls <= keys_count * requests_per_key,
+            "expected between {keys_count} and {} calls, got {calls}",
+            keys_count * requests_per_key
+        );
+
+        eprintln!(
+            "mixed-key throughput: {} requests across {keys_count} keys, {calls} executor calls, {elapsed:?}",
+            keys_count * requests_per_key
+        );
+    }
+
+    #[tokio::test]
+    async fn test_event_hint_channel_throughput() {
+        let (sender, mut receiver) = event_hint_channel(1024);
+        let hint_count = 1000;
+
+        let start = std::time::Instant::now();
+        for i in 0..hint_count {
+            let ref_name = format!("refs/heads/branch-{i}");
+            sender
+                .submit(EventHint::new(repo(), &ref_name).unwrap())
+                .await
+                .unwrap();
+        }
+        let send_elapsed = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let mut received = 0;
+        // Drop sender so receiver knows when channel is closed.
+        drop(sender);
+        while receiver.next_hint().await.unwrap().is_some() {
+            received += 1;
+        }
+        let recv_elapsed = start.elapsed();
+
+        assert_eq!(
+            received, hint_count,
+            "expected {hint_count} hints, got {received}"
+        );
+
+        let total = send_elapsed + recv_elapsed;
+        let throughput = hint_count as f64 / total.as_secs_f64();
+        eprintln!(
+            "event hint channel: send={send_elapsed:?}, recv={recv_elapsed:?}, total={total:?} ({throughput:.0} hints/sec)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_cron_tick_latency() {
+        let executor = Arc::new(RecordingExecutor::new(false));
+        let coordinator = coordinator(Arc::clone(&executor));
+        let job_count = 10;
+        let jobs: Vec<CronJob> = (0..job_count)
+            .map(|i| CronJob::new(repo(), branch(&format!("branch-{i}"))))
+            .collect();
+        let config = CronUpdateConfig::try_new(Duration::from_secs(60), jobs).unwrap();
+        let cron = CronUpdateLoop::new(coordinator, config);
+
+        let start = std::time::Instant::now();
+        let outcomes = cron.tick_once().await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            outcomes.len(),
+            job_count,
+            "expected {job_count} outcomes, got {}",
+            outcomes.len()
+        );
+        for outcome in &outcomes {
+            assert_eq!(outcome.disposition, UpdateDisposition::Updated);
+        }
+        assert_eq!(executor.calls(), job_count);
+
+        eprintln!("cron tick_once: {job_count} jobs completed in {elapsed:?}");
+    }
 }
