@@ -34,33 +34,38 @@ fn ts(seconds: u32) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn test_generation_id() -> GenerationId {
+    GenerationId::new()
+}
+
 fn generation_manifest(repo: &RepoKey) -> GenerationManifest {
+    let gen = test_generation_id();
     GenerationManifest {
         repo: repo.clone(),
-        generation: GenerationId(1),
-        bundle_key: format!("repos/{repo}/generations/000001/base.bundle"),
+        generation: gen,
+        bundle_key: format!("repos/{repo}/generations/{gen}/base.bundle"),
         parent_generation: None,
         created_at: ts(1),
         commits: vec![commit('a')],
     }
 }
 
-fn commit_manifest(repo: &RepoKey) -> CommitManifest {
+fn commit_manifest_with_gen(repo: &RepoKey, gen: GenerationId) -> CommitManifest {
     CommitManifest {
         repo: repo.clone(),
         commit: commit('a'),
-        generation: GenerationId(1),
+        generation: gen,
         complete: true,
         verified_at: ts(2),
     }
 }
 
-fn ref_manifest(repo: &RepoKey) -> RefManifest {
+fn ref_manifest_with_gen(repo: &RepoKey, gen: GenerationId) -> RefManifest {
     RefManifest {
         repo: repo.clone(),
         ref_name: "refs/heads/feature/cache".into(),
         commit: commit('a'),
-        generation: GenerationId(1),
+        generation: gen,
         verified_at: ts(3),
     }
 }
@@ -108,7 +113,7 @@ async fn put_if_absent_is_conditional() {
     );
 
     let mut conflicting = generation.clone();
-    conflicting.bundle_key = format!("repos/{repo}/generations/000001/other.bundle");
+    conflicting.bundle_key = format!("repos/{repo}/generations/{}/other.bundle", generation.generation);
     assert!(
         write_generation_manifest_if_absent_or_matches(&store, &conflicting)
             .await
@@ -125,8 +130,8 @@ async fn manifests_round_trip_as_json() {
     let repo = repo();
 
     let generation = generation_manifest(&repo);
-    let commit = commit_manifest(&repo);
-    let reference = ref_manifest(&repo);
+    let commit = commit_manifest_with_gen(&repo, generation.generation);
+    let reference = ref_manifest_with_gen(&repo, generation.generation);
     let session = session_manifest(&repo);
 
     write_generation_manifest(&store, &generation)
@@ -221,8 +226,8 @@ async fn publish_writes_bundle_generation_then_manifests() {
     let repo = repo();
 
     let generation = generation_manifest(&repo);
-    let commit_manifest = commit_manifest(&repo);
-    let reference = ref_manifest(&repo);
+    let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
+    let reference = ref_manifest_with_gen(&repo, generation.generation);
     let session = session_manifest(&repo);
     let publish = GenerationPublish::with_manifests(
         generation.clone(),
