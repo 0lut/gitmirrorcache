@@ -43,10 +43,7 @@ async fn concurrent_reservations_within_quota_all_succeed() {
         .collect();
 
     let results: Vec<_> = join_all(handles).await;
-    let reservations: Vec<_> = results
-        .into_iter()
-        .map(|r| r.unwrap().unwrap())
-        .collect();
+    let reservations: Vec<_> = results.into_iter().map(|r| r.unwrap().unwrap()).collect();
 
     assert_eq!(reservations.len(), 30);
 
@@ -89,7 +86,10 @@ async fn concurrent_reservations_exceeding_quota_some_fail() {
     }
 
     assert!(successes > 0, "at least one reservation should succeed");
-    assert!(failures > 0, "at least one reservation should fail with DiskFull");
+    assert!(
+        failures > 0,
+        "at least one reservation should fail with DiskFull"
+    );
     assert!(
         successes * 5 * 1024 * 1024 <= 50 * 1024 * 1024,
         "total reserved must not exceed quota"
@@ -194,7 +194,10 @@ async fn concurrent_eviction_no_double_free() {
         }
     }
     // At least some should succeed via eviction.
-    assert!(successes > 0, "at least one eviction-based reservation should succeed");
+    assert!(
+        successes > 0,
+        "at least one eviction-based reservation should succeed"
+    );
 
     // Verify no panics happened and status is consistent.
     let status = manager.status().unwrap();
@@ -242,7 +245,10 @@ async fn lock_contention_tracks_correctly() {
 
     // All 10 locks are held simultaneously.
     let status = manager.status().unwrap();
-    assert_eq!(status.locked_repo_count, 1, "one repo locked by multiple tasks");
+    assert_eq!(
+        status.locked_repo_count, 1,
+        "one repo locked by multiple tasks"
+    );
 
     // Drop half.
     for _ in 0..5 {
@@ -327,10 +333,16 @@ async fn cleanup_does_not_remove_active_reservations() {
 
     assert_eq!(report.removed_temp_dirs, 0);
     assert_eq!(report.removed_reservation_markers, 0);
-    assert!(temp_path.exists(), "active reservation should NOT be cleaned up");
+    assert!(
+        temp_path.exists(),
+        "active reservation should NOT be cleaned up"
+    );
 
     drop(reservation);
-    assert!(!temp_path.exists(), "reservation should be cleaned up on drop");
+    assert!(
+        !temp_path.exists(),
+        "reservation should be cleaned up on drop"
+    );
 }
 
 // ── 8. Drop without release ──────────────────────────────────────────────

@@ -125,20 +125,13 @@ async fn list_prefix_returns_matching_keys() {
         .put("sessions/sub/c.json", Bytes::from("c"))
         .await
         .unwrap();
-    store
-        .put("other/d.json", Bytes::from("d"))
-        .await
-        .unwrap();
+    store.put("other/d.json", Bytes::from("d")).await.unwrap();
 
     let mut keys = store.list_prefix("sessions/").await.unwrap();
     keys.sort();
     assert_eq!(
         keys,
-        vec![
-            "sessions/a.json",
-            "sessions/b.json",
-            "sessions/sub/c.json",
-        ]
+        vec!["sessions/a.json", "sessions/b.json", "sessions/sub/c.json",]
     );
 
     let empty = store.list_prefix("nonexistent/").await.unwrap();
@@ -179,7 +172,10 @@ async fn put_if_absent_is_conditional() {
     );
 
     let mut conflicting = generation.clone();
-    conflicting.bundle_key = format!("repos/{repo}/generations/{}/other.bundle", generation.generation);
+    conflicting.bundle_key = format!(
+        "repos/{repo}/generations/{}/other.bundle",
+        generation.generation
+    );
     assert!(
         write_generation_manifest_if_absent_or_matches(&store, &conflicting)
             .await
@@ -501,17 +497,13 @@ async fn ref_manifest_absent_or_matches_matching_content() {
     let gen_id = test_generation_id();
     let reference = ref_manifest_with_gen(&repo, gen_id);
 
-    assert!(
-        write_ref_manifest_if_absent_or_matches(&store, &reference)
-            .await
-            .unwrap()
-    );
+    assert!(write_ref_manifest_if_absent_or_matches(&store, &reference)
+        .await
+        .unwrap());
     // Same content → not an error, returns false (already exists)
-    assert!(
-        !write_ref_manifest_if_absent_or_matches(&store, &reference)
-            .await
-            .unwrap()
-    );
+    assert!(!write_ref_manifest_if_absent_or_matches(&store, &reference)
+        .await
+        .unwrap());
 
     let _ = fs::remove_dir_all(&root).await;
 }

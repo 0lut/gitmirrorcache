@@ -16,8 +16,8 @@ struct TempTree {
 impl TempTree {
     fn new(name: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("git-cache-perf-{name}-{}-{id}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("git-cache-perf-{name}-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp tree");
         Self { path }
     }
@@ -113,16 +113,10 @@ fn create_source_repo_with_commits(root: &Path, commit_count: usize) -> (PathBuf
     );
 
     for i in 0..commit_count {
-        std::fs::write(
-            source_repo.join("README.md"),
-            format!("commit {i}\n"),
-        )
-        .expect("write README");
+        std::fs::write(source_repo.join("README.md"), format!("commit {i}\n"))
+            .expect("write README");
         run_git(Some(&source_repo), ["add", "README.md"]);
-        run_git(
-            Some(&source_repo),
-            ["commit", "-m", &format!("commit {i}")],
-        );
+        run_git(Some(&source_repo), ["commit", "-m", &format!("commit {i}")]);
     }
 
     let sha = run_git(Some(&source_repo), ["rev-parse", "HEAD"]);
@@ -172,9 +166,7 @@ async fn test_init_bare_throughput() {
     let elapsed = start.elapsed();
 
     let ops_per_sec = count as f64 / elapsed.as_secs_f64();
-    eprintln!(
-        "init_bare throughput: {count} repos in {elapsed:?} ({ops_per_sec:.0} ops/sec)"
-    );
+    eprintln!("init_bare throughput: {count} repos in {elapsed:?} ({ops_per_sec:.0} ops/sec)");
     assert!(
         elapsed.as_secs() < 30,
         "init_bare throughput too slow: {elapsed:?}"
@@ -226,10 +218,7 @@ async fn test_bundle_create_restore_cycle() {
     eprintln!(
         "bundle create/restore: create={bundle_elapsed:?}, restore={restore_elapsed:?}, total={total:?} (50 commits)"
     );
-    assert!(
-        total.as_secs() < 30,
-        "bundle cycle too slow: {total:?}"
-    );
+    assert!(total.as_secs() < 30, "bundle cycle too slow: {total:?}");
 }
 
 // ── 3. upload_pack_advertise_refs latency ────────────────────────────────
@@ -317,9 +306,7 @@ async fn test_rev_parse_latency() {
     let elapsed = start.elapsed();
 
     let avg = elapsed / iterations;
-    eprintln!(
-        "rev_parse: {iterations} calls in {elapsed:?}, avg={avg:?}"
-    );
+    eprintln!("rev_parse: {iterations} calls in {elapsed:?}, avg={avg:?}");
     assert!(
         avg.as_millis() < 500,
         "rev_parse average latency too high: {avg:?}"
@@ -353,11 +340,6 @@ async fn test_fsck_throughput() {
     let elapsed = start.elapsed();
 
     let avg = elapsed / iterations;
-    eprintln!(
-        "fsck: {iterations} calls in {elapsed:?}, avg={avg:?}"
-    );
-    assert!(
-        avg.as_secs() < 5,
-        "fsck average latency too high: {avg:?}"
-    );
+    eprintln!("fsck: {iterations} calls in {elapsed:?}, avg={avg:?}");
+    assert!(avg.as_secs() < 5, "fsck average latency too high: {avg:?}");
 }

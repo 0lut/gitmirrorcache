@@ -767,10 +767,7 @@ impl Materializer {
     /// Compare the upstream branch advertisement against local cache state.
     /// Returns a map of branches that are missing or have a different SHA
     /// locally, plus the upstream default branch name.
-    pub async fn compare_upstream_refs(
-        &self,
-        repo: &RepoKey,
-    ) -> CoreResult<UpstreamRefComparison> {
+    pub async fn compare_upstream_refs(&self, repo: &RepoKey) -> CoreResult<UpstreamRefComparison> {
         let upstream_url = self.upstream_url(repo)?;
         let ls = self.state.git.ls_remote_heads(&upstream_url).await?;
         let repo_dir = self.ensure_repo_dir(repo).await?;
@@ -816,11 +813,7 @@ impl Materializer {
 
         let refspecs: Vec<String> = validated
             .iter()
-            .map(|(branch, _)| {
-                format!(
-                    "+refs/heads/{branch}:refs/cache/upstream/heads/{branch}"
-                )
-            })
+            .map(|(branch, _)| format!("+refs/heads/{branch}:refs/cache/upstream/heads/{branch}"))
             .collect();
 
         self.state
@@ -867,11 +860,7 @@ impl Materializer {
             let db = BranchName::parse(default_branch.as_str())?;
             self.state
                 .git
-                .symbolic_ref(
-                    &repo_dir,
-                    "HEAD",
-                    &format!("refs/heads/{db}"),
-                )
+                .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{db}"))
                 .await?;
 
             if let Some(sha) = comparison.all_upstream.get(default_branch) {
@@ -893,10 +882,7 @@ impl Materializer {
     /// any objects.  Returns the structured ref data so the API layer can
     /// synthesize the pkt-line response directly, avoiding the need to
     /// materialise objects just for ls-remote.
-    pub async fn upstream_refs(
-        &self,
-        repo: &RepoKey,
-    ) -> CoreResult<UpstreamRefComparison> {
+    pub async fn upstream_refs(&self, repo: &RepoKey) -> CoreResult<UpstreamRefComparison> {
         self.validate_host(repo)?;
         let upstream_url = self.upstream_url(repo)?;
         let ls = self.state.git.ls_remote_heads(&upstream_url).await?;
@@ -921,10 +907,7 @@ impl Materializer {
             let ref_name = format!("refs/heads/{branch}");
             let local = self.state.git.rev_parse(&repo_dir, &ref_name).await.ok();
             if local.as_deref() != Some(sha.as_str()) {
-                self.state
-                    .git
-                    .update_ref(&repo_dir, &ref_name, sha)
-                    .await?;
+                self.state.git.update_ref(&repo_dir, &ref_name, sha).await?;
             }
         }
 
@@ -932,11 +915,7 @@ impl Materializer {
             let db = BranchName::parse(default_branch.as_str())?;
             self.state
                 .git
-                .symbolic_ref(
-                    &repo_dir,
-                    "HEAD",
-                    &format!("refs/heads/{db}"),
-                )
+                .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{db}"))
                 .await?;
         }
 
@@ -948,11 +927,7 @@ impl Materializer {
     /// - If the commit is known in object-store manifests, hydrate.
     /// - If unknown and commit_read_through is enabled, fetch from upstream.
     /// - Otherwise, fail.
-    pub async fn ensure_wants_available(
-        &self,
-        repo: &RepoKey,
-        wants: &[String],
-    ) -> CoreResult<()> {
+    pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
 
         for want_sha in wants {
@@ -1182,10 +1157,12 @@ pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u
     // Only advertise symref when the default branch is actually present in
     // the upstream refs. A symref pointing at a non-existent ref confuses
     // git clients during clone.
-    let resolved_default = comparison
-        .default_branch
-        .as_ref()
-        .and_then(|b| comparison.all_upstream.get(b).map(|sha| (b.as_str(), sha.as_str())));
+    let resolved_default = comparison.default_branch.as_ref().and_then(|b| {
+        comparison
+            .all_upstream
+            .get(b)
+            .map(|sha| (b.as_str(), sha.as_str()))
+    });
 
     let symref = resolved_default
         .map(|(b, _)| format!(" symref=HEAD:refs/heads/{b}"))
@@ -1820,7 +1797,10 @@ mod tests {
         assert!(!commits.is_empty(), "at least one materialize must succeed");
         let first = &commits[0];
         for c in &commits {
-            assert_eq!(c, first, "all successful materializations return same commit");
+            assert_eq!(
+                c, first,
+                "all successful materializations return same commit"
+            );
         }
     }
 
@@ -2209,12 +2189,14 @@ mod tests {
         // Verify each session has a unique ref.
         let refs: std::collections::HashSet<_> =
             sessions.iter().map(|s| s.ref_name.clone()).collect();
-        assert_eq!(refs.len(), session_count, "each session should have a unique ref");
+        assert_eq!(
+            refs.len(),
+            session_count,
+            "each session should have a unique ref"
+        );
 
         let avg = elapsed / session_count as u32;
-        eprintln!(
-            "session creation: {session_count} sessions in {elapsed:?}, avg={avg:?}"
-        );
+        eprintln!("session creation: {session_count} sessions in {elapsed:?}, avg={avg:?}");
         assert!(
             elapsed.as_secs() < 60,
             "session creation too slow: {elapsed:?}"
@@ -2272,10 +2254,7 @@ mod tests {
             report.sessions_removed > 0,
             "expected some sessions to be cleaned up"
         );
-        assert!(
-            elapsed.as_secs() < 30,
-            "cleanup too slow: {elapsed:?}"
-        );
+        assert!(elapsed.as_secs() < 30, "cleanup too slow: {elapsed:?}");
     }
 
     // ── synthesize_ref_advertisement unit tests ─────────────────────────

@@ -27,9 +27,15 @@ impl TestServer {
         std::fs::create_dir_all(upstream_bare.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&upstream_work).unwrap();
 
-        run_git(tmp.path(), &["init", "--bare", upstream_bare.to_str().unwrap()]);
+        run_git(
+            tmp.path(),
+            &["init", "--bare", upstream_bare.to_str().unwrap()],
+        );
         run_git(&upstream_work, &["init"]);
-        run_git(&upstream_work, &["config", "user.email", "test@example.com"]);
+        run_git(
+            &upstream_work,
+            &["config", "user.email", "test@example.com"],
+        );
         run_git(&upstream_work, &["config", "user.name", "Test"]);
         std::fs::write(upstream_work.join("README.md"), "initial\n").unwrap();
         run_git(&upstream_work, &["add", "README.md"]);
@@ -40,10 +46,7 @@ impl TestServer {
             &["remote", "add", "origin", upstream_bare.to_str().unwrap()],
         );
         run_git(&upstream_work, &["push", "origin", "main"]);
-        run_git(
-            &upstream_bare,
-            &["symbolic-ref", "HEAD", "refs/heads/main"],
-        );
+        run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         let config = AppConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -95,7 +98,11 @@ impl TestServer {
     }
 
     fn commit_and_push(&self, contents: &str) -> String {
-        std::fs::write(self.upstream_work.join("README.md"), format!("{contents}\n")).unwrap();
+        std::fs::write(
+            self.upstream_work.join("README.md"),
+            format!("{contents}\n"),
+        )
+        .unwrap();
         run_git(&self.upstream_work, &["add", "README.md"]);
         run_git(&self.upstream_work, &["commit", "-m", contents]);
         run_git(&self.upstream_work, &["push", "--force", "origin", "main"]);
@@ -104,7 +111,11 @@ impl TestServer {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -114,7 +125,11 @@ fn run_git(cwd: &Path, args: &[&str]) {
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").current_dir(cwd).args(args).output().unwrap();
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -175,8 +190,16 @@ async fn clone_branch_via_direct_remote() {
 
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone_dir.to_str().unwrap()],
-    ).await;
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone_dir.to_str().unwrap(),
+        ],
+    )
+    .await;
 
     let cloned_head = git_stdout_async(&clone_dir, &["rev-parse", "HEAD"]).await;
     assert_eq!(cloned_head, server.head_commit());
@@ -193,15 +216,31 @@ async fn repeated_clone_does_not_refetch_when_unchanged() {
     let clone1 = server.tmp.path().join("repeat1");
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone1.to_str().unwrap()],
-    ).await;
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone1.to_str().unwrap(),
+        ],
+    )
+    .await;
     let head1 = git_stdout_async(&clone1, &["rev-parse", "HEAD"]).await;
 
     let clone2 = server.tmp.path().join("repeat2");
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone2.to_str().unwrap()],
-    ).await;
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone2.to_str().unwrap(),
+        ],
+    )
+    .await;
     let head2 = git_stdout_async(&clone2, &["rev-parse", "HEAD"]).await;
 
     assert_eq!(head1, head2);
@@ -215,8 +254,16 @@ async fn clone_picks_up_new_branch_head() {
     let clone1 = server.tmp.path().join("adv1");
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone1.to_str().unwrap()],
-    ).await;
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone1.to_str().unwrap(),
+        ],
+    )
+    .await;
     let first_head = git_stdout_async(&clone1, &["rev-parse", "HEAD"]).await;
 
     let new_commit = server.commit_and_push("second commit");
@@ -224,8 +271,16 @@ async fn clone_picks_up_new_branch_head() {
     let clone2 = server.tmp.path().join("adv2");
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone2.to_str().unwrap()],
-    ).await;
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone2.to_str().unwrap(),
+        ],
+    )
+    .await;
     let second_head = git_stdout_async(&clone2, &["rev-parse", "HEAD"]).await;
 
     assert_ne!(first_head, second_head);
@@ -241,8 +296,16 @@ async fn fetch_exact_commit_sha() {
     let clone1 = server.tmp.path().join("sha1");
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone1.to_str().unwrap()],
-    ).await;
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone1.to_str().unwrap(),
+        ],
+    )
+    .await;
     let head = server.head_commit();
 
     // Now fetch by exact SHA from a fresh init.
@@ -253,7 +316,8 @@ async fn fetch_exact_commit_sha() {
     run_git_async(
         &fetch_dir,
         &["fetch", "--no-tags", "--depth=1", "origin", &head],
-    ).await;
+    )
+    .await;
     run_git_async(&fetch_dir, &["checkout", "--detach", &head]).await;
 
     let fetched_head = git_stdout_async(&fetch_dir, &["rev-parse", "HEAD"]).await;
@@ -281,16 +345,21 @@ async fn internal_cache_refs_are_hidden() {
     let clone1 = server.tmp.path().join("hide1");
     run_git_async(
         server.tmp.path(),
-        &["clone", "--no-tags", "--branch", "main", &url, clone1.to_str().unwrap()],
-    ).await;
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone1.to_str().unwrap(),
+        ],
+    )
+    .await;
 
     // ls-remote should not show refs/cache/*
     let text = git_stdout_async(server.tmp.path(), &["ls-remote", &url]).await;
 
     for line in text.lines() {
-        assert!(
-            !line.contains("refs/cache"),
-            "internal ref leaked: {line}"
-        );
+        assert!(!line.contains("refs/cache"), "internal ref leaked: {line}");
     }
 }

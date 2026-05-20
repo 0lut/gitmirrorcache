@@ -127,9 +127,7 @@ async fn test_large_object_10mb() {
     assert_eq!(read_back.len(), size);
     assert_eq!(read_back, data);
 
-    eprintln!(
-        "large object 10MB: put={put_elapsed:?}, get={get_elapsed:?}"
-    );
+    eprintln!("large object 10MB: put={put_elapsed:?}, get={get_elapsed:?}");
     assert!(
         (put_elapsed + get_elapsed).as_secs() < 30,
         "10MB object handling too slow"
@@ -157,9 +155,7 @@ async fn test_large_object_50mb() {
     assert_eq!(read_back.len(), size);
     assert_eq!(read_back, data);
 
-    eprintln!(
-        "large object 50MB: put={put_elapsed:?}, get={get_elapsed:?}"
-    );
+    eprintln!("large object 50MB: put={put_elapsed:?}, get={get_elapsed:?}");
     assert!(
         (put_elapsed + get_elapsed).as_secs() < 60,
         "50MB object handling too slow"
@@ -190,10 +186,7 @@ async fn test_list_prefix_at_scale() {
     );
 
     eprintln!("list_prefix 500 objects: {elapsed:?}");
-    assert!(
-        elapsed.as_secs() < 10,
-        "list_prefix too slow: {elapsed:?}"
-    );
+    assert!(elapsed.as_secs() < 10, "list_prefix too slow: {elapsed:?}");
 }
 
 // ── 5. put_if_absent under contention ────────────────────────────────────
@@ -211,10 +204,7 @@ async fn test_put_if_absent_under_contention() {
         let store = Arc::clone(&store);
         let value = value.clone();
         handles.push(tokio::spawn(async move {
-            store
-                .put_if_absent(key, value)
-                .await
-                .unwrap()
+            store.put_if_absent(key, value).await.unwrap()
         }));
     }
 
@@ -226,7 +216,10 @@ async fn test_put_if_absent_under_contention() {
     }
     let elapsed = start.elapsed();
 
-    assert_eq!(won_count, 1, "exactly one writer should win, got {won_count}");
+    assert_eq!(
+        won_count, 1,
+        "exactly one writer should win, got {won_count}"
+    );
 
     // Verify the object is readable and has the right content.
     let stored = store.get(key).await.unwrap().expect("object should exist");

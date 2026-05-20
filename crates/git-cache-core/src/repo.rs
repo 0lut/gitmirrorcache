@@ -374,7 +374,11 @@ mod tests {
 
     #[test]
     fn commit_sha_mixed_case_normalizes_to_lowercase() {
-        let mixed = "aAbBcCdDeEfF".repeat(4).chars().take(40).collect::<String>();
+        let mixed = "aAbBcCdDeEfF"
+            .repeat(4)
+            .chars()
+            .take(40)
+            .collect::<String>();
         assert_eq!(mixed.len(), 40);
         let sha = CommitSha::parse(&mixed).unwrap();
         assert!(sha.as_str().chars().all(|c| c.is_ascii_lowercase()));
