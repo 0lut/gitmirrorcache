@@ -206,7 +206,7 @@ class AstralUvIntegrationTest(unittest.TestCase):
         short = str(branch["commit"])[:8]
 
         resolved = self.materialize({"short_commit": short})
-        self.assertEqual(resolved["source"], "cache_verified")
+        self.assertEqual(resolved["source"], "github_verified")
         self.assertEqual(resolved["commit"], branch["commit"])
 
         fetched = self.fetch_session_ref(resolved, "short-commit")
