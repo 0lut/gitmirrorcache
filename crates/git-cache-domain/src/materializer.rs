@@ -334,6 +334,7 @@ impl Materializer {
             fs::write(&bundle_path, bundle).await?;
             self.state.git.fetch_bundle(repo_dir, &bundle_path).await?;
             self.state.git.fsck(repo_dir).await?;
+            reservation.release().await?;
         }
         Ok(())
     }
@@ -410,6 +411,8 @@ impl Materializer {
         GenerationPublish::with_manifests(generation_manifest, manifests)
             .publish_bundle_file(&*self.state.store, &bundle_path)
             .await?;
+
+        reservation.release().await?;
 
         Ok(generation)
     }

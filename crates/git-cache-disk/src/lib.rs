@@ -1,6 +1,6 @@
 pub mod async_disk;
 
-pub use async_disk::AsyncDiskManager;
+pub use async_disk::{AsyncDiskManager, AsyncReservation};
 
 use git_cache_core::{GitCacheError, Result};
 use serde::{Deserialize, Serialize};
@@ -66,10 +66,10 @@ pub struct CleanupReport {
 
 #[derive(Debug)]
 pub struct Reservation {
-    id: Uuid,
-    bytes: u64,
-    root: PathBuf,
-    state: Arc<Mutex<DiskState>>,
+    pub(crate) id: Uuid,
+    pub(crate) bytes: u64,
+    pub(crate) root: PathBuf,
+    pub(crate) state: Arc<Mutex<DiskState>>,
 }
 
 #[derive(Debug)]
