@@ -1204,8 +1204,12 @@ pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u
         pkt_line(&mut out, &line);
     }
 
-    // Ref lines.
-    for (name, sha) in &refs {
+    // Ref lines (skip the first if it was already emitted as the capability carrier).
+    let skip_first = comparison.default_branch.is_none() && !refs.is_empty();
+    for (i, (name, sha)) in refs.iter().enumerate() {
+        if skip_first && i == 0 {
+            continue;
+        }
         let line = format!("{sha} refs/heads/{name}\n");
         pkt_line(&mut out, &line);
     }
