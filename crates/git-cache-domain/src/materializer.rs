@@ -665,6 +665,41 @@ impl Materializer {
     }
 }
 
+#[async_trait::async_trait]
+impl git_cache_worker::UpdateExecutor for Materializer {
+    async fn update(&self, request: git_cache_worker::UpdateRequest) -> CoreResult<()> {
+        use git_cache_worker::UpdateTarget;
+        match request.target {
+            UpdateTarget::Branch(branch) => {
+                self.materialize_branch(request.repo, branch, RequestMode::Strict, false)
+                    .await?;
+            }
+            UpdateTarget::DefaultBranch => {
+                self.materialize_default_branch(request.repo, RequestMode::Strict)
+                    .await?;
+            }
+            UpdateTarget::Commit(commit) => {
+                self.materialize_commit(request.repo, commit).await?;
+            }
+            UpdateTarget::ShortCommit(commit) => {
+                self.materialize_short_commit(request.repo, commit).await?;
+            }
+            UpdateTarget::Ref(ref_name) => {
+                if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                    let branch = git_cache_core::BranchName::parse(branch)?;
+                    self.materialize_branch(request.repo, branch, RequestMode::Strict, false)
+                        .await?;
+                } else {
+                    return Err(GitCacheError::Unsupported(format!(
+                        "update target ref `{ref_name}` is not a branch"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u8>> {
     Ok(state
         .git
@@ -1113,5 +1148,57 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn coordinator_deduplicates_concurrent_branch_requests() {
+        use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
+
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let coordinator = UpdateCoordinator::new(
+            Arc::new(materializer),
+            Arc::new(InMemoryRepoLeaseManager::new()),
+        );
+        let branch = Selector::Branch(BranchName::parse("main").unwrap());
+
+        let (r1, r2) = tokio::join!(
+            coordinator.read_through(fixture.repo.clone(), branch.clone()),
+            coordinator.read_through(fixture.repo.clone(), branch.clone()),
+        );
+
+        let o1 = r1.unwrap();
+        let o2 = r2.unwrap();
+        assert_eq!(o1.disposition, UpdateDisposition::Updated);
+        assert_eq!(o2.disposition, UpdateDisposition::Updated);
+    }
+
+    #[tokio::test]
+    async fn commit_lookup_works_without_coordinator() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let branch_response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+
+        let commit_response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(branch_response.commit.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(commit_response.source, MaterializeSource::CacheVerified);
+        assert_eq!(commit_response.commit, branch_response.commit);
     }
 }

@@ -4,10 +4,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult,
+    AppConfig, GitCacheError, MaterializeRequest, RequestMode, Result as CoreResult, Selector,
 };
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
 use git_cache_domain::{AppState, Materializer};
+use git_cache_worker::{
+    InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition,
+};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -36,6 +39,7 @@ pub fn app_result(config: AppConfig) -> CoreResult<Router> {
 #[derive(Clone)]
 struct ApiState {
     domain: Arc<AppState>,
+    coordinator: UpdateCoordinator,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -44,8 +48,14 @@ impl ApiState {
     fn try_new(config: AppConfig) -> CoreResult<Self> {
         let rate_limiter = RateLimiter::new(config.rate_limit_per_minute);
         let domain = Arc::new(AppState::try_new(config)?);
+        let materializer = Materializer::new(Arc::clone(&domain));
+        let coordinator = UpdateCoordinator::new(
+            Arc::new(materializer),
+            Arc::new(InMemoryRepoLeaseManager::new()),
+        );
         Ok(Self {
             domain,
+            coordinator,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
         })
@@ -100,8 +110,42 @@ async fn materialize(
         .metrics
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
-    let materializer = Materializer::new(Arc::clone(&state.domain));
-    match materializer.materialize(request).await {
+
+    let uses_coordinator = matches!(
+        request.selector,
+        Selector::Branch(_) | Selector::DefaultBranch
+    ) && request.mode == RequestMode::Strict;
+
+    let result = if uses_coordinator {
+        let outcome = state
+            .coordinator
+            .read_through(request.repo.clone(), request.selector.clone())
+            .await;
+        match outcome {
+            Ok(outcome) if outcome.disposition == UpdateDisposition::LeaseBusy => {
+                return Err(ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    message: "update in progress, try again shortly".into(),
+                });
+            }
+            Ok(_) => {
+                let materializer = Materializer::new(Arc::clone(&state.domain));
+                materializer
+                    .materialize(MaterializeRequest {
+                        repo: request.repo,
+                        selector: request.selector,
+                        mode: RequestMode::Cached,
+                    })
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        let materializer = Materializer::new(Arc::clone(&state.domain));
+        materializer.materialize(request).await
+    };
+
+    match result {
         Ok(response) => Ok(Json(response).into_response()),
         Err(error) => {
             state
