@@ -61,7 +61,9 @@ impl GenerationPublish {
         S: ObjectStore + ?Sized,
     {
         validate_publish(self)?;
-        store.put_file(&self.generation.bundle_key, path.as_ref()).await?;
+        store
+            .put_file(&self.generation.bundle_key, path.as_ref())
+            .await?;
         write_generation_manifest_if_absent_or_matches(store, &self.generation).await?;
         write_publish_manifests(store, &self.manifests).await
     }

@@ -135,14 +135,11 @@ impl ObjectStore for LocalObjectStore {
         let path = self.object_path(key)?;
         match fs::metadata(&path).await {
             Ok(metadata) => {
-                let updated_at = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| {
-                        t.duration_since(UNIX_EPOCH)
-                            .ok()
-                            .and_then(|d| DateTime::<Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos()))
-                    });
+                let updated_at = metadata.modified().ok().and_then(|t| {
+                    t.duration_since(UNIX_EPOCH).ok().and_then(|d| {
+                        DateTime::<Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos())
+                    })
+                });
                 Ok(Some(ObjectMeta {
                     key: key.to_string(),
                     len: metadata.len(),

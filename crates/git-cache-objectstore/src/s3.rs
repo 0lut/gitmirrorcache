@@ -210,9 +210,9 @@ impl ObjectStore for S3ObjectStore {
         {
             Ok(output) => {
                 let len = output.content_length().unwrap_or(0) as u64;
-                let updated_at = output.last_modified().and_then(|t| {
-                    DateTime::<Utc>::from_timestamp(t.secs(), t.subsec_nanos())
-                });
+                let updated_at = output
+                    .last_modified()
+                    .and_then(|t| DateTime::<Utc>::from_timestamp(t.secs(), t.subsec_nanos()));
                 Ok(Some(ObjectMeta {
                     key: key.to_string(),
                     len,
