@@ -8,9 +8,13 @@ pub mod session;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use config::{AppConfig, BranchRefCheck, DiskConfig, GitRemoteConfig, ObjectStoreConfig};
+pub use config::{
+    AppConfig, BranchRefCheck, CompactionConfig, DiskConfig, GitRemoteConfig, ObjectStoreConfig,
+};
 pub use error::{GitCacheError, Result};
-pub use manifest::{CommitManifest, GenerationId, GenerationManifest, RefManifest};
+pub use manifest::{
+    CommitManifest, GenerationId, GenerationManifest, RefManifest, RepoGenerationHead,
+};
 pub use repo::{CommitSha, RepoKey, ShortCommitSha};
 pub use selector::{BranchName, Selector};
 pub use session::{SessionId, SessionManifest};

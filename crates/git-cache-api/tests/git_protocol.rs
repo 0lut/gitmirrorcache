@@ -75,6 +75,7 @@ impl TestServer {
                 enabled: true,
                 ..Default::default()
             },
+            compaction: Default::default(),
         };
 
         let router = app(config);

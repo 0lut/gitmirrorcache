@@ -140,3 +140,76 @@ Optional field with `#[serde(default)]`. Zero impact on existing configs.
 ### C4. Direct route added conditionally
 The `/git/{*repo_path}` route is only registered when `git_remote.enabled = true`.
 Existing deployments are unaffected.
+
+---
+
+# Implementation Notes: Incremental Generations & Compaction
+
+## Overview
+Implementing the plan from PR #23: generation publishing now creates delta
+bundles when a repository has a previous generation head, and generation chains
+can be compacted into a new full-bundle root generation.
+
+## Decisions not in the spec
+
+### 1. Keep old notes and append this section
+PR #23's diff deleted the prior `implementation-notes.md`, but the request for
+this implementation explicitly asked for a running notes file. I preserved the
+previous notes and appended a new section instead of replacing the file.
+
+### 2. Compaction API returns `CompactionReport`
+The plan's contract summary listed `compact_generation_chain` as returning
+`Option<GenerationId>`, while the detailed section introduced `CompactionReport`.
+I used `Option<CompactionReport>` for the domain API so callers get the new
+generation plus old depth, old generations, and approximate bytes reclaimed.
+
+### 3. Dry-run compaction reserves a synthetic generation ID
+`git-cache compact --dry-run` reports the generation ID that would be used if it
+ran now. It does not write bundles or manifests. Running the real compaction
+later will allocate a different UUIDv7.
+
+### 4. Repointing current manifests only
+Compaction rewrites canonical commit manifests, canonical ref manifests, and the
+default-branch manifest when they point at a compacted generation. Historical
+`ref-updates` observation manifests are left intact because they are append-only
+audit/history records keyed by the old generation.
+
+### 5. Commit list ordering during compaction
+Hydration walks chains from head to root, but compacted manifests store commits
+in root-to-head order for readability and deterministic tests.
+
+## Tradeoffs
+
+### T1. Approximate `bytes_reclaimed`
+The object-store trait does not expose metadata, so compaction computes
+`bytes_reclaimed` by reading old bundles and summing their byte lengths. This is
+accurate for local/S3 object bytes but costs extra reads during compaction.
+
+### T2. Head update after generation publish
+The generation bundle and per-commit/ref manifests are published through the
+existing atomic-ish `GenerationPublish` helper, then `RepoGenerationHead` is
+written afterward. If the final head write fails, the generation still exists and
+can be found by commit/ref manifests; the next publish treats the old head as the
+delta base and may duplicate some objects rather than corrupting state.
+
+### T3. Fallback resets the chain
+When incremental bundle creation fails, the code deletes any partial bundle file,
+creates a full bundle, sets `parent_generation: None`, and resets
+`tip_commits` to the current commit. This favors safe recovery over preserving
+the old chain when the local hot cache cannot prove it has the old tips.
+
+## Things I changed from the plan
+
+### C1. CLI `--all` enumerates generation-head manifests
+There is no repository registry, so `git-cache compact --all` lists
+`repos/*/manifests/generation-head.json` in the object store and compacts those
+repos.
+
+### C2. Inline compaction ignores "nothing to compact"
+When `[compaction].inline = true`, publish calls compaction after writing the new
+head and treats `Ok(None)` as a no-op. Errors still propagate because inline
+compaction is part of the publish path when enabled.
+
+### C3. `Git::run` already supports dynamic args
+The git wrapper's `run` accepts any `IntoIterator<Item = impl AsRef<OsStr>>`, so
+no separate `run_vec` helper was needed for `bundle_create_incremental`.

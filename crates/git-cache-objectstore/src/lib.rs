@@ -13,14 +13,16 @@ use std::path::{Component, Path};
 pub use local::LocalObjectStore;
 pub use manifests::{
     acquire_lease, commit_manifest_key, generation_manifest_key, lease_key, read_commit_manifest,
-    read_generation_manifest, read_json, read_lease, read_ref_manifest, read_session_manifest,
-    ref_manifest_key, session_manifest_key, write_commit_manifest, write_commit_manifest_if_absent,
+    read_generation_manifest, read_json, read_lease, read_ref_manifest, read_repo_generation_head,
+    read_session_manifest, ref_manifest_key, repo_generation_head_key, session_manifest_key,
+    write_commit_manifest, write_commit_manifest_if_absent,
     write_commit_manifest_if_absent_or_matches, write_generation_manifest,
     write_generation_manifest_if_absent, write_generation_manifest_if_absent_or_matches,
     write_json, write_json_if_absent, write_json_if_absent_or_matches, write_ref_manifest,
-    write_ref_manifest_if_absent, write_ref_manifest_if_absent_or_matches, write_session_manifest,
-    write_session_manifest_if_absent, write_session_manifest_if_absent_or_matches,
-    GenerationPublish, LeaseManifest, PublishManifests,
+    write_ref_manifest_if_absent, write_ref_manifest_if_absent_or_matches,
+    write_repo_generation_head, write_session_manifest, write_session_manifest_if_absent,
+    write_session_manifest_if_absent_or_matches, GenerationPublish, LeaseManifest,
+    PublishManifests,
 };
 
 #[cfg(feature = "s3")]

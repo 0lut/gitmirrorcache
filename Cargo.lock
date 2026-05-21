@@ -1142,6 +1142,7 @@ dependencies = [
  "git-cache-core",
  "git-cache-disk",
  "git-cache-domain",
+ "git-cache-objectstore",
  "serde_json",
  "tokio",
 ]

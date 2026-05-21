@@ -18,3 +18,7 @@ endpoint = "https://s3.amazonaws.com"
 [disk]
 quota_bytes = 1099511627776
 min_free_bytes = 107374182400
+
+[compaction]
+chain_depth_threshold = 10
+inline = false

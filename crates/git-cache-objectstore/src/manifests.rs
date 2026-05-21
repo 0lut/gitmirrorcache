@@ -2,8 +2,8 @@ use crate::{validate_key, ObjectStore};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
-    CommitManifest, GenerationId, GenerationManifest, GitCacheError, RefManifest, RepoKey, Result,
-    SessionManifest,
+    CommitManifest, GenerationId, GenerationManifest, GitCacheError, RefManifest,
+    RepoGenerationHead, RepoKey, Result, SessionManifest,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt::Debug;
@@ -142,6 +142,10 @@ pub fn session_manifest_key(repo: &RepoKey, session: git_cache_core::SessionId) 
     format!("repos/{repo}/manifests/sessions/{session}.json")
 }
 
+pub fn repo_generation_head_key(repo: &RepoKey) -> String {
+    format!("repos/{repo}/manifests/generation-head.json")
+}
+
 pub fn lease_key(repo: &RepoKey, name: &str) -> Result<String> {
     validate_name(name, "lease")?;
     Ok(format!(
@@ -169,6 +173,23 @@ where
     S: ObjectStore + ?Sized,
 {
     read_json(store, &generation_manifest_key(repo, generation)).await
+}
+
+pub async fn read_repo_generation_head<S>(
+    store: &S,
+    repo: &RepoKey,
+) -> Result<Option<RepoGenerationHead>>
+where
+    S: ObjectStore + ?Sized,
+{
+    read_json(store, &repo_generation_head_key(repo)).await
+}
+
+pub async fn write_repo_generation_head<S>(store: &S, head: &RepoGenerationHead) -> Result<()>
+where
+    S: ObjectStore + ?Sized,
+{
+    write_json(store, &repo_generation_head_key(&head.repo), head).await
 }
 
 pub async fn write_generation_manifest<S>(store: &S, manifest: &GenerationManifest) -> Result<()>

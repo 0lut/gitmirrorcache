@@ -38,6 +38,14 @@ pub struct GenerationManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoGenerationHead {
+    pub repo: RepoKey,
+    pub generation: GenerationId,
+    pub tip_commits: Vec<CommitSha>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitManifest {
     pub repo: RepoKey,
     pub commit: CommitSha,
