@@ -1834,10 +1834,19 @@ mod tests {
             .await
             .unwrap();
         let third_commit = fixture.commit_and_push("third");
+        fixture.push_head_to_branch("default");
         materializer
             .materialize(MaterializeRequest {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("default").unwrap()),
                 mode: RequestMode::Strict,
             })
             .await
@@ -1893,6 +1902,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(branch_manifest.generation, report.new_generation);
+        let default_branch_manifest = read_ref_manifest(
+            &*state.store,
+            &fixture.repo,
+            &BranchName::parse("default").unwrap().ref_name(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(default_branch_manifest.generation, report.new_generation);
         assert_ne!(first_manifest.generation, report.new_generation);
 
         let repo_dir = materializer.repo_dir(&fixture.repo);
@@ -2604,6 +2622,13 @@ mod tests {
             run_git(&self.work_path(), ["commit", "-m", contents]);
             run_git(&self.work_path(), ["push", "--force", "origin", "main"]);
             CommitSha::parse(git_stdout(&self.work_path(), ["rev-parse", "HEAD"])).unwrap()
+        }
+
+        pub fn push_head_to_branch(&self, branch: &str) {
+            run_git(
+                &self.work_path(),
+                ["push", "--force", "origin", &format!("HEAD:{branch}")],
+            );
         }
 
         pub fn replace_history_and_push(&self, contents: &str) -> CommitSha {
