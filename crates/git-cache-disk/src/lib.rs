@@ -573,12 +573,25 @@ fn directory_size(root: &Path) -> Result<u64> {
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(path) = stack.pop() {
-        let metadata = fs::symlink_metadata(&path)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
         if metadata.is_file() {
             total = total.saturating_add(metadata.len());
         } else if metadata.is_dir() {
-            for entry in fs::read_dir(path)? {
-                stack.push(entry?.path());
+            let entries = match fs::read_dir(&path) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for entry in entries {
+                match entry {
+                    Ok(e) => stack.push(e.path()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
     }
@@ -595,8 +608,17 @@ fn discover_repos(repos_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut stack = vec![repos_dir.to_path_buf()];
 
     while let Some(path) = stack.pop() {
-        for entry in fs::read_dir(&path)? {
-            let path = entry?.path();
+        let entries = match fs::read_dir(&path) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(e) => e.path(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
             if !path.is_dir() {
                 continue;
             }
