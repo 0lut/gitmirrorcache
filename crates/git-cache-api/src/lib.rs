@@ -471,7 +471,9 @@ impl RateLimiter {
             return true;
         }
 
-        let mut state = self.state.lock().expect("rate limiter mutex poisoned");
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
         if state.started.elapsed() >= Duration::from_secs(60) {
             state.started = Instant::now();
             state.count = 0;

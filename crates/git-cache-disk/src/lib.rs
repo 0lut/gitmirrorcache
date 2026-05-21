@@ -106,7 +106,7 @@ impl DiskManager {
     pub fn status(&self) -> Result<DiskStatus> {
         self.ensure_layout()?;
 
-        let state = self.state.lock().expect("disk manager mutex poisoned");
+        let state = self.state.lock().map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
         let index = self.sync_repo_index_locked()?;
         let used_bytes = directory_size(&self.root)?;
         let reserved_bytes = self.reserved_bytes_locked(&state)?;
@@ -145,7 +145,7 @@ impl DiskManager {
     pub fn reserve(&self, bytes: u64) -> Result<Reservation> {
         self.ensure_layout()?;
 
-        let mut state = self.state.lock().expect("disk manager mutex poisoned");
+        let mut state = self.state.lock().map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
         self.evict_until_available_locked(bytes, &state)?;
 
         let accounting = self.accounting_locked(&state)?;
@@ -189,7 +189,7 @@ impl DiskManager {
         let repo_dir = self.repo_dir(&repo_path);
         let size_bytes = directory_size(&repo_dir)?;
 
-        let _state = self.state.lock().expect("disk manager mutex poisoned");
+        let _state = self.state.lock().map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
         let mut index = self.load_index()?;
         let protected = index
             .repos
@@ -219,7 +219,7 @@ impl DiskManager {
         let repo_dir = self.repo_dir(&repo_path);
         let size_bytes = directory_size(&repo_dir)?;
 
-        let _state = self.state.lock().expect("disk manager mutex poisoned");
+        let _state = self.state.lock().map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
         let mut index = self.load_index()?;
         let last_accessed_unix_millis = index
             .repos
@@ -242,7 +242,7 @@ impl DiskManager {
         self.ensure_layout()?;
 
         let repo_path = normalize_repo_path(&self.repos_dir(), repo_path.as_ref())?;
-        let mut state = self.state.lock().expect("disk manager mutex poisoned");
+        let mut state = self.state.lock().map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
         *state.repo_locks.entry(repo_path.clone()).or_insert(0) += 1;
 
         Ok(RepoLock {
@@ -254,14 +254,14 @@ impl DiskManager {
     pub fn repo_index(&self) -> Result<RepoIndex> {
         self.ensure_layout()?;
 
-        let _state = self.state.lock().expect("disk manager mutex poisoned");
+        let _state = self.state.lock().map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
         self.sync_repo_index_locked()
     }
 
     pub fn cleanup_stale_temps(&self, older_than: Duration) -> Result<CleanupReport> {
         self.ensure_layout()?;
 
-        let state = self.state.lock().expect("disk manager mutex poisoned");
+        let state = self.state.lock().map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
         let active_reservations = state
             .active_reservations
             .keys()
