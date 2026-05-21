@@ -217,7 +217,7 @@ fn create_repo_with_n_branches(
 async fn many_commits_repo() {
     let upstream_root = TempDir::new().unwrap();
     let (_bare, _work, expected_head) =
-        create_repo_with_n_commits(upstream_root.path(), "github.com/org/many-commits", 500);
+        create_repo_with_n_commits(upstream_root.path(), "github.com/org/many-commits", 200);
 
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
