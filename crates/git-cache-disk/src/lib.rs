@@ -587,8 +587,17 @@ fn discover_repos(repos_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut stack = vec![repos_dir.to_path_buf()];
 
     while let Some(path) = stack.pop() {
-        for entry in fs::read_dir(&path)? {
-            let path = entry?.path();
+        let entries = match fs::read_dir(&path) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(e) => e.path(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
             if !path.is_dir() {
                 continue;
             }
