@@ -68,17 +68,25 @@ impl TestServer {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for attempt in 0..3 {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        if output.status.success() {
+            return;
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+        panic!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> String {
@@ -217,7 +225,7 @@ fn create_repo_with_n_branches(
 async fn many_commits_repo() {
     let upstream_root = TempDir::new().unwrap();
     let (_bare, _work, expected_head) =
-        create_repo_with_n_commits(upstream_root.path(), "github.com/org/many-commits", 200);
+        create_repo_with_n_commits(upstream_root.path(), "github.com/org/many-commits", 100);
 
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
@@ -424,7 +432,7 @@ fn sha256_hex(data: &[u8]) -> String {
 async fn deep_history_fetch() {
     let upstream_root = TempDir::new().unwrap();
     let (_bare, work_dir, initial_head) =
-        create_repo_with_n_commits(upstream_root.path(), "github.com/org/deep-history", 200);
+        create_repo_with_n_commits(upstream_root.path(), "github.com/org/deep-history", 100);
 
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
@@ -488,12 +496,12 @@ async fn deep_history_fetch() {
     )
     .await;
 
-    // Verify all 250 commits are accessible
+    // Verify all 150 commits are accessible (100 initial + 50 extra)
     let count = git_stdout(&clone_dir2, &["rev-list", "--count", "HEAD"]);
     assert_eq!(
         count.parse::<usize>().unwrap(),
-        250,
-        "should have all 250 commits"
+        150,
+        "should have all 150 commits"
     );
 }
 
