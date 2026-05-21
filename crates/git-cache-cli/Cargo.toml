@@ -16,6 +16,6 @@ clap.workspace = true
 git-cache-core = { path = "../git-cache-core" }
 git-cache-disk = { path = "../git-cache-disk" }
 git-cache-domain = { path = "../git-cache-domain" }
+git-cache-objectstore = { path = "../git-cache-objectstore" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-

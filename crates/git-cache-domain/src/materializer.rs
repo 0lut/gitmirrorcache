@@ -3,17 +3,19 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use git_cache_core::{
     BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest, GitCacheError,
-    MaterializeRequest, MaterializeResponse, MaterializeSource, RefManifest, RepoKey, RequestMode,
-    Result as CoreResult, Selector, SessionId, SessionManifest, ShortCommitSha,
+    MaterializeRequest, MaterializeResponse, MaterializeSource, RefManifest, RepoGenerationHead,
+    RepoKey, RequestMode, Result as CoreResult, Selector, SessionId, SessionManifest,
+    ShortCommitSha,
 };
 use git_cache_objectstore::{
-    read_commit_manifest, read_generation_manifest, read_json, read_ref_manifest,
-    read_session_manifest, write_json, write_ref_manifest, write_session_manifest,
+    generation_manifest_key, read_commit_manifest, read_generation_manifest, read_json,
+    read_ref_manifest, read_repo_generation_head, read_session_manifest, write_commit_manifest,
+    write_json, write_ref_manifest, write_repo_generation_head, write_session_manifest,
     GenerationPublish, PublishManifests,
 };
 use git_cache_worker::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -21,6 +23,15 @@ use tracing::{debug, info, warn};
 
 pub struct Materializer {
     state: Arc<AppState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompactionReport {
+    pub repo: RepoKey,
+    pub old_chain_depth: usize,
+    pub old_generations: Vec<GenerationId>,
+    pub new_generation: GenerationId,
+    pub bytes_reclaimed: u64,
 }
 
 impl Materializer {
@@ -330,8 +341,14 @@ impl Materializer {
         generation: GenerationId,
     ) -> CoreResult<()> {
         let mut chain = Vec::new();
+        let mut seen = HashSet::new();
         let mut next = Some(generation);
         while let Some(current) = next {
+            if !seen.insert(current) {
+                return Err(GitCacheError::Conflict(format!(
+                    "generation chain for `{repo}` contains a cycle at `{current}`"
+                )));
+            }
             let manifest: GenerationManifest = self
                 .get_generation_manifest(repo, current)
                 .await?
@@ -392,6 +409,12 @@ impl Materializer {
         }
 
         self.state.git.fsck(repo_dir).await?;
+        let previous_head = read_repo_generation_head(&*self.state.store, repo).await?;
+        let previous_generation = previous_head.as_ref().map(|head| head.generation);
+        let previous_tips = previous_head
+            .as_ref()
+            .map(|head| head.tip_commits.as_slice())
+            .unwrap_or(&[]);
         let generation = GenerationId::new();
         let bundle_key = bundle_key(repo, generation);
 
@@ -399,16 +422,40 @@ impl Materializer {
         let temp_path = reservation.temp_path();
         fs::create_dir_all(&temp_path).await?;
         let bundle_path = temp_path.join("generation.bundle");
-        self.state
-            .git
-            .bundle_create_all(repo_dir, &bundle_path)
-            .await?;
         let now = Utc::now();
+        let mut parent_generation = previous_generation;
+        let mut tip_commits = previous_head
+            .as_ref()
+            .map(|head| head.tip_commits.clone())
+            .unwrap_or_default();
+
+        if previous_tips.is_empty() {
+            self.state
+                .git
+                .bundle_create_all(repo_dir, &bundle_path)
+                .await?;
+        } else if let Err(err) = self
+            .state
+            .git
+            .bundle_create_incremental(repo_dir, &bundle_path, previous_tips)
+            .await
+        {
+            warn!(%repo, %err, "delta bundle failed, falling back to full bundle");
+            let _ = fs::remove_file(&bundle_path).await;
+            self.state
+                .git
+                .bundle_create_all(repo_dir, &bundle_path)
+                .await?;
+            parent_generation = None;
+            tip_commits.clear();
+        }
+        push_unique_commit(&mut tip_commits, commit.clone());
+
         let generation_manifest = GenerationManifest {
             repo: repo.clone(),
             generation,
             bundle_key,
-            parent_generation: None,
+            parent_generation,
             created_at: now,
             commits: vec![commit.clone()],
         };
@@ -439,10 +486,249 @@ impl Materializer {
         GenerationPublish::with_manifests(generation_manifest, manifests)
             .publish_bundle_file(&*self.state.store, &bundle_path)
             .await?;
+        write_repo_generation_head(
+            &*self.state.store,
+            &RepoGenerationHead {
+                repo: repo.clone(),
+                generation,
+                tip_commits,
+                updated_at: now,
+            },
+        )
+        .await?;
 
         reservation.release().await?;
 
+        if self.state.config.compaction.inline {
+            let _ = self.compact_generation_chain(repo).await?;
+        }
+
         Ok(generation)
+    }
+
+    pub async fn compact_generation_chain(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<Option<CompactionReport>> {
+        let threshold = self.state.config.compaction.chain_depth_threshold as usize;
+        self.compact_generation_chain_inner(repo, threshold, false)
+            .await
+    }
+
+    pub async fn compact_generation_chain_dry_run(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<Option<CompactionReport>> {
+        let threshold = self.state.config.compaction.chain_depth_threshold as usize;
+        self.compact_generation_chain_inner(repo, threshold, true)
+            .await
+    }
+
+    async fn compact_generation_chain_inner(
+        &self,
+        repo: &RepoKey,
+        threshold: usize,
+        dry_run: bool,
+    ) -> CoreResult<Option<CompactionReport>> {
+        let Some(head) = read_repo_generation_head(&*self.state.store, repo).await? else {
+            return Ok(None);
+        };
+        let chain = self.generation_chain(repo, head.generation).await?;
+        if chain.len() <= threshold {
+            return Ok(None);
+        }
+
+        let old_generations: Vec<GenerationId> =
+            chain.iter().map(|manifest| manifest.generation).collect();
+        let old_generation_set: HashSet<GenerationId> = old_generations.iter().copied().collect();
+        let bytes_reclaimed = self
+            .bundle_bytes_for_generations(repo, &old_generations)
+            .await?;
+        let new_generation = GenerationId::new();
+        if dry_run {
+            return Ok(Some(CompactionReport {
+                repo: repo.clone(),
+                old_chain_depth: chain.len(),
+                old_generations,
+                new_generation,
+                bytes_reclaimed,
+            }));
+        }
+
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        self.hydrate_generation(repo, &repo_dir, head.generation)
+            .await?;
+        self.state.git.fsck(&repo_dir).await?;
+
+        let reservation = self.state.disk.reserve(1024 * 1024 * 64).await?;
+        let temp_path = reservation.temp_path();
+        fs::create_dir_all(&temp_path).await?;
+        let bundle_path = temp_path.join("compacted.bundle");
+        self.state
+            .git
+            .bundle_create_all(&repo_dir, &bundle_path)
+            .await?;
+
+        let now = Utc::now();
+        let bundle_key = bundle_key(repo, new_generation);
+        let commits = commits_from_chain(chain.iter().rev());
+        let generation_manifest = GenerationManifest {
+            repo: repo.clone(),
+            generation: new_generation,
+            bundle_key,
+            parent_generation: None,
+            created_at: now,
+            commits: commits.clone(),
+        };
+        GenerationPublish::new(generation_manifest.clone())
+            .publish_bundle_file(&*self.state.store, &bundle_path)
+            .await?;
+
+        self.repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)
+            .await?;
+        for commit in commits {
+            write_commit_manifest(
+                &*self.state.store,
+                &CommitManifest {
+                    repo: repo.clone(),
+                    commit,
+                    generation: new_generation,
+                    complete: true,
+                    verified_at: now,
+                },
+            )
+            .await?;
+        }
+        write_repo_generation_head(
+            &*self.state.store,
+            &RepoGenerationHead {
+                repo: repo.clone(),
+                generation: new_generation,
+                tip_commits: head.tip_commits,
+                updated_at: now,
+            },
+        )
+        .await?;
+        self.delete_old_generations(repo, &old_generations).await?;
+
+        reservation.release().await?;
+
+        Ok(Some(CompactionReport {
+            repo: repo.clone(),
+            old_chain_depth: old_generations.len(),
+            old_generations,
+            new_generation,
+            bytes_reclaimed,
+        }))
+    }
+
+    async fn generation_chain(
+        &self,
+        repo: &RepoKey,
+        generation: GenerationId,
+    ) -> CoreResult<Vec<GenerationManifest>> {
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        let mut next = Some(generation);
+        while let Some(current) = next {
+            if !seen.insert(current) {
+                return Err(GitCacheError::Conflict(format!(
+                    "generation chain for `{repo}` contains a cycle at `{current}`"
+                )));
+            }
+            let manifest = self
+                .get_generation_manifest(repo, current)
+                .await?
+                .ok_or_else(|| {
+                    GitCacheError::NotFound(format!("generation manifest `{current}` not found"))
+                })?;
+            next = manifest.parent_generation;
+            chain.push(manifest);
+        }
+        Ok(chain)
+    }
+
+    async fn bundle_bytes_for_generations(
+        &self,
+        repo: &RepoKey,
+        generations: &[GenerationId],
+    ) -> CoreResult<u64> {
+        let mut total = 0_u64;
+        for generation in generations {
+            let key = bundle_key(repo, *generation);
+            if let Some(bundle) = self.state.store.get(&key).await? {
+                total = total.saturating_add(bundle.len() as u64);
+            }
+        }
+        Ok(total)
+    }
+
+    async fn repoint_manifests_after_compaction(
+        &self,
+        repo: &RepoKey,
+        old_generations: &HashSet<GenerationId>,
+        new_generation: GenerationId,
+    ) -> CoreResult<()> {
+        let prefix = format!("repos/{repo}/manifests/");
+        let keys = self.state.store.list_prefix(&prefix).await?;
+        for key in keys {
+            if key.contains("/manifests/commits/") && key.ends_with(".json") {
+                if let Some(mut manifest) =
+                    read_json::<_, CommitManifest>(&*self.state.store, &key).await?
+                {
+                    if manifest.repo == *repo && old_generations.contains(&manifest.generation) {
+                        manifest.generation = new_generation;
+                        write_commit_manifest(&*self.state.store, &manifest).await?;
+                    }
+                }
+            } else if key.contains("/manifests/refs/") && key.ends_with(".json") {
+                if key.contains("/manifests/ref-updates/")
+                    || key.contains("/manifests/commits/")
+                    || key.contains("/manifests/sessions/")
+                    || key == default_manifest_key(repo)
+                {
+                    continue;
+                }
+                if let Some(mut manifest) =
+                    read_json::<_, RefManifest>(&*self.state.store, &key).await?
+                {
+                    if manifest.repo == *repo && old_generations.contains(&manifest.generation) {
+                        manifest.generation = new_generation;
+                        write_ref_manifest(&*self.state.store, &manifest).await?;
+                    }
+                }
+            }
+        }
+
+        let default_key = default_manifest_key(repo);
+        if let Some(mut manifest) =
+            read_json::<_, RefManifest>(&*self.state.store, &default_key).await?
+        {
+            if manifest.repo == *repo && old_generations.contains(&manifest.generation) {
+                manifest.generation = new_generation;
+                write_json(&*self.state.store, &default_key, &manifest).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn delete_old_generations(
+        &self,
+        repo: &RepoKey,
+        generations: &[GenerationId],
+    ) -> CoreResult<()> {
+        for generation in generations {
+            self.state
+                .store
+                .delete(&bundle_key(repo, *generation))
+                .await?;
+            self.state
+                .store
+                .delete(&generation_manifest_key(repo, *generation))
+                .await?;
+        }
+        Ok(())
     }
 
     async fn put_default_manifest(&self, repo: &RepoKey, commit: &CommitSha) -> CoreResult<()> {
@@ -1240,6 +1526,24 @@ pub fn bundle_key(repo: &RepoKey, generation: GenerationId) -> String {
     )
 }
 
+fn push_unique_commit(commits: &mut Vec<CommitSha>, commit: CommitSha) {
+    if !commits.iter().any(|existing| existing == &commit) {
+        commits.push(commit);
+    }
+}
+
+fn commits_from_chain<'a>(
+    chain: impl IntoIterator<Item = &'a GenerationManifest>,
+) -> Vec<CommitSha> {
+    let mut commits = Vec::new();
+    for manifest in chain {
+        for commit in &manifest.commits {
+            push_unique_commit(&mut commits, commit.clone());
+        }
+    }
+    commits
+}
+
 pub fn repo_from_git_path(repo_path: &str) -> CoreResult<RepoKey> {
     let Some((repo, suffix)) = repo_path.split_once(".git") else {
         return Err(GitCacheError::Validation(format!(
@@ -1267,6 +1571,17 @@ mod tests {
     fn ref_manifest_key(repo: &RepoKey, branch: &str) -> String {
         git_cache_objectstore::ref_manifest_key(repo, &format!("refs/heads/{branch}"))
             .expect("validated branch ref")
+    }
+
+    async fn generation_manifest_for(
+        state: &AppState,
+        repo: &RepoKey,
+        generation: GenerationId,
+    ) -> GenerationManifest {
+        read_generation_manifest(&*state.store, repo, generation)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -1333,6 +1648,289 @@ mod tests {
         assert!(materializer
             .validate_host(&RepoKey::parse("evil.com/org/repo").unwrap())
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn publish_generation_links_delta_to_previous_generation() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let first_manifest = read_commit_manifest(&*state.store, &fixture.repo, &first.commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_generation =
+            generation_manifest_for(&state, &fixture.repo, first_manifest.generation).await;
+        assert_eq!(first_generation.parent_generation, None);
+
+        let second_commit = fixture.commit_and_push("second");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let second_manifest = read_commit_manifest(&*state.store, &fixture.repo, &second_commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_generation =
+            generation_manifest_for(&state, &fixture.repo, second_manifest.generation).await;
+        assert_eq!(
+            second_generation.parent_generation,
+            Some(first_manifest.generation)
+        );
+
+        let head = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.generation, second_manifest.generation);
+        assert_eq!(head.tip_commits, vec![first.commit, second_commit]);
+    }
+
+    #[tokio::test]
+    async fn hydrate_commit_restores_parent_generation_chain_from_cold_cache() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let second_commit = fixture.commit_and_push("second");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+
+        let repo_dir = materializer.repo_dir(&fixture.repo);
+        stdfs::remove_dir_all(&repo_dir).unwrap();
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(second_commit.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+
+        materializer
+            .state
+            .git
+            .rev_parse(&repo_dir, &format!("{}^{{commit}}", first.commit.as_str()))
+            .await
+            .unwrap();
+        assert!(materializer.commit_exists(&repo_dir, &second_commit).await);
+    }
+
+    #[tokio::test]
+    async fn delta_publish_falls_back_to_full_bundle_when_previous_tip_is_missing_locally() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        stdfs::remove_dir_all(materializer.repo_dir(&fixture.repo)).unwrap();
+        let second_commit = fixture.replace_history_and_push("replacement");
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        run_git(
+            &repo_dir,
+            [
+                "fetch",
+                "--no-tags",
+                fixture.upstream_path().to_str().unwrap(),
+                "+refs/heads/main:refs/cache/upstream/heads/main",
+            ],
+        );
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(second_commit.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.commit, second_commit);
+
+        let first_manifest = read_commit_manifest(&*state.store, &fixture.repo, &first.commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_manifest = read_commit_manifest(&*state.store, &fixture.repo, &second_commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_generation =
+            generation_manifest_for(&state, &fixture.repo, second_manifest.generation).await;
+        assert_ne!(first_manifest.generation, second_manifest.generation);
+        assert_eq!(second_generation.parent_generation, None);
+        let head = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.tip_commits, vec![second_commit]);
+    }
+
+    #[tokio::test]
+    async fn compact_generation_chain_replaces_long_chain_with_single_root() {
+        let fixture = GitFixture::new();
+        let config = AppConfig {
+            compaction: git_cache_core::CompactionConfig {
+                chain_depth_threshold: 2,
+                inline: false,
+            },
+            ..fixture.state_config()
+        };
+        let state = Arc::new(AppState::try_new(config).unwrap());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let first_manifest = read_commit_manifest(&*state.store, &fixture.repo, &first.commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_commit = fixture.commit_and_push("second");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let third_commit = fixture.commit_and_push("third");
+        fixture.push_head_to_branch("default");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("default").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+
+        let report = materializer
+            .compact_generation_chain(&fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.old_chain_depth, 3);
+
+        let head = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.generation, report.new_generation);
+        let compacted = generation_manifest_for(&state, &fixture.repo, report.new_generation).await;
+        assert_eq!(compacted.parent_generation, None);
+
+        for old_generation in &report.old_generations {
+            assert!(
+                read_generation_manifest(&*state.store, &fixture.repo, *old_generation)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(state
+                .store
+                .get(&bundle_key(&fixture.repo, *old_generation))
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        for commit in [
+            first.commit.clone(),
+            second_commit.clone(),
+            third_commit.clone(),
+        ] {
+            let manifest = read_commit_manifest(&*state.store, &fixture.repo, &commit)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(manifest.generation, report.new_generation);
+        }
+        let branch_manifest = read_ref_manifest(
+            &*state.store,
+            &fixture.repo,
+            &BranchName::parse("main").unwrap().ref_name(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(branch_manifest.generation, report.new_generation);
+        let default_branch_manifest = read_ref_manifest(
+            &*state.store,
+            &fixture.repo,
+            &BranchName::parse("default").unwrap().ref_name(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(default_branch_manifest.generation, report.new_generation);
+        assert_ne!(first_manifest.generation, report.new_generation);
+
+        let repo_dir = materializer.repo_dir(&fixture.repo);
+        stdfs::remove_dir_all(&repo_dir).unwrap();
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(third_commit.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        for commit in [first.commit, second_commit, third_commit] {
+            materializer
+                .state
+                .git
+                .rev_parse(&repo_dir, &format!("{}^{{commit}}", commit.as_str()))
+                .await
+                .unwrap();
+        }
     }
 
     // ── upstream_url tests ───────────────────────────────────────────
@@ -1962,6 +2560,7 @@ mod tests {
                     min_free_bytes: 0,
                 },
                 git_remote: Default::default(),
+                compaction: Default::default(),
             }
         }
 
@@ -2023,6 +2622,13 @@ mod tests {
             run_git(&self.work_path(), ["commit", "-m", contents]);
             run_git(&self.work_path(), ["push", "--force", "origin", "main"]);
             CommitSha::parse(git_stdout(&self.work_path(), ["rev-parse", "HEAD"])).unwrap()
+        }
+
+        pub fn push_head_to_branch(&self, branch: &str) {
+            run_git(
+                &self.work_path(),
+                ["push", "--force", "origin", &format!("HEAD:{branch}")],
+            );
         }
 
         pub fn replace_history_and_push(&self, contents: &str) -> CommitSha {

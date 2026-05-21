@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub disk: DiskConfig,
     #[serde(default)]
     pub git_remote: GitRemoteConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 impl AppConfig {
@@ -88,6 +90,7 @@ impl AppConfig {
                 min_free_bytes: parse_env_u64("GIT_CACHE_DISK_MIN_FREE_BYTES", 1024 * 1024 * 1024)?,
             },
             git_remote: GitRemoteConfig::default(),
+            compaction: CompactionConfig::default(),
         })
     }
 }
@@ -109,6 +112,27 @@ pub enum ObjectStoreConfig {
 pub struct DiskConfig {
     pub quota_bytes: u64,
     pub min_free_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    #[serde(default = "default_compaction_threshold")]
+    pub chain_depth_threshold: u32,
+    #[serde(default)]
+    pub inline: bool,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            chain_depth_threshold: default_compaction_threshold(),
+            inline: false,
+        }
+    }
+}
+
+fn default_compaction_threshold() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +280,14 @@ min_free_bytes = 100000
         assert_eq!(config.git_timeout_seconds, 120);
         assert_eq!(config.rate_limit_per_minute, 120);
         assert_eq!(config.max_git_output_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.compaction, CompactionConfig::default());
+    }
+
+    #[test]
+    fn compaction_config_default_values() {
+        let config = CompactionConfig::default();
+        assert_eq!(config.chain_depth_threshold, 10);
+        assert!(!config.inline);
     }
 
     #[test]

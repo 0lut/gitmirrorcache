@@ -1,4 +1,4 @@
-use git_cache_core::{GitCacheError, Result};
+use git_cache_core::{CommitSha, GitCacheError, Result};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -120,6 +120,28 @@ impl Git {
             ["bundle", "create", path_to_str(bundle_path)?, "--all"],
         )
         .await
+    }
+
+    pub async fn bundle_create_incremental(
+        &self,
+        repo_dir: &Path,
+        bundle_path: &Path,
+        exclude_tips: &[CommitSha],
+    ) -> Result<GitOutput> {
+        for tip in exclude_tips {
+            reject_revision_arg(tip.as_str())?;
+        }
+
+        let mut args: Vec<OsString> = vec![
+            OsString::from("bundle"),
+            OsString::from("create"),
+            path_to_str(bundle_path)?.into(),
+            OsString::from("--all"),
+        ];
+        for tip in exclude_tips {
+            args.push(OsString::from(format!("^{}", tip.as_str())));
+        }
+        self.run(Some(repo_dir), args).await
     }
 
     pub async fn fetch_bundle(&self, repo_dir: &Path, bundle_path: &Path) -> Result<GitOutput> {

@@ -1,15 +1,16 @@
 use crate::{
     acquire_lease, commit_manifest_key, generation_manifest_key, lease_key, read_commit_manifest,
-    read_generation_manifest, read_lease, read_ref_manifest, read_session_manifest,
-    ref_manifest_key, session_manifest_key, validate_key, write_generation_manifest,
-    write_generation_manifest_if_absent_or_matches, write_ref_manifest_if_absent_or_matches,
-    GenerationPublish, LeaseManifest, LocalObjectStore, ObjectStore, PublishManifests,
+    read_generation_manifest, read_lease, read_ref_manifest, read_repo_generation_head,
+    read_session_manifest, ref_manifest_key, repo_generation_head_key, session_manifest_key,
+    validate_key, write_generation_manifest, write_generation_manifest_if_absent_or_matches,
+    write_ref_manifest_if_absent_or_matches, write_repo_generation_head, GenerationPublish,
+    LeaseManifest, LocalObjectStore, ObjectStore, PublishManifests,
 };
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
-    CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoKey, SessionId,
-    SessionManifest,
+    CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoGenerationHead,
+    RepoKey, SessionId, SessionManifest,
 };
 use tokio::fs;
 
@@ -209,7 +210,7 @@ async fn manifests_round_trip_as_json() {
         read_generation_manifest(&store, &repo, generation.generation)
             .await
             .unwrap(),
-        Some(generation)
+        Some(generation.clone())
     );
     assert_eq!(
         read_commit_manifest(&store, &repo, &commit.commit)
@@ -228,6 +229,22 @@ async fn manifests_round_trip_as_json() {
             .await
             .unwrap(),
         Some(session)
+    );
+
+    let head = RepoGenerationHead {
+        repo: repo.clone(),
+        generation: generation.generation,
+        tip_commits: vec![crate::tests::commit('a'), crate::tests::commit('b')],
+        updated_at: ts(6),
+    };
+    write_repo_generation_head(&store, &head).await.unwrap();
+    assert_eq!(
+        repo_generation_head_key(&repo),
+        "repos/github.com/org/repo/manifests/generation-head.json"
+    );
+    assert_eq!(
+        read_repo_generation_head(&store, &repo).await.unwrap(),
+        Some(head)
     );
 
     let _ = fs::remove_dir_all(root).await;

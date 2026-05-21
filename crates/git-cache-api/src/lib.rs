@@ -591,6 +591,7 @@ mod tests {
                 min_free_bytes: 0,
             },
             git_remote: Default::default(),
+            compaction: Default::default(),
         };
         let api_state = ApiState::try_new(config).unwrap();
         let mut query = HashMap::new();

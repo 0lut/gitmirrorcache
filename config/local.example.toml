@@ -21,3 +21,7 @@ min_free_bytes = 1073741824
 enabled = true
 branch_ref_check = "always"
 commit_read_through = true
+
+[compaction]
+chain_depth_threshold = 10
+inline = false

@@ -1,3 +1,4 @@
+use git_cache_core::CommitSha;
 use git_cache_git::Git;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -140,6 +141,102 @@ async fn upload_pack_rejects_requests_larger_than_limit() {
     );
 }
 
+#[tokio::test]
+async fn bundle_create_incremental_round_trips_from_base_bundle() {
+    let temp = TempTree::new("incremental-bundle");
+    let (source_repo, first_sha) = create_source_repo(&temp.path);
+    let cache_repo = temp.path.join("cache.git");
+    let hydrated_repo = temp.path.join("hydrated.git");
+    let full_bundle = temp.path.join("full.bundle");
+    let delta_bundle = temp.path.join("delta.bundle");
+    let git = test_git();
+
+    git.init_bare(&cache_repo).await.expect("init cache repo");
+    git.fetch_branch(
+        &cache_repo,
+        path_arg(&source_repo),
+        "main",
+        "refs/cache/main",
+    )
+    .await
+    .expect("fetch initial main");
+    git.bundle_create_all(&cache_repo, &full_bundle)
+        .await
+        .expect("create full bundle");
+
+    let second_sha = commit_source(&source_repo, "second");
+    git.fetch_branch(
+        &cache_repo,
+        path_arg(&source_repo),
+        "main",
+        "refs/cache/main",
+    )
+    .await
+    .expect("fetch updated main");
+    git.bundle_create_incremental(
+        &cache_repo,
+        &delta_bundle,
+        &[CommitSha::parse(&first_sha).unwrap()],
+    )
+    .await
+    .expect("create incremental bundle");
+
+    git.init_bare(&hydrated_repo)
+        .await
+        .expect("init hydrated repo");
+    git.fetch_bundle(&hydrated_repo, &full_bundle)
+        .await
+        .expect("fetch full bundle");
+    git.fetch_bundle(&hydrated_repo, &delta_bundle)
+        .await
+        .expect("fetch delta bundle");
+
+    let hydrated_sha = git
+        .rev_parse(&hydrated_repo, "refs/cache/main^{commit}")
+        .await
+        .expect("resolve hydrated ref");
+    assert_eq!(second_sha, hydrated_sha);
+    git.rev_parse(&hydrated_repo, &format!("{first_sha}^{{commit}}"))
+        .await
+        .expect("initial commit remains present");
+    git.fsck(&hydrated_repo).await.expect("fsck hydrated repo");
+}
+
+#[tokio::test]
+async fn bundle_create_incremental_empty_excludes_creates_full_bundle() {
+    let temp = TempTree::new("incremental-empty");
+    let (source_repo, source_sha) = create_source_repo(&temp.path);
+    let cache_repo = temp.path.join("cache.git");
+    let bundle_path = temp.path.join("cache.bundle");
+    let hydrated_repo = temp.path.join("hydrated.git");
+    let git = test_git();
+
+    git.init_bare(&cache_repo).await.expect("init cache repo");
+    git.fetch_branch(
+        &cache_repo,
+        path_arg(&source_repo),
+        "main",
+        "refs/cache/main",
+    )
+    .await
+    .expect("fetch main");
+    git.bundle_create_incremental(&cache_repo, &bundle_path, &[])
+        .await
+        .expect("create full bundle through incremental wrapper");
+
+    git.init_bare(&hydrated_repo)
+        .await
+        .expect("init hydrated repo");
+    git.fetch_bundle(&hydrated_repo, &bundle_path)
+        .await
+        .expect("fetch bundle");
+    let hydrated_sha = git
+        .rev_parse(&hydrated_repo, "refs/cache/main^{commit}")
+        .await
+        .expect("resolve hydrated ref");
+    assert_eq!(source_sha, hydrated_sha);
+}
+
 fn test_git() -> Git {
     Git::default_with_timeout(Duration::from_secs(10))
 }
@@ -163,6 +260,13 @@ fn create_source_repo(root: &Path) -> (PathBuf, String) {
 
     let sha = run_git(Some(&source_repo), ["rev-parse", "HEAD"]);
     (source_repo, sha)
+}
+
+fn commit_source(source_repo: &Path, contents: &str) -> String {
+    std::fs::write(source_repo.join("README.md"), format!("{contents}\n")).expect("write README");
+    run_git(Some(source_repo), ["add", "README.md"]);
+    run_git(Some(source_repo), ["commit", "-m", contents]);
+    run_git(Some(source_repo), ["rev-parse", "HEAD"])
 }
 
 fn run_git<I, S>(cwd: Option<&Path>, args: I) -> String

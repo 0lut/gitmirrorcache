@@ -4,6 +4,7 @@ use git_cache_core::{
 };
 use git_cache_disk::DiskManager;
 use git_cache_domain::{AppState, Materializer};
+use git_cache_objectstore::read_repo_generation_head;
 use std::sync::Arc;
 
 #[derive(Debug, Parser)]
@@ -32,6 +33,18 @@ enum Command {
     },
     /// Remove expired sessions from disk and object store.
     SessionCleanup,
+    /// Compact delta generation chains.
+    Compact {
+        /// Repository key, e.g. github.com/org/repo
+        #[arg(long)]
+        repo: Option<String>,
+        /// Compact all repos with generation heads.
+        #[arg(long)]
+        all: bool,
+        /// Report what would compact without writing bundles/manifests.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -119,7 +132,53 @@ async fn main() -> anyhow::Result<()> {
             let report = materializer.cleanup_expired_sessions().await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::Compact { repo, all, dry_run } => {
+            if repo.is_none() != all {
+                anyhow::bail!("provide exactly one of --repo <repo> or --all");
+            }
+
+            let config = AppConfig::from_env()?;
+            let state = Arc::new(AppState::try_new(config)?);
+            let materializer = Materializer::new(Arc::clone(&state));
+            let repos = if let Some(repo) = repo {
+                vec![git_cache_core::RepoKey::parse(&repo)?]
+            } else {
+                let mut repos = Vec::new();
+                for key in state.store.list_prefix("repos/").await? {
+                    if let Some(repo) = repo_from_generation_head_key(&key) {
+                        repos.push(git_cache_core::RepoKey::parse(repo)?);
+                    }
+                }
+                repos.sort();
+                repos.dedup();
+                repos
+            };
+
+            let mut reports = Vec::new();
+            for repo in repos {
+                if read_repo_generation_head(&*state.store, &repo)
+                    .await?
+                    .is_none()
+                {
+                    continue;
+                }
+                let report = if dry_run {
+                    materializer.compact_generation_chain_dry_run(&repo).await?
+                } else {
+                    materializer.compact_generation_chain(&repo).await?
+                };
+                if let Some(report) = report {
+                    reports.push(report);
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+        }
     }
 
     Ok(())
+}
+
+fn repo_from_generation_head_key(key: &str) -> Option<&str> {
+    key.strip_prefix("repos/")
+        .and_then(|key| key.strip_suffix("/manifests/generation-head.json"))
 }
