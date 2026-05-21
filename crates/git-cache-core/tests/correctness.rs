@@ -129,7 +129,10 @@ fn commit_sha_mixed_case_normalized() {
         .take(40)
         .collect::<String>();
     let sha = CommitSha::parse(&mixed).unwrap();
-    assert!(sha.as_str().chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    assert!(sha
+        .as_str()
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
 }
 
 #[test]
@@ -180,7 +183,10 @@ fn short_commit_sha_accepts_4_chars() {
 #[test]
 fn short_commit_sha_accepts_7_chars() {
     assert!(ShortCommitSha::parse("abcdef1").is_ok());
-    assert_eq!(ShortCommitSha::parse("abcdef1").unwrap().as_str(), "abcdef1");
+    assert_eq!(
+        ShortCommitSha::parse("abcdef1").unwrap().as_str(),
+        "abcdef1"
+    );
 }
 
 #[test]
@@ -299,10 +305,7 @@ fn selector_rejects_two_selectors() {
     assert!(
         serde_json::from_str::<Selector>(r#"{"branch":"main","default_branch":true}"#).is_err()
     );
-    let json = format!(
-        r#"{{"commit":"{}","branch":"main"}}"#,
-        "a".repeat(40)
-    );
+    let json = format!(r#"{{"commit":"{}","branch":"main"}}"#, "a".repeat(40));
     assert!(serde_json::from_str::<Selector>(&json).is_err());
 }
 

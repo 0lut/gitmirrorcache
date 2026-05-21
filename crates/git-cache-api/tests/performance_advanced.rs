@@ -264,11 +264,7 @@ async fn test_clone_fetch_cycle() {
         .await
         .unwrap();
         run_git_async(&upstream_work, &["add", "README.md"]).await;
-        run_git_async(
-            &upstream_work,
-            &["commit", "-m", &format!("cycle {i}")],
-        )
-        .await;
+        run_git_async(&upstream_work, &["commit", "-m", &format!("cycle {i}")]).await;
         run_git_async(&upstream_work, &["push", "origin", "main"]).await;
 
         // Fetch in the cloned dir.
@@ -280,9 +276,7 @@ async fn test_clone_fetch_cycle() {
     let total = start.elapsed();
 
     let avg = total / cycles as u32;
-    eprintln!(
-        "clone+fetch cycle: {cycles} cycles in {total:?}, avg={avg:?}"
-    );
+    eprintln!("clone+fetch cycle: {cycles} cycles in {total:?}, avg={avg:?}");
     assert!(
         total.as_secs() < 120,
         "clone+fetch cycle too slow: {total:?}"
@@ -320,9 +314,7 @@ async fn test_session_creation_throughput() {
     let total = start.elapsed();
 
     let avg = total / session_count as u32;
-    eprintln!(
-        "session creation: {session_count} sessions in {total:?}, avg={avg:?}"
-    );
+    eprintln!("session creation: {session_count} sessions in {total:?}, avg={avg:?}");
     assert!(
         total.as_secs() < 120,
         "session creation too slow: {total:?}"
@@ -363,9 +355,7 @@ async fn test_metrics_endpoint_under_load() {
     }
     let elapsed = start.elapsed();
 
-    eprintln!(
-        "metrics under load: {total_requests} requests in {elapsed:?}, errors={error_count}"
-    );
+    eprintln!("metrics under load: {total_requests} requests in {elapsed:?}, errors={error_count}");
     assert_eq!(error_count, 0, "metrics endpoint had {error_count} errors");
     assert!(
         elapsed.as_secs() < 120,

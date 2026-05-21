@@ -439,11 +439,7 @@ async fn git_archive_returns_error() {
     .await;
 
     // git archive --remote requires upload-archive which the cache likely doesn't support.
-    let output = try_git_async(
-        server.tmp.path(),
-        &["archive", "--remote", &url, "HEAD"],
-    )
-    .await;
+    let output = try_git_async(server.tmp.path(), &["archive", "--remote", &url, "HEAD"]).await;
 
     assert!(
         !output.status.success(),
@@ -574,7 +570,11 @@ async fn fetch_after_force_push_non_fast_forward() {
 
     // Force push with orphaned history.
     run_git(&server.upstream_work, &["checkout", "--orphan", "rewrite"]);
-    std::fs::write(server.upstream_work.join("README.md"), "rewritten history\n").unwrap();
+    std::fs::write(
+        server.upstream_work.join("README.md"),
+        "rewritten history\n",
+    )
+    .unwrap();
     run_git(&server.upstream_work, &["add", "README.md"]);
     run_git(&server.upstream_work, &["commit", "-m", "rewritten"]);
     run_git(&server.upstream_work, &["branch", "-M", "main"]);
@@ -599,10 +599,7 @@ async fn three_branches_all_available_after_clone() {
 
     // Create branch-a and branch-b in addition to main.
     for branch_name in &["branch-a", "branch-b"] {
-        run_git(
-            &server.upstream_work,
-            &["checkout", "-b", branch_name],
-        );
+        run_git(&server.upstream_work, &["checkout", "-b", branch_name]);
         let filename = format!("{branch_name}.txt");
         std::fs::write(
             server.upstream_work.join(&filename),
@@ -614,10 +611,7 @@ async fn three_branches_all_available_after_clone() {
             &server.upstream_work,
             &["commit", "-m", &format!("commit on {branch_name}")],
         );
-        run_git(
-            &server.upstream_work,
-            &["push", "origin", branch_name],
-        );
+        run_git(&server.upstream_work, &["push", "origin", branch_name]);
         run_git(&server.upstream_work, &["checkout", "main"]);
     }
 

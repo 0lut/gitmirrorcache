@@ -20,8 +20,10 @@ struct TempTree {
 impl TempTree {
     fn new(name: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("git-cache-sanitize-{name}-{}-{id}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "git-cache-sanitize-{name}-{}-{id}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).expect("create temp tree");
         Self { path }
     }
@@ -46,7 +48,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_os_string()).collect();
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
     let mut command = Command::new("git");
     command
         .args(&args)
@@ -138,12 +143,7 @@ async fn fetch_branch_rejects_double_dash_local_ref() {
 async fn fetch_branch_rejects_nul_in_branch() {
     let git = test_git();
     let err = git
-        .fetch_branch(
-            Path::new("/unused"),
-            "url",
-            "main\0evil",
-            "refs/cache/test",
-        )
+        .fetch_branch(Path::new("/unused"), "url", "main\0evil", "refs/cache/test")
         .await;
     assert!(err.is_err(), "branch containing NUL must be rejected");
 }
@@ -179,12 +179,7 @@ async fn fetch_branch_rejects_empty_local_ref() {
 async fn fetch_branch_rejects_colon_in_branch() {
     let git = test_git();
     let err = git
-        .fetch_branch(
-            Path::new("/unused"),
-            "url",
-            "HEAD:path",
-            "refs/cache/test",
-        )
+        .fetch_branch(Path::new("/unused"), "url", "HEAD:path", "refs/cache/test")
         .await;
     assert!(err.is_err(), "branch containing ':' must be rejected");
 }
@@ -266,9 +261,13 @@ async fn bundle_create_rejects_double_dash_rev() {
 async fn bundle_create_rejects_nul_in_rev() {
     let git = test_git();
     assert!(
-        git.bundle_create(Path::new("/unused"), Path::new("/unused.bundle"), "rev\0bad")
-            .await
-            .is_err(),
+        git.bundle_create(
+            Path::new("/unused"),
+            Path::new("/unused.bundle"),
+            "rev\0bad"
+        )
+        .await
+        .is_err(),
         "rev containing NUL must be rejected"
     );
 }
@@ -363,7 +362,10 @@ async fn upload_pack_advertise_refs_works_on_valid_repo() {
     let result = git
         .upload_pack_advertise_refs(&cache_repo, 128 * 1024)
         .await;
-    assert!(result.is_ok(), "advertise refs should succeed on valid repo");
+    assert!(
+        result.is_ok(),
+        "advertise refs should succeed on valid repo"
+    );
     let output = result.unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("refs/cache/main"), "output: {text}");
@@ -374,31 +376,28 @@ async fn upload_pack_advertise_refs_works_on_valid_repo() {
 #[tokio::test]
 async fn update_ref_rejects_dash_ref_name() {
     let git = test_git();
-    assert!(
-        git.update_ref(Path::new("/unused"), "-evil", "abc123")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .update_ref(Path::new("/unused"), "-evil", "abc123")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn update_ref_rejects_dash_sha() {
     let git = test_git();
-    assert!(
-        git.update_ref(Path::new("/unused"), "refs/heads/main", "-evil")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .update_ref(Path::new("/unused"), "refs/heads/main", "-evil")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn update_ref_rejects_nul_in_ref_name() {
     let git = test_git();
-    assert!(
-        git.update_ref(Path::new("/unused"), "refs/heads\0bad", "abc123")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .update_ref(Path::new("/unused"), "refs/heads\0bad", "abc123")
+        .await
+        .is_err());
 }
 
 // ── symbolic_ref sanitization ───────────────────────────────────────────
@@ -406,31 +405,28 @@ async fn update_ref_rejects_nul_in_ref_name() {
 #[tokio::test]
 async fn symbolic_ref_rejects_dash_name() {
     let git = test_git();
-    assert!(
-        git.symbolic_ref(Path::new("/unused"), "--evil", "refs/heads/main")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .symbolic_ref(Path::new("/unused"), "--evil", "refs/heads/main")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn symbolic_ref_rejects_dash_target() {
     let git = test_git();
-    assert!(
-        git.symbolic_ref(Path::new("/unused"), "HEAD", "-evil")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .symbolic_ref(Path::new("/unused"), "HEAD", "-evil")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn symbolic_ref_rejects_nul_in_name() {
     let git = test_git();
-    assert!(
-        git.symbolic_ref(Path::new("/unused"), "HEAD\0x", "refs/heads/main")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .symbolic_ref(Path::new("/unused"), "HEAD\0x", "refs/heads/main")
+        .await
+        .is_err());
 }
 
 // ── set_config sanitization ─────────────────────────────────────────────
@@ -438,31 +434,28 @@ async fn symbolic_ref_rejects_nul_in_name() {
 #[tokio::test]
 async fn set_config_rejects_dash_key() {
     let git = test_git();
-    assert!(
-        git.set_config(Path::new("/unused"), "--evil", "value")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .set_config(Path::new("/unused"), "--evil", "value")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn set_config_rejects_nul_in_key() {
     let git = test_git();
-    assert!(
-        git.set_config(Path::new("/unused"), "key\0bad", "value")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .set_config(Path::new("/unused"), "key\0bad", "value")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn set_config_rejects_nul_in_value() {
     let git = test_git();
-    assert!(
-        git.set_config(Path::new("/unused"), "user.name", "value\0bad")
-            .await
-            .is_err()
-    );
+    assert!(git
+        .set_config(Path::new("/unused"), "user.name", "value\0bad")
+        .await
+        .is_err());
 }
 
 // ── ls_remote_heads sanitization ────────────────────────────────────────
@@ -504,47 +497,43 @@ async fn ls_remote_default_branch_rejects_nul_url() {
 #[tokio::test]
 async fn fetch_refs_rejects_dash_url() {
     let git = test_git();
-    assert!(
-        git.fetch_refs(Path::new("/unused"), "-evil", &[])
-            .await
-            .is_err()
-    );
+    assert!(git
+        .fetch_refs(Path::new("/unused"), "-evil", &[])
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn fetch_refs_rejects_nul_in_url() {
     let git = test_git();
-    assert!(
-        git.fetch_refs(Path::new("/unused"), "url\0bad", &[])
-            .await
-            .is_err()
-    );
+    assert!(git
+        .fetch_refs(Path::new("/unused"), "url\0bad", &[])
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn fetch_refs_rejects_nul_in_refspec() {
     let git = test_git();
-    assert!(
-        git.fetch_refs(
+    assert!(git
+        .fetch_refs(
             Path::new("/unused"),
             "https://example.com/repo.git",
             &["bad\0spec".to_string()]
         )
         .await
-        .is_err()
-    );
+        .is_err());
 }
 
 #[tokio::test]
 async fn fetch_refs_rejects_empty_refspec() {
     let git = test_git();
-    assert!(
-        git.fetch_refs(
+    assert!(git
+        .fetch_refs(
             Path::new("/unused"),
             "https://example.com/repo.git",
             &["".to_string()]
         )
         .await
-        .is_err()
-    );
+        .is_err());
 }

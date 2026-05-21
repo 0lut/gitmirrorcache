@@ -139,10 +139,7 @@ impl MultiRepoTestServer {
         Self::start_with_config(repo_count, |config| config).await
     }
 
-    async fn start_with_config(
-        repo_count: usize,
-        f: impl FnOnce(AppConfig) -> AppConfig,
-    ) -> Self {
+    async fn start_with_config(repo_count: usize, f: impl FnOnce(AppConfig) -> AppConfig) -> Self {
         let tmp = TempDir::new().unwrap();
         let mut repos = Vec::new();
 
@@ -363,7 +360,14 @@ async fn materialize_during_active_clone() {
         let u = clone_url;
         tokio::task::spawn_blocking(move || {
             Command::new("git")
-                .args(["clone", "--no-tags", "--branch", "main", &u, dir.to_str().unwrap()])
+                .args([
+                    "clone",
+                    "--no-tags",
+                    "--branch",
+                    "main",
+                    &u,
+                    dir.to_str().unwrap(),
+                ])
                 .output()
                 .unwrap()
         })
@@ -563,10 +567,7 @@ async fn concurrent_session_creation_and_expiry() {
             let c = client.clone();
             handles.push(tokio::spawn(async move {
                 if wave > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        wave as u64 * 500,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(wave as u64 * 500)).await;
                 }
                 bar.wait().await;
                 let resp = c
@@ -624,7 +625,14 @@ async fn parallel_fetch_after_force_push() {
             let dir = clone_dir.clone();
             let result = tokio::task::spawn_blocking(move || {
                 Command::new("git")
-                    .args(["clone", "--no-tags", "--branch", "main", &u, dir.to_str().unwrap()])
+                    .args([
+                        "clone",
+                        "--no-tags",
+                        "--branch",
+                        "main",
+                        &u,
+                        dir.to_str().unwrap(),
+                    ])
                     .output()
                     .unwrap()
             })
@@ -651,7 +659,14 @@ async fn parallel_fetch_after_force_push() {
             let dir = clone_dir.clone();
             let result = tokio::task::spawn_blocking(move || {
                 Command::new("git")
-                    .args(["clone", "--no-tags", "--branch", "main", &u, dir.to_str().unwrap()])
+                    .args([
+                        "clone",
+                        "--no-tags",
+                        "--branch",
+                        "main",
+                        &u,
+                        dir.to_str().unwrap(),
+                    ])
                     .output()
                     .unwrap()
             })

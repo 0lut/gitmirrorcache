@@ -3,16 +3,16 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use git_cache_core::{
-    CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoKey,
-    SessionId, SessionManifest,
+    CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoKey, SessionId,
+    SessionManifest,
 };
 use git_cache_objectstore::{
-    commit_manifest_key, generation_manifest_key, read_commit_manifest,
-    read_generation_manifest, read_ref_manifest, read_session_manifest, ref_manifest_key,
-    repo_generation_head_key, session_manifest_key, write_commit_manifest,
-    write_commit_manifest_if_absent_or_matches, write_generation_manifest,
-    write_ref_manifest, write_ref_manifest_if_absent_or_matches, write_session_manifest,
-    write_session_manifest_if_absent_or_matches, LocalObjectStore, ObjectStore,
+    commit_manifest_key, generation_manifest_key, read_commit_manifest, read_generation_manifest,
+    read_ref_manifest, read_session_manifest, ref_manifest_key, repo_generation_head_key,
+    session_manifest_key, write_commit_manifest, write_commit_manifest_if_absent_or_matches,
+    write_generation_manifest, write_ref_manifest, write_ref_manifest_if_absent_or_matches,
+    write_session_manifest, write_session_manifest_if_absent_or_matches, LocalObjectStore,
+    ObjectStore,
 };
 use tokio::fs;
 
@@ -96,7 +96,9 @@ fn validate_key_accepts_normal_valid_keys() {
     let store = LocalObjectStore::new("/tmp/unused");
     let rt = tokio::runtime::Runtime::new().unwrap();
     // These should not error on validation (just return None for nonexistent)
-    assert!(rt.block_on(store.get("repos/github.com/org/repo/manifest.json")).is_ok());
+    assert!(rt
+        .block_on(store.get("repos/github.com/org/repo/manifest.json"))
+        .is_ok());
     assert!(rt.block_on(store.get("simple.txt")).is_ok());
     assert!(rt.block_on(store.get("a/b/c")).is_ok());
 }
@@ -206,7 +208,10 @@ async fn exists_returns_true_after_put() {
     let root = temp_root();
     let store = LocalObjectStore::new(&root);
 
-    store.put("exists/key.json", Bytes::from("y")).await.unwrap();
+    store
+        .put("exists/key.json", Bytes::from("y"))
+        .await
+        .unwrap();
     assert!(store.exists("exists/key.json").await.unwrap());
 
     let _ = fs::remove_dir_all(&root).await;
@@ -248,18 +253,12 @@ async fn list_prefix_with_nested_keys() {
 
     store.put("ns/a.json", Bytes::from("a")).await.unwrap();
     store.put("ns/b.json", Bytes::from("b")).await.unwrap();
-    store
-        .put("ns/sub/c.json", Bytes::from("c"))
-        .await
-        .unwrap();
+    store.put("ns/sub/c.json", Bytes::from("c")).await.unwrap();
     store
         .put("ns/sub/deep/d.json", Bytes::from("d"))
         .await
         .unwrap();
-    store
-        .put("other/e.json", Bytes::from("e"))
-        .await
-        .unwrap();
+    store.put("other/e.json", Bytes::from("e")).await.unwrap();
 
     let mut keys = store.list_prefix("ns/").await.unwrap();
     keys.sort();
@@ -301,9 +300,7 @@ async fn generation_manifest_write_read_round_trip() {
     };
 
     write_generation_manifest(&store, &manifest).await.unwrap();
-    let read = read_generation_manifest(&store, &repo, gen)
-        .await
-        .unwrap();
+    let read = read_generation_manifest(&store, &repo, gen).await.unwrap();
     assert_eq!(read, Some(manifest));
 
     let _ = fs::remove_dir_all(&root).await;
@@ -558,11 +555,9 @@ async fn ref_manifest_if_absent_or_matches_first_succeeds() {
         verified_at: ts(1),
     };
 
-    assert!(
-        write_ref_manifest_if_absent_or_matches(&store, &manifest)
-            .await
-            .unwrap()
-    );
+    assert!(write_ref_manifest_if_absent_or_matches(&store, &manifest)
+        .await
+        .unwrap());
 
     let _ = fs::remove_dir_all(&root).await;
 }
@@ -585,11 +580,9 @@ async fn ref_manifest_if_absent_or_matches_identical_returns_false() {
     write_ref_manifest_if_absent_or_matches(&store, &manifest)
         .await
         .unwrap();
-    assert!(
-        !write_ref_manifest_if_absent_or_matches(&store, &manifest)
-            .await
-            .unwrap()
-    );
+    assert!(!write_ref_manifest_if_absent_or_matches(&store, &manifest)
+        .await
+        .unwrap());
 
     let _ = fs::remove_dir_all(&root).await;
 }
@@ -644,9 +637,7 @@ fn session_manifest_key_format() {
     let key = session_manifest_key(&repo, sid);
     assert_eq!(
         key,
-        format!(
-            "repos/github.com/test/correctness/manifests/sessions/{sid}.json"
-        )
+        format!("repos/github.com/test/correctness/manifests/sessions/{sid}.json")
     );
 }
 

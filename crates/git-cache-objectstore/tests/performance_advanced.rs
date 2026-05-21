@@ -138,7 +138,11 @@ async fn test_concurrent_mixed_read_write() {
         handles.push(tokio::spawn(async move {
             for i in 0..objects_per_task {
                 let key = format!("pre/{:04}.bin", i % reader_objects);
-                let data = store.get(&key).await.unwrap().expect("pre-populated object");
+                let data = store
+                    .get(&key)
+                    .await
+                    .unwrap()
+                    .expect("pre-populated object");
                 assert_eq!(data.len(), object_size);
             }
             ("reader", t)

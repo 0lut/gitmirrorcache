@@ -281,13 +281,9 @@ async fn test_bundle_create_incremental_vs_full() {
     // Incremental bundle (all refs minus the base commit).
     let incr_bundle = temp.path.join("incr.bundle");
     let start = Instant::now();
-    git.bundle_create_incremental(
-        &cache_repo,
-        &incr_bundle,
-        &[base_sha],
-    )
-    .await
-    .unwrap();
+    git.bundle_create_incremental(&cache_repo, &incr_bundle, &[base_sha])
+        .await
+        .unwrap();
     let incr_elapsed = start.elapsed();
     let incr_size = std::fs::metadata(&incr_bundle).unwrap().len();
 
@@ -372,9 +368,7 @@ async fn test_concurrent_init_bare() {
     let elapsed = start.elapsed();
 
     let ops_per_sec = count as f64 / elapsed.as_secs_f64();
-    eprintln!(
-        "concurrent init_bare: {count} repos in {elapsed:?} ({ops_per_sec:.0} ops/sec)"
-    );
+    eprintln!("concurrent init_bare: {count} repos in {elapsed:?} ({ops_per_sec:.0} ops/sec)");
     assert!(
         elapsed.as_secs() < 120,
         "concurrent init_bare too slow: {elapsed:?}"

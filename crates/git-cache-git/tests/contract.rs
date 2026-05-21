@@ -21,8 +21,10 @@ struct TempTree {
 impl TempTree {
     fn new(name: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("git-cache-contract-{name}-{}-{id}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "git-cache-contract-{name}-{}-{id}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).expect("create temp tree");
         Self { path }
     }
@@ -47,7 +49,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_os_string()).collect();
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
     let mut command = Command::new("git");
     command
         .args(&args)
@@ -302,7 +307,9 @@ async fn fsck_passes_on_empty_bare_repo() {
     let git = test_git();
 
     git.init_bare(&repo_dir).await.expect("init bare");
-    git.fsck(&repo_dir).await.expect("fsck should pass on empty repo");
+    git.fsck(&repo_dir)
+        .await
+        .expect("fsck should pass on empty repo");
 }
 
 // ── bundle_create + fetch_bundle round-trip ─────────────────────────────
@@ -550,10 +557,7 @@ async fn run_git_version_succeeds() {
     let git = test_git();
     let output = git.run(None, ["--version"]).await.expect("git --version");
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        text.contains("git version"),
-        "unexpected output: {text}"
-    );
+    assert!(text.contains("git version"), "unexpected output: {text}");
 }
 
 #[tokio::test]
@@ -603,9 +607,7 @@ async fn timeout_kills_slow_command() {
 
     // Try upload_pack_advertise_refs with 1ms timeout - it needs to spawn
     // a git process which almost certainly takes > 1ms.
-    let result = git
-        .upload_pack_advertise_refs(&repo_dir, 128 * 1024)
-        .await;
+    let result = git.upload_pack_advertise_refs(&repo_dir, 128 * 1024).await;
 
     // The command should either timeout or succeed very quickly.
     // We just verify that if it errors, the error is a timeout.
@@ -676,9 +678,6 @@ async fn set_config_sets_value() {
         .expect("set config");
 
     // Verify using raw git command
-    let value = run_git(
-        Some(&repo_dir),
-        ["config", "--local", "user.name"],
-    );
+    let value = run_git(Some(&repo_dir), ["config", "--local", "user.name"]);
     assert_eq!(value, "Test User");
 }

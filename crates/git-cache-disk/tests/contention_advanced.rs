@@ -146,10 +146,7 @@ async fn concurrent_lock_same_repo_only_one_at_a_time() {
 
     // After all dropped, locked_repo_count should be 0.
     let status = manager.status().unwrap();
-    assert_eq!(
-        status.locked_repo_count, 0,
-        "all locks should be released"
-    );
+    assert_eq!(status.locked_repo_count, 0, "all locks should be released");
 }
 
 // ── 3. Concurrent lock on different repos ────────────────────────────────
@@ -293,10 +290,9 @@ async fn rapid_reserve_release_cycle() {
                 bar.wait().await;
                 for _ in 0..100 {
                     let mgr2 = Arc::clone(&mgr);
-                    let reservation =
-                        tokio::task::spawn_blocking(move || mgr2.reserve(1024))
-                            .await
-                            .unwrap();
+                    let reservation = tokio::task::spawn_blocking(move || mgr2.reserve(1024))
+                        .await
+                        .unwrap();
                     match reservation {
                         Ok(r) => drop(r),
                         Err(GitCacheError::DiskFull(_)) => {}
@@ -389,7 +385,9 @@ async fn eviction_ordering_respects_lru() {
     let first_repo_exists = index
         .repos
         .contains_key(std::path::Path::new(&repo_names[0]));
-    let last_repo_exists = index.repos.contains_key(std::path::Path::new(last_repo.as_str()));
+    let last_repo_exists = index
+        .repos
+        .contains_key(std::path::Path::new(last_repo.as_str()));
 
     // If eviction happened, oldest repos should be evicted before newest.
     if !first_repo_exists {

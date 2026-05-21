@@ -312,11 +312,8 @@ async fn queue_overflow_no_oom_or_deadlock() {
     }
 
     // Use a timeout to detect deadlocks.
-    let all_results = tokio::time::timeout(
-        Duration::from_secs(30),
-        futures::future::join_all(handles),
-    )
-    .await;
+    let all_results =
+        tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(handles)).await;
 
     assert!(
         all_results.is_ok(),
@@ -338,10 +335,7 @@ async fn queue_overflow_no_oom_or_deadlock() {
         }
     }
 
-    assert!(
-        updated > 0,
-        "at least some updates should succeed"
-    );
+    assert!(updated > 0, "at least some updates should succeed");
 
     eprintln!(
         "queue overflow: updated={updated}, lease_busy={lease_busy}, errors={errors}, executor_calls={}",
@@ -349,6 +343,9 @@ async fn queue_overflow_no_oom_or_deadlock() {
     );
 
     // Verify the system is still functional after the flood.
-    let post_flood = coord.read_through(repo_n(999), branch("main")).await.unwrap();
+    let post_flood = coord
+        .read_through(repo_n(999), branch("main"))
+        .await
+        .unwrap();
     assert_eq!(post_flood.disposition, UpdateDisposition::Updated);
 }
