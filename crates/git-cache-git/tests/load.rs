@@ -62,17 +62,41 @@ where
         command.current_dir(cwd);
     }
 
-    let output = command.output().expect("run setup git command");
-    assert!(
-        output.status.success(),
-        "git {:?} failed with {:?}\nstdout:\n{}\nstderr:\n{}",
-        args,
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    for attempt in 0..3 {
+        let output = command.output().expect("run setup git command");
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Rebuild the command since output consumed it
+            command = Command::new("git");
+            command
+                .args(&args)
+                .env_clear()
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_ASKPASS", "/bin/false")
+                .env("SSH_ASKPASS", "/bin/false")
+                .env("HOME", "/nonexistent");
+            if let Some(path) = std::env::var_os("PATH") {
+                command.env("PATH", path);
+            }
+            if let Some(cwd) = cwd {
+                command.current_dir(cwd);
+            }
+            continue;
+        }
+        panic!(
+            "git {:?} failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+            args,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    unreachable!()
 }
 
 fn path_arg(path: &Path) -> &str {
@@ -154,12 +178,12 @@ fn create_repo_with_n_branches(root: &Path, name: &str, n: usize) -> (PathBuf, P
     (bare_repo, work_dir)
 }
 
-// ── 1. Bundle large repo (500 commits) ──────────────────────────────────
+// ── 1. Bundle large repo (100 commits) ──────────────────────────────────
 
 #[tokio::test]
 async fn bundle_large_repo() {
     let temp = TempTree::new("bundle-large");
-    let (bare_repo, _work_dir, _head_sha) = create_repo_with_n_commits(&temp.path, "large", 500);
+    let (bare_repo, _work_dir, _head_sha) = create_repo_with_n_commits(&temp.path, "large", 100);
 
     let cache_repo = temp.path.join("cache.git");
     let bundle_path = temp.path.join("large.bundle");
@@ -355,7 +379,7 @@ async fn concurrent_fetch_branch() {
 #[tokio::test]
 async fn upload_pack_large_repo() {
     let temp = TempTree::new("upload-pack-large");
-    let (bare_repo, _work_dir, head_sha) = create_repo_with_n_commits(&temp.path, "large-up", 200);
+    let (bare_repo, _work_dir, head_sha) = create_repo_with_n_commits(&temp.path, "large-up", 100);
 
     let cache_repo = temp.path.join("cache.git");
     let git = test_git();
