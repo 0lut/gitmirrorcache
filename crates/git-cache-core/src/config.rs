@@ -69,25 +69,25 @@ impl AppConfig {
             git_binary: PathBuf::from(
                 std::env::var("GIT_CACHE_GIT_BINARY").unwrap_or_else(|_| "git".into()),
             ),
-            git_timeout_seconds: parse_env_u64(
+            git_timeout_seconds: parse_env(
                 "GIT_CACHE_GIT_TIMEOUT_SECONDS",
                 default_git_timeout_seconds(),
             )?,
-            max_git_output_bytes: parse_env_usize(
+            max_git_output_bytes: parse_env(
                 "GIT_CACHE_MAX_GIT_OUTPUT_BYTES",
                 default_max_git_output_bytes(),
             )?,
             object_store: ObjectStoreConfig::Local { root: object_root },
-            session_ttl_seconds: parse_env_u64("GIT_CACHE_SESSION_TTL_SECONDS", 3600)?,
+            session_ttl_seconds: parse_env("GIT_CACHE_SESSION_TTL_SECONDS", 3600)?,
             upstream_auth_token_env: std::env::var("GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV").ok(),
-            rate_limit_per_minute: parse_env_u32(
+            rate_limit_per_minute: parse_env(
                 "GIT_CACHE_RATE_LIMIT_PER_MINUTE",
                 default_rate_limit_per_minute(),
             )?,
             allowed_upstream_hosts: default_allowed_upstream_hosts(),
             disk: DiskConfig {
-                quota_bytes: parse_env_u64("GIT_CACHE_DISK_QUOTA_BYTES", 10 * 1024 * 1024 * 1024)?,
-                min_free_bytes: parse_env_u64("GIT_CACHE_DISK_MIN_FREE_BYTES", 1024 * 1024 * 1024)?,
+                quota_bytes: parse_env("GIT_CACHE_DISK_QUOTA_BYTES", 10 * 1024 * 1024 * 1024)?,
+                min_free_bytes: parse_env("GIT_CACHE_DISK_MIN_FREE_BYTES", 1024 * 1024 * 1024)?,
             },
             git_remote: GitRemoteConfig::default(),
             compaction: CompactionConfig::default(),
@@ -189,25 +189,10 @@ fn default_rate_limit_per_minute() -> u32 {
     120
 }
 
-fn parse_env_u64(name: &str, default: u64) -> crate::Result<u64> {
-    match std::env::var(name) {
-        Ok(value) => value.parse().map_err(|err| {
-            crate::GitCacheError::Validation(format!("invalid {name} value `{value}`: {err}"))
-        }),
-        Err(_) => Ok(default),
-    }
-}
-
-fn parse_env_u32(name: &str, default: u32) -> crate::Result<u32> {
-    match std::env::var(name) {
-        Ok(value) => value.parse().map_err(|err| {
-            crate::GitCacheError::Validation(format!("invalid {name} value `{value}`: {err}"))
-        }),
-        Err(_) => Ok(default),
-    }
-}
-
-fn parse_env_usize(name: &str, default: usize) -> crate::Result<usize> {
+fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> crate::Result<T>
+where
+    T::Err: std::fmt::Display,
+{
     match std::env::var(name) {
         Ok(value) => value.parse().map_err(|err| {
             crate::GitCacheError::Validation(format!("invalid {name} value `{value}`: {err}"))
