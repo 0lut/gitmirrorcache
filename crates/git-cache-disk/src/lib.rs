@@ -552,12 +552,25 @@ fn directory_size(root: &Path) -> Result<u64> {
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(path) = stack.pop() {
-        let metadata = fs::symlink_metadata(&path)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
         if metadata.is_file() {
             total = total.saturating_add(metadata.len());
         } else if metadata.is_dir() {
-            for entry in fs::read_dir(path)? {
-                stack.push(entry?.path());
+            let entries = match fs::read_dir(&path) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for entry in entries {
+                match entry {
+                    Ok(e) => stack.push(e.path()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
     }
