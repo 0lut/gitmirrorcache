@@ -137,7 +137,10 @@ fn create_repo_with_n_commits(
     std::fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
     std::fs::create_dir_all(&work_dir).unwrap();
 
-    run_git(upstream_root, &["init", "--bare", bare_path.to_str().unwrap()]);
+    run_git(
+        upstream_root,
+        &["init", "--bare", bare_path.to_str().unwrap()],
+    );
     run_git(&work_dir, &["init"]);
     run_git(&work_dir, &["config", "user.email", "test@example.com"]);
     run_git(&work_dir, &["config", "user.name", "Load Test"]);
@@ -154,10 +157,7 @@ fn create_repo_with_n_commits(
 
     run_git(&work_dir, &["branch", "-M", "main"]);
     run_git(&work_dir, &["push", "origin", "main"]);
-    run_git(
-        &bare_path,
-        &["symbolic-ref", "HEAD", "refs/heads/main"],
-    );
+    run_git(&bare_path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     let head_sha = git_stdout(&work_dir, &["rev-parse", "HEAD"]);
     (bare_path, work_dir, head_sha)
@@ -175,7 +175,10 @@ fn create_repo_with_n_branches(
     std::fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
     std::fs::create_dir_all(&work_dir).unwrap();
 
-    run_git(upstream_root, &["init", "--bare", bare_path.to_str().unwrap()]);
+    run_git(
+        upstream_root,
+        &["init", "--bare", bare_path.to_str().unwrap()],
+    );
     run_git(&work_dir, &["init"]);
     run_git(&work_dir, &["config", "user.email", "test@example.com"]);
     run_git(&work_dir, &["config", "user.name", "Load Test"]);
@@ -203,10 +206,7 @@ fn create_repo_with_n_branches(
     }
 
     run_git(&work_dir, &["checkout", "main"]);
-    run_git(
-        &bare_path,
-        &["symbolic-ref", "HEAD", "refs/heads/main"],
-    );
+    run_git(&bare_path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     (bare_path, work_dir)
 }
@@ -216,11 +216,8 @@ fn create_repo_with_n_branches(
 #[tokio::test(flavor = "multi_thread")]
 async fn many_commits_repo() {
     let upstream_root = TempDir::new().unwrap();
-    let (_bare, _work, expected_head) = create_repo_with_n_commits(
-        upstream_root.path(),
-        "github.com/org/many-commits",
-        500,
-    );
+    let (_bare, _work, expected_head) =
+        create_repo_with_n_commits(upstream_root.path(), "github.com/org/many-commits", 500);
 
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
@@ -242,7 +239,10 @@ async fn many_commits_repo() {
     let git_url = body["git_url"].as_str().unwrap().to_string();
     let commit = body["commit"].as_str().unwrap().to_string();
 
-    assert_eq!(commit, expected_head, "materialized commit should match HEAD");
+    assert_eq!(
+        commit, expected_head,
+        "materialized commit should match HEAD"
+    );
 
     // Clone through the cache (session URLs use synthetic refs, not "main")
     let clone_dir = server.tmp.path().join("many-commits-clone");
@@ -253,7 +253,10 @@ async fn many_commits_repo() {
     .await;
 
     let clone_head = git_stdout(&clone_dir, &["rev-parse", "HEAD"]);
-    assert_eq!(clone_head, expected_head, "cloned HEAD should match upstream");
+    assert_eq!(
+        clone_head, expected_head,
+        "cloned HEAD should match upstream"
+    );
 
     eprintln!("many_commits_repo: materialize took {elapsed:?}");
 }
@@ -338,12 +341,8 @@ async fn many_branches_repo() {
 #[tokio::test(flavor = "multi_thread")]
 async fn large_files_repo() {
     let upstream_root = TempDir::new().unwrap();
-    let bare_path = upstream_root
-        .path()
-        .join("github.com/org/large-files.git");
-    let work_dir = upstream_root
-        .path()
-        .join("github.com/org/large-files-work");
+    let bare_path = upstream_root.path().join("github.com/org/large-files.git");
+    let work_dir = upstream_root.path().join("github.com/org/large-files-work");
 
     std::fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
     std::fs::create_dir_all(&work_dir).unwrap();
@@ -361,9 +360,7 @@ async fn large_files_repo() {
     );
 
     // Create a 10MB binary file
-    let large_data: Vec<u8> = (0..10 * 1024 * 1024)
-        .map(|i| (i % 256) as u8)
-        .collect();
+    let large_data: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 256) as u8).collect();
     let expected_sha256 = sha256_hex(&large_data);
     std::fs::write(work_dir.join("large.bin"), &large_data).unwrap();
 
@@ -371,10 +368,7 @@ async fn large_files_repo() {
     run_git(&work_dir, &["commit", "-m", "add large binary"]);
     run_git(&work_dir, &["branch", "-M", "main"]);
     run_git(&work_dir, &["push", "origin", "main"]);
-    run_git(
-        &bare_path,
-        &["symbolic-ref", "HEAD", "refs/heads/main"],
-    );
+    run_git(&bare_path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
@@ -429,11 +423,8 @@ fn sha256_hex(data: &[u8]) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn deep_history_fetch() {
     let upstream_root = TempDir::new().unwrap();
-    let (_bare, work_dir, initial_head) = create_repo_with_n_commits(
-        upstream_root.path(),
-        "github.com/org/deep-history",
-        200,
-    );
+    let (_bare, work_dir, initial_head) =
+        create_repo_with_n_commits(upstream_root.path(), "github.com/org/deep-history", 200);
 
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
@@ -484,7 +475,10 @@ async fn deep_history_fetch() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let git_url2 = body["git_url"].as_str().unwrap().to_string();
     let commit2 = body["commit"].as_str().unwrap().to_string();
-    assert_eq!(commit2, new_head, "re-materialized commit should be new HEAD");
+    assert_eq!(
+        commit2, new_head,
+        "re-materialized commit should be new HEAD"
+    );
 
     // Clone the updated version
     let clone_dir2 = server.tmp.path().join("deep-history-clone2");
@@ -508,9 +502,7 @@ async fn deep_history_fetch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rapid_update_cycle() {
     let upstream_root = TempDir::new().unwrap();
-    let bare_path = upstream_root
-        .path()
-        .join("github.com/org/rapid-update.git");
+    let bare_path = upstream_root.path().join("github.com/org/rapid-update.git");
     let work_dir = upstream_root
         .path()
         .join("github.com/org/rapid-update-work");
@@ -534,10 +526,7 @@ async fn rapid_update_cycle() {
     run_git(&work_dir, &["commit", "-m", "initial"]);
     run_git(&work_dir, &["branch", "-M", "main"]);
     run_git(&work_dir, &["push", "origin", "main"]);
-    run_git(
-        &bare_path,
-        &["symbolic-ref", "HEAD", "refs/heads/main"],
-    );
+    run_git(&bare_path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
@@ -546,10 +535,7 @@ async fn rapid_update_cycle() {
         // Push a new commit
         std::fs::write(work_dir.join("data.txt"), format!("cycle {cycle}\n")).unwrap();
         run_git(&work_dir, &["add", "data.txt"]);
-        run_git(
-            &work_dir,
-            &["commit", "-m", &format!("cycle {cycle}")],
-        );
+        run_git(&work_dir, &["commit", "-m", &format!("cycle {cycle}")]);
         run_git(&work_dir, &["push", "origin", "main"]);
 
         let expected_head = git_stdout(&work_dir, &["rev-parse", "HEAD"]);
@@ -584,11 +570,8 @@ async fn rapid_update_cycle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_large_clones() {
     let upstream_root = TempDir::new().unwrap();
-    let (_bare, _work, expected_head) = create_repo_with_n_commits(
-        upstream_root.path(),
-        "github.com/org/concurrent-large",
-        100,
-    );
+    let (_bare, _work, expected_head) =
+        create_repo_with_n_commits(upstream_root.path(), "github.com/org/concurrent-large", 100);
 
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
@@ -638,11 +621,9 @@ async fn concurrent_large_clones() {
                 let clone_dir = clone_base.join(format!("conc-clone-{i}"));
                 let dest = clone_dir.to_str().unwrap().to_string();
                 let cwd = clone_base.clone();
-                let ok = tokio::task::spawn_blocking(move || {
-                    try_git_clone(&cwd, &git_url, &dest)
-                })
-                .await
-                .unwrap();
+                let ok = tokio::task::spawn_blocking(move || try_git_clone(&cwd, &git_url, &dest))
+                    .await
+                    .unwrap();
                 if ok {
                     let cd = clone_dir.clone();
                     let head = tokio::task::spawn_blocking(move || {

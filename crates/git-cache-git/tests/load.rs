@@ -17,8 +17,8 @@ struct TempTree {
 impl TempTree {
     fn new(name: &str) -> Self {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("git-cache-load-{name}-{}-{id}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("git-cache-load-{name}-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp tree");
         Self { path }
     }
@@ -159,8 +159,7 @@ fn create_repo_with_n_branches(root: &Path, name: &str, n: usize) -> (PathBuf, P
 #[tokio::test]
 async fn bundle_large_repo() {
     let temp = TempTree::new("bundle-large");
-    let (bare_repo, _work_dir, _head_sha) =
-        create_repo_with_n_commits(&temp.path, "large", 500);
+    let (bare_repo, _work_dir, _head_sha) = create_repo_with_n_commits(&temp.path, "large", 500);
 
     let cache_repo = temp.path.join("cache.git");
     let bundle_path = temp.path.join("large.bundle");
@@ -168,14 +167,9 @@ async fn bundle_large_repo() {
     let git = test_git();
 
     git.init_bare(&cache_repo).await.expect("init cache repo");
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&bare_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .expect("fetch main into cache repo");
+    git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
+        .await
+        .expect("fetch main into cache repo");
 
     git.bundle_create(&cache_repo, &bundle_path, "refs/cache/main")
         .await
@@ -198,8 +192,7 @@ async fn bundle_large_repo() {
 #[tokio::test]
 async fn incremental_bundle_chain() {
     let temp = TempTree::new("incr-bundle-chain");
-    let (bare_repo, work_dir, first_head) =
-        create_repo_with_n_commits(&temp.path, "incr", 100);
+    let (bare_repo, work_dir, first_head) = create_repo_with_n_commits(&temp.path, "incr", 100);
 
     let cache_repo = temp.path.join("cache.git");
     let full_bundle = temp.path.join("full.bundle");
@@ -208,14 +201,9 @@ async fn incremental_bundle_chain() {
     let git = test_git();
 
     git.init_bare(&cache_repo).await.expect("init cache repo");
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&bare_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .expect("fetch initial 100 commits");
+    git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
+        .await
+        .expect("fetch initial 100 commits");
 
     git.bundle_create_all(&cache_repo, &full_bundle)
         .await
@@ -232,14 +220,9 @@ async fn incremental_bundle_chain() {
     }
     run_git(Some(&work_dir), ["push", "origin", "main"]);
 
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&bare_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .expect("fetch 50 new commits");
+    git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
+        .await
+        .expect("fetch 50 new commits");
 
     git.bundle_create_incremental(
         &cache_repo,
@@ -267,12 +250,9 @@ async fn incremental_bundle_chain() {
     let expected_sha = run_git(Some(&work_dir), ["rev-parse", "HEAD"]);
     assert_eq!(hydrated_sha, expected_sha);
 
-    git.rev_parse(
-        &hydrated_repo,
-        &format!("{first_head}^{{commit}}"),
-    )
-    .await
-    .expect("initial commit still present");
+    git.rev_parse(&hydrated_repo, &format!("{first_head}^{{commit}}"))
+        .await
+        .expect("initial commit still present");
 
     let count = run_git(
         Some(&hydrated_repo),
@@ -284,9 +264,7 @@ async fn incremental_bundle_chain() {
         "should have all 150 commits"
     );
 
-    git.fsck(&hydrated_repo)
-        .await
-        .expect("fsck hydrated repo");
+    git.fsck(&hydrated_repo).await.expect("fsck hydrated repo");
 }
 
 // ── 3. Many branches bundle ─────────────────────────────────────────────
@@ -294,8 +272,7 @@ async fn incremental_bundle_chain() {
 #[tokio::test]
 async fn many_branches_bundle() {
     let temp = TempTree::new("many-branches-bundle");
-    let (bare_repo, _work_dir) =
-        create_repo_with_n_branches(&temp.path, "branchy", 50);
+    let (bare_repo, _work_dir) = create_repo_with_n_branches(&temp.path, "branchy", 50);
 
     let cache_repo = temp.path.join("cache.git");
     let bundle_path = temp.path.join("branches.bundle");
@@ -312,14 +289,9 @@ async fn many_branches_bundle() {
             .await
             .unwrap_or_else(|e| panic!("fetch branch {branch}: {e}"));
     }
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&bare_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .expect("fetch main");
+    git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
+        .await
+        .expect("fetch main");
 
     git.bundle_create_all(&cache_repo, &bundle_path)
         .await
@@ -333,7 +305,10 @@ async fn many_branches_bundle() {
         .expect("fetch bundle with many branches");
 
     // Verify all branches are present
-    let refs_output = run_git(Some(&hydrated_repo), ["for-each-ref", "--format=%(refname)"]);
+    let refs_output = run_git(
+        Some(&hydrated_repo),
+        ["for-each-ref", "--format=%(refname)"],
+    );
     for i in 0..50 {
         let expected_ref = format!("refs/cache/feature-{i}");
         assert!(
@@ -342,9 +317,7 @@ async fn many_branches_bundle() {
         );
     }
 
-    git.fsck(&hydrated_repo)
-        .await
-        .expect("fsck hydrated repo");
+    git.fsck(&hydrated_repo).await.expect("fsck hydrated repo");
 }
 
 // ── 4. Concurrent fetch_branch ──────────────────────────────────────────
@@ -352,8 +325,7 @@ async fn many_branches_bundle() {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_fetch_branch() {
     let temp = TempTree::new("concurrent-fetch");
-    let (bare_repo, _work_dir, _head_sha) =
-        create_repo_with_n_commits(&temp.path, "source", 20);
+    let (bare_repo, _work_dir, _head_sha) = create_repo_with_n_commits(&temp.path, "source", 20);
 
     let git = test_git();
     let bare_url = path_arg(&bare_repo).to_string();
@@ -383,21 +355,15 @@ async fn concurrent_fetch_branch() {
 #[tokio::test]
 async fn upload_pack_large_repo() {
     let temp = TempTree::new("upload-pack-large");
-    let (bare_repo, _work_dir, head_sha) =
-        create_repo_with_n_commits(&temp.path, "large-up", 200);
+    let (bare_repo, _work_dir, head_sha) = create_repo_with_n_commits(&temp.path, "large-up", 200);
 
     let cache_repo = temp.path.join("cache.git");
     let git = test_git();
 
     git.init_bare(&cache_repo).await.expect("init cache repo");
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&bare_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .expect("fetch 200 commits into cache");
+    git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
+        .await
+        .expect("fetch 200 commits into cache");
 
     let advertised = git
         .upload_pack_advertise_refs(&cache_repo, 256 * 1024)

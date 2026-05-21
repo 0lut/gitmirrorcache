@@ -104,10 +104,9 @@ async fn sustained_reservation_pressure() {
             let mgr = Arc::clone(&dm);
             tokio::spawn(async move {
                 for _ in 0..iterations {
-                    let result =
-                        tokio::task::spawn_blocking(move || mgr.reserve(reserve_bytes))
-                            .await
-                            .unwrap();
+                    let result = tokio::task::spawn_blocking(move || mgr.reserve(reserve_bytes))
+                        .await
+                        .unwrap();
                     // We don't require every reserve to succeed (quota may be hit), but we
                     // do require no panics/deadlocks.  Drop immediately to release.
                     drop(result);
@@ -159,10 +158,7 @@ async fn sustained_reservation_pressure_full() {
         })
         .collect();
 
-    join_all(handles)
-        .await
-        .into_iter()
-        .for_each(|r| r.unwrap());
+    join_all(handles).await.into_iter().for_each(|r| r.unwrap());
 
     let status = dm.status().unwrap();
     assert_eq!(
@@ -190,8 +186,11 @@ fn large_reservation() {
 
     // Write some data to the temp path
     let temp_path = reservation.temp_path();
-    std::fs::write(temp_path.join("large-data.bin"), vec![0xABu8; 10 * 1024 * 1024])
-        .expect("write 10MB to reservation temp");
+    std::fs::write(
+        temp_path.join("large-data.bin"),
+        vec![0xABu8; 10 * 1024 * 1024],
+    )
+    .expect("write 10MB to reservation temp");
 
     drop(reservation);
 

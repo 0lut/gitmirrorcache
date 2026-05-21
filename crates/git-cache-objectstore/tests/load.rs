@@ -68,7 +68,10 @@ async fn large_bundle_simulation() {
     let data = Bytes::from(vec![0xCDu8; size]);
 
     store
-        .put("bundles/github.com/org/large-repo/gen1.bundle", data.clone())
+        .put(
+            "bundles/github.com/org/large-repo/gen1.bundle",
+            data.clone(),
+        )
         .await
         .expect("put 50MB object");
 
@@ -139,9 +142,7 @@ async fn prefix_listing_at_scale() {
     for host in 0..5 {
         for org in 0..10 {
             for repo in 0..10 {
-                let key = format!(
-                    "repos/host-{host}/org-{org}/repo-{repo}/manifest.json"
-                );
+                let key = format!("repos/host-{host}/org-{org}/repo-{repo}/manifest.json");
                 let payload = Bytes::from(format!("manifest-{host}-{org}-{repo}"));
                 store.put(&key, payload).await.expect("put should succeed");
             }
