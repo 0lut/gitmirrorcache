@@ -1,9 +1,11 @@
-use crate::{validate_key, ObjectStore};
+use crate::{validate_key, ObjectMeta, ObjectStore};
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use git_cache_core::{GitCacheError, Result};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct S3ObjectStore {
@@ -139,7 +141,7 @@ impl ObjectStore for S3ObjectStore {
         Ok(())
     }
 
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+    async fn list_prefix(&self, prefix: &str, max_keys: Option<usize>) -> Result<Vec<String>> {
         let s3_prefix = if self.prefix.is_empty() {
             prefix.to_string()
         } else {
@@ -177,6 +179,11 @@ impl ObjectStore for S3ObjectStore {
                                 .to_string()
                         };
                         keys.push(relative);
+                        if let Some(limit) = max_keys {
+                            if keys.len() >= limit {
+                                return Ok(keys);
+                            }
+                        }
                     }
                 }
             }
@@ -189,6 +196,48 @@ impl ObjectStore for S3ObjectStore {
         }
 
         Ok(keys)
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        let s3_key = self.s3_key(key)?;
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+        {
+            Ok(output) => {
+                let len = output.content_length().unwrap_or(0) as u64;
+                let updated_at = output.last_modified().and_then(|t| {
+                    DateTime::<Utc>::from_timestamp(t.secs(), t.subsec_nanos())
+                });
+                Ok(Some(ObjectMeta {
+                    key: key.to_string(),
+                    len,
+                    updated_at,
+                }))
+            }
+            Err(err) if is_not_found(&err) => Ok(None),
+            Err(err) => Err(s3_error("head", &s3_key, err)),
+        }
+    }
+
+    async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
+        let s3_key = self.s3_key(key)?;
+        let body = ByteStream::from_path(path)
+            .await
+            .map_err(|err| s3_error("put_file read", &s3_key, err))?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .body(body)
+            .send()
+            .await
+            .map_err(|err| s3_error("put_file", &s3_key, err))?;
+        Ok(())
     }
 }
 

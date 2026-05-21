@@ -177,7 +177,7 @@ async fn concurrent_list_prefix_during_writes_is_consistent() {
     let reader = tokio::spawn(async move {
         let mut observed_sizes = Vec::new();
         for _ in 0..50 {
-            let keys = reader_store.list_prefix("prefix/").await.unwrap();
+            let keys = reader_store.list_prefix("prefix/", None).await.unwrap();
             // Filter to final keys (ignore temp files from atomic writes).
             let final_keys: Vec<_> = keys.iter().filter(|k| !k.contains(".tmp")).collect();
             observed_sizes.push(final_keys.len());

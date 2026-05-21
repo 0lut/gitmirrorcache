@@ -128,14 +128,14 @@ async fn list_prefix_returns_matching_keys() {
         .unwrap();
     store.put("other/d.json", Bytes::from("d")).await.unwrap();
 
-    let mut keys = store.list_prefix("sessions/").await.unwrap();
+    let mut keys = store.list_prefix("sessions/", None).await.unwrap();
     keys.sort();
     assert_eq!(
         keys,
         vec!["sessions/a.json", "sessions/b.json", "sessions/sub/c.json",]
     );
 
-    let empty = store.list_prefix("nonexistent/").await.unwrap();
+    let empty = store.list_prefix("nonexistent/", None).await.unwrap();
     assert!(empty.is_empty());
 
     let _ = fs::remove_dir_all(root).await;

@@ -1,6 +1,7 @@
-use crate::{validate_key, ObjectStore};
+use crate::{validate_key, ObjectMeta, ObjectStore};
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use git_cache_core::{GitCacheError, Result};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -97,7 +98,7 @@ impl ObjectStore for LocalObjectStore {
         }
     }
 
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+    async fn list_prefix(&self, prefix: &str, max_keys: Option<usize>) -> Result<Vec<String>> {
         let base = self.root.join(prefix);
         let mut keys = Vec::new();
 
@@ -106,7 +107,7 @@ impl ObjectStore for LocalObjectStore {
         }
 
         let mut stack = vec![base.clone()];
-        while let Some(dir) = stack.pop() {
+        'outer: while let Some(dir) = stack.pop() {
             let mut entries = fs::read_dir(&dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
@@ -116,6 +117,11 @@ impl ObjectStore for LocalObjectStore {
                 } else if ft.is_file() {
                     if let Ok(rel) = path.strip_prefix(&self.root) {
                         keys.push(rel.to_string_lossy().into_owned());
+                        if let Some(limit) = max_keys {
+                            if keys.len() >= limit {
+                                break 'outer;
+                            }
+                        }
                     }
                 }
             }
@@ -123,6 +129,38 @@ impl ObjectStore for LocalObjectStore {
 
         keys.sort();
         Ok(keys)
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        let path = self.object_path(key)?;
+        match fs::metadata(&path).await {
+            Ok(metadata) => {
+                let updated_at = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| {
+                        t.duration_since(UNIX_EPOCH)
+                            .ok()
+                            .and_then(|d| DateTime::<Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos()))
+                    });
+                Ok(Some(ObjectMeta {
+                    key: key.to_string(),
+                    len: metadata.len(),
+                    updated_at,
+                }))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
+        let dest = self.object_path(key)?;
+        let parent = parent_dir(&dest)?;
+        fs::create_dir_all(parent).await?;
+        fs::copy(path, &dest).await?;
+        sync_directory(parent)?;
+        Ok(())
     }
 }
 

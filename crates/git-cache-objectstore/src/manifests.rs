@@ -8,7 +8,6 @@ use git_cache_core::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt::Debug;
 use std::path::Path;
-use tokio::fs;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseManifest {
@@ -61,8 +60,10 @@ impl GenerationPublish {
     where
         S: ObjectStore + ?Sized,
     {
-        let bundle = fs::read(path).await?;
-        self.publish_bundle_bytes(store, Bytes::from(bundle)).await
+        validate_publish(self)?;
+        store.put_file(&self.generation.bundle_key, path.as_ref()).await?;
+        write_generation_manifest_if_absent_or_matches(store, &self.generation).await?;
+        write_publish_manifests(store, &self.manifests).await
     }
 }
 
