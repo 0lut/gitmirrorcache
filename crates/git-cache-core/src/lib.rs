@@ -4,6 +4,7 @@ pub mod manifest;
 pub mod repo;
 pub mod selector;
 pub mod session;
+pub mod update;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,10 @@ pub use manifest::{
 pub use repo::{CommitSha, RepoKey, ShortCommitSha};
 pub use selector::{BranchName, Selector};
 pub use session::{SessionId, SessionManifest};
+pub use update::{
+    validate_event_ref, UpdateDisposition, UpdateExecutor, UpdateKey, UpdateOutcome, UpdateRequest,
+    UpdateSource, UpdateTarget,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
