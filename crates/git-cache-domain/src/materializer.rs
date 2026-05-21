@@ -685,7 +685,7 @@ impl Materializer {
                 if key.contains("/manifests/ref-updates/")
                     || key.contains("/manifests/commits/")
                     || key.contains("/manifests/sessions/")
-                    || key.ends_with("/default.json")
+                    || key == default_manifest_key(repo)
                 {
                     continue;
                 }
