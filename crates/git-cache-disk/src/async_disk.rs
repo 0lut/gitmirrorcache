@@ -80,11 +80,11 @@ impl AsyncReservation {
         }
     }
 
-    pub fn temp_path(&self) -> PathBuf {
+    pub fn temp_path(&self) -> Result<PathBuf> {
         self.inner
             .as_ref()
-            .expect("AsyncReservation already released")
-            .temp_path()
+            .map(|r| r.temp_path())
+            .ok_or_else(|| GitCacheError::Internal("AsyncReservation already released".into()))
     }
 
     /// Consume this reservation, dropping the inner `Reservation` inside
@@ -135,7 +135,7 @@ mod tests {
         let dm = test_disk_manager();
         let async_dm = AsyncDiskManager::new(dm);
         let reservation = async_dm.reserve(1024).await.unwrap();
-        let temp_path = reservation.temp_path();
+        let temp_path = reservation.temp_path().unwrap();
 
         // temp dir should exist after reservation
         assert!(temp_path.exists());
@@ -151,7 +151,7 @@ mod tests {
         let dm = test_disk_manager();
         let async_dm = AsyncDiskManager::new(dm);
         let reservation = async_dm.reserve(1024).await.unwrap();
-        let temp_path = reservation.temp_path();
+        let temp_path = reservation.temp_path().unwrap();
 
         assert!(temp_path.exists());
 

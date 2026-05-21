@@ -358,7 +358,7 @@ impl Materializer {
                 })?;
 
             let reservation = self.state.disk.reserve(bundle.len() as u64).await?;
-            let temp_path = reservation.temp_path();
+            let temp_path = reservation.temp_path()?;
             fs::create_dir_all(&temp_path).await?;
             let bundle_path = temp_path.join("hydrate.bundle");
             fs::write(&bundle_path, bundle).await?;
@@ -404,7 +404,7 @@ impl Materializer {
         let bundle_key = bundle_key(repo, generation);
 
         let reservation = self.state.disk.reserve(1024 * 1024 * 64).await?;
-        let temp_path = reservation.temp_path();
+        let temp_path = reservation.temp_path()?;
         fs::create_dir_all(&temp_path).await?;
         let bundle_path = temp_path.join("generation.bundle");
         let now = Utc::now();
@@ -546,7 +546,7 @@ impl Materializer {
         self.state.git.fsck(&repo_dir).await?;
 
         let reservation = self.state.disk.reserve(1024 * 1024 * 64).await?;
-        let temp_path = reservation.temp_path();
+        let temp_path = reservation.temp_path()?;
         fs::create_dir_all(&temp_path).await?;
         let bundle_path = temp_path.join("compacted.bundle");
         self.state
