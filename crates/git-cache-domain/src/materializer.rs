@@ -8,6 +8,7 @@ use git_cache_core::{
     RepoKey, RequestMode, Result as CoreResult, Selector, SessionId, SessionManifest,
     ShortCommitSha,
 };
+use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateTarget};
 pub use git_cache_git::UploadPackProcess;
 use git_cache_objectstore::{
     generation_manifest_key, read_commit_manifest, read_generation_manifest, read_json,
@@ -15,7 +16,6 @@ use git_cache_objectstore::{
     write_json, write_ref_manifest, write_repo_generation_head, write_session_manifest,
     GenerationPublish, PublishManifests,
 };
-use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
@@ -1499,11 +1499,7 @@ fn pkt_line(out: &mut Vec<u8>, data: &str) {
     out.extend_from_slice(data.as_bytes());
 }
 
-pub async fn upload_pack(
-    state: &AppState,
-    repo: &FsPath,
-    body: Bytes,
-) -> CoreResult<Vec<u8>> {
+pub async fn upload_pack(state: &AppState, repo: &FsPath, body: Bytes) -> CoreResult<Vec<u8>> {
     Ok(state
         .git
         .upload_pack_stateless_rpc(

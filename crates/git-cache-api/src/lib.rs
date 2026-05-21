@@ -361,8 +361,6 @@ async fn git_repo(
     }
 }
 
-
-
 fn git_response(content_type: &'static str, output: Vec<u8>) -> Response {
     Response::builder()
         .status(StatusCode::OK)

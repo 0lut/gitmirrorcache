@@ -1,11 +1,11 @@
 use async_trait::async_trait;
-#[cfg(test)]
-use git_cache_core::{BranchName, CommitSha, ShortCommitSha};
-use git_cache_core::{GitCacheError, RepoKey, Result, Selector};
 pub use git_cache_core::{
     validate_event_ref, UpdateDisposition, UpdateExecutor, UpdateKey, UpdateOutcome, UpdateRequest,
     UpdateSource, UpdateTarget,
 };
+#[cfg(test)]
+use git_cache_core::{BranchName, CommitSha, ShortCommitSha};
+use git_cache_core::{GitCacheError, RepoKey, Result, Selector};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -568,8 +568,6 @@ fn result_to_shared(result: &Result<UpdateOutcome>) -> SharedUpdateResult {
 fn shared_update_error(message: String) -> GitCacheError {
     GitCacheError::Conflict(format!("in-flight update failed: {message}"))
 }
-
-
 
 #[cfg(test)]
 mod tests {
