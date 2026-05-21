@@ -29,6 +29,10 @@ pub struct AppConfig {
     pub git_remote: GitRemoteConfig,
     #[serde(default)]
     pub compaction: CompactionConfig,
+    #[serde(default = "default_max_concurrent_git_processes")]
+    pub max_concurrent_git_processes: usize,
+    #[serde(default = "default_session_cleanup_interval_secs")]
+    pub session_cleanup_interval_secs: u64,
 }
 
 impl AppConfig {
@@ -91,6 +95,14 @@ impl AppConfig {
             },
             git_remote: GitRemoteConfig::default(),
             compaction: CompactionConfig::default(),
+            max_concurrent_git_processes: parse_env(
+                "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
+                default_max_concurrent_git_processes(),
+            )?,
+            session_cleanup_interval_secs: parse_env(
+                "GIT_CACHE_SESSION_CLEANUP_INTERVAL_SECS",
+                default_session_cleanup_interval_secs(),
+            )?,
         })
     }
 }
@@ -187,6 +199,14 @@ fn default_max_git_output_bytes() -> usize {
 
 fn default_rate_limit_per_minute() -> u32 {
     120
+}
+
+pub fn default_max_concurrent_git_processes() -> usize {
+    64
+}
+
+fn default_session_cleanup_interval_secs() -> u64 {
+    300
 }
 
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> crate::Result<T>
