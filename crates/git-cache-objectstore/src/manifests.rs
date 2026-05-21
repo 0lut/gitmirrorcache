@@ -61,6 +61,12 @@ impl GenerationPublish {
         S: ObjectStore + ?Sized,
     {
         validate_publish(self)?;
+        if store.exists(&self.generation.bundle_key).await? {
+            return Err(GitCacheError::Conflict(format!(
+                "bundle `{}` already exists",
+                self.generation.bundle_key
+            )));
+        }
         store
             .put_file(&self.generation.bundle_key, path.as_ref())
             .await?;

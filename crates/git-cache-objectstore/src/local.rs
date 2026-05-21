@@ -155,10 +155,33 @@ impl ObjectStore for LocalObjectStore {
         let dest = self.object_path(key)?;
         let parent = parent_dir(&dest)?;
         fs::create_dir_all(parent).await?;
-        fs::copy(path, &dest).await?;
-        sync_directory(parent)?;
-        Ok(())
+
+        let tmp_path = allocate_temp_path(parent, &dest)?;
+        fs::copy(path, &tmp_path).await?;
+        match fs::rename(&tmp_path, &dest).await {
+            Ok(()) => {
+                sync_directory(parent)?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                Err(err.into())
+            }
+        }
     }
+}
+
+fn allocate_temp_path(parent: &Path, final_path: &Path) -> Result<PathBuf> {
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("object");
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(parent.join(format!(".{file_name}.{pid}.{nanos}.tmp")))
 }
 
 fn parent_dir(path: &Path) -> Result<&Path> {
