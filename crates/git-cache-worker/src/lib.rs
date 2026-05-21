@@ -1032,8 +1032,7 @@ mod tests {
     async fn session_cleanup_loop_ticks_on_interval_and_stops() {
         let cleaner = Arc::new(RecordingCleaner::new(2));
         let cleaner_dyn: Arc<dyn SessionCleaner> = Arc::clone(&cleaner) as _;
-        let loop_ =
-            SessionCleanupLoop::new(cleaner_dyn, Duration::from_secs(10)).unwrap();
+        let loop_ = SessionCleanupLoop::new(cleaner_dyn, Duration::from_secs(10)).unwrap();
         let (stop, stop_signal) = stop_channel();
 
         let task = tokio::spawn(loop_.run_until(stop_signal));
@@ -1066,8 +1065,7 @@ mod tests {
     async fn session_cleanup_loop_multiple_ticks() {
         let cleaner = Arc::new(RecordingCleaner::new(1));
         let cleaner_dyn: Arc<dyn SessionCleaner> = Arc::clone(&cleaner) as _;
-        let loop_ =
-            SessionCleanupLoop::new(cleaner_dyn, Duration::from_secs(5)).unwrap();
+        let loop_ = SessionCleanupLoop::new(cleaner_dyn, Duration::from_secs(5)).unwrap();
         let (stop, stop_signal) = stop_channel();
 
         let task = tokio::spawn(loop_.run_until(stop_signal));

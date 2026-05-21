@@ -10,8 +10,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub use config::{
-    AppConfig, BranchRefCheck, CompactionConfig, DiskConfig, GitRemoteConfig, ObjectStoreConfig,
-    default_max_concurrent_git_processes,
+    default_max_concurrent_git_processes, AppConfig, BranchRefCheck, CompactionConfig, DiskConfig,
+    GitRemoteConfig, ObjectStoreConfig,
 };
 pub use error::{GitCacheError, Result};
 pub use manifest::{
