@@ -44,12 +44,13 @@ impl Git {
         timeout: Duration,
         max_concurrent: usize,
     ) -> Self {
+        let effective = max_concurrent.max(1);
         Self {
             binary: binary.into(),
             timeout,
             output_limit: DEFAULT_OUTPUT_LIMIT,
             extra_env: Vec::new(),
-            process_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            process_semaphore: Arc::new(Semaphore::new(effective)),
         }
     }
 
@@ -368,7 +369,7 @@ impl Git {
             stderr,
             timeout: self.timeout,
             stderr_limit: self.output_limit,
-            _permit: permit,
+            _permit: Some(permit),
         })
     }
 
@@ -424,7 +425,7 @@ impl Git {
             stderr,
             timeout: self.timeout,
             stderr_limit: self.output_limit,
-            _permit: permit,
+            _permit: Some(permit),
         })
     }
 
@@ -658,10 +659,18 @@ pub struct UploadPackProcess {
     stderr: Option<tokio::process::ChildStderr>,
     timeout: Duration,
     stderr_limit: usize,
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl UploadPackProcess {
+    /// Take the semaphore permit out of this process, transferring ownership
+    /// to the caller. This is useful when the child and stdout are moved into
+    /// a separate streaming wrapper that must hold the permit for the full
+    /// duration of the response.
+    pub fn take_permit(&mut self) -> Option<OwnedSemaphorePermit> {
+        self._permit.take()
+    }
+
     /// Wait for the child to finish and check for errors.
     /// Consumes remaining stderr.
     pub async fn wait(mut self) -> Result<()> {
