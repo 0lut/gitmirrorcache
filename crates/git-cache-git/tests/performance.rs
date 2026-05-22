@@ -56,6 +56,9 @@ where
     if let Some(path) = std::env::var_os("PATH") {
         command.env("PATH", path);
     }
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        command.env("TMPDIR", tmpdir);
+    }
 
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
