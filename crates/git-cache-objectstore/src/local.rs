@@ -158,6 +158,9 @@ impl ObjectStore for LocalObjectStore {
 
         let tmp_path = allocate_temp_path(parent, &dest)?;
         fs::copy(path, &tmp_path).await?;
+        let tmp_file = fs::File::open(&tmp_path).await?;
+        tmp_file.sync_all().await?;
+        drop(tmp_file);
         match fs::rename(&tmp_path, &dest).await {
             Ok(()) => {
                 sync_directory(parent)?;
