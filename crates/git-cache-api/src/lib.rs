@@ -35,8 +35,19 @@ pub async fn app(config: AppConfig) -> Router {
 }
 
 pub async fn app_result(config: AppConfig) -> CoreResult<Router> {
+    let (router, _handle) = app_with_shutdown(config).await?;
+    Ok(router)
+}
+
+/// Build the application router and return a shutdown handle for graceful
+/// termination. Call `handle.shutdown().await` on SIGTERM/SIGINT to release
+/// all held leases before exiting.
+pub async fn app_with_shutdown(config: AppConfig) -> CoreResult<(Router, ShutdownHandle)> {
     let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new(config).await?);
+    let handle = ShutdownHandle {
+        state: Arc::clone(&state),
+    };
 
     let mut router = Router::new()
         .route("/healthz", get(healthz))
@@ -49,7 +60,20 @@ pub async fn app_result(config: AppConfig) -> CoreResult<Router> {
         router = router.route("/git/{*repo_path}", any(git_repo));
     }
 
-    Ok(router.with_state(state))
+    Ok((router.with_state(state), handle))
+}
+
+/// Handle for graceful shutdown. Releases all held Postgres leases.
+pub struct ShutdownHandle {
+    state: Arc<ApiState>,
+}
+
+impl ShutdownHandle {
+    /// Release all leases held by this worker. No-op when postgres feature
+    /// is disabled or no database_url is configured.
+    pub async fn shutdown(&self) {
+        self.state.release_leases().await;
+    }
 }
 
 #[derive(Clone)]
@@ -58,6 +82,8 @@ struct ApiState {
     coordinator: UpdateCoordinator,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
+    #[cfg(feature = "postgres")]
+    pg_lease_manager: Option<Arc<git_cache_pg::PgRepoLeaseManager>>,
 }
 
 impl ApiState {
@@ -65,6 +91,9 @@ impl ApiState {
         let rate_limiter = RateLimiter::new(config.rate_limit_per_minute);
         let domain = Arc::new(AppState::try_new(config.clone())?);
         let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
+
+        #[cfg(feature = "postgres")]
+        let pg_lease_manager: Option<Arc<git_cache_pg::PgRepoLeaseManager>>;
 
         let leases: Arc<dyn RepoLeaseManager> = {
             #[cfg(feature = "postgres")]
@@ -75,10 +104,12 @@ impl ApiState {
                         .map_err(|e| GitCacheError::Internal(format!("pg pool connect: {e}")))?;
                     let holder = hostname().unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
                     let ttl = chrono::Duration::minutes(5);
-                    let mgr = git_cache_pg::PgRepoLeaseManager::new(pool, holder, ttl);
+                    let mgr = Arc::new(git_cache_pg::PgRepoLeaseManager::new(pool, holder, ttl));
                     mgr.migrate().await?;
-                    Arc::new(mgr)
+                    pg_lease_manager = Some(Arc::clone(&mgr));
+                    mgr
                 } else {
+                    pg_lease_manager = None;
                     Arc::new(InMemoryRepoLeaseManager::new())
                 }
             }
@@ -94,7 +125,27 @@ impl ApiState {
             coordinator,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
+            #[cfg(feature = "postgres")]
+            pg_lease_manager,
         })
+    }
+
+    async fn release_leases(&self) {
+        #[cfg(feature = "postgres")]
+        if let Some(ref mgr) = self.pg_lease_manager {
+            match mgr.release_all().await {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::info!(released = n, "released pg leases on shutdown");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "failed to release pg leases on shutdown");
+                }
+            }
+        }
+        #[cfg(not(feature = "postgres"))]
+        {}
     }
 }
 

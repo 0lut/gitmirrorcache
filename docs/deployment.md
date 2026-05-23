@@ -57,7 +57,17 @@ database_url = "postgres://user:pass@host/dbname"
 
 When `database_url` is set, the worker uses PostgreSQL for repo-level mutual exclusion instead of the in-memory lease manager. The table is created automatically on startup.
 
-Each worker identifies itself by hostname. Leases have a TTL (default 5 minutes) and are automatically reclaimed if a worker crashes without releasing them.
+Lease acquisition uses `SELECT ... FOR UPDATE` within a transaction to provide row-level locking. This ensures exactly one worker holds a given repo lease at any time, even under concurrent contention.
+
+Each worker identifies itself by hostname. Leases have a TTL (default 5 minutes).
+
+### Termination Handling
+
+**Graceful shutdown (SIGTERM / SIGINT):** The server intercepts termination signals, stops accepting new connections, and calls `release_all()` to delete all leases held by this worker from the database before exiting.
+
+**Non-graceful termination (crash / OOM / kill -9):** Leases are protected by TTL-based expiry. Other workers will reclaim expired leases on their next acquisition attempt. Additionally, `reap_expired()` can be called periodically (e.g. via a background loop or external cron) to bulk-remove stale leases from crashed workers.
+
+### Build
 
 Build with the `postgres` feature enabled:
 

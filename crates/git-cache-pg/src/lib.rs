@@ -24,6 +24,26 @@ impl PgRepoLeaseManager {
             .map_err(|e| GitCacheError::Internal(format!("migration failed: {e}")))?;
         Ok(())
     }
+
+    /// Release all leases held by this worker. Call during graceful shutdown.
+    pub async fn release_all(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM repo_leases WHERE holder = $1")
+            .bind(&self.holder)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| GitCacheError::Internal(format!("release_all failed: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Reap expired leases from any holder. Call periodically for non-graceful
+    /// termination cleanup (e.g. workers that crashed without releasing).
+    pub async fn reap_expired(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM repo_leases WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| GitCacheError::Internal(format!("reap_expired failed: {e}")))?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[async_trait]
@@ -32,23 +52,66 @@ impl RepoLeaseManager for PgRepoLeaseManager {
         let repo_key = repo.to_string();
         let ttl_interval = format!("{} seconds", self.ttl.num_seconds());
 
-        let result = sqlx::query(
-            "INSERT INTO repo_leases (repo_key, holder, acquired_at, expires_at)
-             VALUES ($1, $2, now(), now() + $3::interval)
-             ON CONFLICT (repo_key) DO UPDATE
-               SET holder = EXCLUDED.holder,
-                   acquired_at = EXCLUDED.acquired_at,
-                   expires_at = EXCLUDED.expires_at
-               WHERE repo_leases.expires_at < now()",
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| GitCacheError::Internal(format!("lease tx begin failed: {e}")))?;
+
+        // Lock the row if it exists (SELECT ... FOR UPDATE)
+        let existing: Option<(String, bool)> = sqlx::query_as(
+            "SELECT holder, expires_at < now() AS expired
+             FROM repo_leases
+             WHERE repo_key = $1
+             FOR UPDATE",
         )
         .bind(&repo_key)
-        .bind(&self.holder)
-        .bind(&ttl_interval)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| GitCacheError::Internal(format!("lease acquire failed: {e}")))?;
+        .map_err(|e| GitCacheError::Internal(format!("lease select failed: {e}")))?;
 
-        if result.rows_affected() == 1 {
+        let acquired = match existing {
+            None => {
+                // No row — insert new lease
+                sqlx::query(
+                    "INSERT INTO repo_leases (repo_key, holder, acquired_at, expires_at)
+                     VALUES ($1, $2, now(), now() + $3::interval)",
+                )
+                .bind(&repo_key)
+                .bind(&self.holder)
+                .bind(&ttl_interval)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| GitCacheError::Internal(format!("lease insert failed: {e}")))?;
+                true
+            }
+            Some((ref holder, expired)) => {
+                if holder == &self.holder || expired {
+                    // Same holder re-acquiring or expired lease — take over
+                    sqlx::query(
+                        "UPDATE repo_leases
+                         SET holder = $1, acquired_at = now(), expires_at = now() + $2::interval
+                         WHERE repo_key = $3",
+                    )
+                    .bind(&self.holder)
+                    .bind(&ttl_interval)
+                    .bind(&repo_key)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| GitCacheError::Internal(format!("lease update failed: {e}")))?;
+                    true
+                } else {
+                    // Held by another worker and not expired
+                    false
+                }
+            }
+        };
+
+        tx.commit()
+            .await
+            .map_err(|e| GitCacheError::Internal(format!("lease tx commit failed: {e}")))?;
+
+        if acquired {
             Ok(LeaseAcquire::Acquired(Box::new(PgRepoLease {
                 pool: self.pool.clone(),
                 repo_key,
@@ -246,5 +309,49 @@ mod tests {
             }
         }
         assert_eq!(acquired, 1, "exactly one concurrent acquire should win");
+    }
+
+    #[tokio::test]
+    async fn release_all_clears_holder_leases() {
+        let Some((pool, mgr)) = setup().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let repo_a = RepoKey::parse("test/release-all-a").unwrap();
+        let repo_b = RepoKey::parse("test/release-all-b").unwrap();
+
+        let _lease_a = mgr.acquire(&repo_a).await.unwrap();
+        let _lease_b = mgr.acquire(&repo_b).await.unwrap();
+
+        let released = mgr.release_all().await.unwrap();
+        assert_eq!(released, 2);
+
+        // Another holder can now acquire
+        let mgr_b = PgRepoLeaseManager::new(pool, "other-holder".into(), Duration::minutes(5));
+        let result = mgr_b.acquire(&repo_a).await.unwrap();
+        assert!(matches!(result, LeaseAcquire::Acquired(_)));
+    }
+
+    #[tokio::test]
+    async fn reap_expired_removes_stale_leases() {
+        let Some((pool, _)) = setup().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let repo = RepoKey::parse("test/reap-expired").unwrap();
+        let mgr =
+            PgRepoLeaseManager::new(pool.clone(), "crash-holder".into(), Duration::seconds(0));
+        mgr.migrate().await.unwrap();
+
+        let _lease = mgr.acquire(&repo).await.unwrap();
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        let reaper = PgRepoLeaseManager::new(pool.clone(), "reaper".into(), Duration::minutes(5));
+        let reaped = reaper.reap_expired().await.unwrap();
+        assert!(reaped >= 1);
+
+        // Verify the repo can now be acquired
+        let result = reaper.acquire(&repo).await.unwrap();
+        assert!(matches!(result, LeaseAcquire::Acquired(_)));
     }
 }
