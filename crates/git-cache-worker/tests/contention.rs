@@ -174,8 +174,9 @@ async fn concurrent_read_through_same_key_deduplicates() {
         }));
     }
 
-    // Only one actual execution should happen.
-    tokio::task::yield_now().await;
+    // Give all spawned tasks time to register with the inflight map.
+    // A single yield_now is insufficient on CI with limited cores.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         executor.calls(),
         1,
