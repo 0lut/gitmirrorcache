@@ -82,7 +82,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Start MinIO
-        run: docker compose -f docker-compose.minio.yml up -d --wait
+        run: |
+          docker compose -f docker-compose.minio.yml up -d minio
+          docker compose -f docker-compose.minio.yml run --rm createbuckets
 
       - name: Run MinIO object-store tests
         run: cargo test -p git-cache-objectstore --features s3 minio_
