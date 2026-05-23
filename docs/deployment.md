@@ -59,13 +59,13 @@ When `database_url` is set, the worker uses PostgreSQL for repo-level mutual exc
 
 Lease acquisition uses `SELECT ... FOR UPDATE` within a transaction to provide row-level locking. This ensures exactly one worker holds a given repo lease at any time, even under concurrent contention.
 
-Each worker identifies itself by hostname. Leases have a TTL (default 5 minutes).
+Each worker identifies itself by hostname. Leases have a short TTL (default 30 seconds) and are continuously renewed by a background heartbeat while the holder is alive.
 
 ### Termination Handling
 
-**Graceful shutdown (SIGTERM / SIGINT):** The server intercepts termination signals, stops accepting new connections, and calls `release_all()` to delete all leases held by this worker from the database before exiting.
+**Graceful shutdown (SIGTERM / SIGINT):** The server intercepts termination signals, stops accepting new connections, and calls `release_all()` to delete all leases held by this worker from the database before exiting. Leases are released immediately.
 
-**Non-graceful termination (crash / OOM / kill -9):** Leases are protected by TTL-based expiry. Other workers will reclaim expired leases on their next acquisition attempt. Additionally, `reap_expired()` can be called periodically (e.g. via a background loop or external cron) to bulk-remove stale leases from crashed workers.
+**Non-graceful termination (crash / OOM / kill -9):** Since the heartbeat stops when the process dies, leases expire within ~30 seconds (the default TTL). A background reaper loop runs every 10 seconds to proactively delete expired leases, so other workers can reclaim them promptly without waiting for their next acquisition attempt.
 
 ### Build
 

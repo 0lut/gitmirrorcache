@@ -103,9 +103,13 @@ impl ApiState {
                         .await
                         .map_err(|e| GitCacheError::Internal(format!("pg pool connect: {e}")))?;
                     let holder = hostname().unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-                    let ttl = chrono::Duration::minutes(5);
-                    let mgr = Arc::new(git_cache_pg::PgRepoLeaseManager::new(pool, holder, ttl));
+                    let mgr = Arc::new(git_cache_pg::PgRepoLeaseManager::with_default_ttl(
+                        pool, holder,
+                    ));
                     mgr.migrate().await?;
+                    // Reap expired leases every 10s so crashed-worker leases
+                    // are cleaned up promptly.
+                    mgr.spawn_reaper(std::time::Duration::from_secs(10));
                     pg_lease_manager = Some(Arc::clone(&mgr));
                     mgr
                 } else {

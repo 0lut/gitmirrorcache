@@ -3,7 +3,21 @@ use chrono::Duration;
 use git_cache_core::{GitCacheError, RepoKey, Result};
 use git_cache_worker::{LeaseAcquire, RepoLease, RepoLeaseManager};
 use sqlx::PgPool;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::warn;
+
+/// Default lease TTL. Kept short so that a crashed worker's leases expire
+/// quickly. The background heartbeat renews the lease while the holder is
+/// alive.
+const DEFAULT_LEASE_TTL: Duration = Duration::seconds(30);
+
+/// Heartbeat renewal interval — renew at TTL/3 to give ~2 retries before
+/// expiry.
+fn heartbeat_interval(ttl: &Duration) -> std::time::Duration {
+    let secs = ttl.num_seconds().max(3) / 3;
+    std::time::Duration::from_secs(secs as u64)
+}
 
 pub struct PgRepoLeaseManager {
     pool: PgPool,
@@ -14,6 +28,11 @@ pub struct PgRepoLeaseManager {
 impl PgRepoLeaseManager {
     pub fn new(pool: PgPool, holder: String, ttl: Duration) -> Self {
         Self { pool, holder, ttl }
+    }
+
+    /// Create with the default 30-second TTL.
+    pub fn with_default_ttl(pool: PgPool, holder: String) -> Self {
+        Self::new(pool, holder, DEFAULT_LEASE_TTL)
     }
 
     /// Run migrations. Call once at startup.
@@ -43,6 +62,25 @@ impl PgRepoLeaseManager {
             .await
             .map_err(|e| GitCacheError::Internal(format!("reap_expired failed: {e}")))?;
         Ok(result.rows_affected())
+    }
+
+    /// Spawn a background loop that reaps expired leases every `interval`.
+    /// Returns a handle that can be aborted on shutdown.
+    pub fn spawn_reaper(&self, interval: std::time::Duration) -> JoinHandle<()> {
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let result = sqlx::query("DELETE FROM repo_leases WHERE expires_at < now()")
+                    .execute(&pool)
+                    .await;
+                if let Err(e) = result {
+                    warn!(%e, "lease reaper failed");
+                }
+            }
+        })
     }
 }
 
@@ -112,17 +150,70 @@ impl RepoLeaseManager for PgRepoLeaseManager {
             .map_err(|e| GitCacheError::Internal(format!("lease tx commit failed: {e}")))?;
 
         if acquired {
+            // Spawn heartbeat renewal task
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let heartbeat = spawn_heartbeat(
+                self.pool.clone(),
+                repo_key.clone(),
+                self.holder.clone(),
+                ttl_interval.clone(),
+                self.ttl,
+                stop_rx,
+            );
+
             Ok(LeaseAcquire::Acquired(Box::new(PgRepoLease {
                 pool: self.pool.clone(),
                 repo_key,
                 holder: self.holder.clone(),
                 ttl_interval,
                 released: false,
+                _stop_tx: stop_tx,
+                _heartbeat: heartbeat,
             })))
         } else {
             Ok(LeaseAcquire::Busy)
         }
     }
+}
+
+fn spawn_heartbeat(
+    pool: PgPool,
+    repo_key: String,
+    holder: String,
+    ttl_interval: String,
+    ttl: Duration,
+    mut stop_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    let interval = heartbeat_interval(&ttl);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Skip the first immediate tick
+        tick.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let result = sqlx::query(
+                        "UPDATE repo_leases SET expires_at = now() + $1::interval
+                         WHERE repo_key = $2 AND holder = $3",
+                    )
+                    .bind(&ttl_interval)
+                    .bind(&repo_key)
+                    .bind(&holder)
+                    .execute(&pool)
+                    .await;
+
+                    if let Err(e) = result {
+                        warn!(%e, %repo_key, "heartbeat renewal failed");
+                    }
+                }
+                _ = stop_rx.changed() => {
+                    break;
+                }
+            }
+        }
+    })
 }
 
 pub struct PgRepoLease {
@@ -131,9 +222,12 @@ pub struct PgRepoLease {
     holder: String,
     ttl_interval: String,
     released: bool,
+    _stop_tx: watch::Sender<bool>,
+    _heartbeat: JoinHandle<()>,
 }
 
 impl PgRepoLease {
+    /// Manually renew the lease (extends expiry by TTL).
     pub async fn renew(&self) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE repo_leases SET expires_at = now() + $1::interval
@@ -153,6 +247,9 @@ impl PgRepoLease {
 impl RepoLease for PgRepoLease {
     async fn release(mut self: Box<Self>) -> Result<()> {
         self.released = true;
+        // Signal heartbeat to stop
+        let _ = self._stop_tx.send(true);
+        self._heartbeat.abort();
         sqlx::query("DELETE FROM repo_leases WHERE repo_key = $1 AND holder = $2")
             .bind(&self.repo_key)
             .bind(&self.holder)
@@ -168,6 +265,10 @@ impl Drop for PgRepoLease {
         if self.released {
             return;
         }
+        // Stop heartbeat
+        let _ = self._stop_tx.send(true);
+        self._heartbeat.abort();
+
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
