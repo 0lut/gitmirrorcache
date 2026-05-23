@@ -18,7 +18,7 @@ impl PgRepoLeaseManager {
 
     /// Run migrations. Call once at startup.
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::query(include_str!("../migrations/001_create_repo_leases.sql"))
+        sqlx::raw_sql(include_str!("../migrations/001_create_repo_leases.sql"))
             .execute(&self.pool)
             .await
             .map_err(|e| GitCacheError::Internal(format!("migration failed: {e}")))?;
