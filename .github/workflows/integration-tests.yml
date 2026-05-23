@@ -91,3 +91,11 @@ jobs:
 
       - name: Run MinIO materializer tests
         run: cargo test -p git-cache-domain --features s3-tests minio_
+
+      - name: Run Python integration tests with MinIO backend
+        env:
+          RUN_GITHUB_INTEGRATION: "1"
+          GIT_CACHE_USE_MINIO_BACKEND: "1"
+          GIT_CACHE_TEST_REPO: github.com/astral-sh/uv
+          GIT_CACHE_TEST_BRANCH: main
+        run: python3 -m unittest -v integration_tests.test_astral_uv

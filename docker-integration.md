@@ -13,7 +13,7 @@
 
 - Docker is available in CI and in developer environments that want to run these tests.
 - MinIO is close enough to S3 for object-store contract coverage: object PUT/GET/HEAD/DELETE, conditional `If-None-Match: *`, prefix listing, and bucket creation.
-- Production S3 wiring can remain separate from API startup; these tests can instantiate `S3ObjectStore` directly and inject it into domain `AppState`.
+- Production S3 wiring is now available behind the `s3` feature so the Python API integration tests can run the real API against MinIO; unit/domain tests still instantiate `S3ObjectStore` directly for focused coverage.
 - Local disk cache/block-store semantics are represented by `cache_root`; object storage remains the durable source of truth.
 
 ## Intended symbol-level changes
@@ -30,6 +30,12 @@
    - Verify hot-cache deletion triggers bundle hydration from MinIO.
 6. `pub async fn Materializer::compact_generation_chain(&self, repo: &RepoKey) -> CoreResult<Option<CompactionReport>>`
    - Verify compaction writes a new generation, repoints manifests, deletes old MinIO generation objects, and still hydrates commits after hot-cache deletion.
+7. `fn AppState::try_new(config: AppConfig) -> CoreResult<Self>`
+   - Under the `s3` feature, construct `S3ObjectStore` from `[object_store] kind = "s3"` plus environment credentials so API/CLI entrypoints can use MinIO/S3 configs.
+8. `integration_tests.test_astral_uv.AstralUvIntegrationTest`
+   - Add `GIT_CACHE_USE_MINIO_BACKEND=1` mode that writes S3 config, builds `git-cache-api --features s3`, and verifies MinIO contains cached bundle objects while the local object-store root remains unused.
+9. `integration_tests.test_git_remote_public.GitRemotePublicRepoTest`
+   - Add the same MinIO backend mode and bucket verification for the direct Git remote Python integration path.
 
 ## Changes made
 
@@ -40,9 +46,13 @@
 - Added MinIO materializer tests that publish generations into MinIO, delete local hot-cache repos, hydrate exact commits from bundles, and compact generation chains.
 - Updated S3 error classification to inspect debug metadata so AWS SDK `NoSuchKey` and `PreconditionFailed` service errors map correctly to `None` / `false`.
 - Added CI job that starts MinIO with Docker Compose and runs the S3-feature object-store and materializer tests.
+- Added `git-cache-domain`/`git-cache-api` `s3` feature wiring so `[object_store] kind = "s3"` can construct an `S3ObjectStore` for runtime integration tests.
+- Added `GIT_CACHE_USE_MINIO_BACKEND=1` support to the Python integration tests. In that mode they generate S3 config, pass MinIO credentials through the API process environment, assert the local object-store root is not used, list the MinIO bucket prefix, and assert bundle objects were written.
+- Extended CI to run `integration_tests.test_astral_uv` with `GIT_CACHE_USE_MINIO_BACKEND=1` after starting MinIO.
 
 ## Tradeoffs
 
 - Using Docker Compose keeps local MinIO setup transparent and reproducible, but tests depend on Docker when explicitly enabled.
-- Direct domain `AppState` construction avoids adding incomplete production S3 API startup wiring in this PR.
+- The S3 runtime wiring uses env-sourced credentials and forces path-style addressing when an endpoint override is configured, which matches MinIO and common S3-compatible stores; production AWS credential-provider customization remains intentionally minimal.
 - Tests use small local Git fixtures instead of public GitHub repos to keep them deterministic and fast.
+- The new CI Python/MinIO step currently runs the `test_astral_uv` Python suite to prove the API path writes to MinIO without multiplying the already expensive public-repo test matrix.
