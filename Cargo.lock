@@ -1180,6 +1180,9 @@ name = "git-cache-domain"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-types",
  "bytes",
  "chrono",
  "git-cache-core",
@@ -1207,7 +1210,11 @@ name = "git-cache-objectstore"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
  "bytes",
  "chrono",
  "futures",

@@ -15,6 +15,19 @@ use git_cache_core::{
 use std::path::Path;
 use tokio::fs;
 
+#[cfg(feature = "s3")]
+use crate::S3ObjectStore;
+#[cfg(feature = "s3")]
+use aws_credential_types::Credentials;
+#[cfg(feature = "s3")]
+use aws_sdk_s3::config::BehaviorVersion;
+#[cfg(feature = "s3")]
+use aws_sdk_s3::config::RequestChecksumCalculation;
+#[cfg(feature = "s3")]
+use aws_sdk_s3::Client;
+#[cfg(feature = "s3")]
+use aws_types::region::Region;
+
 fn temp_root() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "git-cache-objectstore-test-{}",
@@ -703,6 +716,167 @@ fn which_strace() -> Option<std::path::PathBuf> {
 
 fn path_str(p: &std::path::Path) -> &str {
     p.to_str().expect("non-UTF-8 path")
+}
+
+#[cfg(feature = "s3")]
+struct MinioFixture {
+    store: S3ObjectStore,
+    prefix: String,
+}
+
+#[cfg(feature = "s3")]
+impl MinioFixture {
+    async fn new(label: &str) -> Option<Self> {
+        if std::env::var("GIT_CACHE_S3_INTEGRATION").ok().as_deref() != Some("1") {
+            return None;
+        }
+
+        let endpoint = std::env::var("GIT_CACHE_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+        let bucket =
+            std::env::var("GIT_CACHE_S3_BUCKET").unwrap_or_else(|_| "gitmirrorcache-test".into());
+        let access_key =
+            std::env::var("GIT_CACHE_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+        let secret_key =
+            std::env::var("GIT_CACHE_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+        let prefix = format!("tests/{label}/{}", uuid::Uuid::now_v7());
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .credentials_provider(Credentials::new(
+                access_key,
+                secret_key,
+                None,
+                None,
+                "minio-integration",
+            ))
+            .build();
+        let client = Client::from_conf(config);
+        client.create_bucket().bucket(&bucket).send().await.ok();
+        let store = S3ObjectStore::new(client, bucket, &prefix).unwrap();
+        Some(Self { store, prefix })
+    }
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test]
+async fn minio_store_round_trips_objects_and_metadata() {
+    let Some(fixture) = MinioFixture::new("round-trip").await else {
+        eprintln!(
+            "skipping minio_store_round_trips_objects_and_metadata: set GIT_CACHE_S3_INTEGRATION=1"
+        );
+        return;
+    };
+    let store = fixture.store;
+
+    let key = "objects/round-trip/blob.bin";
+    store
+        .put(key, Bytes::from_static(b"hello-minio"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(key).await.unwrap().unwrap(),
+        Bytes::from_static(b"hello-minio")
+    );
+
+    let meta = store.head(key).await.unwrap().unwrap();
+    assert_eq!(meta.key, key);
+    assert_eq!(meta.len, b"hello-minio".len() as u64);
+    assert!(store.exists(key).await.unwrap());
+
+    store.delete(key).await.unwrap();
+    assert!(store.get(key).await.unwrap().is_none());
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test]
+async fn minio_put_if_absent_preserves_first_writer() {
+    let Some(fixture) = MinioFixture::new("conditional").await else {
+        eprintln!(
+            "skipping minio_put_if_absent_preserves_first_writer: set GIT_CACHE_S3_INTEGRATION=1"
+        );
+        return;
+    };
+    let store = fixture.store;
+
+    assert!(store.get("conditional/item.json").await.unwrap().is_none());
+    assert!(store
+        .put_if_absent("conditional/item.json", Bytes::from_static(b"first"))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get("conditional/item.json").await.unwrap().unwrap(),
+        Bytes::from_static(b"first")
+    );
+    assert!(!store
+        .put_if_absent("conditional/item.json", Bytes::from_static(b"second"))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get("conditional/item.json").await.unwrap().unwrap(),
+        Bytes::from_static(b"first")
+    );
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test]
+async fn minio_manifest_publish_and_listing_uses_prefix() {
+    let Some(fixture) = MinioFixture::new("manifest").await else {
+        eprintln!(
+            "skipping minio_manifest_publish_and_listing_uses_prefix: set GIT_CACHE_S3_INTEGRATION=1"
+        );
+        return;
+    };
+    let store = fixture.store;
+    let repo = repo();
+    let generation = generation_manifest(&repo);
+    let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
+    let reference = ref_manifest_with_gen(&repo, generation.generation);
+
+    GenerationPublish::with_manifests(
+        generation.clone(),
+        PublishManifests {
+            commits: vec![commit_manifest.clone()],
+            refs: vec![reference.clone()],
+            sessions: Vec::new(),
+        },
+    )
+    .publish_bundle_bytes(&store, Bytes::from_static(b"bundle-bytes"))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store.get(&generation.bundle_key).await.unwrap().unwrap(),
+        Bytes::from_static(b"bundle-bytes")
+    );
+    assert_eq!(
+        read_generation_manifest(&store, &repo, generation.generation)
+            .await
+            .unwrap(),
+        Some(generation.clone())
+    );
+    assert_eq!(
+        read_commit_manifest(&store, &repo, &commit_manifest.commit)
+            .await
+            .unwrap(),
+        Some(commit_manifest)
+    );
+    assert_eq!(
+        read_ref_manifest(&store, &repo, &reference.ref_name)
+            .await
+            .unwrap(),
+        Some(reference)
+    );
+
+    let keys = store
+        .list_prefix(&format!("repos/{repo}/"), Some(2))
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.iter().all(|key| !key.starts_with(&fixture.prefix)));
 }
 
 #[tokio::test]

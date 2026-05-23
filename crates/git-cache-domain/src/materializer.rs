@@ -1605,7 +1605,23 @@ pub fn repo_from_git_path(repo_path: &str) -> CoreResult<RepoKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "s3-tests")]
+    use aws_credential_types::Credentials;
+    #[cfg(feature = "s3-tests")]
+    use aws_sdk_s3::config::BehaviorVersion;
+    #[cfg(feature = "s3-tests")]
+    use aws_sdk_s3::config::RequestChecksumCalculation;
+    #[cfg(feature = "s3-tests")]
+    use aws_sdk_s3::Client;
+    #[cfg(feature = "s3-tests")]
+    use aws_types::region::Region;
     use git_cache_core::{AppConfig, ObjectStoreConfig};
+    #[cfg(feature = "s3-tests")]
+    use git_cache_disk::{AsyncDiskManager, DiskManager};
+    #[cfg(feature = "s3-tests")]
+    use git_cache_git::Git;
+    #[cfg(feature = "s3-tests")]
+    use git_cache_objectstore::{ObjectStore, S3ObjectStore};
     use std::fs as stdfs;
     use std::net::SocketAddr;
     use std::process::Command;
@@ -2615,6 +2631,28 @@ mod tests {
             AppState::try_new(self.state_config()).unwrap()
         }
 
+        #[cfg(feature = "s3-tests")]
+        pub fn state_with_store(&self, store: Arc<dyn ObjectStore>) -> AppState {
+            let config = self.state_config();
+            let git = Git::with_concurrency_limit(
+                config.git_binary.clone(),
+                std::time::Duration::from_secs(config.git_timeout_seconds),
+                config.max_concurrent_git_processes,
+            )
+            .with_output_limit(config.max_git_output_bytes);
+            let disk = DiskManager::new(
+                &config.cache_root,
+                config.disk.quota_bytes,
+                config.disk.min_free_bytes,
+            );
+            AppState {
+                config,
+                store,
+                git,
+                disk: AsyncDiskManager::new(disk),
+            }
+        }
+
         pub fn cache_root(&self) -> PathBuf {
             self.tmp.path().join("cache")
         }
@@ -2690,6 +2728,199 @@ mod tests {
 
         pub fn head_commit(&self) -> CommitSha {
             CommitSha::parse(git_stdout(&self.work_path(), ["rev-parse", "HEAD"])).unwrap()
+        }
+    }
+
+    #[cfg(feature = "s3-tests")]
+    struct MinioFixture {
+        store: Arc<dyn ObjectStore>,
+    }
+
+    #[cfg(feature = "s3-tests")]
+    impl MinioFixture {
+        async fn new() -> Option<Self> {
+            if std::env::var("GIT_CACHE_S3_INTEGRATION").ok().as_deref() != Some("1") {
+                return None;
+            }
+
+            let endpoint = std::env::var("GIT_CACHE_S3_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:9000".into());
+            let bucket = std::env::var("GIT_CACHE_S3_BUCKET")
+                .unwrap_or_else(|_| "gitmirrorcache-test".into());
+            let access_key =
+                std::env::var("GIT_CACHE_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+            let secret_key =
+                std::env::var("GIT_CACHE_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+            let prefix = format!("domain-tests/{}", uuid::Uuid::now_v7());
+            let config = aws_sdk_s3::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .credentials_provider(Credentials::new(
+                    access_key,
+                    secret_key,
+                    None,
+                    None,
+                    "minio-integration",
+                ))
+                .build();
+            let client = Client::from_conf(config);
+            client.create_bucket().bucket(&bucket).send().await.ok();
+            let store = S3ObjectStore::new(client, bucket, prefix).unwrap();
+            Some(Self {
+                store: Arc::new(store),
+            })
+        }
+    }
+
+    #[cfg(feature = "s3-tests")]
+    #[tokio::test]
+    async fn minio_materializer_rehydrates_commit_from_minio_after_hot_cache_deletion() {
+        let Some(minio) = MinioFixture::new().await else {
+            eprintln!("skipping minio_materializer_rehydrates_commit_from_minio_after_hot_cache_deletion: set GIT_CACHE_S3_INTEGRATION=1");
+            return;
+        };
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state_with_store(Arc::clone(&minio.store)));
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let manifest = read_commit_manifest(&*state.store, &fixture.repo, &first.commit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state
+            .store
+            .head(&bundle_key(&fixture.repo, manifest.generation))
+            .await
+            .unwrap()
+            .is_some());
+
+        let repo_dir = materializer.repo_dir(&fixture.repo);
+        stdfs::remove_dir_all(&repo_dir).unwrap();
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(first.commit.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.source, MaterializeSource::CacheVerified);
+        assert!(materializer.commit_exists(&repo_dir, &first.commit).await);
+    }
+
+    #[cfg(feature = "s3-tests")]
+    #[tokio::test]
+    async fn minio_materializer_compacts_generations_and_rehydrates_commits() {
+        let Some(minio) = MinioFixture::new().await else {
+            eprintln!("skipping minio_materializer_compacts_generations_and_rehydrates_commits: set GIT_CACHE_S3_INTEGRATION=1");
+            return;
+        };
+        let fixture = GitFixture::new();
+        let mut config = fixture.state_config();
+        config.compaction = git_cache_core::CompactionConfig {
+            chain_depth_threshold: 2,
+            inline: false,
+        };
+        let git = Git::with_concurrency_limit(
+            config.git_binary.clone(),
+            std::time::Duration::from_secs(config.git_timeout_seconds),
+            config.max_concurrent_git_processes,
+        )
+        .with_output_limit(config.max_git_output_bytes);
+        let disk = DiskManager::new(
+            &config.cache_root,
+            config.disk.quota_bytes,
+            config.disk.min_free_bytes,
+        );
+        let state = Arc::new(AppState {
+            config,
+            store: Arc::clone(&minio.store),
+            git,
+            disk: AsyncDiskManager::new(disk),
+        });
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let second = fixture.commit_and_push("second");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let third = fixture.commit_and_push("third");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+
+        let report = materializer
+            .compact_generation_chain(&fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.old_chain_depth, 3);
+        for old_generation in &report.old_generations {
+            assert!(
+                read_generation_manifest(&*state.store, &fixture.repo, *old_generation)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(state
+                .store
+                .head(&bundle_key(&fixture.repo, *old_generation))
+                .await
+                .unwrap()
+                .is_none());
+        }
+        let compacted = generation_manifest_for(&state, &fixture.repo, report.new_generation).await;
+        assert_eq!(compacted.parent_generation, None);
+
+        let repo_dir = materializer.repo_dir(&fixture.repo);
+        stdfs::remove_dir_all(&repo_dir).unwrap();
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(third.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.source, MaterializeSource::CacheVerified);
+
+        for commit in [first.commit, second, third] {
+            materializer
+                .state
+                .git
+                .rev_parse(&repo_dir, &format!("{}^{{commit}}", commit.as_str()))
+                .await
+                .unwrap();
         }
     }
 

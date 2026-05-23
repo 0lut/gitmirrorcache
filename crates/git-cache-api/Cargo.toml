@@ -24,6 +24,10 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[features]
+default = []
+s3 = ["git-cache-domain/s3"]
+
 [dev-dependencies]
 axum.workspace = true
 futures.workspace = true

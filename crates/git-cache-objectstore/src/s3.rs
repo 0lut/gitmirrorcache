@@ -2,6 +2,10 @@ use crate::{validate_key, ObjectMeta, ObjectStore};
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+#[cfg(feature = "s3")]
+use aws_smithy_runtime_api::{client::orchestrator::HttpResponse, client::result::SdkError};
+#[cfg(feature = "s3")]
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use git_cache_core::{GitCacheError, Result};
@@ -88,7 +92,7 @@ impl ObjectStore for S3ObjectStore {
             .put_object()
             .bucket(&self.bucket)
             .key(&s3_key)
-            .body(ByteStream::from(value.to_vec()))
+            .body(ByteStream::new(value.into()))
             .send()
             .await
             .map_err(|err| s3_error("put", &s3_key, err))?;
@@ -103,7 +107,7 @@ impl ObjectStore for S3ObjectStore {
             .bucket(&self.bucket)
             .key(&s3_key)
             .if_none_match("*")
-            .body(ByteStream::from(value.to_vec()))
+            .body(ByteStream::new(value.into()))
             .send()
             .await
         {
@@ -249,21 +253,82 @@ fn normalize_prefix(prefix: String) -> Result<String> {
     Ok(prefix)
 }
 
-fn is_not_found(error: &impl std::fmt::Display) -> bool {
-    let text = error.to_string();
-    text.contains("NoSuchKey")
-        || text.contains("NotFound")
-        || text.contains("404")
-        || text.contains("not found")
+fn is_not_found<E>(error: &SdkError<E, HttpResponse>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    matches!(
+        error
+            .raw_response()
+            .map(|response| response.status().as_u16()),
+        Some(404)
+    ) || matches!(
+        error.as_service_error().and_then(|err| err.code()),
+        Some("NoSuchKey" | "NotFound")
+    )
 }
 
-fn is_precondition_failed(error: &impl std::fmt::Display) -> bool {
-    let text = error.to_string();
-    text.contains("PreconditionFailed")
-        || text.contains("Precondition Failed")
-        || text.contains("412")
+fn is_precondition_failed<E>(error: &SdkError<E, HttpResponse>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    matches!(
+        error
+            .raw_response()
+            .map(|response| response.status().as_u16()),
+        Some(412)
+    ) || matches!(
+        error.as_service_error().and_then(|err| err.code()),
+        Some("PreconditionFailed")
+    )
 }
 
-fn s3_error(op: &'static str, key: &str, error: impl std::fmt::Display) -> GitCacheError {
-    GitCacheError::UpstreamUnavailable(format!("s3 {op} `{key}` failed: {error}"))
+fn s3_error(op: &'static str, key: &str, error: impl std::fmt::Debug) -> GitCacheError {
+    GitCacheError::UpstreamUnavailable(format!("s3 {op} `{key}` failed: {error:?}"))
+}
+
+#[cfg(test)]
+#[cfg(feature = "s3")]
+mod tests {
+    use super::{is_not_found, is_precondition_failed};
+    use aws_sdk_s3::operation::{head_object::HeadObjectError, put_object::PutObjectError};
+    use aws_smithy_runtime_api::{
+        client::{orchestrator::HttpResponse, result::SdkError},
+        http::StatusCode,
+    };
+    use aws_smithy_types::{body::SdkBody, error::metadata::ErrorMetadata};
+
+    fn response(status: u16, body: &'static str) -> HttpResponse {
+        HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::from(body))
+    }
+
+    #[test]
+    fn non_404_error_with_404_in_key_is_not_not_found() {
+        let error = SdkError::service_error(
+            HeadObjectError::generic(
+                ErrorMetadata::builder()
+                    .code("AccessDenied")
+                    .message("access denied for repos/repo404/base.bundle")
+                    .build(),
+            ),
+            response(403, "<Key>repos/repo404/base.bundle</Key>"),
+        );
+
+        assert!(!is_not_found(&error));
+    }
+
+    #[test]
+    fn non_412_error_with_412_in_message_is_not_precondition_failed() {
+        let error = SdkError::service_error(
+            PutObjectError::generic(
+                ErrorMetadata::builder()
+                    .code("AccessDenied")
+                    .message("access denied for repos/repo412/base.bundle")
+                    .build(),
+            ),
+            response(403, "<Key>repos/repo412/base.bundle</Key>"),
+        );
+
+        assert!(!is_precondition_failed(&error));
+    }
 }
