@@ -180,7 +180,7 @@ async fn test_list_prefix_scaling() {
     let iterations = 10;
     let start = Instant::now();
     for _ in 0..iterations {
-        let keys = store.list_prefix("prefix-scale/").await.unwrap();
+        let keys = store.list_prefix("prefix-scale/", None).await.unwrap();
         assert_eq!(
             keys.len(),
             count,

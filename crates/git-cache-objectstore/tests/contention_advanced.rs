@@ -282,7 +282,7 @@ async fn list_prefix_consistency_during_rapid_mutations() {
         reader_barrier.wait().await;
         let mut observations = Vec::new();
         for _ in 0..100 {
-            let keys = reader_store.list_prefix("prefix/").await.unwrap();
+            let keys = reader_store.list_prefix("prefix/", None).await.unwrap();
             // Filter out temp files.
             let final_keys: Vec<_> = keys.iter().filter(|k| !k.contains(".tmp")).collect();
 
@@ -316,7 +316,7 @@ async fn list_prefix_consistency_during_rapid_mutations() {
     }
 
     // Final state verification.
-    let final_keys = store.list_prefix("prefix/").await.unwrap();
+    let final_keys = store.list_prefix("prefix/", None).await.unwrap();
     let final_keys: Vec<_> = final_keys.iter().filter(|k| !k.contains(".tmp")).collect();
     // Expected final: 25 remaining originals + 50 new = 75.
     assert_eq!(

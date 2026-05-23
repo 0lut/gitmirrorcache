@@ -260,7 +260,7 @@ async fn list_prefix_with_nested_keys() {
         .unwrap();
     store.put("other/e.json", Bytes::from("e")).await.unwrap();
 
-    let mut keys = store.list_prefix("ns/").await.unwrap();
+    let mut keys = store.list_prefix("ns/", None).await.unwrap();
     keys.sort();
     assert_eq!(
         keys,
@@ -272,10 +272,10 @@ async fn list_prefix_with_nested_keys() {
         ]
     );
 
-    let sub_keys = store.list_prefix("ns/sub/").await.unwrap();
+    let sub_keys = store.list_prefix("ns/sub/", None).await.unwrap();
     assert_eq!(sub_keys.len(), 2);
 
-    let empty = store.list_prefix("nonexistent/").await.unwrap();
+    let empty = store.list_prefix("nonexistent/", None).await.unwrap();
     assert!(empty.is_empty());
 
     let _ = fs::remove_dir_all(&root).await;

@@ -150,33 +150,33 @@ async fn prefix_listing_at_scale() {
     }
 
     // List all
-    let all = store.list_prefix("repos").await.expect("list all");
+    let all = store.list_prefix("repos", None).await.expect("list all");
     assert_eq!(all.len(), 500, "should have 500 objects total");
 
     // List by host
     let host0 = store
-        .list_prefix("repos/host-0")
+        .list_prefix("repos/host-0", None)
         .await
         .expect("list host-0");
     assert_eq!(host0.len(), 100, "host-0 should have 100 objects");
 
     // List by host/org
     let org0 = store
-        .list_prefix("repos/host-0/org-0")
+        .list_prefix("repos/host-0/org-0", None)
         .await
         .expect("list host-0/org-0");
     assert_eq!(org0.len(), 10, "host-0/org-0 should have 10 objects");
 
     // List by host/org/repo (single object)
     let single = store
-        .list_prefix("repos/host-0/org-0/repo-0")
+        .list_prefix("repos/host-0/org-0/repo-0", None)
         .await
         .expect("list single repo");
     assert_eq!(single.len(), 1, "single repo should have 1 object");
 
     // List nonexistent prefix
     let empty = store
-        .list_prefix("repos/nonexistent")
+        .list_prefix("repos/nonexistent", None)
         .await
         .expect("list nonexistent");
     assert!(empty.is_empty(), "nonexistent prefix should be empty");
