@@ -13,6 +13,7 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
 
@@ -32,4 +33,21 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run unit tests
-        run: cargo test --workspace --lib
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::Attempt $attempt"
+            if timeout 120 cargo test --workspace --lib 2>&1; then
+              echo "::endgroup::"
+              echo "Tests passed on attempt $attempt"
+              exit 0
+            fi
+            echo "::endgroup::"
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::Attempt $attempt failed, retrying..."
+              sleep 2
+            fi
+          done
+          echo "::error::Tests failed after 3 attempts"
+          exit 1

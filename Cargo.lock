@@ -1151,6 +1151,7 @@ dependencies = [
 name = "git-cache-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "serde",
  "serde_json",
@@ -1185,7 +1186,6 @@ dependencies = [
  "git-cache-disk",
  "git-cache-git",
  "git-cache-objectstore",
- "git-cache-worker",
  "serde",
  "tempfile",
  "tokio",

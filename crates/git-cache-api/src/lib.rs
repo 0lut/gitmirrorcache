@@ -10,7 +10,8 @@ use git_cache_core::{
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    synthesize_ref_advertisement, AppState, Materializer, MaterializerExecutor,
+    frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
+    MaterializerExecutor,
 };
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
@@ -244,10 +245,10 @@ async fn git_session(
         advertise_refs(&state.domain, &session_repo)
             .await
             .map(|output| {
-                let mut framed = Vec::with_capacity(output.len() + 34);
-                framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
-                framed.extend_from_slice(&output);
-                git_response("application/x-git-upload-pack-advertisement", framed)
+                git_response(
+                    "application/x-git-upload-pack-advertisement",
+                    frame_ref_advertisement(&output),
+                )
             })
     } else if method == Method::POST && path.ends_with("/git-upload-pack") {
         state
@@ -325,39 +326,17 @@ async fn git_repo(
         };
 
         let output = synthesize_ref_advertisement(&comparison);
-        let mut framed = Vec::with_capacity(output.len() + 34);
-        framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
-        framed.extend_from_slice(&output);
-        git_response("application/x-git-upload-pack-advertisement", framed)
+        git_response(
+            "application/x-git-upload-pack-advertisement",
+            frame_ref_advertisement(&output),
+        )
     } else if method == Method::POST && path.ends_with("/git-upload-pack") {
         state
             .metrics
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
 
-        // Parse want lines from the pkt-line request body.
-        let wants = parse_want_lines(&body);
-
-        // Ensure all wanted objects are available.
-        if !wants.is_empty() {
-            if let Err(error) = materializer.ensure_wants_available(&repo, &wants).await {
-                return ApiError::from(error).into_response();
-            }
-        }
-
-        let repo_dir = match materializer.ensure_repo_dir(&repo).await {
-            Ok(dir) => dir,
-            Err(error) => return ApiError::from(error).into_response(),
-        };
-
-        // Ensure repo is configured for serving.
-        if let Err(error) = materializer.configure_served_repo(&repo_dir).await {
-            return ApiError::from(error).into_response();
-        }
-
-        // Stream the upload-pack response. We keep the child process alive
-        // for the duration of the HTTP response by moving it into the stream.
-        match state.domain.git.upload_pack_spawn(&repo_dir, &body).await {
+        match materializer.handle_upload_pack(&repo, &body).await {
             Ok(process) => {
                 let child = process.child;
                 let reader_stream = ReaderStream::new(process.stdout);
@@ -380,44 +359,6 @@ async fn git_repo(
         )))
         .into_response()
     }
-}
-
-/// Parse `want <oid>` lines from a Git pkt-line formatted upload-pack request.
-fn parse_want_lines(body: &[u8]) -> Vec<String> {
-    let mut wants = Vec::new();
-    let mut offset = 0;
-    while offset + 4 <= body.len() {
-        let hex = match std::str::from_utf8(&body[offset..offset + 4]) {
-            Ok(h) => h,
-            Err(_) => break,
-        };
-        let pkt_len = match usize::from_str_radix(hex, 16) {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-
-        if pkt_len == 0 {
-            offset += 4;
-            continue;
-        }
-        if pkt_len < 4 || offset + pkt_len > body.len() {
-            break;
-        }
-
-        let line = &body[offset + 4..offset + pkt_len];
-        if let Ok(line_str) = std::str::from_utf8(line) {
-            let line_str = line_str.trim();
-            if let Some(rest) = line_str.strip_prefix("want ") {
-                let oid = rest.split_whitespace().next().unwrap_or("");
-                if !oid.is_empty() {
-                    wants.push(oid.to_string());
-                }
-            }
-        }
-
-        offset += pkt_len;
-    }
-    wants
 }
 
 fn git_response(content_type: &'static str, output: Vec<u8>) -> Response {
@@ -471,7 +412,9 @@ impl RateLimiter {
             return true;
         }
 
-        let mut state = self.state.lock().expect("rate limiter mutex poisoned");
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
         if state.started.elapsed() >= Duration::from_secs(60) {
             state.started = Instant::now();
             state.count = 0;
@@ -556,6 +499,7 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 mod tests {
     use super::*;
     use git_cache_core::ObjectStoreConfig;
+    use git_cache_domain::parse_want_lines;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use tempfile::TempDir;
