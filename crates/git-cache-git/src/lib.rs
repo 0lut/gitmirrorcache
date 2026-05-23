@@ -319,6 +319,9 @@ impl Git {
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", tmpdir);
+        }
 
         for (key, value) in &self.extra_env {
             command.env(key, value);
@@ -369,6 +372,9 @@ impl Git {
 
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
+        }
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", tmpdir);
         }
 
         for (key, value) in &self.extra_env {
@@ -463,6 +469,9 @@ impl Git {
 
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
+        }
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", tmpdir);
         }
 
         for (key, value) in &self.extra_env {
