@@ -1224,6 +1224,7 @@ name = "git-cache-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "git-cache-core",
  "serde",
  "tokio",

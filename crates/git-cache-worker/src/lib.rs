@@ -1069,6 +1069,7 @@ mod tests {
         let (stop, stop_signal) = stop_channel();
 
         let task = tokio::spawn(loop_.run_until(stop_signal));
+        tokio::task::yield_now().await;
 
         advance(Duration::from_secs(5)).await;
         timeout(Duration::from_secs(1), async {
