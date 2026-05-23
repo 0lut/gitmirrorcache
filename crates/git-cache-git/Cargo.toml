@@ -8,6 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 git-cache-core = { path = "../git-cache-core" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 

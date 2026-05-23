@@ -1226,6 +1226,7 @@ dependencies = [
  "async-trait",
  "futures",
  "git-cache-core",
+ "serde",
  "tokio",
  "tracing",
 ]
