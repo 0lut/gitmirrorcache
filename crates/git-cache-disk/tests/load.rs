@@ -104,15 +104,13 @@ async fn sustained_reservation_pressure() {
             let mgr = Arc::clone(&dm);
             tokio::spawn(async move {
                 for _ in 0..iterations {
-                    let result = tokio::task::spawn_blocking(move || mgr.reserve(reserve_bytes))
+                    let m = Arc::clone(&mgr);
+                    let result = tokio::task::spawn_blocking(move || m.reserve(reserve_bytes))
                         .await
                         .unwrap();
                     // We don't require every reserve to succeed (quota may be hit), but we
                     // do require no panics/deadlocks.  Drop immediately to release.
                     drop(result);
-                    // Re-clone Arc for next iteration inside spawn_blocking
-                    // (the move consumed the previous one).
-                    break; // single iteration per spawn to avoid move issues
                 }
             })
         })

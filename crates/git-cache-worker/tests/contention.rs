@@ -35,8 +35,9 @@ impl RecordingExecutor {
     }
 
     async fn wait_started(&self) {
+        let notified = self.started.notified();
         if self.calls() == 0 {
-            self.started.notified().await;
+            notified.await;
         }
     }
 
