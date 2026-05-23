@@ -19,5 +19,12 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[features]
+default = []
+s3-tests = ["git-cache-objectstore/s3"]
+
 [dev-dependencies]
+aws-credential-types.workspace = true
+aws-sdk-s3 = "1"
+aws-types.workspace = true
 tempfile.workspace = true

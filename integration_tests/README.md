@@ -42,3 +42,25 @@ What the tests do:
 - for each high-commit repo (`torvalds/linux`, `llvm/llvm-project`, `gcc-mirror/gcc`, `astral-sh/uv`):
   - `git ls-remote` via the cache and compare to the upstream HEAD
   - `git clone --depth 1` via the cache and verify the cloned HEAD matches upstream
+
+## Docker / MinIO object-store tests
+
+These tests use Docker Compose to run MinIO locally and exercise the S3-compatible
+object-store adapter plus domain materialization over local hot-cache disk storage.
+
+```sh
+docker compose -f docker-compose.minio.yml up -d --wait
+GIT_CACHE_S3_INTEGRATION=1 \
+GIT_CACHE_S3_ENDPOINT=http://127.0.0.1:9000 \
+GIT_CACHE_S3_BUCKET=gitmirrorcache-test \
+GIT_CACHE_S3_ACCESS_KEY=minioadmin \
+GIT_CACHE_S3_SECRET_KEY=minioadmin \
+cargo test -p git-cache-objectstore --features s3 minio_
+
+GIT_CACHE_S3_INTEGRATION=1 \
+GIT_CACHE_S3_ENDPOINT=http://127.0.0.1:9000 \
+GIT_CACHE_S3_BUCKET=gitmirrorcache-test \
+GIT_CACHE_S3_ACCESS_KEY=minioadmin \
+GIT_CACHE_S3_SECRET_KEY=minioadmin \
+cargo test -p git-cache-domain --features s3-tests minio_
+```

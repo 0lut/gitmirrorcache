@@ -88,7 +88,7 @@ impl ObjectStore for S3ObjectStore {
             .put_object()
             .bucket(&self.bucket)
             .key(&s3_key)
-            .body(ByteStream::from(value.to_vec()))
+            .body(ByteStream::new(value.into()))
             .send()
             .await
             .map_err(|err| s3_error("put", &s3_key, err))?;
@@ -103,7 +103,7 @@ impl ObjectStore for S3ObjectStore {
             .bucket(&self.bucket)
             .key(&s3_key)
             .if_none_match("*")
-            .body(ByteStream::from(value.to_vec()))
+            .body(ByteStream::new(value.into()))
             .send()
             .await
         {
@@ -249,21 +249,21 @@ fn normalize_prefix(prefix: String) -> Result<String> {
     Ok(prefix)
 }
 
-fn is_not_found(error: &impl std::fmt::Display) -> bool {
-    let text = error.to_string();
+fn is_not_found(error: &impl std::fmt::Debug) -> bool {
+    let text = format!("{error:?}");
     text.contains("NoSuchKey")
         || text.contains("NotFound")
         || text.contains("404")
         || text.contains("not found")
 }
 
-fn is_precondition_failed(error: &impl std::fmt::Display) -> bool {
-    let text = error.to_string();
+fn is_precondition_failed(error: &impl std::fmt::Debug) -> bool {
+    let text = format!("{error:?}");
     text.contains("PreconditionFailed")
         || text.contains("Precondition Failed")
         || text.contains("412")
 }
 
-fn s3_error(op: &'static str, key: &str, error: impl std::fmt::Display) -> GitCacheError {
-    GitCacheError::UpstreamUnavailable(format!("s3 {op} `{key}` failed: {error}"))
+fn s3_error(op: &'static str, key: &str, error: impl std::fmt::Debug) -> GitCacheError {
+    GitCacheError::UpstreamUnavailable(format!("s3 {op} `{key}` failed: {error:?}"))
 }
