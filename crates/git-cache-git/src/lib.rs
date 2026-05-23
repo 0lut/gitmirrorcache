@@ -4,9 +4,11 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::debug;
 
@@ -18,6 +20,7 @@ pub struct Git {
     timeout: Duration,
     output_limit: usize,
     extra_env: Vec<(OsString, OsString)>,
+    process_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,11 +32,25 @@ pub struct GitOutput {
 
 impl Git {
     pub fn new(binary: impl Into<PathBuf>, timeout: Duration) -> Self {
+        Self::with_concurrency_limit(
+            binary,
+            timeout,
+            git_cache_core::default_max_concurrent_git_processes(),
+        )
+    }
+
+    pub fn with_concurrency_limit(
+        binary: impl Into<PathBuf>,
+        timeout: Duration,
+        max_concurrent: usize,
+    ) -> Self {
+        let effective = max_concurrent.max(1);
         Self {
             binary: binary.into(),
             timeout,
             output_limit: DEFAULT_OUTPUT_LIMIT,
             extra_env: Vec::new(),
+            process_semaphore: Arc::new(Semaphore::new(effective)),
         }
     }
 
@@ -300,6 +317,13 @@ impl Git {
         repo_dir: &Path,
         request_body: &[u8],
     ) -> Result<UploadPackProcess> {
+        let permit = self
+            .process_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
+
         let mut command = Command::new(&self.binary);
         command
             .args(["upload-pack", "--stateless-rpc", "."])
@@ -345,6 +369,7 @@ impl Git {
             stderr,
             timeout: self.timeout,
             stderr_limit: self.output_limit,
+            _permit: Some(permit),
         })
     }
 
@@ -354,6 +379,13 @@ impl Git {
         &self,
         repo_dir: &Path,
     ) -> Result<UploadPackProcess> {
+        let permit = self
+            .process_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
+
         let mut command = Command::new(&self.binary);
         command
             .args(["upload-pack", "--stateless-rpc", "--advertise-refs", "."])
@@ -393,6 +425,7 @@ impl Git {
             stderr,
             timeout: self.timeout,
             stderr_limit: self.output_limit,
+            _permit: Some(permit),
         })
     }
 
@@ -442,6 +475,13 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let _permit = self
+            .process_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
+
         let args: Vec<OsString> = args
             .into_iter()
             .map(|arg| arg.as_ref().to_os_string())
@@ -619,9 +659,18 @@ pub struct UploadPackProcess {
     stderr: Option<tokio::process::ChildStderr>,
     timeout: Duration,
     stderr_limit: usize,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl UploadPackProcess {
+    /// Take the semaphore permit out of this process, transferring ownership
+    /// to the caller. This is useful when the child and stdout are moved into
+    /// a separate streaming wrapper that must hold the permit for the full
+    /// duration of the response.
+    pub fn take_permit(&mut self) -> Option<OwnedSemaphorePermit> {
+        self._permit.take()
+    }
+
     /// Wait for the child to finish and check for errors.
     /// Consumes remaining stderr.
     pub async fn wait(mut self) -> Result<()> {

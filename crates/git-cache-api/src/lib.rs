@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::io::ReaderStream;
 
 pub fn app(config: AppConfig) -> Router {
@@ -337,7 +338,8 @@ async fn git_repo(
             .fetch_add(1, Ordering::Relaxed);
 
         match materializer.handle_upload_pack(&repo, &body).await {
-            Ok(process) => {
+            Ok(mut process) => {
+                let permit = process.take_permit();
                 let child = process.child;
                 let reader_stream = ReaderStream::new(process.stdout);
                 let max_bytes = state.domain.config.max_git_output_bytes as u64;
@@ -346,6 +348,7 @@ async fn git_repo(
                     _child: child,
                     bytes_sent: 0,
                     max_bytes,
+                    _permit: permit,
                 };
                 Response::builder()
                     .status(StatusCode::OK)
@@ -483,12 +486,14 @@ pub fn empty_body() -> Body {
 }
 
 /// Wraps a `ReaderStream` and holds a child process handle to keep the process
-/// alive for the duration of the HTTP response body stream.
+/// alive for the duration of the HTTP response body stream. Also holds the
+/// semaphore permit so it is not released until the stream is fully consumed.
 struct ChildGuardStream<R: AsyncRead + Unpin> {
     inner: ReaderStream<R>,
     _child: tokio::process::Child,
     bytes_sent: u64,
     max_bytes: u64,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
@@ -554,6 +559,8 @@ mod tests {
             },
             git_remote: Default::default(),
             compaction: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            session_cleanup_interval_secs: 300,
         };
         let api_state = ApiState::try_new(config).unwrap();
         let mut query = HashMap::new();

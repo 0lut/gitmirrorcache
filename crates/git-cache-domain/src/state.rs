@@ -25,9 +25,10 @@ impl AppState {
             }
         };
 
-        let git = Git::new(
+        let git = Git::with_concurrency_limit(
             config.git_binary.clone(),
             Duration::from_secs(config.git_timeout_seconds),
+            config.max_concurrent_git_processes,
         )
         .with_output_limit(config.max_git_output_bytes);
         let git = with_optional_upstream_credentials(git, &config);
