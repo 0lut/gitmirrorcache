@@ -13,7 +13,7 @@ use git_cache_domain::{
     frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
     MaterializerExecutor,
 };
-use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
+use git_cache_worker::{InMemoryRepoLeaseManager, RepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -26,13 +26,13 @@ use tokio::io::AsyncRead;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::io::ReaderStream;
 
-pub fn app(config: AppConfig) -> Router {
-    app_result(config).expect("failed to initialize git-cache-api")
+pub async fn app(config: AppConfig) -> Router {
+    app_result(config).await.expect("failed to initialize git-cache-api")
 }
 
-pub fn app_result(config: AppConfig) -> CoreResult<Router> {
+pub async fn app_result(config: AppConfig) -> CoreResult<Router> {
     let git_remote_enabled = config.git_remote.enabled;
-    let state = Arc::new(ApiState::try_new(config)?);
+    let state = Arc::new(ApiState::try_new(config).await?);
 
     let mut router = Router::new()
         .route("/healthz", get(healthz))
@@ -57,11 +57,33 @@ struct ApiState {
 }
 
 impl ApiState {
-    fn try_new(config: AppConfig) -> CoreResult<Self> {
+    async fn try_new(config: AppConfig) -> CoreResult<Self> {
         let rate_limiter = RateLimiter::new(config.rate_limit_per_minute);
-        let domain = Arc::new(AppState::try_new(config)?);
+        let domain = Arc::new(AppState::try_new(config.clone())?);
         let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
-        let leases = Arc::new(InMemoryRepoLeaseManager::new());
+
+        let leases: Arc<dyn RepoLeaseManager> = {
+            #[cfg(feature = "postgres")]
+            {
+                if let Some(ref db_url) = config.database_url {
+                    let pool = sqlx::PgPool::connect(db_url)
+                        .await
+                        .map_err(|e| GitCacheError::Internal(format!("pg pool connect: {e}")))?;
+                    let holder = hostname().unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+                    let ttl = chrono::Duration::minutes(5);
+                    let mgr = git_cache_pg::PgRepoLeaseManager::new(pool, holder, ttl);
+                    mgr.migrate().await?;
+                    Arc::new(mgr)
+                } else {
+                    Arc::new(InMemoryRepoLeaseManager::new())
+                }
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                Arc::new(InMemoryRepoLeaseManager::new())
+            }
+        };
+
         let coordinator = UpdateCoordinator::new(executor, leases);
         Ok(Self {
             domain,
@@ -70,6 +92,20 @@ impl ApiState {
             rate_limiter: Arc::new(rate_limiter),
         })
     }
+}
+
+#[cfg(feature = "postgres")]
+fn hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -561,8 +597,9 @@ mod tests {
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             session_cleanup_interval_secs: 300,
+            database_url: None,
         };
-        let api_state = ApiState::try_new(config).unwrap();
+        let api_state = ApiState::try_new(config).await.unwrap();
         let mut query = HashMap::new();
         query.insert("service".to_string(), "git-receive-pack".to_string());
 

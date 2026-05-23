@@ -13,6 +13,6 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(addr = %config.bind_addr, "starting git-cache-api");
 
-    axum::serve(listener, app(config)).await?;
+    axum::serve(listener, app(config).await).await?;
     Ok(())
 }

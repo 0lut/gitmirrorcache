@@ -33,6 +33,8 @@ pub struct AppConfig {
     pub max_concurrent_git_processes: usize,
     #[serde(default = "default_session_cleanup_interval_secs")]
     pub session_cleanup_interval_secs: u64,
+    #[serde(default)]
+    pub database_url: Option<String>,
 }
 
 impl AppConfig {
@@ -103,6 +105,7 @@ impl AppConfig {
                 "GIT_CACHE_SESSION_CLEANUP_INTERVAL_SECS",
                 default_session_cleanup_interval_secs(),
             )?,
+            database_url: std::env::var("GIT_CACHE_DATABASE_URL").ok(),
         })
     }
 }

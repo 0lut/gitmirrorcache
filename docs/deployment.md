@@ -47,6 +47,24 @@ The current publish path writes a full bundle for each generation. That gives a 
 
 Future incremental bundles can reuse the existing `parent_generation` field. A compactor should publish a new full generation, verify it with `git fsck`, move commit/ref manifests to the compacted generation, then prune old generations after retention expires.
 
+## PostgreSQL Lease Manager
+
+For multi-worker deployments, configure a shared PostgreSQL instance for distributed lease coordination:
+
+```
+database_url = "postgres://user:pass@host/dbname"
+```
+
+When `database_url` is set, the worker uses PostgreSQL for repo-level mutual exclusion instead of the in-memory lease manager. The table is created automatically on startup.
+
+Each worker identifies itself by hostname. Leases have a TTL (default 5 minutes) and are automatically reclaimed if a worker crashes without releasing them.
+
+Build with the `postgres` feature enabled:
+
+```
+cargo build --features postgres
+```
+
 ## Multi-Worker Safety
 
 - Local repo corruption is handled by deleting local state and hydrating from object storage.

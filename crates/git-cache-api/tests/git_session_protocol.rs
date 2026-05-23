@@ -78,6 +78,7 @@ impl TestServer {
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             session_cleanup_interval_secs: 300,
+            database_url: None,
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -88,7 +89,7 @@ impl TestServer {
             ..config
         };
 
-        let router = app(config);
+        let router = app(config).await;
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });

@@ -83,9 +83,10 @@ impl TestServer {
                 ..Default::default()
             },
             compaction: Default::default(),
+            database_url: None,
         });
 
-        let router = app(config);
+        let router = app(config).await;
 
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -218,9 +219,10 @@ impl MultiRepoTestServer {
                 ..Default::default()
             },
             compaction: Default::default(),
+            database_url: None,
         });
 
-        let router = app(config);
+        let router = app(config).await;
 
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
