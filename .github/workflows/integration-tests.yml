@@ -11,19 +11,21 @@ env:
 
 jobs:
   integration-tests:
-    name: Integration Tests (${{ matrix.crate }})
+    name: Integration Tests (${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 3
     strategy:
       fail-fast: false
       matrix:
-        crate:
-          - git-cache-api
-          - git-cache-core
-          - git-cache-disk
-          - git-cache-git
-          - git-cache-objectstore
-          - git-cache-worker
+        include:
+          - group: core
+            packages: -p git-cache-core -p git-cache-worker
+          - group: git
+            packages: -p git-cache-git -p git-cache-disk
+          - group: objectstore
+            packages: -p git-cache-objectstore
+          - group: api
+            packages: -p git-cache-api
     steps:
       - uses: actions/checkout@v4
 
@@ -37,9 +39,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-integration-${{ matrix.crate }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-integration-${{ matrix.group }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-integration-${{ matrix.crate }}-
+            ${{ runner.os }}-cargo-integration-${{ matrix.group }}-
             ${{ runner.os }}-cargo-integration-
             ${{ runner.os }}-cargo-
 
@@ -49,7 +51,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             echo "::group::Attempt $attempt"
-            if timeout 120 cargo test -p ${{ matrix.crate }} --test '*' 2>&1; then
+            if timeout 120 cargo test ${{ matrix.packages }} --test '*' 2>&1; then
               echo "::endgroup::"
               echo "Tests passed on attempt $attempt"
               exit 0
