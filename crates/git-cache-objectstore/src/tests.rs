@@ -12,6 +12,7 @@ use git_cache_core::{
     CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoGenerationHead,
     RepoKey, SessionId, SessionManifest,
 };
+use std::path::Path;
 use tokio::fs;
 
 fn temp_root() -> std::path::PathBuf {
@@ -128,14 +129,14 @@ async fn list_prefix_returns_matching_keys() {
         .unwrap();
     store.put("other/d.json", Bytes::from("d")).await.unwrap();
 
-    let mut keys = store.list_prefix("sessions/").await.unwrap();
+    let mut keys = store.list_prefix("sessions/", None).await.unwrap();
     keys.sort();
     assert_eq!(
         keys,
         vec!["sessions/a.json", "sessions/b.json", "sessions/sub/c.json",]
     );
 
-    let empty = store.list_prefix("nonexistent/").await.unwrap();
+    let empty = store.list_prefix("nonexistent/", None).await.unwrap();
     assert!(empty.is_empty());
 
     let _ = fs::remove_dir_all(root).await;
@@ -546,4 +547,191 @@ async fn ref_manifest_absent_or_matches_conflicting_content() {
     );
 
     let _ = fs::remove_dir_all(&root).await;
+}
+
+#[tokio::test]
+async fn put_file_stores_content_correctly() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    let src_dir = root.join("src");
+    fs::create_dir_all(&src_dir).await.unwrap();
+    let src_path = src_dir.join("input.bundle");
+    fs::write(&src_path, b"bundle-content-12345").await.unwrap();
+
+    store
+        .put_file("bundles/test.bundle", &src_path)
+        .await
+        .unwrap();
+
+    let stored = store.get("bundles/test.bundle").await.unwrap().unwrap();
+    assert_eq!(stored.as_ref(), b"bundle-content-12345");
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn put_file_is_atomic_no_temp_files_left() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    let src_dir = root.join("src");
+    fs::create_dir_all(&src_dir).await.unwrap();
+    let src_path = src_dir.join("input.dat");
+    fs::write(&src_path, b"atomic-write-data").await.unwrap();
+
+    store.put_file("data/output.dat", &src_path).await.unwrap();
+
+    let parent = root.join("data");
+    let mut entries = fs::read_dir(&parent).await.unwrap();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        assert!(!name.ends_with(".tmp"), "temp file not cleaned up: {name}");
+    }
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn put_file_syncs_temp_file_before_rename() {
+    // Verify put_file calls fsync on the temp file before renaming,
+    // matching the durability contract of write_temp_file/put.
+    // Uses strace to trace syscalls and verify fsync occurs between
+    // the copy (write) and the rename.
+    let strace_path = which_strace();
+    if strace_path.is_none() {
+        eprintln!("skipping put_file_syncs_temp_file_before_rename: strace not found");
+        return;
+    }
+
+    let test_bin = std::env::current_exe().unwrap();
+    let root = temp_root();
+
+    let src_dir = root.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src_path = src_dir.join("input.bundle");
+    std::fs::write(&src_path, b"fsync-test-payload-data").unwrap();
+
+    // Run the put_file helper as a subprocess under strace so we can
+    // inspect syscalls. The helper is invoked via --ignored test name
+    // with env vars telling it what to do.
+    let output = std::process::Command::new(strace_path.unwrap())
+        .args([
+            "-f",
+            "-e",
+            "trace=fsync,fdatasync,rename,renameat,renameat2",
+            "-o",
+            "/dev/stderr",
+            &test_bin.to_string_lossy(),
+            "--ignored",
+            "--exact",
+            "tests::put_file_strace_helper",
+        ])
+        .env("PUT_FILE_TEST_ROOT", path_str(&root))
+        .env("PUT_FILE_TEST_SRC", path_str(&src_path))
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Parse strace output: look for fsync/fdatasync BEFORE rename
+    let lines: Vec<&str> = stderr.lines().collect();
+    let mut saw_fsync = false;
+    let mut saw_rename_after_fsync = false;
+    for line in &lines {
+        if line.contains("fsync(") || line.contains("fdatasync(") {
+            saw_fsync = true;
+        }
+        if saw_fsync
+            && (line.contains("rename(")
+                || line.contains("renameat(")
+                || line.contains("renameat2("))
+        {
+            saw_rename_after_fsync = true;
+        }
+    }
+
+    assert!(
+        saw_fsync,
+        "put_file must call fsync/fdatasync on temp file before rename.\n\
+         strace output:\n{stderr}"
+    );
+    assert!(
+        saw_rename_after_fsync,
+        "put_file must call rename AFTER fsync.\n\
+         strace output:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Helper test invoked by `put_file_syncs_temp_file_before_rename` under strace.
+/// Not meant to be run directly — it reads env vars set by the parent test.
+#[tokio::test]
+#[ignore]
+async fn put_file_strace_helper() {
+    let root_str = std::env::var("PUT_FILE_TEST_ROOT").expect("PUT_FILE_TEST_ROOT");
+    let src_str = std::env::var("PUT_FILE_TEST_SRC").expect("PUT_FILE_TEST_SRC");
+
+    let store = LocalObjectStore::new(&root_str);
+    store
+        .put_file("strace/bundle.dat", Path::new(&src_str))
+        .await
+        .unwrap();
+}
+
+fn which_strace() -> Option<std::path::PathBuf> {
+    std::process::Command::new("which")
+        .arg("strace")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(std::path::PathBuf::from(path))
+                }
+            } else {
+                None
+            }
+        })
+}
+
+fn path_str(p: &std::path::Path) -> &str {
+    p.to_str().expect("non-UTF-8 path")
+}
+
+#[tokio::test]
+async fn head_returns_metadata_for_existing_key() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    store
+        .put("meta/test.bin", Bytes::from("hello-metadata"))
+        .await
+        .unwrap();
+
+    let meta = store.head("meta/test.bin").await.unwrap();
+    assert!(meta.is_some());
+    let meta = meta.unwrap();
+    assert_eq!(meta.key, "meta/test.bin");
+    assert_eq!(meta.len, 14); // "hello-metadata".len()
+    assert!(meta.updated_at.is_some());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn head_returns_none_for_missing_key() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    let meta = store.head("does/not/exist.bin").await.unwrap();
+    assert!(meta.is_none());
+
+    let _ = fs::remove_dir_all(root).await;
 }

@@ -340,9 +340,12 @@ async fn git_repo(
             Ok(process) => {
                 let child = process.child;
                 let reader_stream = ReaderStream::new(process.stdout);
+                let max_bytes = state.domain.config.max_git_output_bytes as u64;
                 let guarded = ChildGuardStream {
                     inner: reader_stream,
                     _child: child,
+                    bytes_sent: 0,
+                    max_bytes,
                 };
                 Response::builder()
                     .status(StatusCode::OK)
@@ -484,6 +487,8 @@ pub fn empty_body() -> Body {
 struct ChildGuardStream<R: AsyncRead + Unpin> {
     inner: ReaderStream<R>,
     _child: tokio::process::Child,
+    bytes_sent: u64,
+    max_bytes: u64,
 }
 
 impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
@@ -491,7 +496,20 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_next(cx)
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.bytes_sent = this.bytes_sent.saturating_add(chunk.len() as u64);
+                if this.bytes_sent > this.max_bytes {
+                    Poll::Ready(Some(Err(std::io::Error::other(format!(
+                        "git upload-pack response exceeded {} byte limit",
+                        this.max_bytes
+                    )))))
+                } else {
+                    Poll::Ready(Some(Ok(chunk)))
+                }
+            }
+            other => other,
+        }
     }
 }
 
