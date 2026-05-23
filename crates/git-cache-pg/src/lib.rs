@@ -230,11 +230,8 @@ mod tests {
             let pool = pool.clone();
             let repo = repo.clone();
             handles.push(tokio::spawn(async move {
-                let mgr = PgRepoLeaseManager::new(
-                    pool,
-                    format!("holder-{i}"),
-                    Duration::minutes(5),
-                );
+                let mgr =
+                    PgRepoLeaseManager::new(pool, format!("holder-{i}"), Duration::minutes(5));
                 mgr.acquire(&repo).await
             }));
         }

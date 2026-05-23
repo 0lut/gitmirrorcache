@@ -13,7 +13,9 @@ use git_cache_domain::{
     frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
     MaterializerExecutor,
 };
-use git_cache_worker::{InMemoryRepoLeaseManager, RepoLeaseManager, UpdateCoordinator, UpdateDisposition};
+use git_cache_worker::{
+    InMemoryRepoLeaseManager, RepoLeaseManager, UpdateCoordinator, UpdateDisposition,
+};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -27,7 +29,9 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::io::ReaderStream;
 
 pub async fn app(config: AppConfig) -> Router {
-    app_result(config).await.expect("failed to initialize git-cache-api")
+    app_result(config)
+        .await
+        .expect("failed to initialize git-cache-api")
 }
 
 pub async fn app_result(config: AppConfig) -> CoreResult<Router> {
