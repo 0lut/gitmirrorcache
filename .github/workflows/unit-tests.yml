@@ -11,9 +11,21 @@ env:
 
 jobs:
   unit-tests:
-    name: Unit Tests
+    name: Unit Tests (${{ matrix.crate }})
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - git-cache-api
+          - git-cache-cli
+          - git-cache-core
+          - git-cache-disk
+          - git-cache-domain
+          - git-cache-git
+          - git-cache-objectstore
+          - git-cache-worker
     steps:
       - uses: actions/checkout@v4
 
@@ -27,8 +39,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-unit-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-unit-${{ matrix.crate }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-unit-${{ matrix.crate }}-
             ${{ runner.os }}-cargo-unit-
             ${{ runner.os }}-cargo-
 
@@ -38,7 +51,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             echo "::group::Attempt $attempt"
-            if timeout 120 cargo test --workspace --lib 2>&1; then
+            if timeout 120 cargo test -p ${{ matrix.crate }} --lib 2>&1; then
               echo "::endgroup::"
               echo "Tests passed on attempt $attempt"
               exit 0
