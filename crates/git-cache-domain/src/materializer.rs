@@ -1,5 +1,6 @@
 use crate::state::AppState;
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use git_cache_core::{
     BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest, GitCacheError,
@@ -7,13 +8,14 @@ use git_cache_core::{
     RepoKey, RequestMode, Result as CoreResult, Selector, SessionId, SessionManifest,
     ShortCommitSha,
 };
+use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateTarget};
+pub use git_cache_git::UploadPackProcess;
 use git_cache_objectstore::{
     generation_manifest_key, read_commit_manifest, read_generation_manifest, read_json,
     read_ref_manifest, read_repo_generation_head, read_session_manifest, write_commit_manifest,
     write_json, write_ref_manifest, write_repo_generation_head, write_session_manifest,
     GenerationPublish, PublishManifests,
 };
-use git_cache_worker::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
@@ -340,24 +342,7 @@ impl Materializer {
         repo_dir: &FsPath,
         generation: GenerationId,
     ) -> CoreResult<()> {
-        let mut chain = Vec::new();
-        let mut seen = HashSet::new();
-        let mut next = Some(generation);
-        while let Some(current) = next {
-            if !seen.insert(current) {
-                return Err(GitCacheError::Conflict(format!(
-                    "generation chain for `{repo}` contains a cycle at `{current}`"
-                )));
-            }
-            let manifest: GenerationManifest = self
-                .get_generation_manifest(repo, current)
-                .await?
-                .ok_or_else(|| {
-                GitCacheError::NotFound(format!("generation manifest `{current}` not found"))
-            })?;
-            next = manifest.parent_generation;
-            chain.push(manifest);
-        }
+        let chain = self.generation_chain(repo, generation).await?;
 
         for generation_manifest in chain.iter().rev() {
             let bundle = self
@@ -373,7 +358,7 @@ impl Materializer {
                 })?;
 
             let reservation = self.state.disk.reserve(bundle.len() as u64).await?;
-            let temp_path = reservation.temp_path();
+            let temp_path = reservation.temp_path()?;
             fs::create_dir_all(&temp_path).await?;
             let bundle_path = temp_path.join("hydrate.bundle");
             fs::write(&bundle_path, bundle).await?;
@@ -419,7 +404,7 @@ impl Materializer {
         let bundle_key = bundle_key(repo, generation);
 
         let reservation = self.state.disk.reserve(1024 * 1024 * 64).await?;
-        let temp_path = reservation.temp_path();
+        let temp_path = reservation.temp_path()?;
         fs::create_dir_all(&temp_path).await?;
         let bundle_path = temp_path.join("generation.bundle");
         let now = Utc::now();
@@ -561,7 +546,7 @@ impl Materializer {
         self.state.git.fsck(&repo_dir).await?;
 
         let reservation = self.state.disk.reserve(1024 * 1024 * 64).await?;
-        let temp_path = reservation.temp_path();
+        let temp_path = reservation.temp_path()?;
         fs::create_dir_all(&temp_path).await?;
         let bundle_path = temp_path.join("compacted.bundle");
         self.state
@@ -1296,6 +1281,23 @@ impl Materializer {
         Ok(())
     }
 
+    /// Handle a direct Git remote upload-pack request end-to-end:
+    /// parse want lines, ensure objects are available, configure the repo,
+    /// and spawn the upload-pack process for streaming.
+    pub async fn handle_upload_pack(
+        &self,
+        repo: &RepoKey,
+        body: &Bytes,
+    ) -> CoreResult<UploadPackProcess> {
+        let wants = parse_want_lines(body);
+        if !wants.is_empty() {
+            self.ensure_wants_available(repo, &wants).await?;
+        }
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        self.configure_served_repo(&repo_dir).await?;
+        self.state.git.upload_pack_spawn(&repo_dir, body).await
+    }
+
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
         let keys = self.state.store.list_prefix("repos/", None).await?;
         let session_keys: Vec<String> = keys
@@ -1497,11 +1499,7 @@ fn pkt_line(out: &mut Vec<u8>, data: &str) {
     out.extend_from_slice(data.as_bytes());
 }
 
-pub async fn upload_pack(
-    state: &AppState,
-    repo: &FsPath,
-    body: bytes::Bytes,
-) -> CoreResult<Vec<u8>> {
+pub async fn upload_pack(state: &AppState, repo: &FsPath, body: Bytes) -> CoreResult<Vec<u8>> {
     Ok(state
         .git
         .upload_pack_stateless_rpc(
@@ -1512,6 +1510,52 @@ pub async fn upload_pack(
         )
         .await?
         .stdout)
+}
+
+/// Frame a ref advertisement with the Git smart-HTTP service header.
+pub fn frame_ref_advertisement(refs_output: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(refs_output.len() + 34);
+    framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
+    framed.extend_from_slice(refs_output);
+    framed
+}
+
+/// Parse `want <oid>` lines from a Git pkt-line formatted upload-pack request.
+pub fn parse_want_lines(body: &[u8]) -> Vec<String> {
+    let mut wants = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= body.len() {
+        let hex = match std::str::from_utf8(&body[offset..offset + 4]) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        let pkt_len = match usize::from_str_radix(hex, 16) {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        if pkt_len == 0 {
+            offset += 4;
+            continue;
+        }
+        if pkt_len < 4 || offset + pkt_len > body.len() {
+            break;
+        }
+
+        let line = &body[offset + 4..offset + pkt_len];
+        if let Ok(line_str) = std::str::from_utf8(line) {
+            let line_str = line_str.trim();
+            if let Some(rest) = line_str.strip_prefix("want ") {
+                let oid = rest.split_whitespace().next().unwrap_or("");
+                if !oid.is_empty() {
+                    wants.push(oid.to_string());
+                }
+            }
+        }
+
+        offset += pkt_len;
+    }
+    wants
 }
 
 pub fn default_manifest_key(repo: &RepoKey) -> String {
