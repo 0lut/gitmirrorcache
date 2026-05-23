@@ -19,7 +19,6 @@ jobs:
       matrix:
         crate:
           - git-cache-api
-          - git-cache-cli
           - git-cache-core
           - git-cache-disk
           - git-cache-domain
