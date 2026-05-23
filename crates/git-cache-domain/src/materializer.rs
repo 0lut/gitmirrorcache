@@ -641,8 +641,8 @@ impl Materializer {
         let mut total = 0_u64;
         for generation in generations {
             let key = bundle_key(repo, *generation);
-            if let Some(bundle) = self.state.store.get(&key).await? {
-                total = total.saturating_add(bundle.len() as u64);
+            if let Some(meta) = self.state.store.head(&key).await? {
+                total = total.saturating_add(meta.len);
             }
         }
         Ok(total)
@@ -655,7 +655,7 @@ impl Materializer {
         new_generation: GenerationId,
     ) -> CoreResult<()> {
         let prefix = format!("repos/{repo}/manifests/");
-        let keys = self.state.store.list_prefix(&prefix).await?;
+        let keys = self.state.store.list_prefix(&prefix, None).await?;
         for key in keys {
             if key.contains("/manifests/commits/") && key.ends_with(".json") {
                 if let Some(mut manifest) =
@@ -1299,7 +1299,7 @@ impl Materializer {
     }
 
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
-        let keys = self.state.store.list_prefix("repos/").await?;
+        let keys = self.state.store.list_prefix("repos/", None).await?;
         let session_keys: Vec<String> = keys
             .into_iter()
             .filter(|k| k.contains("/manifests/sessions/") && k.ends_with(".json"))

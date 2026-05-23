@@ -42,7 +42,14 @@ pub trait ObjectStore: Send + Sync {
     async fn put_if_absent(&self, key: &str, value: Bytes) -> Result<bool>;
     async fn exists(&self, key: &str) -> Result<bool>;
     async fn delete(&self, key: &str) -> Result<()>;
-    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
+    async fn list_prefix(&self, prefix: &str, max_keys: Option<usize>) -> Result<Vec<String>>;
+
+    async fn head(&self, key: &str) -> Result<Option<ObjectMeta>>;
+
+    async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
+        let data = tokio::fs::read(path).await?;
+        self.put(key, Bytes::from(data)).await
+    }
 }
 
 pub(crate) fn validate_key(key: &str) -> Result<()> {

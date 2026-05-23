@@ -175,7 +175,7 @@ async fn test_list_prefix_at_scale() {
     }
 
     let start = Instant::now();
-    let keys = store.list_prefix("prefix-test/").await.unwrap();
+    let keys = store.list_prefix("prefix-test/", None).await.unwrap();
     let elapsed = start.elapsed();
 
     assert_eq!(
