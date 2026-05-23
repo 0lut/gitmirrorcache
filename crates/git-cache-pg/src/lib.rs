@@ -105,10 +105,13 @@ impl Drop for PgRepoLease {
         if self.released {
             return;
         }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         let pool = self.pool.clone();
         let repo_key = self.repo_key.clone();
         let holder = self.holder.clone();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             if let Err(e) =
                 sqlx::query("DELETE FROM repo_leases WHERE repo_key = $1 AND holder = $2")
                     .bind(&repo_key)
