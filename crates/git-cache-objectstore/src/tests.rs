@@ -917,10 +917,16 @@ async fn get_to_file_streams_content_to_disk() {
     let root = temp_root();
     let store = LocalObjectStore::new(&root);
     let content = Bytes::from("bundle-data-for-streaming-test");
-    store.put("bundles/test.bundle", content.clone()).await.unwrap();
+    store
+        .put("bundles/test.bundle", content.clone())
+        .await
+        .unwrap();
 
     let dest = root.join("download").join("test.bundle");
-    let found = store.get_to_file("bundles/test.bundle", &dest).await.unwrap();
+    let found = store
+        .get_to_file("bundles/test.bundle", &dest)
+        .await
+        .unwrap();
     assert!(found);
     let on_disk = fs::read(&dest).await.unwrap();
     assert_eq!(on_disk, content.as_ref());
@@ -934,7 +940,10 @@ async fn get_to_file_returns_false_for_missing_key() {
     let store = LocalObjectStore::new(&root);
 
     let dest = root.join("download").join("missing.bundle");
-    let found = store.get_to_file("bundles/missing.bundle", &dest).await.unwrap();
+    let found = store
+        .get_to_file("bundles/missing.bundle", &dest)
+        .await
+        .unwrap();
     assert!(!found);
     assert!(!dest.exists());
 

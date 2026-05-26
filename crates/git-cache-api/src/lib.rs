@@ -105,9 +105,7 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
         .body(Body::from(body))
-        .unwrap_or_else(|_| {
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn materialize(
@@ -369,9 +367,7 @@ async fn git_repo(
                     .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
                     .header(header::CACHE_CONTROL, "no-cache")
                     .body(Body::from_stream(guarded))
-                    .unwrap_or_else(|_| {
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    })
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             }
             Err(error) => ApiError::from(error).into_response(),
         }

@@ -668,7 +668,11 @@ impl Materializer {
         new_generation: GenerationId,
     ) -> CoreResult<()> {
         let prefix = format!("repos/{repo}/manifests/");
-        let keys = self.state.store.list_prefix(&prefix, Some(MAX_LIST_KEYS)).await?;
+        let keys = self
+            .state
+            .store
+            .list_prefix(&prefix, Some(MAX_LIST_KEYS))
+            .await?;
         for key in keys {
             if key.contains("/manifests/commits/") && key.ends_with(".json") {
                 if let Some(mut manifest) =
@@ -913,14 +917,9 @@ impl Materializer {
     async fn ls_remote_branch(&self, repo: &RepoKey, branch: &BranchName) -> CoreResult<CommitSha> {
         let remote = self.upstream_url(repo)?;
         let result = self.state.git.ls_remote_heads(&remote).await?;
-        let sha = result
-            .refs
-            .get(branch.as_str())
-            .ok_or_else(|| {
-                GitCacheError::NotFound(format!(
-                    "branch `{branch}` was verified absent upstream"
-                ))
-            })?;
+        let sha = result.refs.get(branch.as_str()).ok_or_else(|| {
+            GitCacheError::NotFound(format!("branch `{branch}` was verified absent upstream"))
+        })?;
         CommitSha::parse(sha)
     }
 
@@ -1200,11 +1199,7 @@ impl Materializer {
                 let upstream_url = self.upstream_url(repo)?;
                 self.state
                     .git
-                    .fetch_refs(
-                        &repo_dir,
-                        &upstream_url,
-                        &[commit.as_str().to_string()],
-                    )
+                    .fetch_refs(&repo_dir, &upstream_url, &[commit.as_str().to_string()])
                     .await
                     .map_err(|err| {
                         GitCacheError::NotFound(format!(
@@ -1277,7 +1272,11 @@ impl Materializer {
     }
 
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
-        let keys = self.state.store.list_prefix("repos/", Some(MAX_LIST_KEYS)).await?;
+        let keys = self
+            .state
+            .store
+            .list_prefix("repos/", Some(MAX_LIST_KEYS))
+            .await?;
         let session_keys: Vec<String> = keys
             .into_iter()
             .filter(|k| k.contains("/manifests/sessions/") && k.ends_with(".json"))
