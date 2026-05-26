@@ -151,6 +151,18 @@ impl ObjectStore for LocalObjectStore {
         }
     }
 
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<bool> {
+        let src = self.object_path(key)?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        match fs::copy(&src, dest).await {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
         let dest = self.object_path(key)?;
         let parent = parent_dir(&dest)?;

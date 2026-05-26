@@ -909,3 +909,57 @@ async fn head_returns_none_for_missing_key() {
 
     let _ = fs::remove_dir_all(root).await;
 }
+
+// ── get_to_file tests ────────────────────────────────────────
+
+#[tokio::test]
+async fn get_to_file_streams_content_to_disk() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+    let content = Bytes::from("bundle-data-for-streaming-test");
+    store.put("bundles/test.bundle", content.clone()).await.unwrap();
+
+    let dest = root.join("download").join("test.bundle");
+    let found = store.get_to_file("bundles/test.bundle", &dest).await.unwrap();
+    assert!(found);
+    let on_disk = fs::read(&dest).await.unwrap();
+    assert_eq!(on_disk, content.as_ref());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn get_to_file_returns_false_for_missing_key() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    let dest = root.join("download").join("missing.bundle");
+    let found = store.get_to_file("bundles/missing.bundle", &dest).await.unwrap();
+    assert!(!found);
+    assert!(!dest.exists());
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+// ── list_prefix max_keys tests ──────────────────────────────
+
+#[tokio::test]
+async fn list_prefix_respects_max_keys_limit() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    for i in 0..10 {
+        store
+            .put(&format!("bounded/{i:02}.json"), Bytes::from("x"))
+            .await
+            .unwrap();
+    }
+
+    let keys = store.list_prefix("bounded/", Some(3)).await.unwrap();
+    assert_eq!(keys.len(), 3);
+
+    let all_keys = store.list_prefix("bounded/", None).await.unwrap();
+    assert_eq!(all_keys.len(), 10);
+
+    let _ = fs::remove_dir_all(root).await;
+}

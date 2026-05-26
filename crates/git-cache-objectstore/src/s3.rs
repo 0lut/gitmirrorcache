@@ -10,6 +10,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use git_cache_core::{GitCacheError, Result};
 use std::path::Path;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone)]
 pub struct S3ObjectStore {
@@ -226,6 +227,31 @@ impl ObjectStore for S3ObjectStore {
             Err(err) if is_not_found(&err) => Ok(None),
             Err(err) => Err(s3_error("head", &s3_key, err)),
         }
+    }
+
+    async fn get_to_file(&self, key: &str, dest: &Path) -> Result<bool> {
+        let s3_key = self.s3_key(key)?;
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(err) if is_not_found(&err) => return Ok(false),
+            Err(err) => return Err(s3_error("get_to_file", &s3_key, err)),
+        };
+
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut stream = output.body.into_async_read();
+        tokio::io::copy(&mut stream, &mut file).await?;
+        file.sync_all().await?;
+        Ok(true)
     }
 
     async fn put_file(&self, key: &str, path: &Path) -> Result<()> {

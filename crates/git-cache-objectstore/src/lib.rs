@@ -50,6 +50,19 @@ pub trait ObjectStore: Send + Sync {
         let data = tokio::fs::read(path).await?;
         self.put(key, Bytes::from(data)).await
     }
+
+    async fn get_to_file(&self, key: &str, path: &Path) -> Result<bool> {
+        match self.get(key).await? {
+            Some(data) => {
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(path, &data).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 }
 
 pub(crate) fn validate_key(key: &str) -> Result<()> {

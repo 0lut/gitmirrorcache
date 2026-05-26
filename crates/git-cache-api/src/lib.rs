@@ -105,7 +105,9 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
         .body(Body::from(body))
-        .expect("metrics response")
+        .unwrap_or_else(|_| {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })
 }
 
 async fn materialize(
@@ -285,6 +287,18 @@ async fn git_repo(
 ) -> Response {
     let path = uri.path();
 
+    if !state.rate_limiter.check() {
+        state
+            .metrics
+            .rate_limited_total
+            .fetch_add(1, Ordering::Relaxed);
+        return ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limit exceeded".into(),
+        }
+        .into_response();
+    }
+
     // Reject git-receive-pack (push) requests.
     if path.contains("git-receive-pack")
         || query
@@ -355,7 +369,9 @@ async fn git_repo(
                     .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
                     .header(header::CACHE_CONTROL, "no-cache")
                     .body(Body::from_stream(guarded))
-                    .expect("git upload-pack response")
+                    .unwrap_or_else(|_| {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    })
             }
             Err(error) => ApiError::from(error).into_response(),
         }
@@ -373,7 +389,7 @@ fn git_response(content_type: &'static str, output: Vec<u8>) -> Response {
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(output))
-        .expect("git response")
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 #[derive(Debug, Serialize)]
@@ -659,5 +675,103 @@ mod tests {
         let body = b"0032want short\n";
         let wants = parse_want_lines(body);
         assert!(wants.is_empty());
+    }
+
+    // ── want-line OID validation tests ──────────────────────────────
+
+    #[test]
+    fn parse_want_rejects_non_hex_oid() {
+        let body = make_pkt_line("want not-a-valid-hex-object-id-at-all!!\n");
+        let wants = parse_want_lines(&body);
+        assert!(wants.is_empty());
+    }
+
+    #[test]
+    fn parse_want_rejects_short_oid() {
+        let body = make_pkt_line("want abcd1234\n");
+        let wants = parse_want_lines(&body);
+        assert!(wants.is_empty());
+    }
+
+    #[test]
+    fn parse_want_rejects_flag_injection_oid() {
+        let body = make_pkt_line("want --evil-flag-injection-padding-to-40c\n");
+        let wants = parse_want_lines(&body);
+        assert!(wants.is_empty());
+    }
+
+    #[test]
+    fn parse_want_accepts_valid_40_char_hex_oid() {
+        let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let body = make_pkt_line(&format!("want {sha}\n"));
+        let wants = parse_want_lines(&body);
+        assert_eq!(wants, vec![sha]);
+    }
+
+    // ── git_repo rate limiting test ─────────────────────────────────
+
+    #[tokio::test]
+    async fn git_repo_rate_limits_requests() {
+        let tmp = TempDir::new().unwrap();
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            public_base_url: "http://127.0.0.1:0".into(),
+            cache_root: tmp.path().join("cache"),
+            upstream_root: Some(tmp.path().join("upstreams")),
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 60,
+            max_git_output_bytes: 16 * 1024 * 1024,
+            object_store: ObjectStoreConfig::Local {
+                root: tmp.path().join("objects"),
+            },
+            session_ttl_seconds: 3600,
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 1,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 1024 * 1024 * 1024,
+                min_free_bytes: 0,
+            },
+            git_remote: git_cache_core::GitRemoteConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            compaction: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            session_cleanup_interval_secs: 300,
+        };
+        let api_state = Arc::new(ApiState::try_new(config).unwrap());
+
+        // First request should pass rate limit (even if it fails for other reasons).
+        let r1 = git_repo(
+            State(Arc::clone(&api_state)),
+            Path("github.com/org/repo.git/info/refs".to_string()),
+            Query({
+                let mut m = HashMap::new();
+                m.insert("service".to_string(), "git-upload-pack".to_string());
+                m
+            }),
+            Method::GET,
+            Uri::from_static("/git/github.com/org/repo.git/info/refs?service=git-upload-pack"),
+            Bytes::new(),
+        )
+        .await;
+        assert_ne!(r1.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Second request should be rate-limited.
+        let r2 = git_repo(
+            State(Arc::clone(&api_state)),
+            Path("github.com/org/repo.git/info/refs".to_string()),
+            Query({
+                let mut m = HashMap::new();
+                m.insert("service".to_string(), "git-upload-pack".to_string());
+                m
+            }),
+            Method::GET,
+            Uri::from_static("/git/github.com/org/repo.git/info/refs?service=git-upload-pack"),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

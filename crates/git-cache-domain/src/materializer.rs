@@ -23,6 +23,8 @@ use std::sync::Arc;
 use tokio::fs;
 use tracing::{debug, info, warn};
 
+const MAX_LIST_KEYS: usize = 100_000;
+
 pub struct Materializer {
     state: Arc<AppState>,
 }
@@ -345,10 +347,10 @@ impl Materializer {
         let chain = self.generation_chain(repo, generation).await?;
 
         for generation_manifest in chain.iter().rev() {
-            let bundle = self
+            let bundle_meta = self
                 .state
                 .store
-                .get(&generation_manifest.bundle_key)
+                .head(&generation_manifest.bundle_key)
                 .await?
                 .ok_or_else(|| {
                     GitCacheError::NotFound(format!(
@@ -357,11 +359,22 @@ impl Materializer {
                     ))
                 })?;
 
-            let reservation = self.state.disk.reserve(bundle.len() as u64).await?;
+            let reservation = self.state.disk.reserve(bundle_meta.len).await?;
             let temp_path = reservation.temp_path()?;
             fs::create_dir_all(&temp_path).await?;
             let bundle_path = temp_path.join("hydrate.bundle");
-            fs::write(&bundle_path, bundle).await?;
+            let found = self
+                .state
+                .store
+                .get_to_file(&generation_manifest.bundle_key, &bundle_path)
+                .await?;
+            if !found {
+                reservation.release().await?;
+                return Err(GitCacheError::NotFound(format!(
+                    "bundle `{}` not found",
+                    generation_manifest.bundle_key
+                )));
+            }
             self.state.git.fetch_bundle(repo_dir, &bundle_path).await?;
             self.state.git.fsck(repo_dir).await?;
             reservation.release().await?;
@@ -655,7 +668,7 @@ impl Materializer {
         new_generation: GenerationId,
     ) -> CoreResult<()> {
         let prefix = format!("repos/{repo}/manifests/");
-        let keys = self.state.store.list_prefix(&prefix, None).await?;
+        let keys = self.state.store.list_prefix(&prefix, Some(MAX_LIST_KEYS)).await?;
         for key in keys {
             if key.contains("/manifests/commits/") && key.ends_with(".json") {
                 if let Some(mut manifest) =
@@ -887,70 +900,34 @@ impl Materializer {
         let remote = self.upstream_url(repo)?;
         self.state
             .git
-            .run(
-                Some(repo_dir),
-                [
-                    "fetch",
-                    "--no-tags",
-                    "--prune",
-                    &remote,
-                    "+refs/heads/*:refs/cache/upstream/heads/*",
-                ],
+            .fetch_refs(
+                repo_dir,
+                &remote,
+                &["+refs/heads/*:refs/cache/upstream/heads/*".to_string()],
             )
-            .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+            .await?;
         self.state.git.fsck(repo_dir).await?;
         Ok(())
     }
 
     async fn ls_remote_branch(&self, repo: &RepoKey, branch: &BranchName) -> CoreResult<CommitSha> {
         let remote = self.upstream_url(repo)?;
-        let output = self
-            .state
-            .git
-            .run(None, ["ls-remote", "--heads", &remote, branch.as_str()])
-            .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
-
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
-        })?;
-        let Some(line) = text.lines().next() else {
-            return Err(GitCacheError::NotFound(format!(
-                "branch `{branch}` was verified absent upstream"
-            )));
-        };
-        let sha = line.split_whitespace().next().ok_or_else(|| {
-            GitCacheError::UpstreamUnavailable("malformed ls-remote output".into())
-        })?;
+        let result = self.state.git.ls_remote_heads(&remote).await?;
+        let sha = result
+            .refs
+            .get(branch.as_str())
+            .ok_or_else(|| {
+                GitCacheError::NotFound(format!(
+                    "branch `{branch}` was verified absent upstream"
+                ))
+            })?;
         CommitSha::parse(sha)
     }
 
     async fn resolve_default_branch(&self, repo: &RepoKey) -> CoreResult<BranchName> {
         let remote = self.upstream_url(repo)?;
-        let output = self
-            .state
-            .git
-            .run(None, ["ls-remote", "--symref", &remote, "HEAD"])
-            .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
-        })?;
-
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
-                if let Some((branch, head)) = rest.split_once('\t') {
-                    if head == "HEAD" {
-                        return BranchName::parse(branch);
-                    }
-                }
-            }
-        }
-
-        Err(GitCacheError::UpstreamUnavailable(
-            "upstream did not advertise a symbolic HEAD".into(),
-        ))
+        let branch = self.state.git.ls_remote_default_branch(&remote).await?;
+        BranchName::parse(&branch)
     }
 
     async fn prepare_session_repo(
@@ -1223,9 +1200,10 @@ impl Materializer {
                 let upstream_url = self.upstream_url(repo)?;
                 self.state
                     .git
-                    .run(
-                        Some(&repo_dir),
-                        ["fetch", "--no-tags", "--", &upstream_url, commit.as_str()],
+                    .fetch_refs(
+                        &repo_dir,
+                        &upstream_url,
+                        &[commit.as_str().to_string()],
                     )
                     .await
                     .map_err(|err| {
@@ -1299,7 +1277,7 @@ impl Materializer {
     }
 
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
-        let keys = self.state.store.list_prefix("repos/", None).await?;
+        let keys = self.state.store.list_prefix("repos/", Some(MAX_LIST_KEYS)).await?;
         let session_keys: Vec<String> = keys
             .into_iter()
             .filter(|k| k.contains("/manifests/sessions/") && k.ends_with(".json"))
@@ -1547,7 +1525,7 @@ pub fn parse_want_lines(body: &[u8]) -> Vec<String> {
             let line_str = line_str.trim();
             if let Some(rest) = line_str.strip_prefix("want ") {
                 let oid = rest.split_whitespace().next().unwrap_or("");
-                if !oid.is_empty() {
+                if is_valid_oid(oid) {
                     wants.push(oid.to_string());
                 }
             }
@@ -1556,6 +1534,10 @@ pub fn parse_want_lines(body: &[u8]) -> Vec<String> {
         offset += pkt_len;
     }
     wants
+}
+
+fn is_valid_oid(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub fn default_manifest_key(repo: &RepoKey) -> String {
@@ -1686,6 +1668,39 @@ mod tests {
     fn repo_from_git_path_bare_dot_git() {
         let key = repo_from_git_path("github.com/org/repo.git").unwrap();
         assert_eq!(key.as_str(), "github.com/org/repo");
+    }
+
+    // ── is_valid_oid tests ─────────────────────────────────────────
+
+    #[test]
+    fn valid_oid_40_hex_chars() {
+        assert!(is_valid_oid(&"a".repeat(40)));
+        assert!(is_valid_oid("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"));
+    }
+
+    #[test]
+    fn invalid_oid_too_short() {
+        assert!(!is_valid_oid("abcd1234"));
+    }
+
+    #[test]
+    fn invalid_oid_too_long() {
+        assert!(!is_valid_oid(&"a".repeat(41)));
+    }
+
+    #[test]
+    fn invalid_oid_non_hex() {
+        assert!(!is_valid_oid(&format!("{}zz", "a".repeat(38))));
+    }
+
+    #[test]
+    fn invalid_oid_dash_prefix() {
+        assert!(!is_valid_oid(&format!("-{}", "a".repeat(39))));
+    }
+
+    #[test]
+    fn invalid_oid_empty() {
+        assert!(!is_valid_oid(""));
     }
 
     // ── validate_host tests ──────────────────────────────────────────
