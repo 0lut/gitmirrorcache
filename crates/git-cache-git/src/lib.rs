@@ -984,4 +984,26 @@ mod tests {
             .await
             .is_err());
     }
+
+    #[tokio::test]
+    async fn fetch_refs_prune_rejects_dash_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_refs_prune(Path::new("/unused"), "-evil", &[])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refs_prune_rejects_nul_in_refspec() {
+        let git = test_git();
+        assert!(git
+            .fetch_refs_prune(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &["bad\0spec".to_string()]
+            )
+            .await
+            .is_err());
+    }
 }
