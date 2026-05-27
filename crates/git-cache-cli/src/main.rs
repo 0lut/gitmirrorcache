@@ -144,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 vec![git_cache_core::RepoKey::parse(&repo)?]
             } else {
                 let mut repos = Vec::new();
-                for key in state.store.list_prefix("repos/", Some(100_000)).await? {
+                for key in state.store.list_prefix("repos/", None).await? {
                     if let Some(repo) = repo_from_generation_head_key(&key) {
                         repos.push(git_cache_core::RepoKey::parse(repo)?);
                     }
