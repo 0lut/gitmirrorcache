@@ -972,3 +972,118 @@ async fn list_prefix_respects_max_keys_limit() {
 
     let _ = fs::remove_dir_all(root).await;
 }
+
+/// Confirms the truncation bug: when `list_prefix("repos/", Some(N))` is
+/// used for session cleanup across many repos, sessions from repos that
+/// sort late alphabetically are permanently skipped because the first N
+/// keys (alphabetically) are dominated by non-session keys from earlier
+/// repos.
+#[tokio::test]
+async fn list_prefix_truncation_skips_late_alphabet_sessions() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    // Repo "aaa" has many non-session manifests that will appear first alphabetically.
+    for i in 0..10 {
+        store
+            .put(
+                &format!("repos/aaa/manifests/commits/{i:02}.json"),
+                Bytes::from("{}"),
+            )
+            .await
+            .unwrap();
+    }
+    // Repo "zzz" has one session manifest that sorts after all of aaa's keys.
+    store
+        .put(
+            "repos/zzz/manifests/sessions/expired.json",
+            Bytes::from("{}"),
+        )
+        .await
+        .unwrap();
+
+    // With a small limit, the zzz session is truncated away.
+    let bounded = store.list_prefix("repos/", Some(5)).await.unwrap();
+    let bounded_sessions: Vec<_> = bounded
+        .iter()
+        .filter(|k| k.contains("/manifests/sessions/"))
+        .collect();
+    assert!(
+        bounded_sessions.is_empty(),
+        "bounded listing should miss the zzz session — this confirms the truncation bug"
+    );
+
+    // With None, the session is found.
+    let unbounded = store.list_prefix("repos/", None).await.unwrap();
+    let unbounded_sessions: Vec<_> = unbounded
+        .iter()
+        .filter(|k| k.contains("/manifests/sessions/"))
+        .collect();
+    assert_eq!(
+        unbounded_sessions.len(),
+        1,
+        "unbounded listing finds the zzz session"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+/// Confirms the truncation bug for repoint_manifests_after_compaction:
+/// when `list_prefix("repos/{repo}/manifests/", Some(N))` is used and
+/// the repo has more manifests than N, ref manifests beyond the limit
+/// are never repointed and will reference deleted generations.
+#[tokio::test]
+async fn list_prefix_truncation_skips_ref_manifests() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    // Populate many commit manifests (sort before refs alphabetically).
+    for i in 0..10 {
+        store
+            .put(
+                &format!("repos/github.com/org/repo/manifests/commits/{i:02}.json"),
+                Bytes::from("{}"),
+            )
+            .await
+            .unwrap();
+    }
+    // Add a ref manifest that sorts after all commit manifests.
+    store
+        .put(
+            "repos/github.com/org/repo/manifests/refs/heads/main.json",
+            Bytes::from("{}"),
+        )
+        .await
+        .unwrap();
+
+    // With a small limit, the ref manifest is missed.
+    let bounded = store
+        .list_prefix("repos/github.com/org/repo/manifests/", Some(5))
+        .await
+        .unwrap();
+    let bounded_refs: Vec<_> = bounded
+        .iter()
+        .filter(|k| k.contains("/manifests/refs/"))
+        .collect();
+    assert!(
+        bounded_refs.is_empty(),
+        "bounded listing should miss the ref manifest — this confirms the truncation bug"
+    );
+
+    // With None, the ref manifest is found.
+    let unbounded = store
+        .list_prefix("repos/github.com/org/repo/manifests/", None)
+        .await
+        .unwrap();
+    let unbounded_refs: Vec<_> = unbounded
+        .iter()
+        .filter(|k| k.contains("/manifests/refs/"))
+        .collect();
+    assert_eq!(
+        unbounded_refs.len(),
+        1,
+        "unbounded listing finds the ref manifest"
+    );
+
+    let _ = fs::remove_dir_all(root).await;
+}

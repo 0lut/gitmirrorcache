@@ -23,8 +23,6 @@ use std::sync::Arc;
 use tokio::fs;
 use tracing::{debug, info, warn};
 
-const MAX_LIST_KEYS: usize = 100_000;
-
 pub struct Materializer {
     state: Arc<AppState>,
 }
@@ -668,11 +666,10 @@ impl Materializer {
         new_generation: GenerationId,
     ) -> CoreResult<()> {
         let prefix = format!("repos/{repo}/manifests/");
-        let keys = self
-            .state
-            .store
-            .list_prefix(&prefix, Some(MAX_LIST_KEYS))
-            .await?;
+        // Full listing required: after repointing, old generation bundles are
+        // deleted — any ref manifests missed by truncation would reference
+        // deleted generations, causing NotFound errors on materialization.
+        let keys = self.state.store.list_prefix(&prefix, None).await?;
         for key in keys {
             if key.contains("/manifests/commits/") && key.ends_with(".json") {
                 if let Some(mut manifest) =
@@ -1272,11 +1269,11 @@ impl Materializer {
     }
 
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
-        let keys = self
-            .state
-            .store
-            .list_prefix("repos/", Some(MAX_LIST_KEYS))
-            .await?;
+        // Full listing required: the broad "repos/" prefix covers all manifest
+        // types across all repos.  Truncation permanently skips sessions from
+        // repos that sort late alphabetically (deterministic ordering means
+        // the same keys are returned every run).
+        let keys = self.state.store.list_prefix("repos/", None).await?;
         let session_keys: Vec<String> = keys
             .into_iter()
             .filter(|k| k.contains("/manifests/sessions/") && k.ends_with(".json"))
