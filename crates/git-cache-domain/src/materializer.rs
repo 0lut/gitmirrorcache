@@ -904,7 +904,7 @@ impl Materializer {
         let remote = self.upstream_url(repo)?;
         self.state
             .git
-            .fetch_refs(
+            .fetch_refs_prune(
                 repo_dir,
                 &remote,
                 &["+refs/heads/*:refs/cache/upstream/heads/*".to_string()],

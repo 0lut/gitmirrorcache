@@ -51,18 +51,13 @@ pub trait ObjectStore: Send + Sync {
         self.put(key, Bytes::from(data)).await
     }
 
-    async fn get_to_file(&self, key: &str, path: &Path) -> Result<bool> {
-        match self.get(key).await? {
-            Some(data) => {
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                tokio::fs::write(path, &data).await?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
+    /// Stream an object directly to a file on disk without loading it into
+    /// memory.  Returns `Ok(false)` when the key does not exist.
+    ///
+    /// Every `ObjectStore` implementation **must** override this — the trait
+    /// intentionally has no default so that large-blob callers (bundle
+    /// hydration) can never silently fall back to an in-memory path.
+    async fn get_to_file(&self, key: &str, path: &Path) -> Result<bool>;
 }
 
 pub(crate) fn validate_key(key: &str) -> Result<()> {

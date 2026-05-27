@@ -435,16 +435,37 @@ impl Git {
         remote_url: &str,
         refspecs: &[String],
     ) -> Result<GitOutput> {
+        self.fetch_refs_inner(repo_dir, remote_url, refspecs, false)
+            .await
+    }
+
+    pub async fn fetch_refs_prune(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        refspecs: &[String],
+    ) -> Result<GitOutput> {
+        self.fetch_refs_inner(repo_dir, remote_url, refspecs, true)
+            .await
+    }
+
+    async fn fetch_refs_inner(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        refspecs: &[String],
+        prune: bool,
+    ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
         for refspec in refspecs {
             reject_refspec(refspec)?;
         }
-        let mut args: Vec<String> = vec![
-            "fetch".to_string(),
-            "--no-tags".to_string(),
-            "--".to_string(),
-            remote_url.to_string(),
-        ];
+        let mut args: Vec<String> = vec!["fetch".to_string(), "--no-tags".to_string()];
+        if prune {
+            args.push("--prune".to_string());
+        }
+        args.push("--".to_string());
+        args.push(remote_url.to_string());
         args.extend(refspecs.iter().cloned());
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         self.run(Some(repo_dir), args_ref)
