@@ -46,6 +46,30 @@ IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
 LATEST_URI="${ECR_REPOSITORY_URI}:latest"
 
+runtime_s3_prefix() {
+  local prefix="$1"
+  while [[ "$prefix" == /* ]]; do
+    prefix="${prefix#/}"
+  done
+  while [[ "$prefix" == */ ]]; do
+    prefix="${prefix%/}"
+  done
+  if [[ -z "$prefix" ]]; then
+    printf 'v2\n'
+    return
+  fi
+  local component="${prefix##*/}"
+  if [[ "$component" == "v2" || "$component" == *-v2 ]]; then
+    printf '%s\n' "$prefix"
+  elif [[ "$prefix" == */* ]]; then
+    printf '%s/%s-v2\n' "${prefix%/*}" "$component"
+  else
+    printf '%s-v2\n' "$prefix"
+  fi
+}
+
+S3_RUNTIME_PREFIX="${S3_RUNTIME_PREFIX:-$(runtime_s3_prefix "$S3_PREFIX")}"
+
 GIT_CACHE_DISK_MIN_FREE_BYTES="${GIT_CACHE_DISK_MIN_FREE_BYTES:-10737418240}"
 GIT_CACHE_DISK_QUOTA_BYTES="${GIT_CACHE_DISK_QUOTA_BYTES:-$((ECS_EBS_SIZE_GIB * 1024 * 1024 * 1024))}"
 if ((GIT_CACHE_DISK_QUOTA_BYTES < 0)); then
@@ -57,7 +81,7 @@ export ECS_ALB_NAME ECS_TARGET_GROUP_NAME ECS_ALB_SG_NAME ECS_TASK_SG_NAME ECS_L
 export ECS_EXECUTION_ROLE_NAME ECS_TASK_ROLE_NAME ECS_INSTANCE_ROLE_NAME ECS_INSTANCE_PROFILE_NAME
 export ECS_INSTANCE_NAME ECS_CPU ECS_MEMORY ECS_DESIRED_COUNT ECS_EC2_INSTANCE_TYPE ECS_CPU_ARCHITECTURE
 export ECS_EBS_SIZE_GIB ECS_EBS_VOLUME_TYPE ECS_EBS_IOPS ECS_EBS_THROUGHPUT ECS_EBS_DEVICE_NAME
-export IMAGE_URI GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_QUOTA_BYTES
+export IMAGE_URI S3_RUNTIME_PREFIX GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_QUOTA_BYTES
 
 ensure_role() {
   local role_name="$1"
@@ -129,7 +153,7 @@ import sys
 
 partition = os.environ["AWS_PARTITION"]
 bucket = os.environ["S3_BUCKET"]
-prefix = os.environ.get("S3_PREFIX", "").strip("/")
+prefix = os.environ.get("S3_RUNTIME_PREFIX", os.environ.get("S3_PREFIX", "")).strip("/")
 bucket_arn = f"arn:{partition}:s3:::{bucket}"
 object_arn = f"{bucket_arn}/{prefix}/*" if prefix else f"{bucket_arn}/*"
 list_statement = {
@@ -724,4 +748,5 @@ PUBLIC_BASE_URL=$public_base_url
 HEALTH_URL=$public_base_url/healthz
 ECS_EBS_SIZE_GIB=$ECS_EBS_SIZE_GIB
 GIT_CACHE_DISK_QUOTA_BYTES=$GIT_CACHE_DISK_QUOTA_BYTES
+S3_RUNTIME_PREFIX=$S3_RUNTIME_PREFIX
 EOF
