@@ -960,6 +960,23 @@ impl Materializer {
             .is_ok()
     }
 
+    async fn object_exists(&self, repo_dir: &FsPath, object_id: &CommitSha) -> bool {
+        self.state
+            .git
+            .run(Some(repo_dir), ["cat-file", "-e", object_id.as_str()])
+            .await
+            .is_ok()
+    }
+
+    async fn expose_served_commit(&self, repo_dir: &FsPath, commit: &CommitSha) -> CoreResult<()> {
+        let served_ref = format!("refs/git-cache-served/commits/{commit}");
+        self.state
+            .git
+            .update_ref(repo_dir, &served_ref, commit.as_str())
+            .await?;
+        Ok(())
+    }
+
     async fn resolve_short_commit(
         &self,
         repo_dir: &FsPath,
@@ -1109,7 +1126,7 @@ impl Materializer {
         .await?;
         fs::write(
             session_repo.join("config"),
-            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = true\n\tallowAnySHA1InWant = true\n",
+            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = true\n\tallowAnySHA1InWant = true\n\tallowReachableSHA1InWant = true\n",
         )
         .await?;
         fs::write(
@@ -1346,7 +1363,10 @@ impl Materializer {
                 Err(_) => continue,
             };
 
-            if self.commit_exists(&repo_dir, &commit).await {
+            if self.object_exists(&repo_dir, &commit).await {
+                if self.commit_exists(&repo_dir, &commit).await {
+                    self.expose_served_commit(&repo_dir, &commit).await?;
+                }
                 continue;
             }
 
@@ -1360,24 +1380,34 @@ impl Materializer {
             if self.state.config.git_remote.commit_read_through {
                 info!(%repo, %commit, "read-through fetch for unknown commit");
                 let upstream_url = self.upstream_url(repo)?;
-                self.state
+                let fetch_result = self
+                    .state
                     .git
                     .run(
                         Some(&repo_dir),
                         ["fetch", "--no-tags", "--", &upstream_url, commit.as_str()],
                     )
-                    .await
-                    .map_err(|err| {
-                        GitCacheError::NotFound(format!(
-                            "commit `{commit}` could not be fetched from upstream: {err}"
-                        ))
-                    })?;
+                    .await;
+
+                if let Err(fetch_err) = fetch_result {
+                    self.fetch_all_refs(repo, &repo_dir).await?;
+                    if self.object_exists(&repo_dir, &commit).await {
+                        if self.commit_exists(&repo_dir, &commit).await {
+                            self.expose_served_commit(&repo_dir, &commit).await?;
+                        }
+                        continue;
+                    }
+                    return Err(GitCacheError::NotFound(format!(
+                        "object `{commit}` could not be fetched from upstream: {fetch_err}"
+                    )));
+                }
 
                 if !self.commit_exists(&repo_dir, &commit).await {
                     return Err(GitCacheError::NotFound(format!(
                         "commit `{commit}` not found after upstream fetch"
                     )));
                 }
+                self.expose_served_commit(&repo_dir, &commit).await?;
 
                 // Create a ref so that `bundle create --all` has something
                 // to include.  We use refs/cache/ which is hidden from
@@ -1402,6 +1432,7 @@ impl Materializer {
 
     /// Configure a bare repo for serving via the direct Git remote:
     /// - `uploadpack.allowAnySHA1InWant=true`
+    /// - `uploadpack.allowReachableSHA1InWant=true`
     /// - `uploadpack.allowFilter=true`
     /// - `uploadpack.hideRefs=refs/cache`
     /// - `transfer.hideRefs=refs/cache`
@@ -1413,6 +1444,10 @@ impl Materializer {
         self.state
             .git
             .set_config(repo_dir, "uploadpack.allowFilter", "true")
+            .await?;
+        self.state
+            .git
+            .set_config(repo_dir, "uploadpack.allowReachableSHA1InWant", "true")
             .await?;
         self.state
             .git
@@ -1603,7 +1638,8 @@ pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u
     let caps = format!(
         "multi_ack thin-pack side-band side-band-64k ofs-delta \
          shallow deepen-since deepen-not deepen-relative no-progress \
-         include-tag multi_ack_detailed no-done filter{symref} \
+         include-tag multi_ack_detailed no-done filter \
+         allow-tip-sha1-in-want allow-reachable-sha1-in-want{symref} \
          object-format=sha1 agent=git-cache/1.0"
     );
 

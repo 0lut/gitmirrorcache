@@ -328,6 +328,34 @@ async fn fetch_exact_commit_sha() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn filtered_clone_checkout_fetches_blob_wants() {
+    let server = TestServer::start().await;
+    let url = server.git_url("github.com/org/repo");
+    let clone_dir = server.tmp.path().join("filtered");
+
+    run_git_async(
+        server.tmp.path(),
+        &[
+            "clone",
+            "--no-tags",
+            "--depth=1",
+            "--filter=blob:none",
+            "--no-checkout",
+            &url,
+            clone_dir.to_str().unwrap(),
+        ],
+    )
+    .await;
+    run_git_async(&clone_dir, &["checkout", "-q", "HEAD"]).await;
+
+    let cloned_head = git_stdout_async(&clone_dir, &["rev-parse", "HEAD"]).await;
+    assert_eq!(cloned_head, server.head_commit());
+
+    let readme = std::fs::read_to_string(clone_dir.join("README.md")).unwrap();
+    assert_eq!(readme.trim(), "initial");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn receive_pack_rejected_on_direct_remote() {
     let server = TestServer::start().await;
     let url = format!(
