@@ -16,8 +16,12 @@ use git_cache_objectstore::S3ObjectStore;
 use git_cache_objectstore::{LocalObjectStore, ObjectStore};
 #[cfg(feature = "s3")]
 use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+
+const OBJECT_STORE_SCHEMA_SUFFIX: &str = "v2";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,12 +29,15 @@ pub struct AppState {
     pub store: Arc<dyn ObjectStore>,
     pub git: Git,
     pub disk: AsyncDiskManager,
+    pub generation_verification_semaphore: Arc<Semaphore>,
 }
 
 impl AppState {
     pub fn try_new(config: AppConfig) -> CoreResult<Self> {
         let store: Arc<dyn ObjectStore> = match &config.object_store {
-            ObjectStoreConfig::Local { root } => Arc::new(LocalObjectStore::new(root)),
+            ObjectStoreConfig::Local { root } => {
+                Arc::new(LocalObjectStore::new(v2_local_store_root(root)))
+            }
             ObjectStoreConfig::S3 {
                 bucket,
                 prefix,
@@ -38,7 +45,11 @@ impl AppState {
             } => {
                 #[cfg(feature = "s3")]
                 {
-                    Arc::new(s3_store(bucket, prefix, endpoint.as_deref())?)
+                    Arc::new(s3_store(
+                        bucket,
+                        &v2_s3_prefix(prefix),
+                        endpoint.as_deref(),
+                    )?)
                 }
                 #[cfg(not(feature = "s3"))]
                 {
@@ -55,7 +66,9 @@ impl AppState {
 
     pub async fn try_new_async(config: AppConfig) -> CoreResult<Self> {
         let store: Arc<dyn ObjectStore> = match &config.object_store {
-            ObjectStoreConfig::Local { root } => Arc::new(LocalObjectStore::new(root)),
+            ObjectStoreConfig::Local { root } => {
+                Arc::new(LocalObjectStore::new(v2_local_store_root(root)))
+            }
             ObjectStoreConfig::S3 {
                 bucket,
                 prefix,
@@ -63,7 +76,9 @@ impl AppState {
             } => {
                 #[cfg(feature = "s3")]
                 {
-                    Arc::new(s3_store_async(bucket, prefix, endpoint.as_deref()).await?)
+                    Arc::new(
+                        s3_store_async(bucket, &v2_s3_prefix(prefix), endpoint.as_deref()).await?,
+                    )
                 }
                 #[cfg(not(feature = "s3"))]
                 {
@@ -91,14 +106,54 @@ impl AppState {
             config.disk.quota_bytes,
             config.disk.min_free_bytes,
         );
+        let max_concurrent_generation_verifications =
+            config.max_concurrent_generation_verifications.max(1);
 
         Ok(Self {
             config,
             store,
             git,
             disk: AsyncDiskManager::new(disk),
+            generation_verification_semaphore: Arc::new(Semaphore::new(
+                max_concurrent_generation_verifications,
+            )),
         })
     }
+}
+
+fn v2_local_store_root(root: &Path) -> PathBuf {
+    let Some(file_name) = root.file_name().and_then(|name| name.to_str()) else {
+        return root.join(OBJECT_STORE_SCHEMA_SUFFIX);
+    };
+    if is_v2_component(file_name) {
+        return root.to_path_buf();
+    }
+    root.with_file_name(format!("{file_name}-{OBJECT_STORE_SCHEMA_SUFFIX}"))
+}
+
+#[cfg(any(feature = "s3", test))]
+fn v2_s3_prefix(prefix: &str) -> String {
+    let normalized = prefix.trim_matches('/');
+    if normalized.is_empty() {
+        return OBJECT_STORE_SCHEMA_SUFFIX.to_string();
+    }
+
+    if let Some((parent, component)) = normalized.rsplit_once('/') {
+        if is_v2_component(component) {
+            normalized.to_string()
+        } else {
+            format!("{parent}/{component}-{OBJECT_STORE_SCHEMA_SUFFIX}")
+        }
+    } else if is_v2_component(normalized) {
+        normalized.to_string()
+    } else {
+        format!("{normalized}-{OBJECT_STORE_SCHEMA_SUFFIX}")
+    }
+}
+
+fn is_v2_component(component: &str) -> bool {
+    component == OBJECT_STORE_SCHEMA_SUFFIX
+        || component.ends_with(&format!("-{OBJECT_STORE_SCHEMA_SUFFIX}"))
 }
 
 #[cfg(feature = "s3")]
@@ -256,4 +311,35 @@ pub fn with_optional_upstream_credentials(git: Git, config: &AppConfig) -> Git {
             "GIT_CONFIG_VALUE_0",
             format!("Authorization: Bearer {token}"),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_store_root_gets_v2_suffix() {
+        assert_eq!(
+            v2_local_store_root(Path::new("/tmp/object-store")),
+            PathBuf::from("/tmp/object-store-v2")
+        );
+        assert_eq!(
+            v2_local_store_root(Path::new("/tmp/object-store-v2")),
+            PathBuf::from("/tmp/object-store-v2")
+        );
+        assert_eq!(
+            v2_local_store_root(Path::new("/")),
+            PathBuf::from("/").join("v2")
+        );
+    }
+
+    #[test]
+    fn s3_prefix_gets_v2_suffix() {
+        assert_eq!(v2_s3_prefix("repos"), "repos-v2");
+        assert_eq!(v2_s3_prefix("prod/repos"), "prod/repos-v2");
+        assert_eq!(v2_s3_prefix("/prod/repos/"), "prod/repos-v2");
+        assert_eq!(v2_s3_prefix("repos-v2"), "repos-v2");
+        assert_eq!(v2_s3_prefix("prod/v2"), "prod/v2");
+        assert_eq!(v2_s3_prefix(""), "v2");
+    }
 }

@@ -79,6 +79,7 @@ impl TestServer {
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             session_cleanup_interval_secs: 300,
+            max_concurrent_generation_verifications: 1,
         };
 
         let router = app(config);

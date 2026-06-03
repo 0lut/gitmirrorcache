@@ -89,6 +89,7 @@ impl ApiState {
         let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
         let leases = Arc::new(InMemoryRepoLeaseManager::new());
         let coordinator = UpdateCoordinator::new(executor, leases);
+        Materializer::new(Arc::clone(&domain)).enqueue_pending_generation_scan();
         Ok(Self {
             domain,
             coordinator,
@@ -587,6 +588,7 @@ mod tests {
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             session_cleanup_interval_secs: 300,
+            max_concurrent_generation_verifications: 1,
         };
         let api_state = ApiState::try_new(config).unwrap();
         let mut query = HashMap::new();
