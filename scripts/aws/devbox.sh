@@ -8,7 +8,7 @@ init_aws_context
 require_cmd curl
 
 DEVBOX_NAME="${DEVBOX_NAME:-$NAME_PREFIX-devbox}"
-DEVBOX_INSTANCE_TYPE="${DEVBOX_INSTANCE_TYPE:-t3.micro}"
+DEVBOX_INSTANCE_TYPE="${DEVBOX_INSTANCE_TYPE:-t4g.micro}"
 DEVBOX_KEY_NAME="${DEVBOX_KEY_NAME:-$NAME_PREFIX-devbox}"
 DEVBOX_SSH_USER="${DEVBOX_SSH_USER:-ec2-user}"
 
@@ -204,7 +204,7 @@ base_url="$(app_base_url)"
 
 instance_id="$(existing_instance_id)"
 if [[ "$instance_id" == "None" || -z "$instance_id" ]]; then
-  ami_id="${DEVBOX_AMI_ID:-$(aws_cli ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)}"
+  ami_id="${DEVBOX_AMI_ID:-$(aws_cli ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 --query Parameter.Value --output text)}"
   user_data="$(mktemp)"
   write_user_data "$user_data" "$base_url"
   printf 'creating devbox instance: %s\n' "$DEVBOX_NAME"

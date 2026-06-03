@@ -2,15 +2,15 @@
 
 ## Current AWS Deployment Path
 
-Use **ECS on EC2 with host-mounted EBS** for large repository deployments.
+Use **ECS on Graviton EC2 with host-mounted EBS** for large repository deployments.
 Object storage remains the durable source of truth, and the EC2 EBS volume is a
 hot cache mounted at `/cache` that survives task/container replacement on the
 same host.
 
 ```sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev scripts/aws/bootstrap.sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev scripts/aws/deploy-ecs-ec2-ebs.sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev scripts/aws/smoke-test.sh
+AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/bootstrap.sh
+AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-ecs-ec2-ebs.sh
+AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/smoke-test.sh
 ```
 
 `bootstrap.sh` creates the shared S3 bucket and ECR repository. The ECS deploy
@@ -27,14 +27,15 @@ Common overrides:
 
 ```sh
 APP_NAME=gitmirrorcache
-ENVIRONMENT=dev
+ENVIRONMENT=dev-arm
+NAME_PREFIX=gitmirrorcache-arm
 AWS_REGION=us-west-2
-ECS_EC2_INSTANCE_TYPE=m7i.xlarge
-ECS_CPU_ARCHITECTURE=X86_64
-DOCKER_PLATFORM=linux/amd64
+ECS_EC2_INSTANCE_TYPE=m8g.2xlarge
+ECS_CPU_ARCHITECTURE=ARM64
+DOCKER_PLATFORM=linux/arm64
 ECS_EBS_SIZE_GIB=128
-ECS_CPU=4096
-ECS_MEMORY=8192
+ECS_CPU=8192
+ECS_MEMORY=24576
 PUBLIC_BASE_URL=https://cache.example.com
 GITHUB_TOKEN_SECRET_ARN=arn:aws:secretsmanager:us-west-2:123456789012:secret:github-token
 ```
@@ -51,7 +52,7 @@ service needs to keep hydrated bare repositories and large Git bundle work files
 on block storage to avoid repeatedly rehydrating or regenerating expensive cache
 state.
 
-ECS on EC2 with host-mounted EBS gives the service:
+ECS on Graviton EC2 with host-mounted EBS gives the service:
 
 - controllable disk size and gp3 performance settings
 - hot-cache persistence across task replacement on the same instance
@@ -97,8 +98,8 @@ ECS rollout state:
 
 ```sh
 aws ecs describe-services \
-  --cluster gitmirrorcache-dev-ec2 \
-  --services gitmirrorcache-dev-ec2-api \
+  --cluster gitmirrorcache-arm-ec2 \
+  --services gitmirrorcache-arm-ec2-api \
   --query 'services[0].{Running:runningCount,Pending:pendingCount,Desired:desiredCount,Deployments:deployments}'
 ```
 
@@ -106,7 +107,7 @@ ALB target health:
 
 ```sh
 tg_arn="$(aws elbv2 describe-target-groups \
-  --names gitmirrorcache-dev-ec2-host-api \
+  --names gitmirrorcache-arm-ec2-host-api \
   --query 'TargetGroups[0].TargetGroupArn' \
   --output text)"
 aws elbv2 describe-target-health --target-group-arn "$tg_arn"
@@ -115,7 +116,7 @@ aws elbv2 describe-target-health --target-group-arn "$tg_arn"
 Recent logs:
 
 ```sh
-aws logs tail /ecs/gitmirrorcache-dev/ec2-api --since 30m --format short
+aws logs tail /ecs/gitmirrorcache-arm/ec2-api --since 30m --format short
 ```
 
 If an ECS rollout appears stuck while the old task is stopped, check the host for

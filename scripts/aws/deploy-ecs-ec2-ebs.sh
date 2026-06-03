@@ -30,18 +30,18 @@ ECS_INSTANCE_PROFILE_NAME="${ECS_INSTANCE_PROFILE_NAME:-$ECS_INSTANCE_ROLE_NAME}
 ECS_INSTANCE_NAME="${ECS_INSTANCE_NAME:-$NAME_PREFIX-ecs-cache}"
 ECS_LOG_GROUP="${ECS_LOG_GROUP:-/ecs/$NAME_PREFIX/ec2-api}"
 
-ECS_CPU="${ECS_CPU:-4096}"
-ECS_MEMORY="${ECS_MEMORY:-8192}"
+ECS_CPU="${ECS_CPU:-8192}"
+ECS_MEMORY="${ECS_MEMORY:-24576}"
 ECS_DESIRED_COUNT="${ECS_DESIRED_COUNT:-1}"
-ECS_EC2_INSTANCE_TYPE="${ECS_EC2_INSTANCE_TYPE:-m7i.xlarge}"
-ECS_CPU_ARCHITECTURE="${ECS_CPU_ARCHITECTURE:-X86_64}"
+ECS_EC2_INSTANCE_TYPE="${ECS_EC2_INSTANCE_TYPE:-m8g.2xlarge}"
+ECS_CPU_ARCHITECTURE="${ECS_CPU_ARCHITECTURE:-ARM64}"
 ECS_EBS_SIZE_GIB="${ECS_EBS_SIZE_GIB:-128}"
 ECS_EBS_VOLUME_TYPE="${ECS_EBS_VOLUME_TYPE:-gp3}"
 ECS_EBS_IOPS="${ECS_EBS_IOPS:-3000}"
 ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-125}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
 ECS_SKIP_DOCKER_BUILD="${ECS_SKIP_DOCKER_BUILD:-false}"
-DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
 LATEST_URI="${ECR_REPOSITORY_URI}:latest"
@@ -369,8 +369,15 @@ build_and_push_image() {
 }
 
 ecs_optimized_ami_id() {
+  local ami_parameter
+  ami_parameter="${ECS_EC2_AMI_PARAMETER:-}"
+  if [[ -z "$ami_parameter" ]]; then
+    [[ "$ECS_CPU_ARCHITECTURE" == "ARM64" ]] || die "ECS_EC2_AMI_PARAMETER must be set for $ECS_CPU_ARCHITECTURE"
+    ami_parameter="/aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id"
+  fi
+
   aws_cli ssm get-parameter \
-    --name "${ECS_EC2_AMI_PARAMETER:-/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id}" \
+    --name "$ami_parameter" \
     --query Parameter.Value \
     --output text
 }
