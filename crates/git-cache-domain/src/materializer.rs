@@ -4104,6 +4104,7 @@ mod tests {
             store: Arc::clone(&minio.store),
             git,
             disk: AsyncDiskManager::new(disk),
+            generation_verification_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
         });
         let materializer = Materializer::new(Arc::clone(&state));
 
