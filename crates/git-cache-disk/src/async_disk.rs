@@ -41,6 +41,13 @@ impl AsyncDiskManager {
             .map_err(join_error)?
     }
 
+    pub async fn touch_repo_access(&self, repo_path: PathBuf) -> Result<RepoIndexEntry> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.touch_repo_access(repo_path))
+            .await
+            .map_err(join_error)?
+    }
+
     pub async fn invalidate_repo(&self, repo_path: PathBuf) -> Result<()> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.invalidate_repo(repo_path))
