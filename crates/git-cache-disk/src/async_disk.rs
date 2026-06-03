@@ -41,6 +41,20 @@ impl AsyncDiskManager {
             .map_err(join_error)?
     }
 
+    pub async fn touch_repo_access(&self, repo_path: PathBuf) -> Result<RepoIndexEntry> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.touch_repo_access(repo_path))
+            .await
+            .map_err(join_error)?
+    }
+
+    pub async fn invalidate_repo(&self, repo_path: PathBuf) -> Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.invalidate_repo(repo_path))
+            .await
+            .map_err(join_error)?
+    }
+
     pub async fn cleanup_stale_temps(&self, older_than: Duration) -> Result<CleanupReport> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || inner.cleanup_stale_temps(older_than))
@@ -160,5 +174,23 @@ mod tests {
 
         // Sync drop should still clean up
         assert!(!temp_path.exists());
+    }
+
+    #[tokio::test]
+    async fn invalidate_repo_delegates_to_inner_manager() {
+        let dm = test_disk_manager();
+        let repo_dir = dm.repos_dir().join("repo.git");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("pack"), vec![0u8; 8]).unwrap();
+        dm.record_repo_access("repo.git").unwrap();
+        let async_dm = AsyncDiskManager::new(dm);
+
+        async_dm
+            .invalidate_repo(PathBuf::from("repo.git"))
+            .await
+            .unwrap();
+
+        let index = async_dm.repo_index().await.unwrap();
+        assert!(!index.repos.contains_key(std::path::Path::new("repo.git")));
     }
 }

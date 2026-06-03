@@ -64,6 +64,11 @@ S3 remains the durable cache source. The EBS volume is still disposable from a
 correctness perspective; losing it should only force hydration from object
 storage or upstream verification.
 
+The application appends the v2 schema suffix to the configured object-store
+namespace at runtime. For example, `S3_PREFIX=repos` is served from `repos-v2`.
+The ECS deploy script grants task IAM access to that runtime prefix while still
+passing the base prefix to the container.
+
 ## Deployment Findings
 
 The large-repository investigation found two important cache behaviors:

@@ -1,16 +1,19 @@
 use crate::{
-    acquire_lease, commit_manifest_key, generation_manifest_key, lease_key, read_commit_manifest,
-    read_generation_manifest, read_lease, read_ref_manifest, read_repo_generation_head,
-    read_session_manifest, ref_manifest_key, repo_generation_head_key, session_manifest_key,
-    validate_key, write_generation_manifest, write_generation_manifest_if_absent_or_matches,
-    write_ref_manifest_if_absent_or_matches, write_repo_generation_head, GenerationPublish,
-    LeaseManifest, LocalObjectStore, ObjectStore, PublishManifests,
+    acquire_lease, commit_manifest_key, generation_manifest_key, lease_key,
+    pending_generation_publish_key, read_commit_manifest, read_generation_manifest, read_lease,
+    read_pending_generation_publish, read_ref_manifest, read_repo_generation_head,
+    read_session_manifest, read_verified_generation_manifest, ref_manifest_key,
+    repo_generation_head_key, session_manifest_key, validate_key, verified_generation_manifest_key,
+    write_generation_manifest, write_generation_manifest_if_absent_or_matches,
+    write_ref_manifest_if_absent_or_matches, write_repo_generation_head,
+    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, LeaseManifest,
+    LocalObjectStore, ObjectStore, PendingGenerationPublish, PublishManifests,
 };
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
     CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoGenerationHead,
-    RepoKey, SessionId, SessionManifest,
+    RepoKey, SessionId, SessionManifest, VerifiedGenerationManifest,
 };
 use std::path::Path;
 use tokio::fs;
@@ -62,6 +65,25 @@ fn generation_manifest(repo: &RepoKey) -> GenerationManifest {
         parent_generation: None,
         created_at: ts(1),
         commits: vec![commit('a')],
+    }
+}
+
+fn verified_generation_manifest(manifest: &GenerationManifest) -> VerifiedGenerationManifest {
+    VerifiedGenerationManifest {
+        schema_version: 2,
+        repo: manifest.repo.clone(),
+        generation: manifest.generation,
+        bundle_key: manifest.bundle_key.clone(),
+        bundle_len: 12,
+        bundle_sha256: "eb333942340dfa7da54597d78b894f35310289e75ec3a84137a197a37ab1d164".into(),
+        parent_generation: manifest.parent_generation,
+        created_at: manifest.created_at,
+        verified_at: ts(6),
+        verifier_version: 1,
+        git_version: "git version test".into(),
+        fsck_mode: "connectivity-only".into(),
+        commits: manifest.commits.clone(),
+        tip_commits: manifest.commits.clone(),
     }
 }
 
@@ -119,6 +141,42 @@ async fn delete_nonexistent_key_is_noop() {
     let store = LocalObjectStore::new(&root);
 
     store.delete("does/not/exist.json").await.unwrap();
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn verified_generation_manifest_round_trips() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+    let repo = repo();
+    let generation = generation_manifest(&repo);
+    let verification = verified_generation_manifest(&generation);
+
+    assert!(
+        write_verified_generation_manifest_if_absent_or_matches(&store, &verification)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !write_verified_generation_manifest_if_absent_or_matches(&store, &verification)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(
+        read_verified_generation_manifest(&store, &repo, generation.generation)
+            .await
+            .unwrap(),
+        Some(verification)
+    );
+    assert_eq!(
+        verified_generation_manifest_key(&repo, generation.generation),
+        format!(
+            "repos/{repo}/generations/{}/verified.json",
+            generation.generation
+        )
+    );
 
     let _ = fs::remove_dir_all(root).await;
 }
@@ -319,6 +377,7 @@ async fn publish_writes_bundle_generation_then_manifests() {
     let repo = repo();
 
     let generation = generation_manifest(&repo);
+    let verification = verified_generation_manifest(&generation);
     let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
     let reference = ref_manifest_with_gen(&repo, generation.generation);
     let session = session_manifest(&repo);
@@ -329,7 +388,8 @@ async fn publish_writes_bundle_generation_then_manifests() {
             refs: vec![reference.clone()],
             sessions: vec![session.clone()],
         },
-    );
+    )
+    .with_verification(verification.clone());
 
     assert!(publish
         .publish_bundle_file(&store, root.join("missing.bundle"))
@@ -353,6 +413,12 @@ async fn publish_writes_bundle_generation_then_manifests() {
             .await
             .unwrap(),
         Some(generation.clone())
+    );
+    assert_eq!(
+        read_verified_generation_manifest(&store, &repo, generation.generation)
+            .await
+            .unwrap(),
+        Some(verification)
     );
     assert_eq!(
         read_commit_manifest(&store, &repo, &commit_manifest.commit)
@@ -385,6 +451,92 @@ async fn publish_writes_bundle_generation_then_manifests() {
             .await
             .is_err()
     );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn pending_publish_writes_only_bundle_and_pending_metadata() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+    let repo = repo();
+    fs::create_dir_all(&root).await.unwrap();
+
+    let generation = generation_manifest(&repo);
+    let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
+    let reference = ref_manifest_with_gen(&repo, generation.generation);
+    let session = session_manifest(&repo);
+    let head = RepoGenerationHead {
+        repo: repo.clone(),
+        generation: generation.generation,
+        tip_commits: generation.commits.clone(),
+        updated_at: ts(7),
+    };
+    let default_ref = RefManifest {
+        repo: repo.clone(),
+        ref_name: "HEAD".into(),
+        commit: commit_manifest.commit.clone(),
+        generation: generation.generation,
+        verified_at: ts(8),
+    };
+    let publish = GenerationPublish::with_manifests(
+        generation.clone(),
+        PublishManifests {
+            commits: vec![commit_manifest.clone()],
+            refs: vec![reference.clone()],
+            sessions: vec![session.clone()],
+        },
+    );
+    let bundle_path = root.join("pending.bundle");
+    fs::write(&bundle_path, b"bundle-bytes").await.unwrap();
+
+    publish
+        .publish_pending_bundle_file(
+            &store,
+            &bundle_path,
+            head.clone(),
+            Some(default_ref.clone()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.get(&generation.bundle_key).await.unwrap().unwrap(),
+        Bytes::from_static(b"bundle-bytes")
+    );
+    assert_eq!(
+        read_pending_generation_publish(&store, &repo, generation.generation)
+            .await
+            .unwrap(),
+        Some(PendingGenerationPublish {
+            generation: generation.clone(),
+            manifests: publish.manifests.clone(),
+            head,
+            default_ref: Some(default_ref)
+        })
+    );
+    assert_eq!(
+        pending_generation_publish_key(&repo, generation.generation),
+        format!("pending-generations/{repo}/{}.json", generation.generation)
+    );
+    assert!(
+        read_generation_manifest(&store, &repo, generation.generation)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(read_commit_manifest(&store, &repo, &commit_manifest.commit)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(read_ref_manifest(&store, &repo, &reference.ref_name)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(read_repo_generation_head(&store, &repo)
+        .await
+        .unwrap()
+        .is_none());
 
     let _ = fs::remove_dir_all(root).await;
 }

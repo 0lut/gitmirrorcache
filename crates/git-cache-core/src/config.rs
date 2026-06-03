@@ -34,6 +34,8 @@ pub struct AppConfig {
     pub max_concurrent_git_processes: usize,
     #[serde(default = "default_session_cleanup_interval_secs")]
     pub session_cleanup_interval_secs: u64,
+    #[serde(default = "default_max_concurrent_generation_verifications")]
+    pub max_concurrent_generation_verifications: usize,
 }
 
 impl AppConfig {
@@ -115,6 +117,10 @@ impl AppConfig {
             session_cleanup_interval_secs: parse_env(
                 "GIT_CACHE_SESSION_CLEANUP_INTERVAL_SECS",
                 default_session_cleanup_interval_secs(),
+            )?,
+            max_concurrent_generation_verifications: parse_env(
+                "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
+                default_max_concurrent_generation_verifications(),
             )?,
         })
     }
@@ -265,6 +271,10 @@ fn default_session_cleanup_interval_secs() -> u64 {
     300
 }
 
+pub fn default_max_concurrent_generation_verifications() -> usize {
+    1
+}
+
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> crate::Result<T>
 where
     T::Err: std::fmt::Display,
@@ -343,6 +353,7 @@ mod tests {
         "GIT_CACHE_COMPACTION_INLINE",
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
         "GIT_CACHE_SESSION_CLEANUP_INTERVAL_SECS",
+        "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
     ];
 
     struct EnvGuard {
@@ -440,6 +451,7 @@ min_free_bytes = 100000
         assert_eq!(config.rate_limit_per_minute, 120);
         assert_eq!(config.max_git_output_bytes, 16 * 1024 * 1024);
         assert_eq!(config.compaction, CompactionConfig::default());
+        assert_eq!(config.max_concurrent_generation_verifications, 1);
     }
 
     #[test]
@@ -484,6 +496,7 @@ min_free_bytes = 100000
             ("GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "off"),
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
+            ("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "3"),
         ]);
 
         let config = AppConfig::from_env().unwrap();
@@ -498,6 +511,7 @@ min_free_bytes = 100000
         assert!(!config.git_remote.commit_read_through);
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
+        assert_eq!(config.max_concurrent_generation_verifications, 3);
 
         match config.object_store {
             ObjectStoreConfig::S3 {

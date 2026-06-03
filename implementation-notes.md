@@ -213,3 +213,124 @@ compaction is part of the publish path when enabled.
 ### C3. `Git::run` already supports dynamic args
 The git wrapper's `run` accepts any `IntoIterator<Item = impl AsRef<OsStr>>`, so
 no separate `run_vec` helper was needed for `bundle_create_incremental`.
+
+---
+
+# Implementation Notes: Verified S3 Generations and Deferred Fsck
+
+## Overview
+
+We are changing the cache contract so clone/materialize requests do not block on
+full-repo `git fsck --connectivity-only`. Durable S3 cache data is trusted only
+when there is a verified sidecar manifest for the exact bundle bytes. Request
+paths should serve from local/upstream-fetched commits immediately, then enqueue
+background verification/publication for future cold workers.
+
+## Decisions not in the spec
+
+### 1. Use a verified sidecar instead of rewriting generation manifests
+
+I added `VerifiedGenerationManifest` as a sidecar at
+`repos/{repo}/generations/{generation}/verified.json`. This lets durable commit
+and ref manifests mean "verified" while keeping existing generation manifest
+shape mostly stable during the refactor.
+
+### 2. Check SHA-256 from disk after object-store download
+
+Hydration now downloads the bundle to disk, computes SHA-256 with a bounded
+1 MiB buffer, checks byte length and digest, then runs `git fetch` from the
+bundle. This avoids loading large bundles into memory and follows the repo's
+bounded-allocation rules.
+
+### 3. Keep one publish-time fsck temporarily
+
+The first implementation slice still keeps `publish_generation`'s fsck because
+that is currently what makes the new verified sidecar truthful. The remaining
+work is to move that verification into an async background publisher so the
+request path no longer pays for it.
+
+### 4. Create `TODOs.md` as active tracker
+
+The repo already had `TODO.md`, but the request explicitly asked to refresh
+`TODOs.md`. I created `TODOs.md` as the active tracker for this local-agent
+work rather than rewriting the historical milestone file.
+
+## Tradeoffs
+
+### T1. Runtime applies a physical v2 object-store namespace
+
+The code still uses existing logical object keys (`repos/...`,
+`pending-generations/...`) inside the object-store adapter. Runtime store wiring
+now adds a physical v2 suffix to the configured namespace so a deploy
+automatically writes to a clean keyspace:
+
+- local root `./tmp/object-store` resolves to `./tmp/object-store-v2`;
+- S3 prefix `repos` resolves to `repos-v2`;
+- already-suffixed values such as `repos-v2` are left unchanged.
+
+### T2. Verified hydrate rejects missing sidecars
+
+Cold hydration now requires `verified.json`. That is intentional for the clean
+v2 model: unverified S3 data should not be rescued by request-path fsck. In a
+fresh v2 deployment, missing verified manifests will cause fallback paths to use
+upstream/local fetch and enqueue publication.
+
+## Final deferred-fsck implementation notes
+
+### 5. Pending generation publishes are verifier work items
+
+The request path now uploads the generated bundle and writes a pending work item
+under `pending-generations/{repo}/{generation}.json`. It does **not** write
+canonical generation, commit, ref, default, or generation-head manifests. This
+keeps the v2 invariant clear: canonical manifests are durable verified state;
+pending publishes are internal work queue state.
+
+### 6. Canonical manifests are verifier-gated
+
+The background verifier downloads the pending bundle chain into a scratch bare
+repo, fetches each bundle, runs `git fsck --connectivity-only`, computes bundle
+length/SHA-256, writes `verified.json`, then publishes canonical generation,
+commit/ref/default, and generation-head manifests. Hydration reads only canonical
+generation manifests and still requires the verified sidecar.
+
+### 7. Request paths serve local refs instead of waiting for manifests
+
+Branch/default materialization after upstream validation now creates sessions
+from the locally fetched `refs/cache/upstream/heads/*` ref. This preserves fast
+request responses while durable manifests appear asynchronously after verifier
+success.
+
+### 8. Bounded background verification
+
+A new `max_concurrent_generation_verifications` config field bounds concurrent
+background verifier tasks with a semaphore. The default is `1` to avoid multiple
+large-repo fscks competing for CPU/disk IO. Example configs were updated.
+
+### 9. Verification publication ordering
+
+For a pending generation, the verifier publishes the verified sidecar before the
+canonical generation manifest, then commit/ref manifests, then generation-head.
+Tests that assert generation-head state now wait for the head because commit
+manifests can become visible slightly before the head write.
+
+### 10. Compaction follows the same pending path
+
+Compaction no longer writes an unverified canonical generation manifest. It
+publishes its compacted bundle as a pending generation, runs verification, then
+repoints canonical manifests and updates the head.
+
+## Tradeoffs added during final implementation
+
+### T3. Startup pending scan resumes interrupted verification
+
+The verifier is enqueue-on-publish, and API startup also scans the global
+`pending-generations/` prefix and re-enqueues any leftover pending generations.
+This covers process exits after the request path writes pending metadata but
+before background verification finishes. The scan is bounded to avoid unbounded
+object-store listings.
+
+### T4. Configured object-store namespace remains the base name
+
+Operators can keep existing config values such as `prefix = "repos"` or
+`root = "./tmp/object-store"`. The domain state builder appends the v2 suffix at
+runtime and avoids double-suffixing if a config already contains `-v2` or `v2`.
