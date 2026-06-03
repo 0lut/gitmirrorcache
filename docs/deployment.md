@@ -9,8 +9,7 @@ same host.
 
 ```sh
 AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/bootstrap.sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-ecs-ec2-ebs.sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/smoke-test.sh
+AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-and-smoke.sh
 ```
 
 `bootstrap.sh` creates the shared S3 bucket and ECR repository. The ECS deploy
@@ -128,14 +127,29 @@ If an ECS rollout appears stuck while the old task is stopped, check the host fo
 a stale Docker container still holding port `8080`:
 
 ```sh
-aws ssm send-command \
-  --instance-ids i-xxxxxxxxxxxxxxxxx \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["docker ps -a --format \"{{.ID}} {{.Image}} {{.Names}} {{.Status}} {{.Ports}}\"","sudo ss -ltnp | grep :8080 || true"]'
+AWS_REGION=us-west-2 \
+ENVIRONMENT=dev-arm \
+NAME_PREFIX=gitmirrorcache-arm \
+ECS_INSTANCE_ID=i-xxxxxxxxxxxxxxxxx \
+scripts/aws/ecs-host-diagnostics.sh
 ```
 
 Stop only the stale prior-revision container if ECS has already replaced the
 task and the stale process is blocking the new revision from binding `8080`.
+Use the checked-in recovery script rather than one-off SSM commands:
+
+```sh
+AWS_REGION=us-west-2 \
+ENVIRONMENT=dev-arm \
+NAME_PREFIX=gitmirrorcache-arm \
+ECS_INSTANCE_ID=i-xxxxxxxxxxxxxxxxx \
+ECS_STALE_CONTAINER_ID=<docker-container-id> \
+CONFIRM_STOP=true \
+scripts/aws/stop-stale-ecs-container.sh
+```
+
+The script verifies the container belongs to the expected ECS task family and
+container name before stopping it.
 
 ## Worker Model
 

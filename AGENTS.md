@@ -80,3 +80,18 @@ let Ok(mut state) = self.state.lock() else {
    relying on drop, and never call `temp_path()` after `release()`.
 4. **`kill_on_drop(true)`** is mandatory on all `tokio::process::Command`
    child processes to prevent zombie accumulation.
+
+## Deployment operations
+
+Use checked-in deployment scripts instead of ad-hoc AWS/SSM/Docker commands.
+For the maintained ECS/EC2/EBS deployment, use:
+
+```sh
+AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-and-smoke.sh
+```
+
+If an ECS rollout is stuck because a prior-revision container is still holding
+host port `8080`, inspect with `scripts/aws/ecs-host-diagnostics.sh`, then use
+`scripts/aws/stop-stale-ecs-container.sh` with `ECS_STALE_CONTAINER_ID` and
+`CONFIRM_STOP=true`. This script validates the ECS task family/container labels
+before stopping anything.
