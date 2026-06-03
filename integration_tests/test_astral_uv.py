@@ -114,6 +114,7 @@ class AstralUvIntegrationTest(unittest.TestCase):
         cls.cache_root = cls.tmp / "cache"
         cls.object_root = cls.tmp / "object-store"
         cls.object_prefix = f"{MINIO_PREFIX}/astral-uv/{cls.tmp.name}"
+        api_bin = os.environ.get("GIT_CACHE_API_BIN") or None
 
         if USE_MINIO_BACKEND:
             config_path = cls.tmp / "config.toml"
@@ -139,10 +140,18 @@ branch_ref_check = "always"
 commit_read_through = true
 """
             )
-            run(["cargo", "build", "-p", "git-cache-api", "--features", "s3"])
+            if api_bin is None:
+                run(["cargo", "build", "-p", "git-cache-api", "--features", "s3"])
         else:
             config_path = None
-            run(["cargo", "build", "-p", "git-cache-api"])
+            if api_bin is None:
+                run(["cargo", "build", "-p", "git-cache-api"])
+
+        api_bin_path = Path(api_bin) if api_bin is not None else REPO_ROOT / "target/debug/git-cache-api"
+        if not api_bin_path.is_absolute():
+            api_bin_path = REPO_ROOT / api_bin_path
+        if not api_bin_path.exists():
+            raise FileNotFoundError(api_bin_path)
 
         env = os.environ.copy()
         env.update(
@@ -160,7 +169,7 @@ commit_read_through = true
             env["GIT_CACHE_CONFIG"] = str(config_path)
             env.update(minio_env())
         cls.server = subprocess.Popen(
-            [str(REPO_ROOT / "target/debug/git-cache-api")],
+            [str(api_bin_path)],
             cwd=REPO_ROOT,
             env=env,
             text=True,

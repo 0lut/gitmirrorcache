@@ -111,10 +111,45 @@ jobs:
       - name: Run MinIO Rust test shard
         run: ${{ matrix.command }}
 
+  minio-python-api-build:
+    name: MinIO Python API Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-minio-python-api-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-minio-python-api-
+            ${{ runner.os }}-cargo-minio-
+            ${{ runner.os }}-cargo-
+
+      - name: Build git-cache-api with S3 backend
+        run: cargo build -p git-cache-api --features s3
+
+      - name: Upload git-cache-api binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-cache-api-s3
+          path: target/debug/git-cache-api
+          if-no-files-found: error
+          retention-days: 1
+
   minio-python-integration-tests:
     name: MinIO Python Integration (${{ matrix.test_name }})
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    needs: minio-python-api-build
     strategy:
       fail-fast: false
       matrix:
@@ -137,21 +172,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v4
+      - name: Download git-cache-api binary
+        uses: actions/download-artifact@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-minio-python-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-minio-python-
-            ${{ runner.os }}-cargo-minio-
-            ${{ runner.os }}-cargo-
+          name: git-cache-api-s3
+          path: target/debug
+
+      - name: Prepare git-cache-api binary
+        run: chmod +x target/debug/git-cache-api
 
       - name: Start MinIO
         run: |
@@ -165,4 +193,5 @@ jobs:
           GIT_CACHE_USE_MINIO_BACKEND: "1"
           GIT_CACHE_TEST_REPO: github.com/astral-sh/uv
           GIT_CACHE_TEST_BRANCH: main
+          GIT_CACHE_API_BIN: target/debug/git-cache-api
         run: python3 -m unittest -v ${{ matrix.test_target }}
