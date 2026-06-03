@@ -9,6 +9,7 @@ use git_cache_core::{
     ShortCommitSha,
 };
 use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateTarget};
+use git_cache_disk::RepoLock;
 pub use git_cache_git::UploadPackProcess;
 use git_cache_objectstore::{
     generation_manifest_key, read_commit_manifest, read_generation_manifest, read_json,
@@ -680,6 +681,7 @@ impl Materializer {
         }
 
         let repo_dir = self.ensure_repo_dir(repo).await?;
+        let _repo_lock = self.lock_repo(repo).await?;
         self.hydrate_generation(repo, &repo_dir, head.generation)
             .await?;
         self.state.git.fsck(&repo_dir).await?;
@@ -941,11 +943,13 @@ impl Materializer {
     pub async fn ensure_repo_dir(&self, repo: &RepoKey) -> CoreResult<PathBuf> {
         let repo_dir = self.repo_dir(repo);
         if !repo_dir.join("config").exists() {
+            self.reset_invalid_repo_cache(repo).await?;
             if let Some(parent) = repo_dir.parent() {
                 fs::create_dir_all(parent).await?;
             }
             self.state.git.init_bare(&repo_dir).await?;
         }
+        self.record_repo_access(repo).await?;
         Ok(repo_dir)
     }
 
@@ -1040,6 +1044,7 @@ impl Materializer {
     }
 
     pub async fn fetch_all_refs(&self, repo: &RepoKey, repo_dir: &FsPath) -> CoreResult<()> {
+        let _repo_lock = self.lock_repo(repo).await?;
         let remote = self.upstream_url(repo)?;
         self.state
             .git
@@ -1159,6 +1164,29 @@ impl Materializer {
             .join(format!("{session_id}.git"))
     }
 
+    fn repo_disk_path(&self, repo: &RepoKey) -> PathBuf {
+        PathBuf::from(repo.local_bare_path())
+    }
+
+    async fn record_repo_access(&self, repo: &RepoKey) -> CoreResult<()> {
+        self.state
+            .disk
+            .record_repo_access(self.repo_disk_path(repo))
+            .await?;
+        Ok(())
+    }
+
+    async fn lock_repo(&self, repo: &RepoKey) -> CoreResult<RepoLock> {
+        self.state.disk.lock_repo(self.repo_disk_path(repo)).await
+    }
+
+    async fn reset_invalid_repo_cache(&self, repo: &RepoKey) -> CoreResult<()> {
+        self.state
+            .disk
+            .invalidate_repo(self.repo_disk_path(repo))
+            .await
+    }
+
     pub fn validate_host(&self, repo: &RepoKey) -> CoreResult<()> {
         if self
             .state
@@ -1228,6 +1256,7 @@ impl Materializer {
         }
 
         let repo_dir = self.ensure_repo_dir(repo).await?;
+        let _repo_lock = self.lock_repo(repo).await?;
         let upstream_url = self.upstream_url(repo)?;
 
         // Validate all branch names and SHAs from network before passing to git.
@@ -1329,6 +1358,7 @@ impl Materializer {
         comparison: &UpstreamRefComparison,
     ) -> CoreResult<()> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
+        let _repo_lock = self.lock_repo(repo).await?;
 
         for (branch, sha) in &comparison.all_upstream {
             let ref_name = format!("refs/heads/{branch}");
@@ -1356,6 +1386,7 @@ impl Materializer {
     /// - Otherwise, fail.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
+        let _repo_lock = self.lock_repo(repo).await?;
         let object_ids: Vec<CommitSha> = wants
             .iter()
             .filter_map(|want_sha| CommitSha::parse(want_sha.as_str()).ok())
@@ -2270,6 +2301,50 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(head.tip_commits, vec![second_commit]);
+    }
+
+    #[tokio::test]
+    async fn ensure_repo_dir_records_disk_metadata() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        assert!(repo_dir.join("config").exists());
+
+        let index = state.disk.repo_index().await.unwrap();
+        let repo_path = PathBuf::from(fixture.repo.local_bare_path());
+        let entry = index.repos.get(&repo_path).unwrap();
+        assert_eq!(entry.path, repo_path);
+        assert!(entry.size_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_repo_dir_invalidates_partial_repo_cache() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let repo_path = PathBuf::from(fixture.repo.local_bare_path());
+        let repo_dir = materializer.repo_dir(&fixture.repo);
+        stdfs::create_dir_all(&repo_dir).unwrap();
+        stdfs::write(repo_dir.join("partial"), "stale").unwrap();
+        state
+            .disk
+            .record_repo_access(repo_path.clone())
+            .await
+            .unwrap();
+
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+
+        assert!(repo_dir.join("config").exists());
+        assert!(!repo_dir.join("partial").exists());
+        assert!(state
+            .disk
+            .repo_index()
+            .await
+            .unwrap()
+            .repos
+            .contains_key(&repo_path));
     }
 
     #[tokio::test]
