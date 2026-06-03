@@ -73,5 +73,6 @@ Runtime S3 wiring is enabled by building `git-cache-api` with the `s3` feature a
 
 ## Deployment
 
-The maintained AWS deployment path is ECS on EC2 with host-mounted EBS for the
-local hot cache and S3 for durable cache objects. See [docs/deployment.md](docs/deployment.md).
+The maintained AWS deployment path is ECS on Graviton EC2 with host-mounted EBS
+for the local hot cache and S3 for durable cache objects. See
+[docs/deployment.md](docs/deployment.md).
