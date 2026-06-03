@@ -4049,10 +4049,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let manifest = read_commit_manifest(&*state.store, &fixture.repo, &first.commit)
-            .await
-            .unwrap()
-            .unwrap();
+        let manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
         assert!(state
             .store
             .head(&bundle_key(&fixture.repo, manifest.generation))
@@ -4116,6 +4113,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
         let second = fixture.commit_and_push("second");
         materializer
             .materialize(MaterializeRequest {
@@ -4125,6 +4124,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, second_manifest.generation).await;
         let third = fixture.commit_and_push("third");
         materializer
             .materialize(MaterializeRequest {
@@ -4134,6 +4135,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let third_manifest = wait_for_commit_manifest(&state, &fixture.repo, &third).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, third_manifest.generation).await;
 
         let report = materializer
             .compact_generation_chain(&fixture.repo)
