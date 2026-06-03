@@ -1109,7 +1109,7 @@ impl Materializer {
         .await?;
         fs::write(
             session_repo.join("config"),
-            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = true\n\tallowAnySHA1InWant = true\n",
         )
         .await?;
         fs::write(
@@ -1402,12 +1402,17 @@ impl Materializer {
 
     /// Configure a bare repo for serving via the direct Git remote:
     /// - `uploadpack.allowAnySHA1InWant=true`
+    /// - `uploadpack.allowFilter=true`
     /// - `uploadpack.hideRefs=refs/cache`
     /// - `transfer.hideRefs=refs/cache`
     pub async fn configure_served_repo(&self, repo_dir: &FsPath) -> CoreResult<()> {
         self.state
             .git
             .set_config(repo_dir, "uploadpack.allowAnySHA1InWant", "true")
+            .await?;
+        self.state
+            .git
+            .set_config(repo_dir, "uploadpack.allowFilter", "true")
             .await?;
         self.state
             .git
@@ -1598,7 +1603,7 @@ pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u
     let caps = format!(
         "multi_ack thin-pack side-band side-band-64k ofs-delta \
          shallow deepen-since deepen-not deepen-relative no-progress \
-         include-tag multi_ack_detailed no-done{symref} \
+         include-tag multi_ack_detailed no-done filter{symref} \
          object-format=sha1 agent=git-cache/1.0"
     );
 
@@ -2779,6 +2784,7 @@ mod tests {
         let advertised = String::from_utf8_lossy(&advertised);
 
         assert!(advertised.contains(&response.ref_name));
+        assert!(advertised.contains(" filter "));
         assert!(!advertised.contains("git-receive-pack"));
     }
 
@@ -3691,6 +3697,7 @@ mod tests {
             "thin-pack",
             "side-band-64k",
             "no-done",
+            "filter",
             "object-format=sha1",
         ] {
             assert!(text.contains(cap), "missing capability: {cap}");
