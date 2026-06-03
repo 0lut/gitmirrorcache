@@ -21,7 +21,9 @@ jobs:
           - group: core
             packages: -p git-cache-core -p git-cache-worker
           - group: git
-            packages: -p git-cache-git -p git-cache-disk
+            packages: -p git-cache-git
+          - group: disk
+            packages: -p git-cache-disk
           - group: objectstore
             packages: -p git-cache-objectstore
           - group: api
