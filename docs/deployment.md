@@ -8,19 +8,23 @@ hot cache mounted at `/cache` that survives task/container replacement on the
 same host.
 
 ```sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/bootstrap.sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-and-smoke.sh
+scripts/aws/bootstrap.sh
+scripts/aws/deploy-and-smoke.sh
 ```
+
+The AWS helper scripts default to the current EC2/EBS stack discovered in
+`us-west-2`: `ENVIRONMENT=dev-arm` and `NAME_PREFIX=gitmirrorcache-arm`.
 
 `bootstrap.sh` creates the shared S3 bucket and ECR repository. The ECS deploy
 script creates or updates the runtime infrastructure:
 
 - IAM roles for ECS task execution, task runtime, and the EC2 container instance
 - ECS cluster, service, task definition, and CloudWatch log group
+- hourly EventBridge rule that runs `git-cache compact --all` as a one-off ECS task
 - internet-facing HTTP ALB and target group
 - ECS-optimized EC2 instance
 - non-root gp3 EBS volume mounted on the host at `/cache`
-- Docker image built with `git-cache-api --features s3`
+- Docker image built with `git-cache-api` and `git-cache` CLI S3 support
 
 Common overrides:
 
@@ -37,6 +41,9 @@ ECS_CPU=8192
 ECS_MEMORY=24576
 PUBLIC_BASE_URL=https://cache.example.com
 GITHUB_TOKEN_SECRET_ARN=arn:aws:secretsmanager:us-west-2:123456789012:secret:github-token
+ECS_COMPACTION_SCHEDULE_EXPRESSION='rate(1 hour)'
+ECS_COMPACTION_MEMORY_RESERVATION=4096
+GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD=10
 ```
 
 If `PUBLIC_BASE_URL` is omitted, the deployment script uses the ALB DNS name and
@@ -123,6 +130,20 @@ Recent logs:
 aws logs tail /ecs/gitmirrorcache-arm/ec2-api --since 30m --format short
 ```
 
+Recent hourly compaction logs:
+
+```sh
+aws logs tail /ecs/gitmirrorcache-arm/ec2-api --since 2h --format short \
+  --log-stream-name-prefix compaction
+```
+
+Compaction schedule:
+
+```sh
+aws events describe-rule --name gitmirrorcache-arm-compact-hourly
+aws events list-targets-by-rule --rule gitmirrorcache-arm-compact-hourly
+```
+
 If an ECS rollout appears stuck while the old task is stopped, check the host for
 a stale Docker container still holding port `8080`:
 
@@ -191,9 +212,29 @@ which commits are complete. Hydration downloads bundles to disk before fetching
 them into the local bare repository, so large bundles are not loaded entirely
 into memory.
 
-Future compaction can publish a new full generation, verify it with `git fsck`,
-move commit/ref manifests to the compacted generation, then prune old
-generations after retention expires.
+The ECS deployment registers an hourly EventBridge rule that runs
+`git-cache compact --all` as a separate one-off ECS task. The compaction task
+uses the same image, S3 prefix, task role, and host `/cache` mount as the API
+service, but has no port mapping. It uses a host-volume `flock` at
+`/cache/git-cache-compaction.lock` so a later hourly tick exits successfully if a
+previous compaction is still running.
+
+Compaction walks each repo's current generation chain. If the chain exceeds
+`GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD` (default `10`), it hydrates the
+chain, publishes a new full generation, verifies it with `git fsck`, repoints
+commit/ref manifests to the compacted generation, and prunes old generation
+objects that are not still needed by pending verification.
+
+Useful overrides:
+
+```sh
+ECS_COMPACTION_RULE_NAME=gitmirrorcache-arm-compact-hourly
+ECS_COMPACTION_SCHEDULE_EXPRESSION='rate(1 hour)'
+ECS_COMPACTION_SCHEDULE_STATE=ENABLED
+ECS_COMPACTION_LOCK_PATH=/cache/git-cache-compaction.lock
+ECS_COMPACTION_MEMORY_RESERVATION=4096
+GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD=10
+```
 
 ## Multi-Worker Safety
 
