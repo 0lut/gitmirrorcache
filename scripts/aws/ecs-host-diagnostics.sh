@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
+
+init_aws_context
+require_cmd python3
+
+ECS_CLUSTER_NAME="${ECS_CLUSTER_NAME:-$NAME_PREFIX-ec2}"
+ECS_HOST_PORT="${ECS_HOST_PORT:-8080}"
+
+if [[ -z "${ECS_INSTANCE_ID:-}" ]]; then
+  container_instance_arn="$(aws_cli ecs list-container-instances \
+    --cluster "$ECS_CLUSTER_NAME" \
+    --status ACTIVE \
+    --query 'containerInstanceArns[0]' \
+    --output text)"
+  [[ -n "$container_instance_arn" && "$container_instance_arn" != "None" ]] || die "no active ECS container instance found; set ECS_INSTANCE_ID"
+  ECS_INSTANCE_ID="$(aws_cli ecs describe-container-instances \
+    --cluster "$ECS_CLUSTER_NAME" \
+    --container-instances "$container_instance_arn" \
+    --query 'containerInstances[0].ec2InstanceId' \
+    --output text)"
+fi
+[[ "$ECS_INSTANCE_ID" =~ ^i-[a-f0-9]+$ ]] || die "invalid ECS_INSTANCE_ID: $ECS_INSTANCE_ID"
+
+tmpdir="$(mktemp -d)"
+cleanup() {
+  rm -rf "$tmpdir"
+}
+trap cleanup EXIT
+
+export ECS_HOST_PORT
+python3 >"$tmpdir/ssm-parameters.json" <<'PY'
+import json
+import os
+import shlex
+
+host_port = shlex.quote(os.environ["ECS_HOST_PORT"])
+script = f"""set -euo pipefail
+host_port={host_port}
+
+echo '--- docker containers ---'
+docker ps -a --format '{{{{.ID}}}} {{{{.Image}}}} {{{{.Names}}}} {{{{.Status}}}} {{{{.Ports}}}}'
+echo
+echo "--- listeners on :$host_port ---"
+sudo ss -ltnp | grep ":$host_port" || true
+echo
+echo '--- ecs agent recent logs ---'
+sudo journalctl -u ecs --no-pager -n 80
+"""
+
+json.dump({"commands": [script]}, open("/dev/stdout", "w"))
+PY
+
+command_id="$(aws_cli ssm send-command \
+  --instance-ids "$ECS_INSTANCE_ID" \
+  --document-name AWS-RunShellScript \
+  --parameters "file://$tmpdir/ssm-parameters.json" \
+  --query 'Command.CommandId' \
+  --output text)"
+
+printf 'SSM_COMMAND_ID=%s\n' "$command_id"
+for _ in {1..60}; do
+  status="$(aws_cli ssm get-command-invocation \
+    --command-id "$command_id" \
+    --instance-id "$ECS_INSTANCE_ID" \
+    --query 'Status' \
+    --output text 2>/dev/null || true)"
+  case "$status" in
+    Success|Cancelled|TimedOut|Failed|Cancelling)
+      break
+      ;;
+  esac
+  sleep 2
+done
+
+aws_cli ssm get-command-invocation \
+  --command-id "$command_id" \
+  --instance-id "$ECS_INSTANCE_ID" \
+  --query '{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' \
+  --output json
+
+[[ "$status" == "Success" ]] || die "SSM command did not succeed: $status"
