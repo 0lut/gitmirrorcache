@@ -108,6 +108,83 @@ impl Git {
             })
     }
 
+    pub async fn is_ancestor(
+        &self,
+        repo_dir: &Path,
+        ancestor: &CommitSha,
+        descendant: &CommitSha,
+    ) -> Result<bool> {
+        reject_revision_arg(ancestor.as_str())?;
+        reject_revision_arg(descendant.as_str())?;
+        let output = self
+            .run(
+                Some(repo_dir),
+                [
+                    "rev-list",
+                    "--max-count=1",
+                    ancestor.as_str(),
+                    "--not",
+                    descendant.as_str(),
+                    "--",
+                ],
+            )
+            .await?;
+        Ok(output.stdout.iter().all(|byte| byte.is_ascii_whitespace()))
+    }
+
+    pub async fn for_each_ref_commits(
+        &self,
+        repo_dir: &Path,
+        ref_prefix: &str,
+    ) -> Result<Vec<CommitSha>> {
+        reject_ref_arg(ref_prefix, "ref prefix")?;
+        let output = self
+            .run(
+                Some(repo_dir),
+                ["for-each-ref", "--format=%(objectname)", "--", ref_prefix],
+            )
+            .await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
+        })?;
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| CommitSha::parse(line.trim()))
+            .collect()
+    }
+
+    pub async fn for_each_ref_containing_commit(
+        &self,
+        repo_dir: &Path,
+        commit: &CommitSha,
+        ref_prefixes: &[&str],
+    ) -> Result<Vec<CommitSha>> {
+        reject_revision_arg(commit.as_str())?;
+        for ref_prefix in ref_prefixes {
+            reject_ref_arg(ref_prefix, "ref prefix")?;
+        }
+
+        let contains = format!("--contains={}", commit.as_str());
+        let mut args: Vec<OsString> = vec![
+            OsString::from("for-each-ref"),
+            OsString::from("--format=%(objectname)"),
+            OsString::from(contains),
+            OsString::from("--"),
+        ];
+        for ref_prefix in ref_prefixes {
+            args.push(OsString::from(ref_prefix));
+        }
+
+        let output = self.run(Some(repo_dir), args).await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
+        })?;
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| CommitSha::parse(line.trim()))
+            .collect()
+    }
+
     pub async fn fsck(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(Some(repo_dir), ["fsck", "--connectivity-only"])
             .await
@@ -899,6 +976,25 @@ mod tests {
         let git = test_git();
         assert!(git
             .bundle_create(Path::new("/unused"), Path::new("/unused"), "-evil")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn for_each_ref_commits_rejects_dash_ref_prefix() {
+        let git = test_git();
+        assert!(git
+            .for_each_ref_commits(Path::new("/unused"), "-evil")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn for_each_ref_containing_commit_rejects_dash_ref_prefix() {
+        let git = test_git();
+        let commit = CommitSha::parse("a".repeat(40)).unwrap();
+        assert!(git
+            .for_each_ref_containing_commit(Path::new("/unused"), &commit, &["-evil"])
             .await
             .is_err());
     }

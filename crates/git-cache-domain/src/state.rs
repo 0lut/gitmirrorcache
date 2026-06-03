@@ -1,7 +1,9 @@
 #[cfg(feature = "s3")]
+use aws_config::BehaviorVersion;
+#[cfg(feature = "s3")]
 use aws_credential_types::Credentials;
 #[cfg(feature = "s3")]
-use aws_sdk_s3::config::{BehaviorVersion, RequestChecksumCalculation};
+use aws_sdk_s3::config::RequestChecksumCalculation;
 #[cfg(feature = "s3")]
 use aws_sdk_s3::Client;
 #[cfg(feature = "s3")]
@@ -48,6 +50,35 @@ impl AppState {
             }
         };
 
+        Self::with_store(config, store)
+    }
+
+    pub async fn try_new_async(config: AppConfig) -> CoreResult<Self> {
+        let store: Arc<dyn ObjectStore> = match &config.object_store {
+            ObjectStoreConfig::Local { root } => Arc::new(LocalObjectStore::new(root)),
+            ObjectStoreConfig::S3 {
+                bucket,
+                prefix,
+                endpoint,
+            } => {
+                #[cfg(feature = "s3")]
+                {
+                    Arc::new(s3_store_async(bucket, prefix, endpoint.as_deref()).await?)
+                }
+                #[cfg(not(feature = "s3"))]
+                {
+                    let _ = (bucket, prefix, endpoint);
+                    return Err(GitCacheError::NotImplemented(
+                        "S3 object store wiring requires the s3 feature".into(),
+                    ));
+                }
+            }
+        };
+
+        Self::with_store(config, store)
+    }
+
+    fn with_store(config: AppConfig, store: Arc<dyn ObjectStore>) -> CoreResult<Self> {
         let git = Git::with_concurrency_limit(
             config.git_binary.clone(),
             Duration::from_secs(config.git_timeout_seconds),
@@ -114,6 +145,89 @@ fn s3_store(bucket: &str, prefix: &str, endpoint: Option<&str>) -> CoreResult<S3
         bucket.to_string(),
         prefix.to_string(),
     )
+}
+
+#[cfg(feature = "s3")]
+async fn s3_store_async(
+    bucket: &str,
+    prefix: &str,
+    endpoint: Option<&str>,
+) -> CoreResult<S3ObjectStore> {
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+
+    if let Some(region) = s3_region_from_env() {
+        loader = loader.region(Region::new(region));
+    }
+
+    if let Some(credentials) = explicit_s3_credentials()? {
+        loader = loader.credentials_provider(credentials);
+    }
+
+    let sdk_config = loader.load().await;
+    let mut config = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .credentials_provider(
+            sdk_config
+                .credentials_provider()
+                .ok_or_else(|| {
+                    GitCacheError::Validation(
+                        "S3 object store requires AWS credentials from env, profile, or role"
+                            .into(),
+                    )
+                })?
+                .clone(),
+        );
+
+    if let Some(region) = sdk_config.region().cloned() {
+        config = config.region(region);
+    }
+
+    if let Some(endpoint) = endpoint.filter(|value| !value.trim().is_empty()) {
+        config = config.endpoint_url(endpoint).force_path_style(true);
+    }
+
+    S3ObjectStore::new(
+        Client::from_conf(config.build()),
+        bucket.to_string(),
+        prefix.to_string(),
+    )
+}
+
+#[cfg(feature = "s3")]
+fn explicit_s3_credentials() -> CoreResult<Option<Credentials>> {
+    let access_key = env::var("GIT_CACHE_S3_ACCESS_KEY").ok();
+    let secret_key = env::var("GIT_CACHE_S3_SECRET_KEY").ok();
+    if access_key.is_none() && secret_key.is_none() {
+        return Ok(None);
+    }
+
+    let access_key = access_key.ok_or_else(|| {
+        GitCacheError::Validation("GIT_CACHE_S3_SECRET_KEY requires GIT_CACHE_S3_ACCESS_KEY".into())
+    })?;
+    let secret_key = secret_key.ok_or_else(|| {
+        GitCacheError::Validation("GIT_CACHE_S3_ACCESS_KEY requires GIT_CACHE_S3_SECRET_KEY".into())
+    })?;
+    let session_token = env::var("GIT_CACHE_S3_SESSION_TOKEN")
+        .or_else(|_| env::var("AWS_SESSION_TOKEN"))
+        .ok();
+
+    Ok(Some(Credentials::new(
+        access_key,
+        secret_key,
+        session_token,
+        None,
+        "git-cache-s3-env",
+    )))
+}
+
+#[cfg(feature = "s3")]
+fn s3_region_from_env() -> Option<String> {
+    env::var("GIT_CACHE_S3_REGION")
+        .or_else(|_| env::var("AWS_REGION"))
+        .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 pub fn with_optional_upstream_credentials(git: Git, config: &AppConfig) -> Git {

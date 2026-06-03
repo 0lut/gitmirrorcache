@@ -46,6 +46,17 @@ pub trait ObjectStore: Send + Sync {
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>>;
 
+    async fn get_file(&self, key: &str, path: &Path) -> Result<bool> {
+        let Some(data) = self.get(key).await? else {
+            return Ok(false);
+        };
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(path, data).await?;
+        Ok(true)
+    }
+
     async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
         let data = tokio::fs::read(path).await?;
         self.put(key, Bytes::from(data)).await

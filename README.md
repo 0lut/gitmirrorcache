@@ -69,4 +69,9 @@ The object-store crate includes a feature-gated S3-compatible adapter:
 cargo test -p git-cache-objectstore --features s3
 ```
 
-API wiring currently initializes the local adapter directly. Production deployments should construct the `S3ObjectStore` from an AWS SDK client and pass it through the same `ObjectStore` trait boundary.
+Runtime S3 wiring is enabled by building `git-cache-api` with the `s3` feature and setting `GIT_CACHE_OBJECT_STORE_KIND=s3`, `GIT_CACHE_S3_BUCKET`, and `GIT_CACHE_S3_PREFIX`.
+
+## Deployment
+
+The maintained AWS deployment path is ECS on EC2 with host-mounted EBS for the
+local hot cache and S3 for durable cache objects. See [docs/deployment.md](docs/deployment.md).

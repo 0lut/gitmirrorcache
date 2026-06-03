@@ -151,6 +151,19 @@ impl ObjectStore for LocalObjectStore {
         }
     }
 
+    async fn get_file(&self, key: &str, dest: &Path) -> Result<bool> {
+        let src = self.object_path(key)?;
+        if !matches!(fs::metadata(&src).await, Ok(metadata) if metadata.is_file()) {
+            return Ok(false);
+        }
+
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::copy(src, dest).await?;
+        Ok(true)
+    }
+
     async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
         let dest = self.object_path(key)?;
         let parent = parent_dir(&dest)?;

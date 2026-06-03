@@ -1,5 +1,5 @@
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
@@ -33,16 +33,32 @@ pub fn app(config: AppConfig) -> Router {
 pub fn app_result(config: AppConfig) -> CoreResult<Router> {
     let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new(config)?);
+    router(git_remote_enabled, state)
+}
 
+pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
+    let git_remote_enabled = config.git_remote.enabled;
+    let state = Arc::new(ApiState::try_new_async(config).await?);
+    router(git_remote_enabled, state)
+}
+
+fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> {
+    let git_body_limit = state.domain.config.max_git_output_bytes;
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/v1/materialize", post(materialize))
         .route("/v1/resolve", post(resolve))
-        .route("/git/session/{session_id}/{*repo_path}", any(git_session));
+        .route(
+            "/git/session/{session_id}/{*repo_path}",
+            any(git_session).layer(DefaultBodyLimit::max(git_body_limit)),
+        );
 
     if git_remote_enabled {
-        router = router.route("/git/{*repo_path}", any(git_repo));
+        router = router.route(
+            "/git/{*repo_path}",
+            any(git_repo).layer(DefaultBodyLimit::max(git_body_limit)),
+        );
     }
 
     Ok(router.with_state(state))
@@ -60,6 +76,16 @@ impl ApiState {
     fn try_new(config: AppConfig) -> CoreResult<Self> {
         let rate_limiter = RateLimiter::new(config.rate_limit_per_minute);
         let domain = Arc::new(AppState::try_new(config)?);
+        Self::with_domain(rate_limiter, domain)
+    }
+
+    async fn try_new_async(config: AppConfig) -> CoreResult<Self> {
+        let rate_limiter = RateLimiter::new(config.rate_limit_per_minute);
+        let domain = Arc::new(AppState::try_new_async(config).await?);
+        Self::with_domain(rate_limiter, domain)
+    }
+
+    fn with_domain(rate_limiter: RateLimiter, domain: Arc<AppState>) -> CoreResult<Self> {
         let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
         let leases = Arc::new(InMemoryRepoLeaseManager::new());
         let coordinator = UpdateCoordinator::new(executor, leases);
