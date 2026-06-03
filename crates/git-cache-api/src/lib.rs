@@ -7,11 +7,11 @@ use futures::Stream;
 use git_cache_core::{
     AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
 };
-use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
+use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
     frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
-    MaterializerExecutor,
+    MaterializerExecutor, UploadPackProcess,
 };
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
@@ -283,9 +283,14 @@ async fn git_session(
             .metrics
             .upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
-        upload_pack(&state.domain, &session_repo, body)
+        state
+            .domain
+            .git
+            .upload_pack_spawn(&session_repo, body)
             .await
-            .map(|output| git_response("application/x-git-upload-pack-result", output))
+            .map(|process| {
+                upload_pack_stream_response(process, state.domain.config.max_git_output_bytes)
+            })
     } else {
         Err(GitCacheError::Unsupported(format!(
             "unsupported git session request: {method} {path}"
@@ -365,24 +370,8 @@ async fn git_repo(
             .fetch_add(1, Ordering::Relaxed);
 
         match materializer.handle_upload_pack(&repo, &body).await {
-            Ok(mut process) => {
-                let permit = process.take_permit();
-                let child = process.child;
-                let reader_stream = ReaderStream::new(process.stdout);
-                let max_bytes = state.domain.config.max_git_output_bytes as u64;
-                let guarded = ChildGuardStream {
-                    inner: reader_stream,
-                    _child: child,
-                    bytes_sent: 0,
-                    max_bytes,
-                    _permit: permit,
-                };
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .body(Body::from_stream(guarded))
-                    .expect("git upload-pack response")
+            Ok(process) => {
+                upload_pack_stream_response(process, state.domain.config.max_git_output_bytes)
             }
             Err(error) => ApiError::from(error).into_response(),
         }
@@ -401,6 +390,26 @@ fn git_response(content_type: &'static str, output: Vec<u8>) -> Response {
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(output))
         .expect("git response")
+}
+
+fn upload_pack_stream_response(mut process: UploadPackProcess, max_bytes: usize) -> Response {
+    let permit = process.take_permit();
+    let child = process.child;
+    let reader_stream = ReaderStream::new(process.stdout);
+    let guarded = ChildGuardStream {
+        inner: reader_stream,
+        _child: child,
+        bytes_sent: 0,
+        max_bytes: max_bytes as u64,
+        _permit: permit,
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(guarded))
+        .expect("git upload-pack response")
 }
 
 #[derive(Debug, Serialize)]

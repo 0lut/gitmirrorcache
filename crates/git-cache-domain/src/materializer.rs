@@ -1911,7 +1911,10 @@ impl Materializer {
         }
         let repo_dir = self.ensure_repo_dir(repo).await?;
         self.configure_served_repo(&repo_dir).await?;
-        self.state.git.upload_pack_spawn(&repo_dir, body).await
+        self.state
+            .git
+            .upload_pack_spawn(&repo_dir, body.clone())
+            .await
     }
 
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {

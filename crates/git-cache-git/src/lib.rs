@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use git_cache_core::{CommitSha, GitCacheError, Result};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -427,12 +428,12 @@ impl Git {
     }
 
     /// Spawn `git upload-pack --stateless-rpc .` and return the child process
-    /// for streaming. The caller is responsible for writing stdin, reading
-    /// stdout, and waiting on the child.
+    /// for streaming. Stdin is written on a background task so large requests
+    /// cannot deadlock waiting for the caller to start reading stdout.
     pub async fn upload_pack_spawn(
         &self,
         repo_dir: &Path,
-        request_body: &[u8],
+        request_body: Bytes,
     ) -> Result<UploadPackProcess> {
         let permit = self
             .process_semaphore
@@ -470,10 +471,20 @@ impl Git {
 
         let mut child = command.spawn()?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(request_body).await?;
-            stdin.shutdown().await?;
-        }
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| GitCacheError::Validation("failed to open upload-pack stdin".into()))?;
+        tokio::spawn(async move {
+            let result = async {
+                stdin.write_all(&request_body).await?;
+                stdin.shutdown().await
+            }
+            .await;
+            if let Err(err) = result {
+                debug!(%err, "failed to write upload-pack request body");
+            }
+        });
 
         let stderr = child.stderr.take();
         let stdout = child.stdout.take().ok_or_else(|| {
