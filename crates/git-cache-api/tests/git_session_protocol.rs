@@ -278,6 +278,49 @@ async fn full_session_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_upload_pack_accepts_large_request_body() {
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let resp = post_json(
+        &client,
+        &server.materialize_url(),
+        &serde_json::json!({
+            "repo": "github.com/org/repo",
+            "selector": {"branch": "main"}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let mat: MaterializeResponse = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+
+    let sha = &mat.commit;
+    let want_line = format!("want {sha}\n");
+    let mut pack_body = format!("{:04x}{want_line}0000", 4 + want_line.len()).into_bytes();
+    let have_line = format!("have {sha}\n");
+    let have_pkt = format!("{:04x}{have_line}", 4 + have_line.len());
+    while pack_body.len() <= 2 * 1024 * 1024 {
+        pack_body.extend_from_slice(have_pkt.as_bytes());
+    }
+    pack_body.extend_from_slice(b"0009done\n");
+
+    let pack_url = format!("{}/git-upload-pack", mat.git_url);
+    let pack_resp = client
+        .post(&pack_url)
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .body(pack_body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        pack_resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "git upload-pack requests over Axum's default 2 MiB body limit should reach the handler"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn expired_session_returns_404() {
     let server = TestServer::start_with_ttl(1).await;
     let client = reqwest::Client::new();
