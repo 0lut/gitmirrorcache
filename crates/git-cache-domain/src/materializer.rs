@@ -177,39 +177,85 @@ impl Materializer {
             return Ok(None);
         };
 
-        let mut candidate_tips = head.tip_commits;
-        for ref_prefix in ["refs/cache/commits", "refs/cache/upstream/heads"] {
-            for tip in self
-                .state
-                .git
-                .for_each_ref_commits(repo_dir, ref_prefix)
+        let mut checked_tips = Vec::new();
+        for tip in head.tip_commits.iter().rev() {
+            push_unique_commit(&mut checked_tips, tip.clone());
+            if self
+                .index_local_commit_if_ancestor_of_tip(repo, repo_dir, commit, tip, head.generation)
                 .await?
             {
-                push_unique_commit(&mut candidate_tips, tip);
+                return Ok(Some(head.generation));
             }
         }
 
-        for tip in candidate_tips.iter().rev() {
-            let Some(tip_manifest) = self.get_commit_manifest(repo, tip).await? else {
+        let candidate_tips = self
+            .state
+            .git
+            .for_each_ref_containing_commit(
+                repo_dir,
+                commit,
+                &["refs/cache/commits", "refs/cache/upstream/heads"],
+            )
+            .await?;
+
+        for tip in candidate_tips {
+            if checked_tips.iter().any(|checked| checked == &tip) {
+                continue;
+            }
+            push_unique_commit(&mut checked_tips, tip.clone());
+            let Some(tip_manifest) = self.get_commit_manifest(repo, &tip).await? else {
                 continue;
             };
-            if !tip_manifest.complete || !self.commit_exists(repo_dir, tip).await {
+            if !tip_manifest.complete {
                 continue;
             }
-            if self.state.git.is_ancestor(repo_dir, commit, tip).await? {
-                let manifest = CommitManifest {
-                    repo: repo.clone(),
-                    commit: commit.clone(),
-                    generation: tip_manifest.generation,
-                    complete: true,
-                    verified_at: Utc::now(),
-                };
-                write_commit_manifest(&*self.state.store, &manifest).await?;
-                return Ok(Some(tip_manifest.generation));
-            }
+            self.index_local_commit(repo, commit, tip_manifest.generation)
+                .await?;
+            return Ok(Some(tip_manifest.generation));
         }
 
         Ok(None)
+    }
+
+    async fn index_local_commit_if_ancestor_of_tip(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+        tip: &CommitSha,
+        generation: GenerationId,
+    ) -> CoreResult<bool> {
+        let Some(tip_manifest) = self.get_commit_manifest(repo, tip).await? else {
+            return Ok(false);
+        };
+        if !tip_manifest.complete || tip_manifest.generation != generation {
+            return Ok(false);
+        }
+        if !self.commit_exists(repo_dir, tip).await {
+            return Ok(false);
+        }
+        if !self.state.git.is_ancestor(repo_dir, commit, tip).await? {
+            return Ok(false);
+        }
+        self.index_local_commit(repo, commit, generation).await?;
+        Ok(true)
+    }
+
+    async fn index_local_commit(
+        &self,
+        repo: &RepoKey,
+        commit: &CommitSha,
+        generation: GenerationId,
+    ) -> CoreResult<()> {
+        let manifest = CommitManifest {
+            repo: repo.clone(),
+            commit: commit.clone(),
+            generation,
+            complete: true,
+            verified_at: Utc::now(),
+        };
+        write_commit_manifest(&*self.state.store, &manifest).await?;
+        Ok(())
     }
 
     pub async fn materialize_branch(

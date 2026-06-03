@@ -257,6 +257,39 @@ async fn for_each_ref_commits_lists_matching_refs() {
 }
 
 #[tokio::test]
+async fn for_each_ref_containing_commit_lists_matching_refs() {
+    let temp = TempTree::new("for-each-ref-contains");
+    let (source_repo, first_sha) = create_source_repo(&temp.path);
+    let cache_repo = temp.path.join("cache.git");
+    let git = test_git();
+
+    let second_sha = commit_source(&source_repo, "second");
+    git.init_bare(&cache_repo).await.expect("init cache repo");
+    git.fetch_branch(
+        &cache_repo,
+        path_arg(&source_repo),
+        "main",
+        "refs/cache/upstream/heads/main",
+    )
+    .await
+    .expect("fetch cache ref");
+
+    let first = CommitSha::parse(&first_sha).unwrap();
+    let second = CommitSha::parse(&second_sha).unwrap();
+    let first_containing = git
+        .for_each_ref_containing_commit(&cache_repo, &first, &["refs/cache/upstream/heads"])
+        .await
+        .expect("list refs containing first commit");
+    assert_eq!(first_containing, vec![second.clone()]);
+
+    let second_containing = git
+        .for_each_ref_containing_commit(&cache_repo, &second, &["refs/cache/upstream/heads"])
+        .await
+        .expect("list refs containing second commit");
+    assert_eq!(second_containing, vec![second]);
+}
+
+#[tokio::test]
 async fn bundle_create_incremental_empty_excludes_creates_full_bundle() {
     let temp = TempTree::new("incremental-empty");
     let (source_repo, source_sha) = create_source_repo(&temp.path);
