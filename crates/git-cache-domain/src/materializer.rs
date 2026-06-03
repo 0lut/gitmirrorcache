@@ -1356,73 +1356,84 @@ impl Materializer {
     /// - Otherwise, fail.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
+        let object_ids: Vec<CommitSha> = wants
+            .iter()
+            .filter_map(|want_sha| CommitSha::parse(want_sha.as_str()).ok())
+            .collect();
+        let object_types = self
+            .state
+            .git
+            .cat_file_batch_types(&repo_dir, &object_ids)
+            .await?;
 
-        for want_sha in wants {
-            let commit = match CommitSha::parse(want_sha.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            if self.object_exists(&repo_dir, &commit).await {
-                if self.commit_exists(&repo_dir, &commit).await {
-                    self.expose_served_commit(&repo_dir, &commit).await?;
+        for object_id in object_ids {
+            if let Some(object_type) = object_types.get(&object_id) {
+                if object_type == "commit" {
+                    self.expose_served_commit(&repo_dir, &object_id).await?;
                 }
                 continue;
             }
 
-            if let Some(manifest) = self.get_commit_manifest(repo, &commit).await? {
+            if let Some(manifest) = self.get_commit_manifest(repo, &object_id).await? {
                 if manifest.complete {
                     self.hydrate_commit(&manifest).await?;
+                    self.expose_served_commit(&repo_dir, &object_id).await?;
                     continue;
                 }
             }
 
             if self.state.config.git_remote.commit_read_through {
-                info!(%repo, %commit, "read-through fetch for unknown commit");
+                info!(%repo, commit = %object_id, "read-through fetch for unknown commit");
                 let upstream_url = self.upstream_url(repo)?;
                 let fetch_result = self
                     .state
                     .git
                     .run(
                         Some(&repo_dir),
-                        ["fetch", "--no-tags", "--", &upstream_url, commit.as_str()],
+                        [
+                            "fetch",
+                            "--no-tags",
+                            "--",
+                            &upstream_url,
+                            object_id.as_str(),
+                        ],
                     )
                     .await;
 
                 if let Err(fetch_err) = fetch_result {
                     self.fetch_all_refs(repo, &repo_dir).await?;
-                    if self.object_exists(&repo_dir, &commit).await {
-                        if self.commit_exists(&repo_dir, &commit).await {
-                            self.expose_served_commit(&repo_dir, &commit).await?;
+                    if self.object_exists(&repo_dir, &object_id).await {
+                        if self.commit_exists(&repo_dir, &object_id).await {
+                            self.expose_served_commit(&repo_dir, &object_id).await?;
                         }
                         continue;
                     }
                     return Err(GitCacheError::NotFound(format!(
-                        "object `{commit}` could not be fetched from upstream: {fetch_err}"
+                        "object `{object_id}` could not be fetched from upstream: {fetch_err}"
                     )));
                 }
 
-                if !self.commit_exists(&repo_dir, &commit).await {
+                if !self.commit_exists(&repo_dir, &object_id).await {
                     return Err(GitCacheError::NotFound(format!(
-                        "commit `{commit}` not found after upstream fetch"
+                        "commit `{object_id}` not found after upstream fetch"
                     )));
                 }
-                self.expose_served_commit(&repo_dir, &commit).await?;
+                self.expose_served_commit(&repo_dir, &object_id).await?;
 
                 // Create a ref so that `bundle create --all` has something
                 // to include.  We use refs/cache/ which is hidden from
                 // clients by configure_served_repo.
-                let cache_ref = format!("refs/cache/commits/{commit}");
+                let cache_ref = format!("refs/cache/commits/{object_id}");
                 self.state
                     .git
-                    .update_ref(&repo_dir, &cache_ref, commit.as_str())
+                    .update_ref(&repo_dir, &cache_ref, object_id.as_str())
                     .await?;
 
-                self.publish_generation(repo, &repo_dir, &commit, None)
+                self.publish_generation(repo, &repo_dir, &object_id, None)
                     .await?;
             } else {
                 return Err(GitCacheError::NotFound(format!(
-                    "commit `{commit}` is not available and read-through is disabled"
+                    "commit `{object_id}` is not available and read-through is disabled"
                 )));
             }
         }

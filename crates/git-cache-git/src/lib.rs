@@ -185,6 +185,46 @@ impl Git {
             .collect()
     }
 
+    pub async fn cat_file_batch_types(
+        &self,
+        repo_dir: &Path,
+        object_ids: &[CommitSha],
+    ) -> Result<HashMap<CommitSha, String>> {
+        let mut stdin = Vec::with_capacity(object_ids.len() * 41);
+        for object_id in object_ids {
+            reject_revision_arg(object_id.as_str())?;
+            stdin.extend_from_slice(object_id.as_str().as_bytes());
+            stdin.push(b'\n');
+        }
+
+        let output = self
+            .run_with_stdin_and_limits(
+                Some(repo_dir),
+                ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                Some(&stdin),
+                self.output_limit,
+                self.output_limit,
+            )
+            .await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git cat-file returned non-utf8: {err}"))
+        })?;
+
+        let mut types = HashMap::new();
+        for line in text.lines() {
+            let Some((object_id, object_type)) = line.split_once(' ') else {
+                return Err(GitCacheError::Validation(format!(
+                    "malformed git cat-file output line: {line:?}"
+                )));
+            };
+            if object_type == "missing" {
+                continue;
+            }
+            types.insert(CommitSha::parse(object_id)?, object_type.to_string());
+        }
+        Ok(types)
+    }
+
     pub async fn fsck(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(Some(repo_dir), ["fsck", "--connectivity-only"])
             .await
