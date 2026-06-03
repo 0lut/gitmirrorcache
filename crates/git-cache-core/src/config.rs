@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -43,27 +44,26 @@ impl AppConfig {
     }
 
     pub fn from_env() -> crate::Result<Self> {
-        if let Ok(path) = std::env::var("GIT_CACHE_CONFIG") {
+        if let Ok(path) = env::var("GIT_CACHE_CONFIG") {
             return Self::from_path(path);
         }
 
-        let bind_addr = std::env::var("GIT_CACHE_BIND_ADDR")
+        let bind_addr = env::var("GIT_CACHE_BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()
             .map_err(|err| crate::GitCacheError::Validation(format!("invalid bind addr: {err}")))?;
 
-        let public_base_url = std::env::var("GIT_CACHE_PUBLIC_BASE_URL")
-            .unwrap_or_else(|_| format!("http://{bind_addr}"));
+        let public_base_url =
+            env::var("GIT_CACHE_PUBLIC_BASE_URL").unwrap_or_else(|_| format!("http://{bind_addr}"));
 
         let cache_root =
-            PathBuf::from(std::env::var("GIT_CACHE_ROOT").unwrap_or_else(|_| "./cache".into()));
-        let object_root = PathBuf::from(
-            std::env::var("GIT_CACHE_OBJECT_STORE_ROOT")
-                .unwrap_or_else(|_| "./tmp/object-store".into()),
+            PathBuf::from(env::var("GIT_CACHE_ROOT").unwrap_or_else(|_| "./cache".into()));
+        let object_store = object_store_from_env()?;
+        let upstream_root = env::var("GIT_CACHE_UPSTREAM_ROOT").ok().map(PathBuf::from);
+        let allowed_upstream_hosts = parse_csv_env(
+            "GIT_CACHE_ALLOWED_UPSTREAM_HOSTS",
+            default_allowed_upstream_hosts(),
         );
-        let upstream_root = std::env::var("GIT_CACHE_UPSTREAM_ROOT")
-            .ok()
-            .map(PathBuf::from);
 
         Ok(Self {
             bind_addr,
@@ -71,7 +71,7 @@ impl AppConfig {
             cache_root,
             upstream_root,
             git_binary: PathBuf::from(
-                std::env::var("GIT_CACHE_GIT_BINARY").unwrap_or_else(|_| "git".into()),
+                env::var("GIT_CACHE_GIT_BINARY").unwrap_or_else(|_| "git".into()),
             ),
             git_timeout_seconds: parse_env(
                 "GIT_CACHE_GIT_TIMEOUT_SECONDS",
@@ -81,20 +81,33 @@ impl AppConfig {
                 "GIT_CACHE_MAX_GIT_OUTPUT_BYTES",
                 default_max_git_output_bytes(),
             )?,
-            object_store: ObjectStoreConfig::Local { root: object_root },
+            object_store,
             session_ttl_seconds: parse_env("GIT_CACHE_SESSION_TTL_SECONDS", 3600)?,
-            upstream_auth_token_env: std::env::var("GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV").ok(),
+            upstream_auth_token_env: env::var("GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV").ok(),
             rate_limit_per_minute: parse_env(
                 "GIT_CACHE_RATE_LIMIT_PER_MINUTE",
                 default_rate_limit_per_minute(),
             )?,
-            allowed_upstream_hosts: default_allowed_upstream_hosts(),
+            allowed_upstream_hosts,
             disk: DiskConfig {
                 quota_bytes: parse_env("GIT_CACHE_DISK_QUOTA_BYTES", 10 * 1024 * 1024 * 1024)?,
                 min_free_bytes: parse_env("GIT_CACHE_DISK_MIN_FREE_BYTES", 1024 * 1024 * 1024)?,
             },
-            git_remote: GitRemoteConfig::default(),
-            compaction: CompactionConfig::default(),
+            git_remote: GitRemoteConfig {
+                enabled: parse_bool_env("GIT_CACHE_GIT_REMOTE_ENABLED", false)?,
+                branch_ref_check: BranchRefCheck::Always,
+                commit_read_through: parse_bool_env(
+                    "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
+                    true,
+                )?,
+            },
+            compaction: CompactionConfig {
+                chain_depth_threshold: parse_env(
+                    "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
+                    default_compaction_threshold(),
+                )?,
+                inline: parse_bool_env("GIT_CACHE_COMPACTION_INLINE", false)?,
+            },
             max_concurrent_git_processes: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
                 default_max_concurrent_git_processes(),
@@ -104,6 +117,49 @@ impl AppConfig {
                 default_session_cleanup_interval_secs(),
             )?,
         })
+    }
+}
+
+fn object_store_from_env() -> crate::Result<ObjectStoreConfig> {
+    match env::var("GIT_CACHE_OBJECT_STORE_KIND")
+        .unwrap_or_else(|_| "local".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "local" => Ok(ObjectStoreConfig::Local {
+            root: PathBuf::from(
+                env::var("GIT_CACHE_OBJECT_STORE_ROOT")
+                    .unwrap_or_else(|_| "./tmp/object-store".into()),
+            ),
+        }),
+        "s3" => {
+            let bucket = env::var("GIT_CACHE_S3_BUCKET")
+                .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_BUCKET"))
+                .map_err(|_| {
+                    crate::GitCacheError::Validation(
+                        "GIT_CACHE_OBJECT_STORE_KIND=s3 requires GIT_CACHE_S3_BUCKET".into(),
+                    )
+                })?;
+            if bucket.trim().is_empty() {
+                return Err(crate::GitCacheError::Validation(
+                    "GIT_CACHE_S3_BUCKET must not be empty".into(),
+                ));
+            }
+
+            Ok(ObjectStoreConfig::S3 {
+                bucket,
+                prefix: env::var("GIT_CACHE_S3_PREFIX")
+                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_PREFIX"))
+                    .unwrap_or_else(|_| "repos".into()),
+                endpoint: env::var("GIT_CACHE_S3_ENDPOINT")
+                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_ENDPOINT"))
+                    .ok()
+                    .filter(|value| !value.trim().is_empty()),
+            })
+        }
+        other => Err(crate::GitCacheError::Validation(format!(
+            "unsupported GIT_CACHE_OBJECT_STORE_KIND `{other}`"
+        ))),
     }
 }
 
@@ -213,7 +269,7 @@ fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> crate::Result<T>
 where
     T::Err: std::fmt::Display,
 {
-    match std::env::var(name) {
+    match env::var(name) {
         Ok(value) => value.parse().map_err(|err| {
             crate::GitCacheError::Validation(format!("invalid {name} value `{value}`: {err}"))
         }),
@@ -221,10 +277,108 @@ where
     }
 }
 
+fn parse_bool_env(name: &str, default: bool) -> crate::Result<bool> {
+    match env::var(name) {
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(crate::GitCacheError::Validation(format!(
+                "invalid {name} value `{value}`: expected boolean"
+            ))),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_csv_env(name: &str, default: Vec<String>) -> Vec<String> {
+    let Ok(value) = env::var(name) else {
+        return default;
+    };
+    let values: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    if values.is_empty() {
+        default
+    } else {
+        values
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const ENV_KEYS: &[&str] = &[
+        "GIT_CACHE_CONFIG",
+        "GIT_CACHE_BIND_ADDR",
+        "GIT_CACHE_PUBLIC_BASE_URL",
+        "GIT_CACHE_ROOT",
+        "GIT_CACHE_OBJECT_STORE_KIND",
+        "GIT_CACHE_OBJECT_STORE_ROOT",
+        "GIT_CACHE_OBJECT_STORE_BUCKET",
+        "GIT_CACHE_OBJECT_STORE_PREFIX",
+        "GIT_CACHE_OBJECT_STORE_ENDPOINT",
+        "GIT_CACHE_S3_BUCKET",
+        "GIT_CACHE_S3_PREFIX",
+        "GIT_CACHE_S3_ENDPOINT",
+        "GIT_CACHE_UPSTREAM_ROOT",
+        "GIT_CACHE_GIT_BINARY",
+        "GIT_CACHE_GIT_TIMEOUT_SECONDS",
+        "GIT_CACHE_MAX_GIT_OUTPUT_BYTES",
+        "GIT_CACHE_SESSION_TTL_SECONDS",
+        "GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV",
+        "GIT_CACHE_RATE_LIMIT_PER_MINUTE",
+        "GIT_CACHE_ALLOWED_UPSTREAM_HOSTS",
+        "GIT_CACHE_DISK_QUOTA_BYTES",
+        "GIT_CACHE_DISK_MIN_FREE_BYTES",
+        "GIT_CACHE_GIT_REMOTE_ENABLED",
+        "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
+        "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
+        "GIT_CACHE_COMPACTION_INLINE",
+        "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
+        "GIT_CACHE_SESSION_CLEANUP_INTERVAL_SECS",
+    ];
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        old: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(vars: &[(&str, &str)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let old = ENV_KEYS
+                .iter()
+                .map(|key| (*key, env::var(key).ok()))
+                .collect();
+            for key in ENV_KEYS {
+                env::remove_var(key);
+            }
+            for (key, value) in vars {
+                env::set_var(key, value);
+            }
+            Self { _lock: lock, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for key in ENV_KEYS {
+                env::remove_var(key);
+            }
+            for (key, value) in &self.old {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                }
+            }
+        }
+    }
 
     #[test]
     fn from_path_parses_valid_toml() {
@@ -313,6 +467,56 @@ min_free_bytes = 100000
         let json = serde_json::to_string(&config).unwrap();
         let parsed: GitRemoteConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn from_env_configures_s3_object_store_and_git_remote() {
+        let _env = EnvGuard::new(&[
+            ("GIT_CACHE_BIND_ADDR", "0.0.0.0:8080"),
+            ("GIT_CACHE_PUBLIC_BASE_URL", "https://cache.example.com"),
+            ("GIT_CACHE_ROOT", "/cache"),
+            ("GIT_CACHE_OBJECT_STORE_KIND", "s3"),
+            ("GIT_CACHE_S3_BUCKET", "git-cache-bucket"),
+            ("GIT_CACHE_S3_PREFIX", "prod"),
+            ("GIT_CACHE_S3_ENDPOINT", "https://s3.example.com"),
+            ("GIT_CACHE_ALLOWED_UPSTREAM_HOSTS", "github.com, gitlab.com"),
+            ("GIT_CACHE_GIT_REMOTE_ENABLED", "true"),
+            ("GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "off"),
+            ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
+            ("GIT_CACHE_COMPACTION_INLINE", "yes"),
+        ]);
+
+        let config = AppConfig::from_env().unwrap();
+        assert_eq!(config.bind_addr.port(), 8080);
+        assert_eq!(config.public_base_url, "https://cache.example.com");
+        assert_eq!(config.cache_root, PathBuf::from("/cache"));
+        assert_eq!(
+            config.allowed_upstream_hosts,
+            vec!["github.com".to_string(), "gitlab.com".to_string()]
+        );
+        assert!(config.git_remote.enabled);
+        assert!(!config.git_remote.commit_read_through);
+        assert_eq!(config.compaction.chain_depth_threshold, 4);
+        assert!(config.compaction.inline);
+
+        match config.object_store {
+            ObjectStoreConfig::S3 {
+                bucket,
+                prefix,
+                endpoint,
+            } => {
+                assert_eq!(bucket, "git-cache-bucket");
+                assert_eq!(prefix, "prod");
+                assert_eq!(endpoint.as_deref(), Some("https://s3.example.com"));
+            }
+            ObjectStoreConfig::Local { .. } => panic!("expected s3 object store"),
+        }
+    }
+
+    #[test]
+    fn from_env_rejects_s3_without_bucket() {
+        let _env = EnvGuard::new(&[("GIT_CACHE_OBJECT_STORE_KIND", "s3")]);
+        assert!(AppConfig::from_env().is_err());
     }
 
     #[test]

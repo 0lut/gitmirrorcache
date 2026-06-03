@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
             let repo = git_cache_core::RepoKey::parse(&repo)?;
             let selector = parse_selector(&selector)?;
             let config = AppConfig::from_env()?;
-            let state = Arc::new(AppState::try_new(config)?);
+            let state = Arc::new(AppState::try_new_async(config).await?);
             let materializer = Materializer::new(state);
             let response = materializer
                 .materialize(MaterializeRequest {
@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::SessionCleanup => {
             let config = AppConfig::from_env()?;
-            let state = Arc::new(AppState::try_new(config)?);
+            let state = Arc::new(AppState::try_new_async(config).await?);
             let materializer = Materializer::new(state);
             let report = materializer.cleanup_expired_sessions().await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let config = AppConfig::from_env()?;
-            let state = Arc::new(AppState::try_new(config)?);
+            let state = Arc::new(AppState::try_new_async(config).await?);
             let materializer = Materializer::new(Arc::clone(&state));
             let repos = if let Some(repo) = repo {
                 vec![git_cache_core::RepoKey::parse(&repo)?]

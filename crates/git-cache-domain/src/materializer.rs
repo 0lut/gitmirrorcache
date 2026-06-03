@@ -114,12 +114,34 @@ impl Materializer {
         }
 
         let repo_dir = self.ensure_repo_dir(&repo).await?;
+        if self.commit_exists(&repo_dir, &commit).await {
+            if let Some(generation) = self
+                .index_local_commit_from_known_generation(&repo, &repo_dir, &commit)
+                .await?
+            {
+                debug!(%repo, %commit, %generation, "indexed exact commit from known generation");
+                return self
+                    .create_session(repo, commit, MaterializeSource::CacheVerified)
+                    .await;
+            }
+        }
+
         self.fetch_all_refs(&repo, &repo_dir).await?;
 
         if !self.commit_exists(&repo_dir, &commit).await {
             return Err(GitCacheError::NotFound(format!(
                 "commit `{commit}` was not found after upstream verification"
             )));
+        }
+
+        if let Some(generation) = self
+            .index_local_commit_from_known_generation(&repo, &repo_dir, &commit)
+            .await?
+        {
+            debug!(%repo, %commit, %generation, "indexed exact commit from known generation after upstream fetch");
+            return self
+                .create_session(repo, commit, MaterializeSource::CacheVerified)
+                .await;
         }
 
         self.materialize_existing_local_commit(
@@ -143,6 +165,51 @@ impl Materializer {
             .await?;
         debug!(%repo, %commit, %generation, "published generation for exact commit");
         self.create_session(repo, commit, source).await
+    }
+
+    async fn index_local_commit_from_known_generation(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> CoreResult<Option<GenerationId>> {
+        let Some(head) = read_repo_generation_head(&*self.state.store, repo).await? else {
+            return Ok(None);
+        };
+
+        let mut candidate_tips = head.tip_commits;
+        for ref_prefix in ["refs/cache/commits", "refs/cache/upstream/heads"] {
+            for tip in self
+                .state
+                .git
+                .for_each_ref_commits(repo_dir, ref_prefix)
+                .await?
+            {
+                push_unique_commit(&mut candidate_tips, tip);
+            }
+        }
+
+        for tip in candidate_tips.iter().rev() {
+            let Some(tip_manifest) = self.get_commit_manifest(repo, tip).await? else {
+                continue;
+            };
+            if !tip_manifest.complete || !self.commit_exists(repo_dir, tip).await {
+                continue;
+            }
+            if self.state.git.is_ancestor(repo_dir, commit, tip).await? {
+                let manifest = CommitManifest {
+                    repo: repo.clone(),
+                    commit: commit.clone(),
+                    generation: tip_manifest.generation,
+                    complete: true,
+                    verified_at: Utc::now(),
+                };
+                write_commit_manifest(&*self.state.store, &manifest).await?;
+                return Ok(Some(tip_manifest.generation));
+            }
+        }
+
+        Ok(None)
     }
 
     pub async fn materialize_branch(
@@ -345,10 +412,10 @@ impl Materializer {
         let chain = self.generation_chain(repo, generation).await?;
 
         for generation_manifest in chain.iter().rev() {
-            let bundle = self
+            let bundle_meta = self
                 .state
                 .store
-                .get(&generation_manifest.bundle_key)
+                .head(&generation_manifest.bundle_key)
                 .await?
                 .ok_or_else(|| {
                     GitCacheError::NotFound(format!(
@@ -357,11 +424,21 @@ impl Materializer {
                     ))
                 })?;
 
-            let reservation = self.state.disk.reserve(bundle.len() as u64).await?;
+            let reservation = self.state.disk.reserve(bundle_meta.len).await?;
             let temp_path = reservation.temp_path()?;
             fs::create_dir_all(&temp_path).await?;
             let bundle_path = temp_path.join("hydrate.bundle");
-            fs::write(&bundle_path, bundle).await?;
+            if !self
+                .state
+                .store
+                .get_file(&generation_manifest.bundle_key, &bundle_path)
+                .await?
+            {
+                return Err(GitCacheError::NotFound(format!(
+                    "bundle `{}` not found",
+                    generation_manifest.bundle_key
+                )));
+            }
             self.state.git.fetch_bundle(repo_dir, &bundle_path).await?;
             self.state.git.fsck(repo_dir).await?;
             reservation.release().await?;
@@ -436,23 +513,39 @@ impl Materializer {
         }
         push_unique_commit(&mut tip_commits, commit.clone());
 
+        let mut manifest_commits = vec![commit.clone()];
+        for ref_prefix in ["refs/cache/upstream/heads", "refs/cache/commits"] {
+            for candidate in self
+                .state
+                .git
+                .for_each_ref_commits(repo_dir, ref_prefix)
+                .await?
+            {
+                if self.get_commit_manifest(repo, &candidate).await?.is_none() {
+                    push_unique_commit(&mut manifest_commits, candidate);
+                }
+            }
+        }
+
         let generation_manifest = GenerationManifest {
             repo: repo.clone(),
             generation,
             bundle_key,
             parent_generation,
             created_at: now,
-            commits: vec![commit.clone()],
-        };
-        let commit_manifest = CommitManifest {
-            repo: repo.clone(),
-            commit: commit.clone(),
-            generation,
-            complete: true,
-            verified_at: now,
+            commits: manifest_commits.clone(),
         };
         let mut manifests = PublishManifests {
-            commits: vec![commit_manifest],
+            commits: manifest_commits
+                .into_iter()
+                .map(|commit| CommitManifest {
+                    repo: repo.clone(),
+                    commit,
+                    generation,
+                    complete: true,
+                    verified_at: now,
+                })
+                .collect(),
             refs: Vec::new(),
             sessions: Vec::new(),
         };
@@ -1644,6 +1737,14 @@ mod tests {
             .unwrap()
     }
 
+    async fn generation_object_keys(state: &AppState, repo: &RepoKey) -> Vec<String> {
+        state
+            .store
+            .list_prefix(&format!("repos/{repo}/generations/"), None)
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn object_keys_are_stable() {
         let repo = RepoKey::parse("github.com/org/repo").unwrap();
@@ -1802,6 +1903,220 @@ mod tests {
             .await
             .unwrap();
         assert!(materializer.commit_exists(&repo_dir, &second_commit).await);
+    }
+
+    #[tokio::test]
+    async fn exact_ancestor_in_known_generation_indexes_without_new_bundle() {
+        let fixture = GitFixture::new();
+        let ancestor_commit = fixture.head_commit();
+        let tip_commit = fixture.commit_and_push("second");
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert!(
+            read_commit_manifest(&*state.store, &fixture.repo, &ancestor_commit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let tip_manifest = read_commit_manifest(&*state.store, &fixture.repo, &tip_commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let head_before = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap();
+        let generation_keys_before = generation_object_keys(&state, &fixture.repo).await;
+
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(ancestor_commit.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.source, MaterializeSource::CacheVerified);
+        assert_eq!(response.commit, ancestor_commit);
+
+        let ancestor_manifest =
+            read_commit_manifest(&*state.store, &fixture.repo, &ancestor_commit)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(ancestor_manifest.generation, tip_manifest.generation);
+        let head_after = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap();
+        let generation_keys_after = generation_object_keys(&state, &fixture.repo).await;
+        assert_eq!(head_after, head_before);
+        assert_eq!(generation_keys_after, generation_keys_before);
+    }
+
+    #[tokio::test]
+    async fn exact_ancestor_uses_local_cache_refs_when_generation_head_is_stale() {
+        let fixture = GitFixture::new();
+        let ancestor_commit = fixture.commit_and_push("second");
+        let tip_commit = fixture.commit_and_push("third");
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert!(
+            read_commit_manifest(&*state.store, &fixture.repo, &ancestor_commit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let tip_manifest = read_commit_manifest(&*state.store, &fixture.repo, &tip_commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_head = RepoGenerationHead {
+            repo: fixture.repo.clone(),
+            generation: tip_manifest.generation,
+            tip_commits: vec![ancestor_commit.clone()],
+            updated_at: Utc::now(),
+        };
+        write_repo_generation_head(&*state.store, &stale_head)
+            .await
+            .unwrap();
+        let generation_keys_before = generation_object_keys(&state, &fixture.repo).await;
+
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(ancestor_commit.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.source, MaterializeSource::CacheVerified);
+        assert_eq!(response.commit, ancestor_commit);
+
+        let ancestor_manifest =
+            read_commit_manifest(&*state.store, &fixture.repo, &ancestor_commit)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(ancestor_manifest.generation, tip_manifest.generation);
+        let generation_keys_after = generation_object_keys(&state, &fixture.repo).await;
+        assert_eq!(generation_keys_after, generation_keys_before);
+    }
+
+    #[tokio::test]
+    async fn exact_descendants_after_cold_ancestor_fetch_reuse_full_bundle() {
+        let fixture = GitFixture::new();
+        let tip_2 = fixture.head_commit();
+        let tip_1 = fixture.commit_and_push("second");
+        let tip = fixture.commit_and_push("third");
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(tip_2.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.commit, tip_2);
+        assert_eq!(first.source, MaterializeSource::GithubVerified);
+        let generation_keys_after_first = generation_object_keys(&state, &fixture.repo).await;
+
+        let second = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(tip_1.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.commit, tip_1);
+        assert_eq!(second.source, MaterializeSource::CacheVerified);
+        assert_eq!(
+            generation_object_keys(&state, &fixture.repo).await,
+            generation_keys_after_first
+        );
+
+        let third = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(tip.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(third.commit, tip);
+        assert_eq!(third.source, MaterializeSource::CacheVerified);
+        assert_eq!(
+            generation_object_keys(&state, &fixture.repo).await,
+            generation_keys_after_first
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_commit_ahead_of_known_generation_publishes_incremental_bundle() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let first_manifest = read_commit_manifest(&*state.store, &fixture.repo, &first.commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_commit = fixture.commit_and_push("second");
+
+        let response = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(second_commit.clone()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.commit, second_commit);
+        assert_eq!(response.source, MaterializeSource::GithubVerified);
+
+        let second_manifest = read_commit_manifest(&*state.store, &fixture.repo, &second_commit)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_generation =
+            generation_manifest_for(&state, &fixture.repo, second_manifest.generation).await;
+        assert_eq!(
+            second_generation.parent_generation,
+            Some(first_manifest.generation)
+        );
+        let head = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.tip_commits, vec![first.commit, second_commit]);
     }
 
     #[tokio::test]
