@@ -7,7 +7,7 @@ use futures::Stream;
 use git_cache_core::{
     AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector, UpstreamAuth,
 };
-use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
+use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
     frame_ref_advertisement, synthesize_protected_ref_advertisement, synthesize_ref_advertisement,
@@ -18,6 +18,7 @@ use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDispos
 use http::{header, HeaderMap, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
@@ -317,9 +319,12 @@ async fn git_session(
             .metrics
             .upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
-        upload_pack(&state.domain, &session_repo, body)
+        state
+            .domain
+            .git
+            .upload_pack_spawn(&session_repo, body)
             .await
-            .map(|output| git_response("application/x-git-upload-pack-result", output))
+            .map(|process| stream_upload_pack_response(&state, process))
     } else {
         Err(GitCacheError::Unsupported(format!(
             "unsupported git session request: {method} {path}"
@@ -479,16 +484,19 @@ fn session_bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError>
 }
 
 fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackProcess) -> Response {
+    let timeout_duration = process.timeout();
     let permit = process.take_permit();
-    let child = process.child;
     let reader_stream =
         ReaderStream::with_capacity(process.stdout, GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES);
     let max_bytes = state.domain.config.max_git_output_bytes as u64;
     let guarded = ChildGuardStream {
         inner: reader_stream,
-        _child: child,
+        child: process.child,
         bytes_sent: 0,
         max_bytes,
+        timeout: Box::pin(tokio::time::sleep(timeout_duration)),
+        timeout_duration,
+        timed_out: false,
         _permit: permit,
     };
     Response::builder()
@@ -624,9 +632,12 @@ pub fn empty_body() -> Body {
 /// semaphore permit so it is not released until the stream is fully consumed.
 struct ChildGuardStream<R: AsyncRead + Unpin> {
     inner: ReaderStream<R>,
-    _child: tokio::process::Child,
+    child: tokio::process::Child,
     bytes_sent: u64,
     max_bytes: u64,
+    timeout: Pin<Box<Sleep>>,
+    timeout_duration: Duration,
+    timed_out: bool,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -635,6 +646,22 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.timed_out {
+            return Poll::Ready(None);
+        }
+
+        if this.timeout.as_mut().poll(cx).is_ready() {
+            this.timed_out = true;
+            let _ = this.child.start_kill();
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "git upload-pack response exceeded timeout of {:?}",
+                    this.timeout_duration
+                ),
+            ))));
+        }
+
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 this.bytes_sent = this.bytes_sent.saturating_add(chunk.len() as u64);
@@ -655,11 +682,15 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use git_cache_core::ObjectStoreConfig;
     use git_cache_domain::parse_want_lines;
     use std::net::SocketAddr;
     use std::path::PathBuf;
+    use std::process::Stdio;
     use tempfile::TempDir;
+    use tokio::io::duplex;
+    use tokio::process::Command;
 
     #[test]
     fn rate_limiter_blocks_after_limit() {
@@ -667,6 +698,43 @@ mod tests {
         assert!(limiter.check());
         assert!(limiter.check());
         assert!(!limiter.check());
+    }
+
+    #[tokio::test]
+    async fn upload_pack_stream_times_out_when_reader_stays_pending() {
+        let (reader, _writer) = duplex(64);
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep child");
+        let timeout_duration = Duration::from_millis(10);
+        let mut stream = ChildGuardStream {
+            inner: ReaderStream::new(reader),
+            child,
+            bytes_sent: 0,
+            max_bytes: 1024,
+            timeout: Box::pin(tokio::time::sleep(timeout_duration)),
+            timeout_duration,
+            timed_out: false,
+            _permit: None,
+        };
+
+        let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream should wake on timeout")
+            .expect("stream should yield timeout error");
+        let error = item.expect_err("silent stream should time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .contains("git upload-pack response exceeded timeout"),
+            "unexpected timeout error: {error}"
+        );
     }
 
     #[tokio::test]

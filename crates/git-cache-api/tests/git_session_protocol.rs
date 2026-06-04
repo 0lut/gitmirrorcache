@@ -180,6 +180,29 @@ async fn git_stdout_async(cwd: &Path, args: &[&str]) -> String {
     .unwrap()
 }
 
+async fn run_git_with_extra_header_async(cwd: &Path, args: &[&str], header: String) {
+    let cwd = cwd.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let output = Command::new("git")
+            .current_dir(&cwd)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env("GIT_CONFIG_VALUE_0", header)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    })
+    .await
+    .unwrap();
+}
+
 /// POST JSON to a URL, returning the response.
 async fn post_json(
     client: &reqwest::Client,
@@ -248,7 +271,7 @@ async fn full_session_lifecycle() {
 
     // 4. Upload-pack POST with the session commit
     let sha = &mat.commit;
-    let want_line = format!("want {sha}\n");
+    let want_line = format!("want {sha} multi_ack_detailed side-band-64k thin-pack ofs-delta\n");
     let pkt_want = format!("{:04x}{}", 4 + want_line.len(), want_line);
     let pack_body = format!("{pkt_want}00000009done\n");
 
@@ -262,9 +285,16 @@ async fn full_session_lifecycle() {
         .unwrap();
     assert_eq!(pack_resp.status(), 200);
     let pack_bytes = pack_resp.bytes().await.unwrap();
+    let has_nak = pack_bytes.windows(3).any(|w| w == b"NAK");
+    let has_pack = pack_bytes.windows(4).any(|w| w == b"PACK");
     assert!(
-        pack_bytes.windows(4).any(|w| w == b"PACK"),
-        "upload-pack response missing PACK"
+        has_nak,
+        "upload-pack response should contain negotiation data"
+    );
+    assert!(
+        has_pack,
+        "upload-pack response should contain pack data, got {} bytes",
+        pack_bytes.len()
     );
 
     // 5. Actual git clone using session URL
@@ -378,23 +408,22 @@ async fn authenticated_materialize_session_requires_bearer_token() {
         "protected session should not advertise filter capability"
     );
 
-    let want_line = format!("want {}\n", mat.commit);
-    let pkt_want = format!("{:04x}{}", 4 + want_line.len(), want_line);
-    let pack_body = format!("{pkt_want}00000009done\n");
-    let pack_url = format!("{}/git-upload-pack", mat.git_url);
-    let pack_resp = client
-        .post(&pack_url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Content-Type", "application/x-git-upload-pack-request")
-        .body(pack_body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(pack_resp.status(), 200);
-    let pack_bytes = pack_resp.bytes().await.unwrap();
-    assert!(
-        pack_bytes.windows(4).any(|w| w == b"PACK"),
-        "protected upload-pack response missing PACK"
+    let clone_dir = server.tmp.path().join("protected_session_clone");
+    run_git_with_extra_header_async(
+        server.tmp.path(),
+        &[
+            "clone",
+            "--no-tags",
+            &mat.git_url,
+            clone_dir.to_str().unwrap(),
+        ],
+        format!("Authorization: Bearer {token}"),
+    )
+    .await;
+    let cloned_head = git_stdout_async(&clone_dir, &["rev-parse", "HEAD"]).await;
+    assert_eq!(
+        cloned_head, mat.commit,
+        "protected session clone should fetch the authorized commit"
     );
 }
 

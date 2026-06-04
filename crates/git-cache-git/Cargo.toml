@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes.workspace = true
 git-cache-core = { path = "../git-cache-core" }
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
-

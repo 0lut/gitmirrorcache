@@ -436,3 +436,27 @@ omits `filter`, `allow-tip-sha1-in-want`, and
 New coverage asserts Basic auth redaction, protected session token issuance,
 missing/wrong session-token rejection, protected session upload-pack success,
 and preservation of existing public direct remote behavior.
+
+## Merge conflict resolution notes
+
+### M1. Kept main's runtime-cache completeness checks
+
+While merging `origin/main`, I preserved its `commit_ready_for_serving` checks
+for direct upload-pack wants. Authenticated wants still require current upstream
+proof, but commit wants are not exposed unless both the commit and tree are
+available locally.
+
+### M2. Protected session repos do not hide their synthetic ref
+
+The protected session repo contains only the authorized synthetic session ref
+and uses alternates for objects. Hiding `refs/cache` in that repo also hides the
+synthetic `refs/cache/sessions/...` ref from stateless upload-pack, so protected
+sessions keep the stricter `allow*InWant=false` config but do not set
+`hideRefs=refs/cache`.
+
+### M3. Session-token test uses a real Git client flow
+
+After the merge, the single handcrafted upload-pack POST could stop after the
+negotiation `NAK` under the stricter protected config. The regression now uses
+`git clone` with `http.extraHeader` injected through `GIT_CONFIG_*`, which is
+closer to the workflow users actually run and keeps the token out of argv.

@@ -284,8 +284,9 @@ async fn upload_pack_post_returns_pack_data() {
 
     let sha = extract_first_sha(&refs_body);
 
-    // Build a minimal pkt-line want/done body.
-    let want_line = format!("want {sha}\n");
+    // Build a pkt-line want/done body with the capabilities a real fetch
+    // client would advertise before expecting pack data.
+    let want_line = format!("want {sha} multi_ack_detailed side-band-64k thin-pack ofs-delta\n");
     let pkt_want = format!("{:04x}{}", 4 + want_line.len(), want_line);
     let body = format!("{pkt_want}00000009done\n");
 
@@ -309,14 +310,17 @@ async fn upload_pack_post_returns_pack_data() {
     assert_eq!(ct, "application/x-git-upload-pack-result");
 
     let resp_body = resp.bytes().await.unwrap();
-    // Valid upload-pack response: either NAK+PACK or just NAK (if the
-    // server uses streaming and the child process exits before sending
-    // pack data — a source-level issue to fix separately).
     let has_nak = resp_body.windows(3).any(|w| w == b"NAK");
     let has_pack = resp_body.windows(4).any(|w| w == b"PACK");
     assert!(
-        has_nak || has_pack,
-        "upload-pack response should contain NAK or PACK, got {} bytes: {:?}",
+        has_nak,
+        "upload-pack response should contain negotiation data, got {} bytes: {:?}",
+        resp_body.len(),
+        &resp_body[..resp_body.len().min(200)]
+    );
+    assert!(
+        has_pack,
+        "upload-pack response should contain pack data, got {} bytes: {:?}",
         resp_body.len(),
         &resp_body[..resp_body.len().min(200)]
     );

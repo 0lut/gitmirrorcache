@@ -756,9 +756,9 @@ impl Materializer {
         };
 
         let repo_dir = self.ensure_repo_dir(&repo).await?;
-        if !self.commit_exists(&repo_dir, &commit).await {
+        if !self.commit_ready_for_serving(&repo_dir, &commit).await {
             return Err(GitCacheError::NotFound(format!(
-                "cannot create session for missing local commit `{commit}`"
+                "cannot create session for missing or incomplete local commit `{commit}`"
             )));
         }
 
@@ -879,7 +879,10 @@ impl Materializer {
         }
 
         let repo_dir = self.ensure_repo_dir(&manifest.repo).await?;
-        if !self.commit_exists(&repo_dir, &manifest.commit).await {
+        if !self
+            .commit_ready_for_serving(&repo_dir, &manifest.commit)
+            .await
+        {
             let commit_manifest = self
                 .get_commit_manifest(&manifest.repo, &manifest.commit)
                 .await?
@@ -906,15 +909,21 @@ impl Materializer {
         repo_dir: &FsPath,
         manifest: &CommitManifest,
     ) -> CoreResult<()> {
-        if self.commit_exists(repo_dir, &manifest.commit).await {
+        if self
+            .commit_ready_for_serving(repo_dir, &manifest.commit)
+            .await
+        {
             return Ok(());
         }
 
         self.hydrate_generation(&manifest.repo, repo_dir, manifest.generation)
             .await?;
-        if !self.commit_exists(repo_dir, &manifest.commit).await {
+        if !self
+            .commit_ready_for_serving(repo_dir, &manifest.commit)
+            .await
+        {
             return Err(GitCacheError::NotFound(format!(
-                "hydrated generation `{}` did not contain commit `{}`",
+                "hydrated generation `{}` did not contain complete commit `{}`",
                 manifest.generation, manifest.commit
             )));
         }
@@ -1802,6 +1811,22 @@ impl Materializer {
             .is_ok()
     }
 
+    async fn commit_tree_exists(&self, repo_dir: &FsPath, commit: &CommitSha) -> bool {
+        self.state
+            .git
+            .run(
+                Some(repo_dir),
+                ["cat-file", "-e", &format!("{}^{{tree}}", commit.as_str())],
+            )
+            .await
+            .is_ok()
+    }
+
+    async fn commit_ready_for_serving(&self, repo_dir: &FsPath, commit: &CommitSha) -> bool {
+        self.commit_exists(repo_dir, commit).await
+            && self.commit_tree_exists(repo_dir, commit).await
+    }
+
     async fn object_exists(&self, repo_dir: &FsPath, object_id: &CommitSha) -> bool {
         self.state
             .git
@@ -1962,7 +1987,7 @@ impl Materializer {
                 "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = true\n\tallowAnySHA1InWant = true\n\tallowReachableSHA1InWant = true\n"
             }
             SessionProtection::BearerToken { .. } => {
-                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = false\n\tallowAnySHA1InWant = false\n\tallowReachableSHA1InWant = false\n[transfer]\n\thideRefs = refs/cache\n"
+                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = false\n\tallowAnySHA1InWant = false\n\tallowReachableSHA1InWant = false\n"
             }
         };
         fs::write(session_repo.join("config"), upload_pack_config).await?;
@@ -2305,18 +2330,29 @@ impl Materializer {
                     .fetch_object_with_auth(&repo_dir, &upstream_url, &object_id, auth)
                     .await
                 {
-                    if auth.is_authenticated() {
+                    self.state
+                        .git
+                        .fetch_all_heads_with_auth(&repo_dir, &upstream_url, auth)
+                        .await?;
+                    if self.object_exists(&repo_dir, &object_id).await {
+                        // The object is reachable from refs that upstream just served
+                        // with this request credential.
+                    } else if auth.is_authenticated() {
                         return Err(GitCacheError::Forbidden(format!(
                             "object `{object_id}` is not authorized by upstream: {err}"
                         )));
+                    } else {
+                        return Err(GitCacheError::NotFound(format!(
+                            "object `{object_id}` was not available from upstream: {err}"
+                        )));
                     }
-                    return Err(GitCacheError::NotFound(format!(
-                        "object `{object_id}` was not available from upstream: {err}"
-                    )));
                 }
             }
 
-            if !self.object_exists(&repo_dir, &object_id).await {
+            if !self.object_exists(&repo_dir, &object_id).await
+                || (self.commit_exists(&repo_dir, &object_id).await
+                    && !self.commit_ready_for_serving(&repo_dir, &object_id).await)
+            {
                 if let Some(manifest) = self.get_commit_manifest(repo, &object_id).await? {
                     if manifest.complete {
                         self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
@@ -2330,22 +2366,40 @@ impl Materializer {
                 )));
             }
 
-            if self.commit_exists(&repo_dir, &object_id).await {
-                self.expose_served_commit(&repo_dir, &object_id).await?;
+            let object_types = self
+                .state
+                .git
+                .cat_file_batch_types(&repo_dir, std::slice::from_ref(&object_id))
+                .await?;
+            let Some(object_type) = object_types.get(&object_id) else {
+                return Err(GitCacheError::NotFound(format!(
+                    "object `{object_id}` is authorized but unavailable locally"
+                )));
+            };
+            if object_type != "commit" {
+                continue;
+            }
 
-                // Create a ref so that `bundle create --all` has something
-                // to include.  We use refs/cache/ which is hidden from
-                // clients by configure_served_repo.
-                let cache_ref = format!("refs/cache/commits/{object_id}");
-                self.state
-                    .git
-                    .update_ref(&repo_dir, &cache_ref, object_id.as_str())
+            if !self.commit_ready_for_serving(&repo_dir, &object_id).await {
+                return Err(GitCacheError::NotFound(format!(
+                    "commit `{object_id}` is incomplete after upstream fetch"
+                )));
+            }
+
+            self.expose_served_commit(&repo_dir, &object_id).await?;
+
+            // Create a ref so that `bundle create --all` has something
+            // to include.  We use refs/cache/ which is hidden from
+            // clients by configure_served_repo.
+            let cache_ref = format!("refs/cache/commits/{object_id}");
+            self.state
+                .git
+                .update_ref(&repo_dir, &cache_ref, object_id.as_str())
+                .await?;
+
+            if self.get_commit_manifest(repo, &object_id).await?.is_none() {
+                self.publish_generation(repo, &repo_dir, &object_id, None, false)
                     .await?;
-
-                if self.get_commit_manifest(repo, &object_id).await?.is_none() {
-                    self.publish_generation(repo, &repo_dir, &object_id, None, false)
-                        .await?;
-                }
             }
         }
 
@@ -2438,7 +2492,10 @@ impl Materializer {
         }
         let repo_dir = self.ensure_repo_dir(repo).await?;
         self.configure_served_repo(&repo_dir).await?;
-        self.state.git.upload_pack_spawn(&repo_dir, body).await
+        self.state
+            .git
+            .upload_pack_spawn(&repo_dir, body.clone())
+            .await
     }
 
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
