@@ -1347,11 +1347,14 @@ name = "git-cache-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "git-cache-core",
+ "git-cache-objectstore",
  "serde",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

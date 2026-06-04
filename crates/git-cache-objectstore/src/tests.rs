@@ -1,13 +1,14 @@
 use crate::{
-    acquire_lease, commit_manifest_key, generation_manifest_key, lease_key,
-    pending_generation_publish_key, read_commit_manifest, read_generation_manifest, read_lease,
-    read_pending_generation_publish, read_ref_manifest, read_repo_generation_head,
-    read_session_manifest, read_verified_generation_manifest, ref_manifest_key,
+    acquire_lease, advance_generation_head, commit_manifest_key, generation_manifest_key,
+    lease_key, pending_generation_publish_key, read_commit_manifest, read_generation_manifest,
+    read_json_with_version, read_lease, read_pending_generation_publish, read_ref_manifest,
+    read_repo_generation_head, read_session_manifest, read_verified_generation_manifest,
+    ref_manifest_key, release_lease_if_token_matches, renew_lease_if_token_matches,
     repo_generation_head_key, session_manifest_key, validate_key, verified_generation_manifest_key,
     write_generation_manifest, write_generation_manifest_if_absent_or_matches,
     write_ref_manifest_if_absent_or_matches, write_repo_generation_head,
-    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, LeaseManifest,
-    LocalObjectStore, ObjectStore, PendingGenerationPublish, PublishManifests,
+    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, LocalObjectStore,
+    ObjectStore, PendingGenerationPublish, PublishManifests,
 };
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
@@ -339,16 +340,17 @@ async fn lease_acquisition_uses_create_once_semantics() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(
-        acquired,
-        LeaseManifest {
-            repo: repo.clone(),
-            name: "update".into(),
-            holder: "worker-a".into(),
-            acquired_at: ts(10),
-            expires_at: ts(10) + Duration::minutes(15),
-        }
-    );
+    assert_eq!(acquired.schema_version, 1);
+    assert_eq!(acquired.repo, repo.clone());
+    assert_eq!(acquired.name, "update");
+    assert_eq!(acquired.holder, "worker-a");
+    assert!(!acquired.token.is_empty());
+    assert_eq!(acquired.acquired_at, ts(10));
+    assert_eq!(acquired.renewed_at, Some(ts(10)));
+    assert_eq!(acquired.expires_at, ts(10) + Duration::minutes(15));
+    assert_eq!(acquired.released_at, None);
+    assert_eq!(acquired.operation, None);
+    assert_eq!(acquired.expected_head, None);
 
     assert!(acquire_lease(
         &store,
@@ -366,6 +368,156 @@ async fn lease_acquisition_uses_create_once_semantics() {
         read_lease(&store, &repo, "update").await.unwrap(),
         Some(acquired)
     );
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn local_store_versioned_writes_reject_stale_versions() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+
+    store
+        .put(
+            "repos/github.com/org/repo/manifests/current.json",
+            Bytes::from_static(b"one"),
+        )
+        .await
+        .unwrap();
+    let Some((_, first_version)) = store
+        .get_with_version("repos/github.com/org/repo/manifests/current.json")
+        .await
+        .unwrap()
+    else {
+        panic!("expected object");
+    };
+
+    assert!(store
+        .put_if_version_matches(
+            "repos/github.com/org/repo/manifests/current.json",
+            &first_version,
+            Bytes::from_static(b"two"),
+        )
+        .await
+        .unwrap());
+    assert!(!store
+        .put_if_version_matches(
+            "repos/github.com/org/repo/manifests/current.json",
+            &first_version,
+            Bytes::from_static(b"three"),
+        )
+        .await
+        .unwrap());
+
+    let value = store
+        .get("repos/github.com/org/repo/manifests/current.json")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, Bytes::from_static(b"two"));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn lease_renew_and_release_are_token_fenced() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+    let repo = repo();
+    let lease = acquire_lease(
+        &store,
+        &repo,
+        "update",
+        "worker-a",
+        ts(10),
+        Duration::minutes(15),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(!renew_lease_if_token_matches(
+        &store,
+        &repo,
+        "update",
+        "wrong-token",
+        ts(11),
+        Duration::minutes(15),
+    )
+    .await
+    .unwrap());
+    assert!(renew_lease_if_token_matches(
+        &store,
+        &repo,
+        "update",
+        &lease.token,
+        ts(11),
+        Duration::minutes(15),
+    )
+    .await
+    .unwrap());
+    assert!(
+        !release_lease_if_token_matches(&store, &repo, "update", "wrong-token", ts(12))
+            .await
+            .unwrap()
+    );
+    assert!(
+        release_lease_if_token_matches(&store, &repo, "update", &lease.token, ts(12))
+            .await
+            .unwrap()
+    );
+
+    let released = read_lease(&store, &repo, "update").await.unwrap().unwrap();
+    assert_eq!(released.released_at, Some(ts(12)));
+
+    let _ = fs::remove_dir_all(root).await;
+}
+
+#[tokio::test]
+async fn generation_head_advancement_is_expected_parent_fenced() {
+    let root = temp_root();
+    let store = LocalObjectStore::new(&root);
+    let repo = repo();
+    let first = RepoGenerationHead {
+        repo: repo.clone(),
+        generation: GenerationId::new(),
+        tip_commits: vec![commit('a')],
+        updated_at: ts(1),
+    };
+    assert!(advance_generation_head(&store, None, None, &first)
+        .await
+        .unwrap());
+    let Some((stored, version)) =
+        read_json_with_version::<_, RepoGenerationHead>(&store, &repo_generation_head_key(&repo))
+            .await
+            .unwrap()
+    else {
+        panic!("expected head");
+    };
+    assert_eq!(stored.generation, first.generation);
+
+    let second = RepoGenerationHead {
+        repo: repo.clone(),
+        generation: GenerationId::new(),
+        tip_commits: vec![commit('b')],
+        updated_at: ts(2),
+    };
+    assert!(
+        !advance_generation_head(&store, Some(GenerationId::new()), Some(&version), &second)
+            .await
+            .unwrap()
+    );
+    assert!(
+        advance_generation_head(&store, Some(first.generation), Some(&version), &second)
+            .await
+            .unwrap()
+    );
+
+    let stored = read_repo_generation_head(&store, &repo)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.generation, second.generation);
 
     let _ = fs::remove_dir_all(root).await;
 }

@@ -1,4 +1,4 @@
-use crate::{validate_key, ObjectStore};
+use crate::{validate_key, ObjectStore, ObjectVersion};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
@@ -11,11 +11,23 @@ use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseManifest {
+    #[serde(default = "lease_schema_version")]
+    pub schema_version: u32,
     pub repo: RepoKey,
     pub name: String,
     pub holder: String,
+    #[serde(default)]
+    pub token: String,
     pub acquired_at: DateTime<Utc>,
+    #[serde(default)]
+    pub renewed_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub released_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub operation: Option<String>,
+    #[serde(default)]
+    pub expected_head: Option<GenerationId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +173,20 @@ where
     Ok(Some(serde_json::from_slice(&value)?))
 }
 
+pub async fn read_json_with_version<S, T>(
+    store: &S,
+    key: &str,
+) -> Result<Option<(T, ObjectVersion)>>
+where
+    S: ObjectStore + ?Sized,
+    T: DeserializeOwned,
+{
+    let Some((value, version)) = store.get_with_version(key).await? else {
+        return Ok(None);
+    };
+    Ok(Some((serde_json::from_slice(&value)?, version)))
+}
+
 pub async fn write_json<S, T>(store: &S, key: &str, value: &T) -> Result<()>
 where
     S: ObjectStore + ?Sized,
@@ -195,6 +221,43 @@ where
         Err(GitCacheError::Conflict(format!(
             "object `{key}` already contains a different manifest"
         )))
+    }
+}
+
+pub async fn put_json_if_version_matches<S, T>(
+    store: &S,
+    key: &str,
+    expected: &ObjectVersion,
+    value: &T,
+) -> Result<bool>
+where
+    S: ObjectStore + ?Sized,
+    T: Serialize + ?Sized,
+{
+    store
+        .put_if_version_matches(key, expected, json_bytes(value)?)
+        .await
+}
+
+pub async fn compare_and_swap_json<S, T, F>(store: &S, key: &str, f: F) -> Result<bool>
+where
+    S: ObjectStore + ?Sized,
+    T: Serialize + DeserializeOwned,
+    F: FnOnce(Option<T>) -> Result<Option<T>>,
+{
+    match read_json_with_version::<_, T>(store, key).await? {
+        Some((current, version)) => {
+            let Some(next) = f(Some(current))? else {
+                return store.delete_if_version_matches(key, &version).await;
+            };
+            put_json_if_version_matches(store, key, &version, &next).await
+        }
+        None => {
+            let Some(next) = f(None)? else {
+                return Ok(true);
+            };
+            write_json_if_absent(store, key, &next).await
+        }
     }
 }
 
@@ -282,6 +345,50 @@ where
     S: ObjectStore + ?Sized,
 {
     write_json(store, &repo_generation_head_key(&head.repo), head).await
+}
+
+pub async fn read_repo_generation_head_with_version<S>(
+    store: &S,
+    repo: &RepoKey,
+) -> Result<Option<(RepoGenerationHead, ObjectVersion)>>
+where
+    S: ObjectStore + ?Sized,
+{
+    read_json_with_version(store, &repo_generation_head_key(repo)).await
+}
+
+pub async fn advance_generation_head<S>(
+    store: &S,
+    expected_current: Option<GenerationId>,
+    expected_version: Option<&ObjectVersion>,
+    new_head: &RepoGenerationHead,
+) -> Result<bool>
+where
+    S: ObjectStore + ?Sized,
+{
+    let key = repo_generation_head_key(&new_head.repo);
+    match read_json_with_version::<_, RepoGenerationHead>(store, &key).await? {
+        Some((current, version)) => {
+            if current.generation == new_head.generation {
+                return Ok(true);
+            }
+            if Some(current.generation) != expected_current {
+                return Ok(false);
+            }
+            if let Some(expected_version) = expected_version {
+                if version.token != expected_version.token {
+                    return Ok(false);
+                }
+            }
+            put_json_if_version_matches(store, &key, &version, new_head).await
+        }
+        None => {
+            if expected_current.is_some() || expected_version.is_some() {
+                return Ok(false);
+            }
+            write_json_if_absent(store, &key, new_head).await
+        }
+    }
 }
 
 pub async fn write_generation_manifest<S>(store: &S, manifest: &GenerationManifest) -> Result<()>
@@ -447,16 +554,54 @@ where
     read_json(store, &ref_manifest_key(repo, ref_name)?).await
 }
 
+pub async fn read_ref_manifest_with_version<S>(
+    store: &S,
+    repo: &RepoKey,
+    ref_name: &str,
+) -> Result<Option<(RefManifest, ObjectVersion)>>
+where
+    S: ObjectStore + ?Sized,
+{
+    read_json_with_version(store, &ref_manifest_key(repo, ref_name)?).await
+}
+
 pub async fn write_ref_manifest<S>(store: &S, manifest: &RefManifest) -> Result<()>
 where
     S: ObjectStore + ?Sized,
 {
-    write_json(
-        store,
-        &ref_manifest_key(&manifest.repo, &manifest.ref_name)?,
-        manifest,
-    )
-    .await
+    let key = ref_manifest_key(&manifest.repo, &manifest.ref_name)?;
+    loop {
+        match read_json_with_version::<_, RefManifest>(store, &key).await? {
+            Some((existing, version)) => {
+                if existing == *manifest || existing.verified_at > manifest.verified_at {
+                    return Ok(());
+                }
+                if put_json_if_version_matches(store, &key, &version, manifest).await? {
+                    return Ok(());
+                }
+            }
+            None => {
+                if write_json_if_absent(store, &key, manifest).await? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+pub async fn write_ref_manifest_if_version_matches<S>(
+    store: &S,
+    manifest: &RefManifest,
+    expected: Option<&ObjectVersion>,
+) -> Result<bool>
+where
+    S: ObjectStore + ?Sized,
+{
+    let key = ref_manifest_key(&manifest.repo, &manifest.ref_name)?;
+    match expected {
+        Some(version) => put_json_if_version_matches(store, &key, version, manifest).await,
+        None => write_json_if_absent(store, &key, manifest).await,
+    }
 }
 
 pub async fn write_ref_manifest_if_absent<S>(store: &S, manifest: &RefManifest) -> Result<bool>
@@ -550,12 +695,34 @@ pub async fn acquire_lease<S>(
 where
     S: ObjectStore + ?Sized,
 {
+    let token = git_cache_core::GenerationId::new().to_string();
+    acquire_lease_with_token(store, repo, name, holder, token, acquired_at, ttl).await
+}
+
+pub async fn acquire_lease_with_token<S>(
+    store: &S,
+    repo: &RepoKey,
+    name: &str,
+    holder: impl Into<String>,
+    token: impl Into<String>,
+    acquired_at: DateTime<Utc>,
+    ttl: Duration,
+) -> Result<Option<LeaseManifest>>
+where
+    S: ObjectStore + ?Sized,
+{
     let lease = LeaseManifest {
+        schema_version: lease_schema_version(),
         repo: repo.clone(),
         name: name.to_string(),
         holder: holder.into(),
+        token: token.into(),
         acquired_at,
+        renewed_at: Some(acquired_at),
         expires_at: acquired_at + ttl,
+        released_at: None,
+        operation: None,
+        expected_head: None,
     };
     let key = lease_key(repo, name)?;
     if write_json_if_absent(store, &key, &lease).await? {
@@ -570,6 +737,79 @@ where
     S: ObjectStore + ?Sized,
 {
     read_json(store, &lease_key(repo, name)?).await
+}
+
+pub async fn read_lease_with_version<S>(
+    store: &S,
+    repo: &RepoKey,
+    name: &str,
+) -> Result<Option<(LeaseManifest, ObjectVersion)>>
+where
+    S: ObjectStore + ?Sized,
+{
+    read_json_with_version(store, &lease_key(repo, name)?).await
+}
+
+pub async fn renew_lease_if_token_matches<S>(
+    store: &S,
+    repo: &RepoKey,
+    name: &str,
+    token: &str,
+    renewed_at: DateTime<Utc>,
+    ttl: Duration,
+) -> Result<bool>
+where
+    S: ObjectStore + ?Sized,
+{
+    let key = lease_key(repo, name)?;
+    let Some((mut lease, version)) =
+        read_json_with_version::<_, LeaseManifest>(store, &key).await?
+    else {
+        return Ok(false);
+    };
+    if lease.token != token || lease.released_at.is_some() {
+        return Ok(false);
+    }
+    lease.renewed_at = Some(renewed_at);
+    lease.expires_at = renewed_at + ttl;
+    put_json_if_version_matches(store, &key, &version, &lease).await
+}
+
+pub async fn release_lease_if_token_matches<S>(
+    store: &S,
+    repo: &RepoKey,
+    name: &str,
+    token: &str,
+    released_at: DateTime<Utc>,
+) -> Result<bool>
+where
+    S: ObjectStore + ?Sized,
+{
+    let key = lease_key(repo, name)?;
+    let Some((mut lease, version)) =
+        read_json_with_version::<_, LeaseManifest>(store, &key).await?
+    else {
+        return Ok(false);
+    };
+    if lease.token != token || lease.released_at.is_some() {
+        return Ok(false);
+    }
+    lease.released_at = Some(released_at);
+    put_json_if_version_matches(store, &key, &version, &lease).await
+}
+
+pub async fn steal_expired_lease_if_version_matches<S>(
+    store: &S,
+    repo: &RepoKey,
+    name: &str,
+    expected: &ObjectVersion,
+    mut lease: LeaseManifest,
+) -> Result<bool>
+where
+    S: ObjectStore + ?Sized,
+{
+    lease.schema_version = lease_schema_version();
+    put_json_if_version_matches(store, &lease_key(repo, name)?, expected, &lease).await
 }
 
 async fn write_publish_manifests<S>(store: &S, manifests: &PublishManifests) -> Result<()>
@@ -621,6 +861,10 @@ where
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     Ok(Bytes::from(bytes))
+}
+
+fn lease_schema_version() -> u32 {
+    1
 }
 
 fn validate_publish(publish: &GenerationPublish) -> Result<()> {

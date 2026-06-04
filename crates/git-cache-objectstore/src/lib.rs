@@ -12,18 +12,22 @@ use std::path::{Component, Path};
 
 pub use local::LocalObjectStore;
 pub use manifests::{
-    acquire_lease, commit_manifest_key, generation_manifest_key, lease_key,
-    pending_generation_publish_key, read_commit_manifest, read_generation_manifest, read_json,
-    read_lease, read_pending_generation_publish, read_ref_manifest, read_repo_generation_head,
-    read_session_manifest, read_verified_generation_manifest, ref_manifest_key,
-    repo_generation_head_key, session_manifest_key, verified_generation_manifest_key,
+    acquire_lease, acquire_lease_with_token, advance_generation_head, commit_manifest_key,
+    compare_and_swap_json, generation_manifest_key, lease_key, pending_generation_publish_key,
+    put_json_if_version_matches, read_commit_manifest, read_generation_manifest, read_json,
+    read_json_with_version, read_lease, read_lease_with_version, read_pending_generation_publish,
+    read_ref_manifest, read_ref_manifest_with_version, read_repo_generation_head,
+    read_repo_generation_head_with_version, read_session_manifest,
+    read_verified_generation_manifest, ref_manifest_key, release_lease_if_token_matches,
+    renew_lease_if_token_matches, repo_generation_head_key, session_manifest_key,
+    steal_expired_lease_if_version_matches, verified_generation_manifest_key,
     write_commit_manifest, write_commit_manifest_if_absent,
     write_commit_manifest_if_absent_or_matches, write_generation_manifest,
     write_generation_manifest_if_absent, write_generation_manifest_if_absent_or_matches,
     write_json, write_json_if_absent, write_json_if_absent_or_matches, write_ref_manifest,
     write_ref_manifest_if_absent, write_ref_manifest_if_absent_or_matches,
-    write_repo_generation_head, write_session_manifest, write_session_manifest_if_absent,
-    write_session_manifest_if_absent_or_matches,
+    write_ref_manifest_if_version_matches, write_repo_generation_head, write_session_manifest,
+    write_session_manifest_if_absent, write_session_manifest_if_absent_or_matches,
     write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, LeaseManifest,
     PendingGenerationPublish, PublishManifests,
 };
@@ -32,19 +36,34 @@ pub use manifests::{
 pub use s3::S3ObjectStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersion {
+    pub token: String,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
     pub key: String,
     pub len: u64,
     pub updated_at: Option<DateTime<Utc>>,
+    pub version: Option<ObjectVersion>,
 }
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Bytes>>;
+    async fn get_with_version(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>>;
     async fn put(&self, key: &str, value: Bytes) -> Result<()>;
     async fn put_if_absent(&self, key: &str, value: Bytes) -> Result<bool>;
+    async fn put_if_version_matches(
+        &self,
+        key: &str,
+        expected: &ObjectVersion,
+        value: Bytes,
+    ) -> Result<bool>;
     async fn exists(&self, key: &str) -> Result<bool>;
     async fn delete(&self, key: &str) -> Result<()>;
+    async fn delete_if_version_matches(&self, key: &str, expected: &ObjectVersion) -> Result<bool>;
     async fn list_prefix(&self, prefix: &str, max_keys: Option<usize>) -> Result<Vec<String>>;
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>>;

@@ -1,4 +1,4 @@
-use crate::{validate_key, ObjectMeta, ObjectStore};
+use crate::{validate_key, ObjectMeta, ObjectStore, ObjectVersion};
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -216,6 +216,36 @@ impl ObjectStore for S3ObjectStore {
         Ok(Some(body.into_bytes()))
     }
 
+    async fn get_with_version(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>> {
+        let s3_key = self.s3_key(key)?;
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(s3_error("get_with_version", &s3_key, err)),
+        };
+        let version = object_version(
+            output.e_tag(),
+            output.version_id(),
+            output
+                .last_modified()
+                .and_then(|t| DateTime::<Utc>::from_timestamp(t.secs(), t.subsec_nanos())),
+            &s3_key,
+        )?;
+        let body = output
+            .body
+            .collect()
+            .await
+            .map_err(|err| s3_error("read body", &s3_key, err))?;
+        Ok(Some((body.into_bytes(), version)))
+    }
+
     async fn put(&self, key: &str, value: Bytes) -> Result<()> {
         let s3_key = self.s3_key(key)?;
         self.client
@@ -247,6 +277,29 @@ impl ObjectStore for S3ObjectStore {
         }
     }
 
+    async fn put_if_version_matches(
+        &self,
+        key: &str,
+        expected: &ObjectVersion,
+        value: Bytes,
+    ) -> Result<bool> {
+        let s3_key = self.s3_key(key)?;
+        match self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .if_match(&expected.token)
+            .body(ByteStream::new(value.into()))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) if is_precondition_failed(&err) || is_not_found(&err) => Ok(false),
+            Err(err) => Err(s3_error("put_if_version_matches", &s3_key, err)),
+        }
+    }
+
     async fn exists(&self, key: &str) -> Result<bool> {
         let s3_key = self.s3_key(key)?;
         match self
@@ -273,6 +326,23 @@ impl ObjectStore for S3ObjectStore {
             .await
             .map_err(|err| s3_error("delete", &s3_key, err))?;
         Ok(())
+    }
+
+    async fn delete_if_version_matches(&self, key: &str, expected: &ObjectVersion) -> Result<bool> {
+        let s3_key = self.s3_key(key)?;
+        match self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .if_match(&expected.token)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) if is_precondition_failed(&err) || is_not_found(&err) => Ok(false),
+            Err(err) => Err(s3_error("delete_if_version_matches", &s3_key, err)),
+        }
     }
 
     async fn list_prefix(&self, prefix: &str, max_keys: Option<usize>) -> Result<Vec<String>> {
@@ -351,6 +421,12 @@ impl ObjectStore for S3ObjectStore {
                     key: key.to_string(),
                     len,
                     updated_at,
+                    version: Some(object_version(
+                        output.e_tag(),
+                        output.version_id(),
+                        updated_at,
+                        &s3_key,
+                    )?),
                 }))
             }
             Err(err) if is_not_found(&err) => Ok(None),
@@ -462,6 +538,23 @@ where
         error.as_service_error().and_then(|err| err.code()),
         Some("PreconditionFailed")
     )
+}
+
+fn object_version(
+    e_tag: Option<&str>,
+    version_id: Option<&str>,
+    updated_at: Option<DateTime<Utc>>,
+    key: &str,
+) -> Result<ObjectVersion> {
+    let token = version_id.or(e_tag).ok_or_else(|| {
+        GitCacheError::UpstreamUnavailable(format!(
+            "s3 object `{key}` returned no etag or version id"
+        ))
+    })?;
+    Ok(ObjectVersion {
+        token: token.to_string(),
+        updated_at,
+    })
 }
 
 fn s3_error(op: &'static str, key: &str, error: impl std::fmt::Debug) -> GitCacheError {

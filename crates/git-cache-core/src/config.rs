@@ -36,6 +36,8 @@ pub struct AppConfig {
     pub session_cleanup_interval_secs: u64,
     #[serde(default = "default_max_concurrent_generation_verifications")]
     pub max_concurrent_generation_verifications: usize,
+    #[serde(default)]
+    pub leases: LeaseConfig,
 }
 
 impl AppConfig {
@@ -122,6 +124,22 @@ impl AppConfig {
                 "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
                 default_max_concurrent_generation_verifications(),
             )?,
+            leases: LeaseConfig {
+                worker_id: env::var("GIT_CACHE_WORKER_ID").ok(),
+                ttl_seconds: parse_env("GIT_CACHE_LEASE_TTL_SECONDS", default_lease_ttl_seconds())?,
+                renew_interval_seconds: parse_env(
+                    "GIT_CACHE_LEASE_RENEW_INTERVAL_SECONDS",
+                    default_lease_renew_interval_seconds(),
+                )?,
+                steal_skew_seconds: parse_env(
+                    "GIT_CACHE_LEASE_STEAL_SKEW_SECONDS",
+                    default_lease_steal_skew_seconds(),
+                )?,
+                busy_retry_after_seconds: parse_env(
+                    "GIT_CACHE_LEASE_BUSY_RETRY_AFTER_SECONDS",
+                    default_lease_busy_retry_after_seconds(),
+                )?,
+            },
         })
     }
 }
@@ -203,6 +221,48 @@ impl Default for CompactionConfig {
             inline: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseConfig {
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    #[serde(default = "default_lease_ttl_seconds")]
+    pub ttl_seconds: u64,
+    #[serde(default = "default_lease_renew_interval_seconds")]
+    pub renew_interval_seconds: u64,
+    #[serde(default = "default_lease_steal_skew_seconds")]
+    pub steal_skew_seconds: u64,
+    #[serde(default = "default_lease_busy_retry_after_seconds")]
+    pub busy_retry_after_seconds: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            worker_id: None,
+            ttl_seconds: default_lease_ttl_seconds(),
+            renew_interval_seconds: default_lease_renew_interval_seconds(),
+            steal_skew_seconds: default_lease_steal_skew_seconds(),
+            busy_retry_after_seconds: default_lease_busy_retry_after_seconds(),
+        }
+    }
+}
+
+pub fn default_lease_ttl_seconds() -> u64 {
+    300
+}
+
+pub fn default_lease_renew_interval_seconds() -> u64 {
+    60
+}
+
+pub fn default_lease_steal_skew_seconds() -> u64 {
+    30
+}
+
+pub fn default_lease_busy_retry_after_seconds() -> u64 {
+    5
 }
 
 fn default_compaction_threshold() -> u32 {
@@ -354,6 +414,11 @@ mod tests {
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
         "GIT_CACHE_SESSION_CLEANUP_INTERVAL_SECS",
         "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
+        "GIT_CACHE_WORKER_ID",
+        "GIT_CACHE_LEASE_TTL_SECONDS",
+        "GIT_CACHE_LEASE_RENEW_INTERVAL_SECONDS",
+        "GIT_CACHE_LEASE_STEAL_SKEW_SECONDS",
+        "GIT_CACHE_LEASE_BUSY_RETRY_AFTER_SECONDS",
     ];
 
     struct EnvGuard {
@@ -452,6 +517,7 @@ min_free_bytes = 100000
         assert_eq!(config.max_git_output_bytes, 16 * 1024 * 1024);
         assert_eq!(config.compaction, CompactionConfig::default());
         assert_eq!(config.max_concurrent_generation_verifications, 1);
+        assert_eq!(config.leases, LeaseConfig::default());
     }
 
     #[test]
@@ -459,6 +525,16 @@ min_free_bytes = 100000
         let config = CompactionConfig::default();
         assert_eq!(config.chain_depth_threshold, 10);
         assert!(!config.inline);
+    }
+
+    #[test]
+    fn lease_config_default_values() {
+        let config = LeaseConfig::default();
+        assert_eq!(config.worker_id, None);
+        assert_eq!(config.ttl_seconds, 300);
+        assert_eq!(config.renew_interval_seconds, 60);
+        assert_eq!(config.steal_skew_seconds, 30);
+        assert_eq!(config.busy_retry_after_seconds, 5);
     }
 
     #[test]
@@ -497,6 +573,11 @@ min_free_bytes = 100000
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
             ("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "3"),
+            ("GIT_CACHE_WORKER_ID", "worker-a"),
+            ("GIT_CACHE_LEASE_TTL_SECONDS", "11"),
+            ("GIT_CACHE_LEASE_RENEW_INTERVAL_SECONDS", "3"),
+            ("GIT_CACHE_LEASE_STEAL_SKEW_SECONDS", "2"),
+            ("GIT_CACHE_LEASE_BUSY_RETRY_AFTER_SECONDS", "1"),
         ]);
 
         let config = AppConfig::from_env().unwrap();
@@ -512,6 +593,11 @@ min_free_bytes = 100000
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
         assert_eq!(config.max_concurrent_generation_verifications, 3);
+        assert_eq!(config.leases.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(config.leases.ttl_seconds, 11);
+        assert_eq!(config.leases.renew_interval_seconds, 3);
+        assert_eq!(config.leases.steal_skew_seconds, 2);
+        assert_eq!(config.leases.busy_retry_after_seconds, 1);
 
         match config.object_store {
             ObjectStoreConfig::S3 {

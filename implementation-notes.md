@@ -1,3 +1,45 @@
+# Implementation Notes: Multi-Worker Conflict Avoidance
+
+## Running notes for PR #47 implementation
+
+### Decisions not explicit in the spec
+
+1. Implemented local object-store CAS with sidecar version files plus per-key
+   lock files under the local store root. This keeps the same object-store API
+   shape as S3 and exercises stale-version paths locally without adding a new
+   filesystem-lock dependency.
+2. S3 CAS uses ETag/version metadata as an opaque `ObjectVersion` token and
+   conditional `If-Match` writes. Large bundle objects still use immutable
+   create-once semantics; CAS is intended for small mutable JSON records.
+3. Production API wiring now uses an object-store-backed `repo-write` lease via
+   the existing worker `RepoLeaseManager` trait. The in-memory lease manager is
+   retained for focused unit tests.
+4. `repo-write` lease release is fenced by token and implemented as a conditional
+   transition to `released_at` instead of an unconditional delete. Cleanup can
+   safely delete released records later.
+5. Generation-head advancement during pending-generation verification re-reads
+   the actual current head, skips stale/out-of-order verification completions,
+   and CASes forward only when the observed head is older than the verified
+   generation.
+
+### Tradeoffs / follow-ups
+
+1. The first implementation keeps the existing asynchronous verification model.
+   That is less strict than holding `repo-write` through verification, but
+   monotonic head CAS prevents stale/sibling head overwrites. Fully serializing
+   publish through verification remains a follow-up if contention proves
+   problematic.
+2. Direct `/git/...` read-through still needs deeper integration with the durable
+   lease manager for unknown wants. The shared object-store CAS and production
+   `repo-write` manager are in place first so the direct path can reuse them
+   without inventing a second coordination primitive.
+3. Existing compaction still has explicit call sites that mutate manifests. The
+   durable lease/CAS primitives are available, but compaction fencing is only
+   partially wired in this pass and should be completed before enabling
+   aggressive GC/deletion in production.
+
+---
+
 # Implementation Notes: Read-Through Git Remote
 
 ## Overview
@@ -334,3 +376,20 @@ object-store listings.
 Operators can keep existing config values such as `prefix = "repos"` or
 `root = "./tmp/object-store"`. The domain state builder appends the v2 suffix at
 runtime and avoids double-suffixing if a config already contains `-v2` or `v2`.
+
+### T5. Verification head advancement is monotonic but tolerant of races
+
+Background verification no longer treats every generation-head CAS miss as a
+hard error. Verifier tasks can complete out of order, so the verifier re-reads
+the current head and only attempts to advance when the current head is older
+than the pending generation. A strict `>` timestamp check is used instead of
+`>=` because tests can publish multiple generations within the same timestamp
+tick; equal timestamps must still allow CAS advancement.
+
+### T6. Mutable ref/default manifests use versioned writes
+
+Ref manifests and the default manifest now use object-store versions for writes
+instead of blind overwrites. If a manifest with a strictly newer verification
+timestamp already exists, the older write is skipped. This is a pragmatic
+fencing guard for mutable branch/default state while preserving idempotent
+rewrites of identical content.

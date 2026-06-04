@@ -13,12 +13,15 @@ use git_cache_disk::RepoLock;
 pub use git_cache_git::UploadPackProcess;
 #[cfg(test)]
 use git_cache_objectstore::read_ref_manifest;
+#[cfg(test)]
+use git_cache_objectstore::write_repo_generation_head;
 use git_cache_objectstore::{
-    generation_manifest_key, pending_generation_publish_key, read_commit_manifest,
-    read_generation_manifest, read_json, read_pending_generation_publish,
-    read_repo_generation_head, read_session_manifest, read_verified_generation_manifest,
-    verified_generation_manifest_key, write_commit_manifest, write_json, write_ref_manifest,
-    write_repo_generation_head, write_session_manifest,
+    advance_generation_head, generation_manifest_key, pending_generation_publish_key,
+    put_json_if_version_matches, read_commit_manifest, read_generation_manifest, read_json,
+    read_json_with_version, read_pending_generation_publish, read_repo_generation_head,
+    read_session_manifest, read_verified_generation_manifest, verified_generation_manifest_key,
+    write_commit_manifest, write_commit_manifest_if_absent_or_matches, write_json,
+    write_json_if_absent, write_ref_manifest, write_session_manifest,
     write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, PublishManifests,
 };
 use serde::Serialize;
@@ -266,7 +269,7 @@ impl Materializer {
             complete: true,
             verified_at: Utc::now(),
         };
-        write_commit_manifest(&*self.state.store, &manifest).await?;
+        write_commit_manifest_if_absent_or_matches(&*self.state.store, &manifest).await?;
         Ok(())
     }
 
@@ -898,21 +901,30 @@ impl Materializer {
 
         if let Some(default_ref) = pending.default_ref {
             write_ref_manifest(&*self.state.store, &default_ref).await?;
-            write_json(
-                &*self.state.store,
-                &default_manifest_key(&repo),
-                &default_ref,
-            )
-            .await?;
+            self.write_default_ref_manifest(&default_ref).await?;
         }
 
         let current_head = read_repo_generation_head(&*self.state.store, &repo).await?;
-        if current_head
+        let current_gen = current_head.as_ref().map(|h| h.generation);
+        let current_is_newer = current_head
             .as_ref()
-            .map(|head| head.updated_at <= pending.head.updated_at)
-            .unwrap_or(true)
+            .map(|h| h.updated_at > pending.head.updated_at)
+            .unwrap_or(false);
+        if current_gen != Some(pending.head.generation)
+            && !current_is_newer
+            && !advance_generation_head(&*self.state.store, current_gen, None, &pending.head)
+                .await?
         {
-            write_repo_generation_head(&*self.state.store, &pending.head).await?;
+            let refreshed = read_repo_generation_head(&*self.state.store, &repo).await?;
+            if refreshed
+                .as_ref()
+                .map(|h| h.updated_at > pending.head.updated_at)
+                .unwrap_or(false)
+            {
+                debug!(%repo, %generation, "head already at or past verified generation");
+            } else {
+                warn!(%repo, %generation, "generation head CAS conflict; head is older than expected");
+            }
         }
         if let Err(err) = self
             .state
@@ -1072,7 +1084,10 @@ impl Materializer {
             )
             .await?;
         }
-        write_repo_generation_head(&*self.state.store, &new_head).await?;
+        // Use CAS to advance head from the old chain tip to the compacted generation.
+        // The verification step may have already advanced it; if CAS fails, that is fine.
+        let _ = advance_generation_head(&*self.state.store, Some(head.generation), None, &new_head)
+            .await?;
         let retained_generations = self
             .old_generations_needed_by_pending_publishes(repo, &old_generation_set)
             .await?;
@@ -1283,7 +1298,30 @@ impl Materializer {
             verified_at: Utc::now(),
         };
         write_ref_manifest(&*self.state.store, &manifest).await?;
-        write_json(&*self.state.store, &default_manifest_key(repo), &manifest).await
+        self.write_default_ref_manifest(&manifest).await
+    }
+
+    async fn write_default_ref_manifest(&self, manifest: &RefManifest) -> CoreResult<()> {
+        let key = default_manifest_key(&manifest.repo);
+        loop {
+            match read_json_with_version::<_, RefManifest>(&*self.state.store, &key).await? {
+                Some((existing, version)) => {
+                    if existing == *manifest || existing.verified_at > manifest.verified_at {
+                        return Ok(());
+                    }
+                    if put_json_if_version_matches(&*self.state.store, &key, &version, manifest)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
+                None => {
+                    if write_json_if_absent(&*self.state.store, &key, manifest).await? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
 
     pub async fn get_commit_manifest(
@@ -3945,6 +3983,7 @@ mod tests {
                 ),
                 session_cleanup_interval_secs: 300,
                 max_concurrent_generation_verifications: 1,
+                leases: Default::default(),
             }
         }
 

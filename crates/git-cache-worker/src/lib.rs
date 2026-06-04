@@ -1,17 +1,24 @@
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 pub use git_cache_core::{
     validate_event_ref, UpdateDisposition, UpdateExecutor, UpdateKey, UpdateOutcome, UpdateRequest,
     UpdateSource, UpdateTarget,
 };
 #[cfg(test)]
 use git_cache_core::{BranchName, CommitSha, ShortCommitSha};
-use git_cache_core::{GitCacheError, RepoKey, Result, Selector};
+use git_cache_core::{GitCacheError, LeaseConfig, RepoKey, Result, Selector};
+use git_cache_objectstore::{
+    acquire_lease_with_token, read_lease_with_version, release_lease_if_token_matches,
+    renew_lease_if_token_matches, steal_expired_lease_if_version_matches, LeaseManifest,
+    ObjectStore,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 #[cfg(test)]
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, watch, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, warn};
 
@@ -135,6 +142,204 @@ impl Drop for InMemoryRepoLease {
     fn drop(&mut self) {
         let _ = self.release_sync();
     }
+}
+
+#[derive(Clone)]
+pub struct ObjectStoreRepoLeaseManager {
+    store: Arc<dyn ObjectStore>,
+    holder: String,
+    ttl: ChronoDuration,
+    renew_interval: Duration,
+    steal_skew: ChronoDuration,
+}
+
+impl ObjectStoreRepoLeaseManager {
+    pub fn new(store: Arc<dyn ObjectStore>, config: &LeaseConfig) -> Self {
+        let holder = config.worker_id.clone().unwrap_or_else(default_holder_id);
+        Self {
+            store,
+            holder,
+            ttl: ChronoDuration::seconds(config.ttl_seconds as i64),
+            renew_interval: Duration::from_secs(config.renew_interval_seconds.max(1)),
+            steal_skew: ChronoDuration::seconds(config.steal_skew_seconds as i64),
+        }
+    }
+
+    fn lease_manifest(
+        &self,
+        repo: &RepoKey,
+        token: String,
+        now: chrono::DateTime<Utc>,
+    ) -> LeaseManifest {
+        LeaseManifest {
+            schema_version: 1,
+            repo: repo.clone(),
+            name: "repo-write".into(),
+            holder: self.holder.clone(),
+            token,
+            acquired_at: now,
+            renewed_at: Some(now),
+            expires_at: now + self.ttl,
+            released_at: None,
+            operation: Some("repo-write".into()),
+            expected_head: None,
+        }
+    }
+}
+
+#[async_trait]
+impl RepoLeaseManager for ObjectStoreRepoLeaseManager {
+    async fn acquire(&self, repo: &RepoKey) -> Result<LeaseAcquire> {
+        let now = Utc::now();
+        let token = uuid::Uuid::now_v7().to_string();
+        if let Some(lease) = acquire_lease_with_token(
+            &*self.store,
+            repo,
+            "repo-write",
+            self.holder.clone(),
+            token.clone(),
+            now,
+            self.ttl,
+        )
+        .await?
+        {
+            return Ok(LeaseAcquire::Acquired(Box::new(ObjectStoreRepoLease::new(
+                Arc::clone(&self.store),
+                repo.clone(),
+                lease.name.clone(),
+                lease.token,
+                self.ttl,
+                self.renew_interval,
+            ))));
+        }
+
+        let Some((existing, version)) =
+            read_lease_with_version(&*self.store, repo, "repo-write").await?
+        else {
+            return Err(GitCacheError::LeaseStealConflict(format!(
+                "repo-write lease for `{repo}` disappeared during acquisition"
+            )));
+        };
+
+        let expired = existing.released_at.is_some() || now > existing.expires_at + self.steal_skew;
+        if !expired {
+            return Ok(LeaseAcquire::Busy);
+        }
+
+        let stolen = self.lease_manifest(repo, token, now);
+        if !steal_expired_lease_if_version_matches(
+            &*self.store,
+            repo,
+            "repo-write",
+            &version,
+            stolen.clone(),
+        )
+        .await?
+        {
+            return Ok(LeaseAcquire::Busy);
+        }
+
+        Ok(LeaseAcquire::Acquired(Box::new(ObjectStoreRepoLease::new(
+            Arc::clone(&self.store),
+            repo.clone(),
+            stolen.name,
+            stolen.token,
+            self.ttl,
+            self.renew_interval,
+        ))))
+    }
+}
+
+struct ObjectStoreRepoLease {
+    store: Arc<dyn ObjectStore>,
+    repo: RepoKey,
+    name: String,
+    token: String,
+    renew_task: JoinHandle<()>,
+}
+
+impl ObjectStoreRepoLease {
+    fn new(
+        store: Arc<dyn ObjectStore>,
+        repo: RepoKey,
+        name: String,
+        token: String,
+        ttl: ChronoDuration,
+        renew_interval: Duration,
+    ) -> Self {
+        let renew_task = spawn_lease_renewal(
+            Arc::clone(&store),
+            repo.clone(),
+            name.clone(),
+            token.clone(),
+            ttl,
+            renew_interval,
+        );
+        Self {
+            store,
+            repo,
+            name,
+            token,
+            renew_task,
+        }
+    }
+}
+
+#[async_trait]
+impl RepoLease for ObjectStoreRepoLease {
+    async fn release(self: Box<Self>) -> Result<()> {
+        self.renew_task.abort();
+        if release_lease_if_token_matches(
+            &*self.store,
+            &self.repo,
+            &self.name,
+            &self.token,
+            Utc::now(),
+        )
+        .await?
+        {
+            Ok(())
+        } else {
+            Err(GitCacheError::LeaseLost(format!(
+                "repo-write lease for `{}` was lost before release",
+                self.repo
+            )))
+        }
+    }
+}
+
+fn spawn_lease_renewal(
+    store: Arc<dyn ObjectStore>,
+    repo: RepoKey,
+    name: String,
+    token: String,
+    ttl: ChronoDuration,
+    renew_interval: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(renew_interval);
+        loop {
+            interval.tick().await;
+            match renew_lease_if_token_matches(&*store, &repo, &name, &token, Utc::now(), ttl).await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(%repo, lease = %name, "stopping lease renewal after token mismatch");
+                    return;
+                }
+                Err(err) => warn!(%repo, lease = %name, %err, "failed to renew repo lease"),
+            }
+        }
+    })
+}
+
+fn default_holder_id() -> String {
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".into());
+    format!(
+        "{hostname}/pid-{}/{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    )
 }
 
 #[derive(Clone)]
@@ -627,6 +832,7 @@ fn shared_update_error(message: String) -> GitCacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_cache_objectstore::{LocalObjectStore, ObjectStore as TestObjectStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{advance, timeout};
 
@@ -692,6 +898,74 @@ mod tests {
 
     fn coordinator(executor: Arc<RecordingExecutor>) -> UpdateCoordinator {
         UpdateCoordinator::new(executor, Arc::new(InMemoryRepoLeaseManager::new()))
+    }
+
+    fn temp_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("git-cache-worker-test-{}", uuid::Uuid::now_v7()))
+    }
+
+    fn lease_config(worker_id: &str) -> LeaseConfig {
+        LeaseConfig {
+            worker_id: Some(worker_id.into()),
+            ttl_seconds: 60,
+            renew_interval_seconds: 60,
+            steal_skew_seconds: 0,
+            busy_retry_after_seconds: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn object_store_repo_lease_manager_reports_busy_for_held_lease() {
+        let root = temp_root();
+        let store: Arc<dyn TestObjectStore> = Arc::new(LocalObjectStore::new(&root));
+        let manager_a = ObjectStoreRepoLeaseManager::new(store.clone(), &lease_config("worker-a"));
+        let manager_b = ObjectStoreRepoLeaseManager::new(store.clone(), &lease_config("worker-b"));
+
+        let LeaseAcquire::Acquired(lease) = manager_a.acquire(&repo()).await.unwrap() else {
+            panic!("expected lease");
+        };
+        assert!(matches!(
+            manager_b.acquire(&repo()).await.unwrap(),
+            LeaseAcquire::Busy
+        ));
+
+        lease.release().await.unwrap();
+        let LeaseAcquire::Acquired(lease) = manager_b.acquire(&repo()).await.unwrap() else {
+            panic!("expected released lease to be reusable");
+        };
+        lease.release().await.unwrap();
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn object_store_repo_lease_manager_steals_expired_lease() {
+        let root = temp_root();
+        let store: Arc<dyn TestObjectStore> = Arc::new(LocalObjectStore::new(&root));
+        let short = LeaseConfig {
+            worker_id: Some("worker-a".into()),
+            ttl_seconds: 0,
+            renew_interval_seconds: 60,
+            steal_skew_seconds: 0,
+            busy_retry_after_seconds: 1,
+        };
+        let manager_a = ObjectStoreRepoLeaseManager::new(store.clone(), &short);
+        let steal = LeaseConfig {
+            worker_id: Some("worker-b".into()),
+            ..short.clone()
+        };
+        let manager_b = ObjectStoreRepoLeaseManager::new(store.clone(), &steal);
+
+        let LeaseAcquire::Acquired(lease_a) = manager_a.acquire(&repo()).await.unwrap() else {
+            panic!("expected lease");
+        };
+        let LeaseAcquire::Acquired(lease_b) = manager_b.acquire(&repo()).await.unwrap() else {
+            panic!("expected expired lease steal");
+        };
+        assert!(lease_a.release().await.is_err());
+        lease_b.release().await.unwrap();
+
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     // ── UpdateTarget::from_selector tests ─────────────────────────

@@ -18,6 +18,18 @@ pub enum GitCacheError {
     Timeout(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("lease busy: {0}")]
+    LeaseBusy(String),
+    #[error("lease lost: {0}")]
+    LeaseLost(String),
+    #[error("lease steal conflict: {0}")]
+    LeaseStealConflict(String),
+    #[error("compare-and-swap conflict: {0}")]
+    CasConflict(String),
+    #[error("pending generation invalid: {0}")]
+    PendingGenerationInvalid(String),
+    #[error("cold hydration failed: {0}")]
+    ColdHydrationFailed(String),
     #[error("not implemented yet: {0}")]
     NotImplemented(String),
     #[error("internal error: {0}")]

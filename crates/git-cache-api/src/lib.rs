@@ -14,7 +14,7 @@ use git_cache_domain::{
     MaterializerExecutor,
 };
 use git_cache_git::UploadPackProcess;
-use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
+use git_cache_worker::{ObjectStoreRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -92,7 +92,10 @@ impl ApiState {
 
     fn with_domain(rate_limiter: RateLimiter, domain: Arc<AppState>) -> CoreResult<Self> {
         let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
-        let leases = Arc::new(InMemoryRepoLeaseManager::new());
+        let leases = Arc::new(ObjectStoreRepoLeaseManager::new(
+            Arc::clone(&domain.store),
+            &domain.config.leases,
+        ));
         let coordinator = UpdateCoordinator::new(executor, leases);
         Materializer::new(Arc::clone(&domain)).enqueue_pending_generation_scan();
         Ok(Self {
@@ -492,10 +495,16 @@ impl From<GitCacheError> for ApiError {
             GitCacheError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             GitCacheError::Validation(_) => StatusCode::BAD_REQUEST,
             GitCacheError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
-            GitCacheError::Conflict(_) => StatusCode::CONFLICT,
-            GitCacheError::Internal(_) | GitCacheError::Io(_) | GitCacheError::Json(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            GitCacheError::LeaseBusy(_) => StatusCode::SERVICE_UNAVAILABLE,
+            GitCacheError::Conflict(_)
+            | GitCacheError::LeaseLost(_)
+            | GitCacheError::LeaseStealConflict(_)
+            | GitCacheError::CasConflict(_) => StatusCode::CONFLICT,
+            GitCacheError::PendingGenerationInvalid(_)
+            | GitCacheError::ColdHydrationFailed(_)
+            | GitCacheError::Internal(_)
+            | GitCacheError::Io(_)
+            | GitCacheError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         Self {
@@ -663,6 +672,7 @@ mod tests {
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
+            leases: Default::default(),
         };
         let api_state = ApiState::try_new(config).unwrap();
         let mut query = HashMap::new();

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub use config::{
     default_max_concurrent_git_processes, AppConfig, BranchRefCheck, CompactionConfig, DiskConfig,
-    GitRemoteConfig, ObjectStoreConfig,
+    GitRemoteConfig, LeaseConfig, ObjectStoreConfig,
 };
 pub use error::{GitCacheError, Result};
 pub use manifest::{
