@@ -715,14 +715,22 @@ impl Git {
             command.env("TMPDIR", tmpdir);
         }
 
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
+        let mut git_config_entries = git_config_entries_from_extra_env(&self.extra_env);
         if apply_upstream_auth {
             if let Some(auth_env) = &self.upstream_auth_env {
-                auth_env.apply(&mut command);
+                git_config_entries.retain(|(key, _)| key != &auth_env.config_key);
+                git_config_entries.push((
+                    auth_env.config_key.clone(),
+                    OsString::from(auth_env.config_value.clone()),
+                ));
             }
         }
+        for (key, value) in &self.extra_env {
+            if !is_git_config_env_key(key) {
+                command.env(key, value);
+            }
+        }
+        apply_git_config_entries(&mut command, &git_config_entries);
 
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -792,16 +800,22 @@ impl Git {
     }
 
     fn map_upstream_git_error(&self, error: GitCacheError) -> GitCacheError {
+        let error_text = error.to_string();
         if self
             .upstream_auth_env
             .as_ref()
             .is_some_and(|auth| auth.authenticated)
-            && looks_like_auth_rejection(&error.to_string())
+            && looks_like_auth_rejection(&error_text)
         {
             return GitCacheError::Unauthorized("upstream rejected authorization".into());
         }
 
-        GitCacheError::UpstreamUnavailable("upstream git command failed".into())
+        match error {
+            GitCacheError::Validation(message) => GitCacheError::UpstreamUnavailable(format!(
+                "upstream git command failed: {message}"
+            )),
+            other => other,
+        }
     }
 }
 
@@ -866,6 +880,64 @@ fn reject_nul(value: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
+fn git_config_count_from_extra_env(extra_env: &[(OsString, OsString)]) -> usize {
+    extra_env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| {
+            if key == OsStr::new("GIT_CONFIG_COUNT") {
+                value.to_str()?.parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn git_config_entries_from_extra_env(
+    extra_env: &[(OsString, OsString)],
+) -> Vec<(String, OsString)> {
+    let count = git_config_count_from_extra_env(extra_env);
+    let mut keys: HashMap<usize, String> = HashMap::new();
+    let mut values: HashMap<usize, OsString> = HashMap::new();
+
+    for (name, value) in extra_env {
+        if let Some(slot) = git_config_env_slot(name, "GIT_CONFIG_KEY_") {
+            if let Some(key) = value.to_str() {
+                keys.insert(slot, key.to_string());
+            }
+        } else if let Some(slot) = git_config_env_slot(name, "GIT_CONFIG_VALUE_") {
+            values.insert(slot, value.clone());
+        }
+    }
+
+    (0..count)
+        .filter_map(|slot| Some((keys.remove(&slot)?, values.remove(&slot)?)))
+        .collect()
+}
+
+fn git_config_env_slot(name: &OsStr, prefix: &str) -> Option<usize> {
+    name.to_str()?.strip_prefix(prefix)?.parse().ok()
+}
+
+fn is_git_config_env_key(name: &OsStr) -> bool {
+    name == OsStr::new("GIT_CONFIG_COUNT")
+        || git_config_env_slot(name, "GIT_CONFIG_KEY_").is_some()
+        || git_config_env_slot(name, "GIT_CONFIG_VALUE_").is_some()
+}
+
+fn apply_git_config_entries(command: &mut Command, entries: &[(String, OsString)]) {
+    if entries.is_empty() {
+        return;
+    }
+    command.env("GIT_CONFIG_COUNT", entries.len().to_string());
+    for (slot, (key, value)) in entries.iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{slot}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{slot}"), value);
+    }
+}
+
 #[derive(Clone)]
 struct GitAuthEnv {
     config_key: String,
@@ -886,13 +958,6 @@ impl GitAuthEnv {
             config_value: format!("Authorization: {raw_header}"),
             authenticated: auth.is_authenticated(),
         }))
-    }
-
-    fn apply(&self, command: &mut Command) {
-        command
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", &self.config_key)
-            .env("GIT_CONFIG_VALUE_0", &self.config_value);
     }
 }
 
@@ -1009,6 +1074,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // ── reject_ref_arg tests ────────────────────────────────────────
 
@@ -1087,6 +1153,123 @@ mod tests {
     #[test]
     fn reject_config_key_allows_equals() {
         assert!(reject_config_key("key=value").is_ok());
+    }
+
+    #[test]
+    fn upstream_error_mapping_preserves_timeout() {
+        let git = Git::default_with_timeout(Duration::from_secs(1));
+
+        let error = git.map_upstream_git_error(GitCacheError::Timeout("slow git".into()));
+
+        assert!(
+            matches!(&error, GitCacheError::Timeout(message) if message == "slow git"),
+            "timeout should not be remapped to upstream unavailable: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_auth_env_appends_to_existing_git_config_entries() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "git-cache-auth-env-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-git");
+        let env_out = root.join("env.txt");
+        std::fs::write(&script, "#!/bin/sh\nenv > \"$FAKE_ENV_OUT\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+        let git = Git::new(&script, Duration::from_secs(5))
+            .with_env("FAKE_ENV_OUT", env_out.as_os_str().to_os_string())
+            .with_env("GIT_CONFIG_COUNT", "1")
+            .with_env("GIT_CONFIG_KEY_0", "http.https://example.com/.extraHeader")
+            .with_env("GIT_CONFIG_VALUE_0", "Authorization: Bearer process")
+            .with_upstream_auth("https://github.com/org/repo.git", &auth)
+            .unwrap();
+
+        git.ls_remote_heads("https://github.com/org/repo.git")
+            .await
+            .unwrap();
+
+        let env = std::fs::read_to_string(&env_out).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(env.contains("GIT_CONFIG_COUNT=2"), "{env}");
+        assert!(
+            env.contains("GIT_CONFIG_KEY_0=http.https://example.com/.extraHeader"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_VALUE_0=Authorization: Bearer process"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_KEY_1=http.https://github.com/.extraHeader"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_VALUE_1=Authorization: Basic dXNlcjpwYXNz"),
+            "{env}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_auth_env_replaces_existing_entry_for_same_host() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "git-cache-auth-env-same-host-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-git");
+        let env_out = root.join("env.txt");
+        std::fs::write(&script, "#!/bin/sh\nenv > \"$FAKE_ENV_OUT\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+        let git = Git::new(&script, Duration::from_secs(5))
+            .with_env("FAKE_ENV_OUT", env_out.as_os_str().to_os_string())
+            .with_env("GIT_CONFIG_COUNT", "1")
+            .with_env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraHeader")
+            .with_env("GIT_CONFIG_VALUE_0", "Authorization: Bearer process")
+            .with_upstream_auth("https://github.com/org/repo.git", &auth)
+            .unwrap();
+
+        git.ls_remote_heads("https://github.com/org/repo.git")
+            .await
+            .unwrap();
+
+        let env = std::fs::read_to_string(&env_out).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(env.contains("GIT_CONFIG_COUNT=1"), "{env}");
+        assert!(
+            env.contains("GIT_CONFIG_KEY_0=http.https://github.com/.extraHeader"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_VALUE_0=Authorization: Basic dXNlcjpwYXNz"),
+            "{env}"
+        );
+        assert!(!env.contains("Authorization: Bearer process"), "{env}");
     }
 
     // ── reject_remote_url tests ─────────────────────────────────────

@@ -242,6 +242,17 @@ async fn handle_resolve_request(
     let authenticated = auth.is_authenticated()
         || request.upstream_authorization == git_cache_core::UpstreamAuthorizationMode::Required;
     if authenticated {
+        if !state.rate_limiter.check() {
+            state
+                .metrics
+                .rate_limited_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "rate limit exceeded".into(),
+            });
+        }
+
         let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
         return match materializer.resolve(request).await {
             Ok(response) => Ok(Json(response).into_response()),
@@ -682,7 +693,9 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use git_cache_core::ObjectStoreConfig;
+    use git_cache_core::{
+        MaterializeRequest, ObjectStoreConfig, RepoKey, UpstreamAuthorizationMode,
+    };
     use git_cache_domain::parse_want_lines;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -710,6 +723,53 @@ mod tests {
         let auth = upstream_api_auth(&headers).unwrap();
 
         assert_eq!(auth, UpstreamAuth::Anonymous);
+    }
+
+    #[tokio::test]
+    async fn authenticated_resolve_is_rate_limited_before_upstream_work() {
+        let tmp = TempDir::new().unwrap();
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            public_base_url: "http://127.0.0.1:0".into(),
+            cache_root: tmp.path().join("cache"),
+            upstream_root: Some(tmp.path().join("upstreams")),
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 60,
+            max_git_output_bytes: 16 * 1024 * 1024,
+            object_store: ObjectStoreConfig::Local {
+                root: tmp.path().join("objects"),
+            },
+            session_ttl_seconds: 3600,
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 1,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 1024 * 1024 * 1024,
+                min_free_bytes: 0,
+            },
+            git_remote: Default::default(),
+            compaction: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            session_cleanup_interval_secs: 300,
+            max_concurrent_generation_verifications: 1,
+        };
+        let state = Arc::new(ApiState::try_new(config).unwrap());
+        assert!(state.rate_limiter.check(), "first request consumes quota");
+
+        let request = MaterializeRequest {
+            repo: RepoKey::parse("evil.com/org/repo").unwrap(),
+            selector: Selector::DefaultBranch,
+            mode: Default::default(),
+            upstream_authorization: UpstreamAuthorizationMode::Required,
+        };
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+
+        let result = handle_resolve_request(&state, request, auth).await;
+
+        match result {
+            Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),
+            Ok(_) => panic!("rate-limited authenticated resolve should not succeed"),
+        }
     }
 
     #[tokio::test]

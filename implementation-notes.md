@@ -496,3 +496,15 @@ structure and provided less entropy than the plan expected. I reproduced this
 with a token-shape test that required `gcs_` plus 32 bytes of lowercase hex,
 then changed token generation to concatenate two UUID v4 byte arrays before
 hex encoding.
+
+### D3. PR #46 follow-up comments were reproduced before fixes
+
+The authenticated `/v1/resolve` rate-limit bypass reproduced with a handler test
+that consumed the quota first and expected 429 before host validation/upstream
+work. The upstream timeout mapping issue reproduced with a git-wrapper unit test
+that expected `GitCacheError::Timeout` to survive `run_upstream` error mapping.
+The GIT_CONFIG clobber issue reproduced with a fake git executable that recorded
+its environment; the fix now composes different-host entries and replaces a
+matching same-host entry so request credentials still take precedence. The
+protected-session tree check was not open as a PR #46 thread, but the code issue
+reproduced with a synthetic commit object whose tree was absent.

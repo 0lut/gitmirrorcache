@@ -750,9 +750,9 @@ impl Materializer {
         };
 
         let repo_dir = self.ensure_repo_dir(&repo).await?;
-        if !self.commit_exists(&repo_dir, &commit).await {
+        if !self.commit_ready_for_serving(&repo_dir, &commit).await {
             return Err(GitCacheError::NotFound(format!(
-                "cannot create protected session for missing local commit `{commit}`"
+                "cannot create protected session for missing or incomplete local commit `{commit}`"
             )));
         }
 
@@ -2841,8 +2841,9 @@ mod tests {
     #[cfg(feature = "s3-tests")]
     use git_cache_objectstore::{ObjectStore, S3ObjectStore};
     use std::fs as stdfs;
+    use std::io::Write;
     use std::net::SocketAddr;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use tempfile::TempDir;
 
     #[cfg(test)]
@@ -2941,6 +2942,53 @@ mod tests {
 
         let tokens: HashSet<_> = (0..128).map(|_| new_session_token()).collect();
         assert_eq!(tokens.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn create_protected_session_rejects_commit_without_tree_object() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let commit_body = b"tree 0000000000000000000000000000000000000000\nauthor Cache Test <cache@example.invalid> 0 +0000\ncommitter Cache Test <cache@example.invalid> 0 +0000\n\nmissing tree\n";
+        let mut child = Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["hash-object", "-w", "-t", "commit", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(commit_body)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let commit = CommitSha::parse(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+        assert!(materializer.commit_exists(&repo_dir, &commit).await);
+        assert!(
+            !materializer
+                .commit_ready_for_serving(&repo_dir, &commit)
+                .await
+        );
+
+        let result = materializer
+            .create_protected_session(
+                fixture.repo.clone(),
+                commit,
+                MaterializeSource::UpstreamAuthorizedCacheHit,
+                vec!["refs/heads/main".into()],
+            )
+            .await;
+
+        assert!(matches!(result, Err(GitCacheError::NotFound(_))));
     }
 
     #[test]
