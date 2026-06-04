@@ -412,12 +412,14 @@ per-command git config env when present.
 
 ## Things I changed from the plan
 
-### C1. Added auth-aware git wrapper methods
+### C1. Added auth-scoped git execution context
 
-`ls_remote_heads_with_auth`, `fetch_branch_with_auth`,
-`fetch_refs_with_auth`, `fetch_object_with_auth`, and
-`fetch_all_heads_with_auth` inject `http.https://.../.extraHeader` through
-`GIT_CONFIG_*` env. Tokens stay out of argv and debug logging.
+Request-scoped upstream auth lives on a cloned `Git` execution context created
+with `with_upstream_auth(remote_url, auth)`. The ordinary git wrapper methods
+(`ls_remote_heads`, `fetch_branch`, `fetch_refs`, `fetch_object`, and
+`fetch_all_heads`) remain the only command builders; the scoped context injects
+`http.https://.../.extraHeader` through `GIT_CONFIG_*` env. Tokens stay out of
+argv and debug logging.
 
 ### C2. Added bearer-protected session manifests
 
@@ -460,3 +462,19 @@ After the merge, the single handcrafted upload-pack POST could stop after the
 negotiation `NAK` under the stricter protected config. The regression now uses
 `git clone` with `http.extraHeader` injected through `GIT_CONFIG_*`, which is
 closer to the workflow users actually run and keeps the token out of argv.
+
+## Auth-context refactor notes
+
+### R1. Keep permission proof separate from command auth plumbing
+
+I removed the duplicate direct-remote `*_with_auth` method family. The API now
+parses upstream credentials once, creates `materializer.using_upstream_auth(...)`,
+and then calls the ordinary methods such as `upstream_refs`,
+`handle_upload_pack`, `compare_upstream_refs`, and `fetch_changed_refs`.
+
+### R2. Share branch fetch/publish after authorization
+
+Authenticated branch materialization still proves the branch tip with GitHub
+before serving, but the actual fetch, moved-tip check, default-branch update,
+and generation publish now go through the same `ensure_branch_from_verified_tip`
+helper used by the public branch path.

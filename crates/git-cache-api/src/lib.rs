@@ -213,13 +213,13 @@ async fn handle_materialize_request(
         false
     };
 
-    let materializer = Materializer::new(Arc::clone(&state.domain));
+    let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
     let result = if verified_by_coordinator {
         materializer
             .materialize_after_upstream_validation(request)
             .await
     } else {
-        materializer.materialize_with_auth(request, &auth).await
+        materializer.materialize(request).await
     };
 
     match result {
@@ -242,8 +242,8 @@ async fn handle_resolve_request(
     let authenticated = auth.is_authenticated()
         || request.upstream_authorization == git_cache_core::UpstreamAuthorizationMode::Required;
     if authenticated {
-        let materializer = Materializer::new(Arc::clone(&state.domain));
-        return match materializer.resolve_with_auth(request, &auth).await {
+        let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
+        return match materializer.resolve(request).await {
             Ok(response) => Ok(Json(response).into_response()),
             Err(error) => Err(error.into()),
         };
@@ -387,12 +387,13 @@ async fn git_repo(
             .metrics
             .git_remote_refs_total
             .fetch_add(1, Ordering::Relaxed);
+        let materializer = materializer.using_upstream_auth(&auth);
 
         // Fetch upstream refs via ls-remote and synthesize the pkt-line
         // response directly.  No objects are fetched — the repo may not
         // even exist locally yet.  Objects are fetched lazily when the
         // client actually issues an upload-pack POST.
-        let comparison = match materializer.upstream_refs_with_auth(&repo, &auth).await {
+        let comparison = match materializer.upstream_refs(&repo).await {
             Ok(c) => c,
             Err(error) => return ApiError::from(error).into_response(),
         };
@@ -415,11 +416,9 @@ async fn git_repo(
             .metrics
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
+        let materializer = materializer.using_upstream_auth(&auth);
 
-        match materializer
-            .handle_upload_pack_with_auth(&repo, &body, &auth)
-            .await
-        {
+        match materializer.handle_upload_pack(&repo, &body).await {
             Ok(process) => stream_upload_pack_response(&state, process),
             Err(error) => ApiError::from(error).into_response(),
         }

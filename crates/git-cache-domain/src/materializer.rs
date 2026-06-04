@@ -45,6 +45,7 @@ const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
 #[derive(Clone)]
 pub struct Materializer {
     state: Arc<AppState>,
+    upstream_auth: UpstreamAuth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -58,25 +59,26 @@ pub struct CompactionReport {
 
 impl Materializer {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            upstream_auth: UpstreamAuth::Anonymous,
+        }
+    }
+
+    pub fn using_upstream_auth(&self, auth: &UpstreamAuth) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            upstream_auth: auth.clone(),
+        }
     }
 
     pub async fn materialize(
         &self,
         request: MaterializeRequest,
     ) -> CoreResult<MaterializeResponse> {
-        self.materialize_with_auth(request, &UpstreamAuth::Anonymous)
-            .await
-    }
-
-    pub async fn materialize_with_auth(
-        &self,
-        request: MaterializeRequest,
-        auth: &UpstreamAuth,
-    ) -> CoreResult<MaterializeResponse> {
-        self.validate_requested_auth(&request, auth)?;
-        if self.authenticated_mode(&request, auth) {
-            return self.materialize_authenticated(request, auth).await;
+        self.validate_requested_auth(&request)?;
+        if self.authenticated_mode(&request) {
+            return self.materialize_authenticated(request).await;
         }
 
         self.validate_host(&request.repo)?;
@@ -111,28 +113,20 @@ impl Materializer {
         }
     }
 
-    pub async fn resolve_with_auth(
-        &self,
-        request: MaterializeRequest,
-        auth: &UpstreamAuth,
-    ) -> CoreResult<ResolveResponse> {
-        self.validate_requested_auth(&request, auth)?;
-        if !self.authenticated_mode(&request, auth) {
+    pub async fn resolve(&self, request: MaterializeRequest) -> CoreResult<ResolveResponse> {
+        self.validate_requested_auth(&request)?;
+        if !self.authenticated_mode(&request) {
             return Err(GitCacheError::Unsupported(
                 "anonymous resolve still uses the materialize-compatible endpoint".into(),
             ));
         }
 
-        self.resolve_authenticated(request, auth).await
+        self.resolve_authenticated(request).await
     }
 
-    fn validate_requested_auth(
-        &self,
-        request: &MaterializeRequest,
-        auth: &UpstreamAuth,
-    ) -> CoreResult<()> {
+    fn validate_requested_auth(&self, request: &MaterializeRequest) -> CoreResult<()> {
         if request.upstream_authorization == UpstreamAuthorizationMode::Required
-            && !auth.is_authenticated()
+            && !self.upstream_auth.is_authenticated()
         {
             return Err(GitCacheError::Unauthorized(
                 "upstream authorization is required".into(),
@@ -141,17 +135,16 @@ impl Materializer {
         Ok(())
     }
 
-    fn authenticated_mode(&self, request: &MaterializeRequest, auth: &UpstreamAuth) -> bool {
-        auth.is_authenticated()
+    fn authenticated_mode(&self, request: &MaterializeRequest) -> bool {
+        self.upstream_auth.is_authenticated()
             || request.upstream_authorization == UpstreamAuthorizationMode::Required
     }
 
     async fn materialize_authenticated(
         &self,
         request: MaterializeRequest,
-        auth: &UpstreamAuth,
     ) -> CoreResult<MaterializeResponse> {
-        if !auth.is_authenticated() {
+        if !self.upstream_auth.is_authenticated() {
             return Err(GitCacheError::Unauthorized(
                 "upstream authorization is required".into(),
             ));
@@ -160,15 +153,13 @@ impl Materializer {
         self.validate_host(&request.repo)?;
         match request.selector {
             Selector::Branch(branch) => {
-                let (branch, commit) = self
-                    .authorized_branch_tip(&request.repo, branch, auth)
-                    .await?;
-                self.materialize_authenticated_branch_tip(request.repo, branch, commit, false, auth)
+                let (branch, commit) = self.authorized_branch_tip(&request.repo, branch).await?;
+                self.materialize_authenticated_branch_tip(request.repo, branch, commit, false)
                     .await
             }
             Selector::DefaultBranch => {
-                let (branch, commit) = self.authorized_default_branch(&request.repo, auth).await?;
-                self.materialize_authenticated_branch_tip(request.repo, branch, commit, true, auth)
+                let (branch, commit) = self.authorized_default_branch(&request.repo).await?;
+                self.materialize_authenticated_branch_tip(request.repo, branch, commit, true)
                     .await
             }
             Selector::CommitReachableFrom {
@@ -179,7 +170,6 @@ impl Materializer {
                     request.repo,
                     commit,
                     reachable_from,
-                    auth,
                 )
                 .await
             }
@@ -192,9 +182,8 @@ impl Materializer {
     async fn resolve_authenticated(
         &self,
         request: MaterializeRequest,
-        auth: &UpstreamAuth,
     ) -> CoreResult<ResolveResponse> {
-        if !auth.is_authenticated() {
+        if !self.upstream_auth.is_authenticated() {
             return Err(GitCacheError::Unauthorized(
                 "upstream authorization is required".into(),
             ));
@@ -204,9 +193,7 @@ impl Materializer {
         let now = Utc::now();
         match request.selector.clone() {
             Selector::Branch(branch) => {
-                let (_, commit) = self
-                    .authorized_branch_tip(&request.repo, branch, auth)
-                    .await?;
+                let (_, commit) = self.authorized_branch_tip(&request.repo, branch).await?;
                 let cache_available = self.cache_has_commit(&request.repo, &commit).await?;
                 Ok(ResolveResponse {
                     repo: request.repo,
@@ -222,7 +209,7 @@ impl Materializer {
                 })
             }
             Selector::DefaultBranch => {
-                let (_, commit) = self.authorized_default_branch(&request.repo, auth).await?;
+                let (_, commit) = self.authorized_default_branch(&request.repo).await?;
                 let cache_available = self.cache_has_commit(&request.repo, &commit).await?;
                 Ok(ResolveResponse {
                     repo: request.repo,
@@ -242,7 +229,7 @@ impl Materializer {
                 reachable_from,
             } => {
                 let (_, tip) = self
-                    .authorized_reachability_tip(&request.repo, reachable_from, auth)
+                    .authorized_reachability_tip(&request.repo, reachable_from)
                     .await?;
                 let repo_dir = self.ensure_repo_dir(&request.repo).await?;
                 let cache_available = self.commit_exists(&repo_dir, &commit).await
@@ -272,14 +259,9 @@ impl Materializer {
         &self,
         repo: &RepoKey,
         branch: BranchName,
-        auth: &UpstreamAuth,
     ) -> CoreResult<(BranchName, CommitSha)> {
         let remote = self.upstream_url(repo)?;
-        let ls = self
-            .state
-            .git
-            .ls_remote_heads_with_auth(&remote, auth)
-            .await?;
+        let ls = self.upstream_git(&remote)?.ls_remote_heads(&remote).await?;
         let sha = ls.refs.get(branch.as_str()).ok_or_else(|| {
             GitCacheError::NotFound(format!("branch `{branch}` was verified absent upstream"))
         })?;
@@ -289,14 +271,9 @@ impl Materializer {
     async fn authorized_default_branch(
         &self,
         repo: &RepoKey,
-        auth: &UpstreamAuth,
     ) -> CoreResult<(BranchName, CommitSha)> {
         let remote = self.upstream_url(repo)?;
-        let ls = self
-            .state
-            .git
-            .ls_remote_heads_with_auth(&remote, auth)
-            .await?;
+        let ls = self.upstream_git(&remote)?.ls_remote_heads(&remote).await?;
         let branch = ls.default_branch.ok_or_else(|| {
             GitCacheError::UpstreamUnavailable("upstream did not advertise a symbolic HEAD".into())
         })?;
@@ -310,14 +287,17 @@ impl Materializer {
         &self,
         repo: &RepoKey,
         reachable_from: ReachabilitySelector,
-        auth: &UpstreamAuth,
     ) -> CoreResult<(BranchName, CommitSha)> {
         match reachable_from {
-            ReachabilitySelector::Branch(branch) => {
-                self.authorized_branch_tip(repo, branch, auth).await
-            }
-            ReachabilitySelector::DefaultBranch => self.authorized_default_branch(repo, auth).await,
+            ReachabilitySelector::Branch(branch) => self.authorized_branch_tip(repo, branch).await,
+            ReachabilitySelector::DefaultBranch => self.authorized_default_branch(repo).await,
         }
+    }
+
+    fn upstream_git(&self, remote_url: &str) -> CoreResult<git_cache_git::Git> {
+        self.state
+            .git
+            .with_upstream_auth(remote_url, &self.upstream_auth)
     }
 
     async fn materialize_authenticated_branch_tip(
@@ -326,10 +306,9 @@ impl Materializer {
         branch: BranchName,
         commit: CommitSha,
         default_branch: bool,
-        auth: &UpstreamAuth,
     ) -> CoreResult<MaterializeResponse> {
         let source = self
-            .ensure_authenticated_branch_tip(&repo, &branch, &commit, default_branch, auth)
+            .ensure_authenticated_branch_tip(&repo, &branch, &commit, default_branch)
             .await?;
         self.create_protected_session(repo, commit, source, vec![format!("refs/heads/{branch}")])
             .await
@@ -341,10 +320,8 @@ impl Materializer {
         branch: &BranchName,
         commit: &CommitSha,
         default_branch: bool,
-        auth: &UpstreamAuth,
     ) -> CoreResult<MaterializeSource> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
-        let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
 
         if self.cache_has_commit(repo, commit).await? {
             if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
@@ -360,49 +337,8 @@ impl Materializer {
             return Ok(MaterializeSource::UpstreamAuthorizedCacheHit);
         }
 
-        let _repo_lock = self.lock_repo(repo).await?;
-        self.state
-            .git
-            .fetch_branch_with_auth(
-                &repo_dir,
-                &self.upstream_url(repo)?,
-                branch.as_str(),
-                &local_ref,
-                auth,
-            )
+        self.ensure_branch_from_verified_tip(repo, branch, commit, default_branch)
             .await?;
-
-        let fetched = self
-            .state
-            .git
-            .rev_parse(&repo_dir, &local_ref)
-            .await
-            .and_then(CommitSha::parse)?;
-        if fetched != *commit {
-            return Err(GitCacheError::Conflict(format!(
-                "upstream branch `{branch}` moved during authenticated fetch: ls-remote={commit}, fetched={fetched}"
-            )));
-        }
-        if default_branch {
-            self.state
-                .git
-                .symbolic_ref(
-                    &repo_dir,
-                    "HEAD",
-                    &format!("refs/cache/upstream/heads/{branch}"),
-                )
-                .await?;
-        }
-
-        self.publish_generation(
-            repo,
-            &repo_dir,
-            commit,
-            Some(branch.clone()),
-            default_branch,
-        )
-        .await?;
-
         Ok(MaterializeSource::UpstreamAuthorizedFetched)
     }
 
@@ -411,13 +347,12 @@ impl Materializer {
         repo: RepoKey,
         commit: CommitSha,
         reachable_from: ReachabilitySelector,
-        auth: &UpstreamAuth,
     ) -> CoreResult<MaterializeResponse> {
         let (branch, tip) = self
-            .authorized_reachability_tip(&repo, reachable_from, auth)
+            .authorized_reachability_tip(&repo, reachable_from)
             .await?;
         let branch_source = self
-            .ensure_authenticated_branch_tip(&repo, &branch, &tip, false, auth)
+            .ensure_authenticated_branch_tip(&repo, &branch, &tip, false)
             .await?;
         let repo_dir = self.ensure_repo_dir(&repo).await?;
 
@@ -666,19 +601,24 @@ impl Materializer {
     ) -> CoreResult<CommitSha> {
         self.validate_host(repo)?;
         let upstream_commit = self.ls_remote_branch(repo, branch).await?;
+        self.ensure_branch_from_verified_tip(repo, branch, &upstream_commit, default_branch)
+            .await
+    }
+
+    async fn ensure_branch_from_verified_tip(
+        &self,
+        repo: &RepoKey,
+        branch: &BranchName,
+        upstream_commit: &CommitSha,
+        default_branch: bool,
+    ) -> CoreResult<CommitSha> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
         let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
-        self.state
-            .git
-            .fetch_branch(
-                &repo_dir,
-                &self.upstream_url(repo)?,
-                branch.as_str(),
-                &local_ref,
-            )
-            .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+        let upstream_url = self.upstream_url(repo)?;
+        self.upstream_git(&upstream_url)?
+            .fetch_branch(&repo_dir, &upstream_url, branch.as_str(), &local_ref)
+            .await?;
 
         let commit = self
             .state
@@ -687,7 +627,7 @@ impl Materializer {
             .await
             .and_then(CommitSha::parse)?;
 
-        if commit != upstream_commit {
+        if commit != *upstream_commit {
             return Err(GitCacheError::Conflict(format!(
                 "upstream branch `{branch}` moved during fetch: ls-remote={upstream_commit}, fetched={commit}"
             )));
@@ -1909,62 +1849,27 @@ impl Materializer {
     pub async fn fetch_all_refs(&self, repo: &RepoKey, repo_dir: &FsPath) -> CoreResult<()> {
         let _repo_lock = self.lock_repo(repo).await?;
         let remote = self.upstream_url(repo)?;
-        self.state
-            .git
-            .fetch_all_heads_with_auth(repo_dir, &remote, &UpstreamAuth::Anonymous)
-            .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+        self.upstream_git(&remote)?
+            .fetch_all_heads(repo_dir, &remote)
+            .await?;
         Ok(())
     }
 
     async fn ls_remote_branch(&self, repo: &RepoKey, branch: &BranchName) -> CoreResult<CommitSha> {
         let remote = self.upstream_url(repo)?;
-        let output = self
-            .state
-            .git
-            .run(None, ["ls-remote", "--heads", &remote, branch.as_str()])
-            .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
-
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
-        })?;
-        let Some(line) = text.lines().next() else {
-            return Err(GitCacheError::NotFound(format!(
-                "branch `{branch}` was verified absent upstream"
-            )));
-        };
-        let sha = line.split_whitespace().next().ok_or_else(|| {
-            GitCacheError::UpstreamUnavailable("malformed ls-remote output".into())
+        let refs = self.upstream_git(&remote)?.ls_remote_heads(&remote).await?;
+        let sha = refs.refs.get(branch.as_str()).ok_or_else(|| {
+            GitCacheError::NotFound(format!("branch `{branch}` was verified absent upstream"))
         })?;
         CommitSha::parse(sha)
     }
 
     async fn resolve_default_branch(&self, repo: &RepoKey) -> CoreResult<BranchName> {
         let remote = self.upstream_url(repo)?;
-        let output = self
-            .state
-            .git
-            .run(None, ["ls-remote", "--symref", &remote, "HEAD"])
+        self.upstream_git(&remote)?
+            .ls_remote_default_branch(&remote)
             .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
-        })?;
-
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
-                if let Some((branch, head)) = rest.split_once('\t') {
-                    if head == "HEAD" {
-                        return BranchName::parse(branch);
-                    }
-                }
-            }
-        }
-
-        Err(GitCacheError::UpstreamUnavailable(
-            "upstream did not advertise a symbolic HEAD".into(),
-        ))
+            .and_then(BranchName::parse)
     }
 
     async fn prepare_session_repo(
@@ -2088,20 +1993,10 @@ impl Materializer {
     /// Returns a map of branches that are missing or have a different SHA
     /// locally, plus the upstream default branch name.
     pub async fn compare_upstream_refs(&self, repo: &RepoKey) -> CoreResult<UpstreamRefComparison> {
-        self.compare_upstream_refs_with_auth(repo, &UpstreamAuth::Anonymous)
-            .await
-    }
-
-    pub async fn compare_upstream_refs_with_auth(
-        &self,
-        repo: &RepoKey,
-        auth: &UpstreamAuth,
-    ) -> CoreResult<UpstreamRefComparison> {
         let upstream_url = self.upstream_url(repo)?;
         let ls = self
-            .state
-            .git
-            .ls_remote_heads_with_auth(&upstream_url, auth)
+            .upstream_git(&upstream_url)?
+            .ls_remote_heads(&upstream_url)
             .await?;
         let repo_dir = self.ensure_repo_dir(repo).await?;
 
@@ -2129,16 +2024,6 @@ impl Materializer {
         repo: &RepoKey,
         comparison: &UpstreamRefComparison,
     ) -> CoreResult<()> {
-        self.fetch_changed_refs_with_auth(repo, comparison, &UpstreamAuth::Anonymous)
-            .await
-    }
-
-    pub async fn fetch_changed_refs_with_auth(
-        &self,
-        repo: &RepoKey,
-        comparison: &UpstreamRefComparison,
-        auth: &UpstreamAuth,
-    ) -> CoreResult<()> {
         if comparison.changed.is_empty() {
             return Ok(());
         }
@@ -2160,9 +2045,8 @@ impl Materializer {
             .map(|(branch, _)| format!("+refs/heads/{branch}:refs/cache/upstream/heads/{branch}"))
             .collect();
 
-        self.state
-            .git
-            .fetch_refs_with_auth(&repo_dir, &upstream_url, &refspecs, auth)
+        self.upstream_git(&upstream_url)?
+            .fetch_refs(&repo_dir, &upstream_url, &refspecs)
             .await?;
 
         for (branch_name, expected_commit) in &validated {
@@ -2228,21 +2112,11 @@ impl Materializer {
     /// synthesize the pkt-line response directly, avoiding the need to
     /// materialise objects just for ls-remote.
     pub async fn upstream_refs(&self, repo: &RepoKey) -> CoreResult<UpstreamRefComparison> {
-        self.upstream_refs_with_auth(repo, &UpstreamAuth::Anonymous)
-            .await
-    }
-
-    pub async fn upstream_refs_with_auth(
-        &self,
-        repo: &RepoKey,
-        auth: &UpstreamAuth,
-    ) -> CoreResult<UpstreamRefComparison> {
         self.validate_host(repo)?;
         let upstream_url = self.upstream_url(repo)?;
         let ls = self
-            .state
-            .git
-            .ls_remote_heads_with_auth(&upstream_url, auth)
+            .upstream_git(&upstream_url)?
+            .ls_remote_heads(&upstream_url)
             .await?;
 
         Ok(UpstreamRefComparison {
@@ -2288,19 +2162,17 @@ impl Materializer {
     /// - Use cached bytes only after that request-scoped upstream proof exists.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
         let comparison = self.compare_upstream_refs(repo).await?;
-        self.ensure_wants_available_with_auth(repo, wants, &comparison, &UpstreamAuth::Anonymous)
+        self.ensure_wants_available_from_comparison(repo, wants, &comparison)
             .await
     }
 
-    pub async fn ensure_wants_available_with_auth(
+    async fn ensure_wants_available_from_comparison(
         &self,
         repo: &RepoKey,
         wants: &[String],
         comparison: &UpstreamRefComparison,
-        auth: &UpstreamAuth,
     ) -> CoreResult<()> {
-        self.fetch_changed_refs_with_auth(repo, comparison, auth)
-            .await?;
+        self.fetch_changed_refs(repo, comparison).await?;
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
 
@@ -2310,6 +2182,7 @@ impl Materializer {
             .map(|sha| sha.to_ascii_lowercase())
             .collect();
         let upstream_url = self.upstream_url(repo)?;
+        let upstream_git = self.upstream_git(&upstream_url)?;
         let object_ids: Vec<CommitSha> = wants
             .iter()
             .map(|want_sha| CommitSha::parse(want_sha.as_str()))
@@ -2324,20 +2197,17 @@ impl Materializer {
                     )));
                 }
 
-                if let Err(err) = self
-                    .state
-                    .git
-                    .fetch_object_with_auth(&repo_dir, &upstream_url, &object_id, auth)
+                if let Err(err) = upstream_git
+                    .fetch_object(&repo_dir, &upstream_url, &object_id)
                     .await
                 {
-                    self.state
-                        .git
-                        .fetch_all_heads_with_auth(&repo_dir, &upstream_url, auth)
+                    upstream_git
+                        .fetch_all_heads(&repo_dir, &upstream_url)
                         .await?;
                     if self.object_exists(&repo_dir, &object_id).await {
                         // The object is reachable from refs that upstream just served
                         // with this request credential.
-                    } else if auth.is_authenticated() {
+                    } else if self.upstream_auth.is_authenticated() {
                         return Err(GitCacheError::Forbidden(format!(
                             "object `{object_id}` is not authorized by upstream: {err}"
                         )));
@@ -2474,20 +2344,10 @@ impl Materializer {
         repo: &RepoKey,
         body: &Bytes,
     ) -> CoreResult<UploadPackProcess> {
-        self.handle_upload_pack_with_auth(repo, body, &UpstreamAuth::Anonymous)
-            .await
-    }
-
-    pub async fn handle_upload_pack_with_auth(
-        &self,
-        repo: &RepoKey,
-        body: &Bytes,
-        auth: &UpstreamAuth,
-    ) -> CoreResult<UploadPackProcess> {
         let wants = parse_want_lines(body);
         if !wants.is_empty() {
-            let comparison = self.compare_upstream_refs_with_auth(repo, auth).await?;
-            self.ensure_wants_available_with_auth(repo, &wants, &comparison, auth)
+            let comparison = self.compare_upstream_refs(repo).await?;
+            self.ensure_wants_available_from_comparison(repo, &wants, &comparison)
                 .await?;
         }
         let repo_dir = self.ensure_repo_dir(repo).await?;
