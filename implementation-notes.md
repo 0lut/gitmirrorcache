@@ -29,18 +29,22 @@ without `Debug`/`Display` derive ensures these traits always go through our manu
 There is no `RedactedHeader` wrapper because the Display/Debug impls already prove
 redaction safety in tests.
 
-## 2. Session Token Generation — No External Hex Crate
+## 2. Session Token Generation — No External Hex/Rand Crate
 
 **AUTH-PLAN.md specified:** `gcs_<random-hex>` format with cryptographic randomness.
 
-**Implemented:** Uses UUID v7 bytes (which contain timestamp + random) XOR'd with
-additional UUID v4 bytes, then hex-encoded inline. Format: `gcs_` + 64 hex chars
-(32 bytes of entropy).
+**Implemented:** Uses two independent UUID v4s (each providing 122 random bits)
+concatenated to form 32 bytes, then hex-encoded inline. Format: `gcs_` + 64 hex
+chars. This provides >= 128 bits of entropy per OWASP recommendations for session
+identifiers.
 
-**Rationale:** Avoids adding `hex` or `rand` crate dependencies. UUID v7 already
-provides strong randomness via the `uuid` crate (already in deps). The XOR with
-a second UUID provides additional entropy independent of UUID structure. An inline
+**Rationale:** Avoids adding `hex` or `rand` crate dependencies. UUID v4 uses the
+OS CSPRNG via the `uuid` crate (already in deps, added `v4` feature). An inline
 `to_hex()` function handles encoding.
+
+**Earlier approach (superseded):** Originally used UUID v7 XOR'd with timestamp
+bytes, but the second half was derivable from the first — reducing effective
+entropy to ~74 bits. Fixed after Devin Review flagged this.
 
 ## 3. Token Hashing — SHA-256 via sha2 Crate
 
