@@ -474,10 +474,15 @@ fn session_bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError>
         status: StatusCode::UNAUTHORIZED,
         message: "session authorization header must be valid ASCII".into(),
     })?;
-    let Some(token) = value.strip_prefix("Bearer ") else {
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let scheme = parts.next().unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Ok(None);
+    }
+    let Some(token) = parts.next() else {
         return Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
-            message: "session authorization must use Bearer authentication".into(),
+            message: "session bearer token is invalid".into(),
         });
     };
     if token.trim().is_empty()
@@ -723,6 +728,26 @@ mod tests {
         let auth = upstream_api_auth(&headers).unwrap();
 
         assert_eq!(auth, UpstreamAuth::Anonymous);
+    }
+
+    #[test]
+    fn session_bearer_token_accepts_case_insensitive_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "bearer gcs_token".parse().unwrap());
+
+        let token = session_bearer_token(&headers).unwrap();
+
+        assert_eq!(token.as_deref(), Some("gcs_token"));
+    }
+
+    #[test]
+    fn session_bearer_token_ignores_unrelated_authorization_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());
+
+        let token = session_bearer_token(&headers).unwrap();
+
+        assert_eq!(token, None);
     }
 
     #[tokio::test]

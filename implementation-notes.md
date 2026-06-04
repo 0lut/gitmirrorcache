@@ -508,3 +508,15 @@ its environment; the fix now composes different-host entries and replaces a
 matching same-host entry so request credentials still take precedence. The
 protected-session tree check was not open as a PR #46 thread, but the code issue
 reproduced with a synthetic commit object whose tree was absent.
+
+### D4. Static-review flag triage after PR #46 fixes
+
+The follow-up static-review flags included several stale positives after D3:
+authenticated resolve is rate-limited, GIT_CONFIG auth entries compose instead
+of clobbering, upstream timeout errors keep their type, and session token entropy
+uses two UUID v4 byte arrays. Two small hardening items were still useful and
+had focused repro tests: `MaterializeResponse` debug output now redacts
+`session_token`, and session Bearer parsing accepts case-insensitive schemes
+while ignoring unrelated auth schemes so public sessions are not rejected by
+cached Basic credentials. The direct Git shared-repo / request-scoped proof
+concerns remain known hardening tradeoffs pending ephemeral repo isolation.
