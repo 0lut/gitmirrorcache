@@ -60,21 +60,16 @@ pub struct SessionManifest {
     pub protection: SessionProtection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionProtection {
+    #[default]
     Public,
     BearerToken {
         token_hash: String,
         authorized_commits: Vec<CommitSha>,
         authorized_refs: Vec<String>,
     },
-}
-
-impl Default for SessionProtection {
-    fn default() -> Self {
-        Self::Public
-    }
 }
 
 #[cfg(test)]

@@ -2,10 +2,13 @@ use crate::{GitCacheError, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum UpstreamAuth {
+    #[default]
     Anonymous,
-    Basic { raw: SecretString },
+    Basic {
+        raw: SecretString,
+    },
 }
 
 impl UpstreamAuth {
@@ -46,12 +49,6 @@ impl UpstreamAuth {
     }
 }
 
-impl Default for UpstreamAuth {
-    fn default() -> Self {
-        Self::Anonymous
-    }
-}
-
 impl fmt::Debug for UpstreamAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -80,17 +77,12 @@ impl fmt::Debug for SecretString {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamAuthorizationMode {
+    #[default]
     Anonymous,
     Required,
-}
-
-impl Default for UpstreamAuthorizationMode {
-    fn default() -> Self {
-        Self::Anonymous
-    }
 }
 
 fn validate_auth_header(value: &str) -> Result<()> {
