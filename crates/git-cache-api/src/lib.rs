@@ -293,9 +293,7 @@ async fn git_session(
             .git
             .upload_pack_spawn(&session_repo, body)
             .await
-            .map(|process| {
-                upload_pack_stream_response(process, state.domain.config.max_git_output_bytes)
-            })
+            .map(|process| stream_upload_pack_response(&state, process))
     } else {
         Err(GitCacheError::Unsupported(format!(
             "unsupported git session request: {method} {path}"
