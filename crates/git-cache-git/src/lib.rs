@@ -791,6 +791,10 @@ pub struct UploadPackProcess {
 }
 
 impl UploadPackProcess {
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Take the semaphore permit out of this process, transferring ownership
     /// to the caller. This is useful when the child and stdout are moved into
     /// a separate streaming wrapper that must hold the permit for the full
