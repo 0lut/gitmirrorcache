@@ -37,8 +37,11 @@ ECS_EC2_INSTANCE_TYPE=m8g.2xlarge
 ECS_CPU_ARCHITECTURE=ARM64
 DOCKER_PLATFORM=linux/arm64
 ECS_EBS_SIZE_GIB=128
+ECS_EBS_IOPS=8000
+ECS_EBS_THROUGHPUT=500
 ECS_CPU=8192
 ECS_MEMORY=24576
+GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES=8
 PUBLIC_BASE_URL=https://cache.example.com
 GITHUB_TOKEN_SECRET_ARN=arn:aws:secretsmanager:us-west-2:123456789012:secret:github-token
 ECS_COMPACTION_SCHEDULE_EXPRESSION='rate(1 hour)'
@@ -204,6 +207,9 @@ Git config environment variables:
 - `rate_limit_per_minute` applies a simple global materialize limit.
 - `max_git_output_bytes` bounds captured Git stdout/stderr.
 - `git_timeout_seconds` bounds Git process lifetime.
+- `GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES` bounds simultaneous Git subprocesses,
+  including active upload-pack streams.
+- `ECS_EBS_IOPS` and `ECS_EBS_THROUGHPUT` provision gp3 hot-cache performance.
 
 ## Bundle Strategy And Compaction
 

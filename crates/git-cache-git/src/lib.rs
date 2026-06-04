@@ -286,6 +286,14 @@ impl Git {
         .await
     }
 
+    pub async fn repack_for_serving(&self, repo_dir: &Path) -> Result<GitOutput> {
+        self.run(
+            Some(repo_dir),
+            ["repack", "-a", "-d", "--write-bitmap-index"],
+        )
+        .await
+    }
+
     pub async fn upload_pack_advertise_refs(
         &self,
         repo_dir: &Path,
