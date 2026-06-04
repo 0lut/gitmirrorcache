@@ -2765,7 +2765,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn new_session_token() -> String {
-    format!("gcs_{}", Uuid::now_v7())
+    let mut bytes = [0_u8; 32];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    format!("gcs_{}", hex_lower(&bytes))
 }
 
 fn hash_session_token(token: &str) -> String {
@@ -2919,6 +2922,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("generation head `{generation}` not written");
+    }
+
+    #[test]
+    fn protected_session_token_uses_32_random_bytes_of_hex() {
+        let token = new_session_token();
+        let random_hex = token
+            .strip_prefix("gcs_")
+            .expect("token should include gcs_ prefix");
+
+        assert_eq!(random_hex.len(), 64);
+        assert!(
+            random_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "token suffix should be lowercase hex"
+        );
+
+        let tokens: HashSet<_> = (0..128).map(|_| new_session_token()).collect();
+        assert_eq!(tokens.len(), 128);
     }
 
     #[test]

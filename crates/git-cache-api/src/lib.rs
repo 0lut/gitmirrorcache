@@ -699,6 +699,19 @@ mod tests {
         assert!(!limiter.check());
     }
 
+    #[test]
+    fn upstream_api_auth_ignores_gateway_bearer_authorization() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer gateway-token".parse().unwrap(),
+        );
+
+        let auth = upstream_api_auth(&headers).unwrap();
+
+        assert_eq!(auth, UpstreamAuth::Anonymous);
+    }
+
     #[tokio::test]
     async fn upload_pack_stream_times_out_when_reader_stays_pending() {
         let (reader, _writer) = duplex(64);

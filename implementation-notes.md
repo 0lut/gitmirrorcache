@@ -478,3 +478,21 @@ Authenticated branch materialization still proves the branch tip with GitHub
 before serving, but the actual fetch, moved-tip check, default-branch update,
 and generation publish now go through the same `ensure_branch_from_verified_tip`
 helper used by the public branch path.
+
+## Devin PR bug-report follow-up notes
+
+### D1. Gateway bearer auth report did not reproduce on this branch
+
+Devin's PR reported that anonymous API requests could fail if a gateway placed
+`Authorization: Bearer ...` on the request. Our current API upstream-auth path
+only reads `Git-Cache-Upstream-Authorization`, so the bug did not reproduce
+here. I added a regression test to keep gateway bearer auth from being parsed as
+upstream GitHub credentials on API endpoints.
+
+### D2. Protected session token entropy report reproduced
+
+The protected session token was `gcs_` plus UUID v7, which exposed timestamp
+structure and provided less entropy than the plan expected. I reproduced this
+with a token-shape test that required `gcs_` plus 32 bytes of lowercase hex,
+then changed token generation to concatenate two UUID v4 byte arrays before
+hex encoding.
