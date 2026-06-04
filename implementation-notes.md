@@ -402,3 +402,11 @@ materialization now scans the repo's bounded pending-generation work queue for a
 matching commit and waits for that generation verification before falling back to
 publishing a new generation. This avoids duplicate generation publication during
 cold-cache rehydrate races.
+
+### T8. Synthetic git performance repos disable auto maintenance
+
+The `git-cache-git` performance tests create hundreds of commits in temporary
+repositories while other tests run concurrently. CI exposed intermittent
+repository corruption from Git auto maintenance/gc during those synthetic setup
+loops, so the test fixture disables `gc.auto` and `maintenance.auto` for those
+temporary repos.

@@ -93,6 +93,8 @@ fn create_source_repo(root: &Path) -> (PathBuf, String) {
         Some(&source_repo),
         ["config", "user.name", "Git Cache Test"],
     );
+    run_git(Some(&source_repo), ["config", "gc.auto", "0"]);
+    run_git(Some(&source_repo), ["config", "maintenance.auto", "false"]);
 
     std::fs::write(source_repo.join("README.md"), "hello from git-cache\n").expect("write README");
     run_git(Some(&source_repo), ["add", "README.md"]);
@@ -114,6 +116,8 @@ fn create_source_repo_with_commits(root: &Path, commit_count: usize) -> (PathBuf
         Some(&source_repo),
         ["config", "user.name", "Git Cache Test"],
     );
+    run_git(Some(&source_repo), ["config", "gc.auto", "0"]);
+    run_git(Some(&source_repo), ["config", "maintenance.auto", "false"]);
 
     for i in 0..commit_count {
         std::fs::write(source_repo.join("README.md"), format!("commit {i}\n"))
@@ -138,6 +142,8 @@ fn create_source_repo_with_branches(root: &Path, branch_count: usize) -> PathBuf
         Some(&source_repo),
         ["config", "user.name", "Git Cache Test"],
     );
+    run_git(Some(&source_repo), ["config", "gc.auto", "0"]);
+    run_git(Some(&source_repo), ["config", "maintenance.auto", "false"]);
 
     std::fs::write(source_repo.join("README.md"), "base\n").expect("write README");
     run_git(Some(&source_repo), ["add", "README.md"]);
