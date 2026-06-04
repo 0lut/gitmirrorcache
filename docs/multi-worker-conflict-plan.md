@@ -15,6 +15,88 @@ We do not need distributed singleflight. We do need worker-local request
 deduplication and object-store backed coordination for every operation that can
 publish or mutate shared repository metadata.
 
+## Research Context: Packhorse
+
+This plan was informed by a comparison with GitLab's
+[Packhorse](https://gitlab.com/gitlab-org/packhorse), inspected on `main` at
+`d8cebce033d11789ac1da01c39ec46f01c7166ed` from 2026-06-03. Packhorse is the
+closest public system found, but it solves a different primary problem.
+
+Packhorse is a Git Smart HTTP v2 proxy for GitLab/Gitaly CI clone storms. It
+protects Gitaly when many CI jobs fetch the same repository at the same time by
+caching upload-pack responses, coalescing identical misses inside one process,
+and optionally injecting Git `packfile-uris` so large base packs are downloaded
+from object storage rather than streamed from Gitaly.
+
+Important Packhorse findings:
+
+- Its main cache key is derived from repository, sorted `want`s, optional
+  `have`s, optional base-packfile hash, and shallow depth.
+- Its cacheable surface is intentionally narrow: Git protocol v2 fetches with
+  explicit `want`s, `deepen` between 1 and 10, no filters, and no `want-ref`.
+  Other traffic falls through to upstream.
+- Its request coalescing is in-process `singleflight`. Redis/distributed
+  coalescing is discussed as future work, not an implemented requirement.
+- Its packfile-URI path depends on externally generated base packfiles uploaded
+  to object storage and registered with Packhorse. Packhorse extracts commit
+  IDs, injects those commits as `have`s, and injects a fresh signed URI into the
+  upload-pack response.
+- Its local cache is response-file oriented and instance-local. Object storage
+  is used for optional base packfiles, not as a durable source of truth for the
+  repository's verified generation graph.
+- Its Phase 1 base-packfile manager is in-memory, and distributed cache
+  consistency/auth-aware caching are either planned or design-level in the
+  inspected code.
+- Its README describes LRU/size eviction and broad metrics, but the inspected
+  implementation is narrower: cache eviction metadata does not currently remove
+  disk files in `evictIfNeeded`, and app metrics are mostly hit/miss and
+  non-cacheable request counters.
+
+The lesson for this project is not "copy Packhorse." Packhorse is optimized as a
+near-runner Git CDN/proxy. This project is a correctness-gated Git
+materialization cache whose durable state is object-store manifests and bundles.
+Therefore:
+
+- keep worker-local singleflight, because it is useful and simple;
+- do not add distributed singleflight unless a future performance profile proves
+  it is needed;
+- do add object-store backed leases, because cross-worker mutation conflicts
+  cannot be solved with in-memory state;
+- do not treat local response files or local bare repos as authoritative;
+- consider packfile-URI offload later as a throughput optimization, separate
+  from the correctness work in this plan.
+
+## Local System Context
+
+The current cache already differs from Packhorse in the ways this plan depends
+on:
+
+- `POST /v1/materialize` resolves selectors into short-lived session Git URLs.
+- Exact complete commit manifests can be served from cache without contacting
+  upstream.
+- Strict branch/default requests must verify upstream before serving.
+- Sessions pin one commit behind `refs/cache/sessions/<uuid>`.
+- Generation bundles, generation manifests, commit manifests, ref manifests,
+  sessions, and pending publishes are stored in the object store.
+- Local `/cache` contains hydrated bare repos and temporary bundle work files,
+  but losing it should only force rehydration or upstream verification.
+- Push is not supported; `git-receive-pack` is rejected.
+
+Relevant implementation areas:
+
+- `crates/git-cache-api`: API wiring, materialize handler, direct Git remote,
+  metrics, upload-pack streaming bounds.
+- `crates/git-cache-domain`: materialization, generation publishing,
+  verification, hydration, compaction, session repos.
+- `crates/git-cache-worker`: worker-local in-flight dedupe and repo lease
+  abstraction.
+- `crates/git-cache-objectstore`: object-store trait, manifest helpers,
+  create-once writes, lease helpers, local and S3 adapters.
+- `crates/git-cache-disk`: local repo locks, disk reservations, LRU eviction,
+  stale temp cleanup.
+- `crates/git-cache-git`: hardened Git subprocess wrapper and argument
+  validation.
+
 ## Goals
 
 - Keep exact known-complete commit reads fast and independent of upstream.
@@ -154,11 +236,36 @@ and Worker A later resumes, Worker A must not be able to release B's lease or
 advance shared metadata. Every mutable write should either happen while holding
 the lease token or be conditional on an expected object-store version.
 
+### Lease runtime defaults
+
+Start with explicit, configurable defaults:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `GIT_CACHE_WORKER_ID` | generated boot UUID plus pid/hostname | Holder identity written into lease manifests and logs. |
+| `GIT_CACHE_LEASE_TTL_SECONDS` | `300` | Lease duration long enough for temporary process stalls and object-store tail latency. |
+| `GIT_CACHE_LEASE_RENEW_INTERVAL_SECONDS` | `60` | Renewal cadence while a worker is fetching, bundling, verifying, or mutating manifests. |
+| `GIT_CACHE_LEASE_STEAL_SKEW_SECONDS` | `30` | Extra age required before treating a lease as expired, to absorb clock skew and object-store timestamp granularity. |
+| `GIT_CACHE_LEASE_BUSY_RETRY_AFTER_SECONDS` | `5` | Default `Retry-After` for requests that cannot acquire `repo-write`. |
+
+Lease expiry decisions should prefer object-store metadata time, such as S3
+`LastModified`, over worker wall-clock fields in the JSON body. The manifest's
+`acquired_at`, `renewed_at`, and `expires_at` fields are useful diagnostics, but
+they are not the correctness boundary. If a backend cannot provide reliable
+object metadata time, it must apply the configured skew margin before stealing.
+
+A mutating operation should run a renewal task while it holds the lease. Before
+publishing any mutable pointer, it must verify that the current lease object
+still has its token. If renewal fails because the token changed, or if the
+worker cannot prove it still owns the lease before a mutable write, the worker
+must abort the operation. Uploaded immutable bundles or pending manifests can be
+left for pending-generation recovery and GC.
+
 ## Object-Store CAS Requirements
 
 The object-store trait should grow compare-and-swap support. S3 can implement it
-with ETag/version conditions; the local adapter can implement it with lock files
-or atomic compare-then-rename in a critical section.
+with version IDs or ETag conditions; the local adapter can implement it with
+lock files or atomic compare-then-rename in a critical section.
 
 Minimum useful API:
 
@@ -191,6 +298,37 @@ We can wrap those in JSON helpers:
 
 Until CAS exists, durable cross-worker leases are incomplete because expired
 lease takeover and fenced release cannot be made safe.
+
+### Backend CAS semantics
+
+CAS is required only for small mutable JSON records: leases, generation heads,
+current ref manifests, default-branch manifests, and compaction repoints.
+Immutable bundles remain content-addressed or generation-ID-addressed and should
+use create-once semantics.
+
+For S3:
+
+- Prefer bucket versioning and use `VersionId` as `ObjectVersion`.
+- If versioning is unavailable, use the returned ETag as an opaque version token
+  for small single-part JSON objects. Do not interpret ETags as MD5 hashes.
+- Create-if-absent should use conditional create semantics, such as
+  `If-None-Match: *`.
+- Update-if-version-matches should use the provider's conditional write support
+  for the current `VersionId` or ETag. If the provider cannot conditionally
+  write, multi-worker durable leases must be disabled for that backend.
+- Avoid correctness-critical conditional deletes. Release a lease by
+  conditionally writing a `released` state with the current token/version, then
+  let cleanup delete old released records later.
+- Delete markers and multipart ETags must not appear on mutable JSON keys.
+  Large bundles may be multipart, but they are immutable and are verified by
+  length and SHA-256 in the generation metadata.
+
+For the local object store:
+
+- Use a per-key lock around read-version/write-version operations.
+- Store a monotonically changing local version token next to mutable JSON files,
+  or derive one from inode metadata only inside the per-key critical section.
+- Exercise the same CAS failure paths in tests as S3/MinIO.
 
 ## Write Discipline
 
@@ -237,12 +375,17 @@ publish that discovered the same commit in another generation.
 ### Ref manifests
 
 Current ref manifests should be changed only after upstream verification and
-only by a holder of the repo-write lease. The write helper should reject older
-observations:
+only by a holder of the repo-write lease. The write helper should CAS against
+the ref object version read after lease acquisition:
 
-- if existing `verified_at` is newer, keep existing;
-- if existing has the same `verified_at` and different commit, return conflict;
-- otherwise write the new verified observation.
+- if the version still matches, write the new verified observation;
+- if the current ref already equals the new observation, treat it as success;
+- if the version changed unexpectedly, abort and re-enter materialization under
+  a fresh durable-state read.
+
+Do not use wall-clock `verified_at` values to choose the winner between workers.
+They are audit metadata. The winner is the holder that still owns the lease token
+and updates the expected object version.
 
 The append-only ref observation path can remain immutable and useful for audit.
 
@@ -272,7 +415,8 @@ All mutating materialization paths should follow this structure:
 2. Re-read commit/ref manifests before taking the lease.
 3. If the request can now be served from verified cache, serve it and stop.
 4. Acquire durable `repo-write` lease.
-5. Record `request_started_at`, `lease_token`, and `observed_head`.
+5. Record `lease_token`, `observed_head`, relevant object versions, and
+   diagnostic `operation_started_at`.
 6. Re-read manifests after acquiring the lease.
 7. If another worker already published the answer, serve it and release.
 8. Hydrate `observed_head` into the local repo if an incremental publish may be
@@ -313,8 +457,8 @@ Worker2 should:
    its local repo, verify the commit/tree exists, create a session, and serve.
 3. If absent, acquire `repo-write`.
 4. Re-read manifests after lease acquisition.
-5. If Worker1's generation now has a manifest that covers `tip~1`, hydrate and
-   serve without fetching upstream.
+5. If another worker has meanwhile published a complete commit manifest for
+   `tip~1`, hydrate and serve without fetching upstream.
 6. Otherwise hydrate current generation head before building anything.
 7. Fetch upstream for the requested commit/ref.
 8. If the hydrated generation already contains the requested commit after fetch
@@ -326,6 +470,13 @@ Worker2 should:
 This preserves incremental behavior without assuming Worker2 has Worker1's EBS
 state.
 
+In the usual Git notation, `tip~1` is newer than `tip~3`. The common path is
+therefore not that Worker1's `tip~3` generation magically contains `tip~1`.
+Instead, Worker2 should hydrate the durable `tip~3` generation as the parent,
+fetch the newer objects needed for `tip~1`, and publish a child generation. If a
+later worker already published `tip~1` while Worker2 was waiting, Worker2 should
+reuse that manifest instead of building another generation.
+
 ### Required local-cache behavior
 
 - `ensure_repo_dir` may create an empty bare repo.
@@ -334,13 +485,18 @@ state.
 - Failed hydration should invalidate only the local repo, not durable metadata.
 - A worker may discard its local repo at any time and rebuild from object store.
 
-## Advanced Case: Two Workers Building Dependent Generations
+## Advanced Case: Two Workers Request Dependent Generations
 
 Consider:
 
 - Worker1 starts building `G1` for `tip~3`.
 - Worker2 starts building `G2` for `tip~1`.
 - `G2` should ideally parent to `G1`, not to the older head or a sibling chain.
+
+The first implementation does not allow the two workers to truly build dependent
+generations concurrently. It serializes writers with `repo-write` and lets the
+second worker retry from the new durable head. That is simpler than a
+distributed build graph and still produces a linear generation chain.
 
 Correctness-first behavior:
 
@@ -349,9 +505,10 @@ Correctness-first behavior:
 3. Worker2 checks whether the desired commit manifest appeared.
 4. If not, Worker2 returns `503`/`Retry-After` or retries after a short delay.
 5. Worker1 publishes, verifies, advances head, releases.
-6. Worker2 retries, rereads head, hydrates `G1`, and either:
-   - serves `tip~1` from `G1` if the generation contains it; or
-   - builds `G2` parented to `G1`.
+6. Worker2 retries, rereads head, hydrates `G1`, and builds `G2` parented to
+   `G1`. If a complete commit manifest for `tip~1` appeared while Worker2 was
+   waiting, Worker2 serves that durable result instead of building another
+   generation.
 
 Crash behavior:
 
@@ -370,10 +527,14 @@ This serializes writers but keeps readers independent.
 When a worker cannot acquire the durable repo-write lease:
 
 1. Re-read relevant manifests.
-2. If the answer is now available from verified cache, serve it.
-3. For strict branch/default requests, only use a ref observation whose
-   `verified_at >= request_started_at` and whose selector matches the request.
-4. Otherwise return `503` with `Retry-After`.
+2. If an exact commit answer is now available from a complete commit manifest,
+   hydrate and serve it.
+3. For strict branch/default requests, do not satisfy the request from another
+   worker's timestamped ref observation while the lease is busy. Without
+   distributed singleflight or synchronized clocks, that timestamp is not proof
+   that upstream was verified after this request began.
+4. Return `503` with `Retry-After`, unless the caller explicitly requested a
+   future bounded-staleness mode.
 
 This is not distributed singleflight because the waiting worker does not attach
 to another worker's in-memory result. It only follows durable metadata if that
@@ -409,6 +570,192 @@ Pending-generation GC should be TTL based and conservative:
   verification over deletion;
 - pending manifest whose parent chain was compacted: verify against compacted
   chain if possible, otherwise leave until explicit repair/GC.
+
+## Pending Generation Recovery Protocol
+
+Pending generations need enough metadata for a different worker to finish or
+safely abandon work after a lease expires.
+
+Use a lexically ordered key so bounded scans find older work first:
+
+```text
+repos/{repo}/pending-generations/{created_unix_ms}-{generation_id}.json
+```
+
+Pending manifest fields:
+
+```json
+{
+  "schema_version": 1,
+  "repo": "github.com/org/repo",
+  "generation_id": "uuid-v7",
+  "state": "pending",
+  "target": "branch main",
+  "holder": "worker-uuid/pid/boot-id",
+  "lease_token": "uuid-v7",
+  "created_at": "...",
+  "observed_head": "optional parent generation id",
+  "observed_head_version": "object-store version",
+  "parent_generation": "optional parent generation id",
+  "bundle_key": "repos/.../bundles/<generation>.bundle",
+  "bundle_len": 123,
+  "bundle_sha256": "...",
+  "ref_updates": ["refs/heads/main"],
+  "commit_ids": ["..."]
+}
+```
+
+Recovery after acquiring or stealing `repo-write`:
+
+1. List `repos/{repo}/pending-generations/` with `max_keys = 1000`. Do not use
+   unbounded listing. If the result is truncated, process the returned page,
+   emit `git_cache_pending_generation_scan_truncated_total`, and continue on a
+   later cleanup pass.
+2. Skip pending records whose holder still owns a non-expired lease.
+3. Read the pending manifest with version metadata.
+4. `head` the bundle object and require `bundle_len` to match before
+   downloading.
+5. Hydrate the parent generation chain, or the compacted replacement chain if a
+   compaction manifest explicitly maps the old parent to a new root.
+6. Reserve disk, download the bundle to a temp file, hash it, and require
+   `bundle_sha256` to match.
+7. Apply the bundle into the local repo and run the existing connectivity and
+   `git fsck` verification.
+8. If valid, publish verified generation metadata and advance head/ref manifests
+   only with the current lease token and expected object versions.
+9. If invalid, CAS the pending manifest to `state = "aborted"` with a reason and
+   leave physical bundle deletion to conservative GC.
+
+This lets Worker2 finish Worker1's work after a crash without guessing from
+local disk state, and without loading an unbounded number of object-store keys.
+
+## Execution Map
+
+This section maps the plan to concrete work areas.
+
+### Cross-Cutting Decisions
+
+- New error categories should be explicit: `LeaseBusy`, `LeaseLost`,
+  `LeaseStealConflict`, `CasConflict`, `PendingGenerationInvalid`, and
+  `ColdHydrationFailed`.
+- A `CasConflict` should not try to merge two mutable updates in place. Re-read
+  durable state and re-enter the materialization flow.
+- Config should use the lease names in this document so staging can tune them
+  without code changes.
+- Metrics labels should stay low-cardinality: use `result`, `operation`, and
+  `backend`, not repo names, commit IDs, lease tokens, or generation IDs.
+- Tests should expose deterministic pause points rather than relying on sleeps:
+  before lease acquire, after bundle upload, after pending manifest write, before
+  verification, and before head/ref CAS.
+
+### Object Store
+
+Files:
+
+- `crates/git-cache-objectstore/src/lib.rs`
+- `crates/git-cache-objectstore/src/local.rs`
+- `crates/git-cache-objectstore/src/s3.rs`
+- `crates/git-cache-objectstore/src/manifests.rs`
+- `crates/git-cache-objectstore/src/tests.rs`
+
+Tasks:
+
+- Add version-aware object reads and conditional writes/deletes.
+- Preserve the existing create-once helpers for immutable objects.
+- Add JSON CAS helpers for mutable manifests and leases.
+- Implement stale-version tests for local store and S3-compatible store.
+- Ensure `list_prefix` callers that do not require a full listing keep passing
+  a bounded `max_keys`.
+
+### Worker Coordination
+
+Files:
+
+- `crates/git-cache-worker/src/lib.rs`
+- `crates/git-cache-api/src/lib.rs`
+- `crates/git-cache-domain/src/state.rs`
+
+Tasks:
+
+- Implement `ObjectStoreRepoLeaseManager` behind the existing
+  `RepoLeaseManager` trait.
+- Add holder identity from config or generated process identity at startup.
+- Replace `InMemoryRepoLeaseManager` in production API wiring.
+- Keep worker-local `inflight` dedupe exactly where it is: per worker,
+  per `UpdateKey`, not distributed.
+- Add lease-busy behavior that rereads durable manifests before returning
+  `503`/`Retry-After`.
+
+### Materialization And Publishing
+
+Files:
+
+- `crates/git-cache-domain/src/materializer.rs`
+- `crates/git-cache-objectstore/src/manifests.rs`
+
+Tasks:
+
+- Re-read durable state before and after acquiring `repo-write`.
+- Add `hydrate_current_head(repo)` and use it before incremental bundle
+  creation.
+- Thread lease token/expected head through publish, verification, ref writes,
+  and generation-head advancement.
+- Replace blind mutable writes with CAS helpers.
+- Make conflicts explicit: if the expected head changed, abort and re-enter the
+  materialization flow from the top rather than trying to merge state in place.
+
+### Direct Git Remote
+
+Files:
+
+- `crates/git-cache-api/src/lib.rs`
+- `crates/git-cache-domain/src/materializer.rs`
+- `crates/git-cache-api/tests/git_remote_integration.rs`
+
+Tasks:
+
+- Ensure `/git/{repo}` read-through uses the same durable repo-write lease when
+  it must fetch unknown `want`s.
+- Keep ref advertisement upstream-verified.
+- Keep exact known wants fast when their commit manifests are complete.
+- Add cold-worker tests for direct remote clone/fetch, not only
+  `/v1/materialize`.
+
+### Compaction And Cleanup
+
+Files:
+
+- `crates/git-cache-domain/src/materializer.rs`
+- `crates/git-cache-cli/src/main.rs`
+- `docs/deployment.md`
+
+Tasks:
+
+- Require a writer-excluding durable lease before compaction mutates manifests
+  or deletes generation objects.
+- Snapshot pending generations under the lease.
+- Repoint manifests with expected old generation IDs.
+- Add a dry-run report for pending/orphan cleanup before enabling deletion in
+  production.
+
+### Test Harness
+
+Files:
+
+- `crates/git-cache-domain/src/materializer.rs` tests
+- `crates/git-cache-api/tests/*`
+- `crates/git-cache-worker/src/lib.rs` tests
+- `integration_tests/*`
+
+Tasks:
+
+- Build a reusable two-worker fixture with one shared object store and two
+  separate cache roots.
+- Add deterministic pause points around lease acquisition, bundle upload,
+  pending publish, verification, and head advancement.
+- Test both local object store and S3-compatible/MinIO behavior for CAS and
+  lease takeover.
+- Add regression tests for stale holder fencing.
 
 ## Implementation Phases
 
