@@ -76,6 +76,44 @@ async fn fetch_bundle_and_verify_local_bare_repos() {
 }
 
 #[tokio::test]
+async fn repack_for_serving_writes_bitmap_index() {
+    let temp = TempTree::new("repack-serving");
+    let (source_repo, _) = create_source_repo(&temp.path);
+    let cache_repo = temp.path.join("cache.git");
+    let git = test_git();
+
+    git.init_bare(&cache_repo).await.expect("init cache repo");
+    git.fetch_branch(
+        &cache_repo,
+        path_arg(&source_repo),
+        "main",
+        "refs/cache/main",
+    )
+    .await
+    .expect("fetch main into cache repo");
+
+    git.repack_for_serving(&cache_repo)
+        .await
+        .expect("repack repo for serving");
+
+    let pack_dir = cache_repo.join("objects/pack");
+    let has_bitmap = std::fs::read_dir(&pack_dir)
+        .expect("read pack dir")
+        .any(|entry| {
+            entry
+                .expect("pack dir entry")
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "bitmap")
+        });
+    assert!(
+        has_bitmap,
+        "expected a bitmap index in {}",
+        pack_dir.display()
+    );
+}
+
+#[tokio::test]
 async fn upload_pack_advertises_refs_and_serves_stateless_rpc() {
     let temp = TempTree::new("upload-pack");
     let (source_repo, source_sha) = create_source_repo(&temp.path);

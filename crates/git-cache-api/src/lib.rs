@@ -11,8 +11,9 @@ use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
     frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
-    MaterializerExecutor, UploadPackProcess,
+    MaterializerExecutor,
 };
+use git_cache_git::UploadPackProcess;
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
@@ -27,6 +28,8 @@ use tokio::io::AsyncRead;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
+
+const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 pub fn app(config: AppConfig) -> Router {
     app_result(config).expect("failed to initialize git-cache-api")
@@ -372,9 +375,7 @@ async fn git_repo(
             .fetch_add(1, Ordering::Relaxed);
 
         match materializer.handle_upload_pack(&repo, &body).await {
-            Ok(process) => {
-                upload_pack_stream_response(process, state.domain.config.max_git_output_bytes)
-            }
+            Ok(process) => stream_upload_pack_response(&state, process),
             Err(error) => ApiError::from(error).into_response(),
         }
     } else {
@@ -385,6 +386,30 @@ async fn git_repo(
     }
 }
 
+fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackProcess) -> Response {
+    let timeout_duration = process.timeout();
+    let permit = process.take_permit();
+    let reader_stream =
+        ReaderStream::with_capacity(process.stdout, GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES);
+    let max_bytes = state.domain.config.max_git_output_bytes as u64;
+    let guarded = ChildGuardStream {
+        inner: reader_stream,
+        child: process.child,
+        bytes_sent: 0,
+        max_bytes,
+        timeout: Box::pin(tokio::time::sleep(timeout_duration)),
+        timeout_duration,
+        timed_out: false,
+        _permit: permit,
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(guarded))
+        .expect("git upload-pack response")
+}
+
 fn git_response(content_type: &'static str, output: Vec<u8>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -392,29 +417,6 @@ fn git_response(content_type: &'static str, output: Vec<u8>) -> Response {
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(output))
         .expect("git response")
-}
-
-fn upload_pack_stream_response(mut process: UploadPackProcess, max_bytes: usize) -> Response {
-    let timeout_duration = process.timeout();
-    let permit = process.take_permit();
-    let reader_stream = ReaderStream::new(process.stdout);
-    let guarded = ChildGuardStream {
-        inner: reader_stream,
-        child: process.child,
-        bytes_sent: 0,
-        max_bytes: max_bytes as u64,
-        timeout: Box::pin(tokio::time::sleep(timeout_duration)),
-        timeout_duration,
-        timed_out: false,
-        _permit: permit,
-    };
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(guarded))
-        .expect("git upload-pack response")
 }
 
 #[derive(Debug, Serialize)]

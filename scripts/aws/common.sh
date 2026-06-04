@@ -28,7 +28,7 @@ role_arn() {
 init_aws_context() {
   require_cmd aws
 
-  AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+  AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
   AWS_DEFAULT_REGION="$AWS_REGION"
   export AWS_REGION AWS_DEFAULT_REGION
 
@@ -42,8 +42,8 @@ init_aws_context() {
 
   AWS_PARTITION="${AWS_PARTITION:-aws}"
   APP_NAME="${APP_NAME:-gitmirrorcache}"
-  ENVIRONMENT="${ENVIRONMENT:-dev}"
-  NAME_PREFIX="${NAME_PREFIX:-$(slug "$APP_NAME-$ENVIRONMENT")}"
+  ENVIRONMENT="${ENVIRONMENT:-dev-arm}"
+  NAME_PREFIX="${NAME_PREFIX:-gitmirrorcache-arm}"
   [[ -n "$NAME_PREFIX" ]] || die "NAME_PREFIX resolved to empty"
 
   S3_BUCKET="${S3_BUCKET:-$NAME_PREFIX-$AWS_ACCOUNT_ID-$AWS_REGION}"

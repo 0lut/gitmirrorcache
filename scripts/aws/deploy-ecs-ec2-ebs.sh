@@ -18,6 +18,16 @@ ECS_CLUSTER_NAME="${ECS_CLUSTER_NAME:-$NAME_PREFIX-ec2}"
 ECS_SERVICE_NAME="${ECS_SERVICE_NAME:-$NAME_PREFIX-ec2-api}"
 ECS_TASK_FAMILY="${ECS_TASK_FAMILY:-$NAME_PREFIX-ec2-api}"
 ECS_CONTAINER_NAME="${ECS_CONTAINER_NAME:-git-cache-api}"
+ECS_COMPACTION_TASK_FAMILY="${ECS_COMPACTION_TASK_FAMILY:-$NAME_PREFIX-ec2-compaction}"
+ECS_COMPACTION_CONTAINER_NAME="${ECS_COMPACTION_CONTAINER_NAME:-git-cache-compaction}"
+ECS_COMPACTION_EVENTS_ROLE_NAME="${ECS_COMPACTION_EVENTS_ROLE_NAME:-$NAME_PREFIX-ecs-compaction-events}"
+ECS_COMPACTION_RULE_NAME="${ECS_COMPACTION_RULE_NAME:-$NAME_PREFIX-compact-hourly}"
+ECS_COMPACTION_TARGET_ID="${ECS_COMPACTION_TARGET_ID:-compact-all}"
+ECS_COMPACTION_SCHEDULE_EXPRESSION="${ECS_COMPACTION_SCHEDULE_EXPRESSION:-rate(1 hour)}"
+ECS_COMPACTION_SCHEDULE_STATE="${ECS_COMPACTION_SCHEDULE_STATE:-ENABLED}"
+ECS_COMPACTION_LOG_STREAM_PREFIX="${ECS_COMPACTION_LOG_STREAM_PREFIX:-compaction}"
+ECS_COMPACTION_LOCK_PATH="${ECS_COMPACTION_LOCK_PATH:-/cache/git-cache-compaction.lock}"
+ECS_COMPACTION_MEMORY_RESERVATION="${ECS_COMPACTION_MEMORY_RESERVATION:-4096}"
 ECS_CACHE_VOLUME_NAME="${ECS_CACHE_VOLUME_NAME:-cache}"
 ECS_ALB_NAME="${ECS_ALB_NAME:-$NAME_PREFIX-ec2-alb}"
 ECS_TARGET_GROUP_NAME="${ECS_TARGET_GROUP_NAME:-$NAME_PREFIX-ec2-host-api}"
@@ -37,8 +47,8 @@ ECS_EC2_INSTANCE_TYPE="${ECS_EC2_INSTANCE_TYPE:-m8g.2xlarge}"
 ECS_CPU_ARCHITECTURE="${ECS_CPU_ARCHITECTURE:-ARM64}"
 ECS_EBS_SIZE_GIB="${ECS_EBS_SIZE_GIB:-128}"
 ECS_EBS_VOLUME_TYPE="${ECS_EBS_VOLUME_TYPE:-gp3}"
-ECS_EBS_IOPS="${ECS_EBS_IOPS:-3000}"
-ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-125}"
+ECS_EBS_IOPS="${ECS_EBS_IOPS:-8000}"
+ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-500}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
 ECS_SKIP_DOCKER_BUILD="${ECS_SKIP_DOCKER_BUILD:-false}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
@@ -77,6 +87,10 @@ if ((GIT_CACHE_DISK_QUOTA_BYTES < 0)); then
 fi
 
 export ECS_CLUSTER_NAME ECS_SERVICE_NAME ECS_TASK_FAMILY ECS_CONTAINER_NAME ECS_CACHE_VOLUME_NAME
+export ECS_COMPACTION_TASK_FAMILY ECS_COMPACTION_CONTAINER_NAME ECS_COMPACTION_EVENTS_ROLE_NAME
+export ECS_COMPACTION_RULE_NAME ECS_COMPACTION_TARGET_ID ECS_COMPACTION_SCHEDULE_EXPRESSION
+export ECS_COMPACTION_SCHEDULE_STATE ECS_COMPACTION_LOG_STREAM_PREFIX ECS_COMPACTION_LOCK_PATH
+export ECS_COMPACTION_MEMORY_RESERVATION
 export ECS_ALB_NAME ECS_TARGET_GROUP_NAME ECS_ALB_SG_NAME ECS_TASK_SG_NAME ECS_LOG_GROUP
 export ECS_EXECUTION_ROLE_NAME ECS_TASK_ROLE_NAME ECS_INSTANCE_ROLE_NAME ECS_INSTANCE_PROFILE_NAME
 export ECS_INSTANCE_NAME ECS_CPU ECS_MEMORY ECS_DESIRED_COUNT ECS_EC2_INSTANCE_TYPE ECS_CPU_ARCHITECTURE
@@ -378,6 +392,13 @@ alb_dns_name() {
     --output text
 }
 
+cluster_arn_by_name() {
+  aws_cli ecs describe-clusters \
+    --clusters "$ECS_CLUSTER_NAME" \
+    --query 'clusters[0].clusterArn' \
+    --output text
+}
+
 build_and_push_image() {
   aws_cli ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || die "ECR repository not found; run scripts/aws/bootstrap.sh first"
 
@@ -537,6 +558,46 @@ EOF
   die "timed out waiting for ECS container instance registration for $instance_id"
 }
 
+cache_volume_id_for_instance() {
+  local instance_id="$1"
+  aws_cli ec2 describe-instances \
+    --instance-ids "$instance_id" \
+    --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName=='$ECS_EBS_DEVICE_NAME'].Ebs.VolumeId | [0]" \
+    --output text
+}
+
+ensure_cache_volume_performance() {
+  local instance_id="$1"
+  local volume_id volume_type iops throughput
+
+  volume_id="$(cache_volume_id_for_instance "$instance_id")"
+  if [[ "$volume_id" == "None" || -z "$volume_id" ]]; then
+    printf 'cache EBS volume not found for %s; skipping volume performance update\n' "$instance_id" >&2
+    return 0
+  fi
+
+  read -r volume_type iops throughput < <(aws_cli ec2 describe-volumes \
+    --volume-ids "$volume_id" \
+    --query 'Volumes[0].[VolumeType,Iops,Throughput]' \
+    --output text)
+
+  if [[ "$volume_type" == "$ECS_EBS_VOLUME_TYPE" && "$iops" == "$ECS_EBS_IOPS" && "$throughput" == "$ECS_EBS_THROUGHPUT" ]]; then
+    printf 'cache EBS volume already tuned: %s type=%s iops=%s throughput=%s\n' \
+      "$volume_id" "$volume_type" "$iops" "$throughput" >&2
+    printf '%s\n' "$volume_id"
+    return 0
+  fi
+
+  printf 'modifying cache EBS volume %s: type=%s iops=%s throughput=%s\n' \
+    "$volume_id" "$ECS_EBS_VOLUME_TYPE" "$ECS_EBS_IOPS" "$ECS_EBS_THROUGHPUT" >&2
+  aws_cli ec2 modify-volume \
+    --volume-id "$volume_id" \
+    --volume-type "$ECS_EBS_VOLUME_TYPE" \
+    --iops "$ECS_EBS_IOPS" \
+    --throughput "$ECS_EBS_THROUGHPUT" >/dev/null
+  printf '%s\n' "$volume_id"
+}
+
 register_task_definition() {
   local execution_role_arn="$1"
   local task_role_arn="$2"
@@ -554,10 +615,13 @@ env = [
     {"name": "GIT_CACHE_BIND_ADDR", "value": "0.0.0.0:8080"},
     {"name": "GIT_CACHE_DISK_MIN_FREE_BYTES", "value": os.environ["GIT_CACHE_DISK_MIN_FREE_BYTES"]},
     {"name": "GIT_CACHE_DISK_QUOTA_BYTES", "value": os.environ["GIT_CACHE_DISK_QUOTA_BYTES"]},
+    {"name": "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "value": os.environ.get("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "10")},
+    {"name": "GIT_CACHE_COMPACTION_INLINE", "value": os.environ.get("GIT_CACHE_COMPACTION_INLINE", "false")},
     {"name": "GIT_CACHE_GIT_REMOTE_ENABLED", "value": os.environ.get("GIT_REMOTE_ENABLED", "true")},
     {"name": "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "value": os.environ.get("GIT_REMOTE_COMMIT_READ_THROUGH", "true")},
     {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
-    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "4")},
+    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
+    {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
     {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "1073741824")},
     {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
     {"name": "GIT_CACHE_PUBLIC_BASE_URL", "value": os.environ["PUBLIC_BASE_URL_VALUE"]},
@@ -626,8 +690,212 @@ PY
   ECS_TASK_EXECUTION_ROLE_ARN="$execution_role_arn" ECS_TASK_ROLE_ARN="$task_role_arn" \
     aws_cli ecs register-task-definition \
       --cli-input-json "file://$tmpdir/task-definition.json" \
+    --query 'taskDefinition.taskDefinitionArn' \
+    --output text
+}
+
+register_compaction_task_definition() {
+  local execution_role_arn="$1"
+  local task_role_arn="$2"
+  local public_base_url="$3"
+
+  PUBLIC_BASE_URL_VALUE="$public_base_url" python3 - "$tmpdir/compaction-task-definition.json" <<'PY'
+import json
+import os
+import shlex
+import sys
+
+env = [
+    {"name": "AWS_DEFAULT_REGION", "value": os.environ["AWS_REGION"]},
+    {"name": "AWS_REGION", "value": os.environ["AWS_REGION"]},
+    {"name": "GIT_CACHE_ALLOWED_UPSTREAM_HOSTS", "value": os.environ.get("ALLOWED_UPSTREAM_HOSTS", "github.com")},
+    {"name": "GIT_CACHE_BIND_ADDR", "value": "0.0.0.0:8080"},
+    {"name": "GIT_CACHE_DISK_MIN_FREE_BYTES", "value": os.environ["GIT_CACHE_DISK_MIN_FREE_BYTES"]},
+    {"name": "GIT_CACHE_DISK_QUOTA_BYTES", "value": os.environ["GIT_CACHE_DISK_QUOTA_BYTES"]},
+    {"name": "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "value": os.environ.get("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "10")},
+    {"name": "GIT_CACHE_COMPACTION_INLINE", "value": os.environ.get("GIT_CACHE_COMPACTION_INLINE", "false")},
+    {"name": "GIT_CACHE_GIT_REMOTE_ENABLED", "value": os.environ.get("GIT_REMOTE_ENABLED", "true")},
+    {"name": "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "value": os.environ.get("GIT_REMOTE_COMMIT_READ_THROUGH", "true")},
+    {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
+    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
+    {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
+    {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "1073741824")},
+    {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
+    {"name": "GIT_CACHE_PUBLIC_BASE_URL", "value": os.environ["PUBLIC_BASE_URL_VALUE"]},
+    {"name": "GIT_CACHE_RATE_LIMIT_PER_MINUTE", "value": os.environ.get("GIT_CACHE_RATE_LIMIT_PER_MINUTE", "120")},
+    {"name": "GIT_CACHE_ROOT", "value": "/cache"},
+    {"name": "GIT_CACHE_S3_BUCKET", "value": os.environ["S3_BUCKET"]},
+    {"name": "GIT_CACHE_S3_PREFIX", "value": os.environ["S3_PREFIX"]},
+    {"name": "RUST_LOG", "value": os.environ.get("RUST_LOG", "info")},
+]
+if os.environ.get("S3_ENDPOINT"):
+    env.append({"name": "GIT_CACHE_S3_ENDPOINT", "value": os.environ["S3_ENDPOINT"]})
+secrets = []
+if os.environ.get("GITHUB_TOKEN_SECRET_ARN"):
+    env.append({"name": "GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV", "value": "GITHUB_TOKEN"})
+    secrets.append({"name": "GITHUB_TOKEN", "valueFrom": os.environ["GITHUB_TOKEN_SECRET_ARN"]})
+
+lock_path = shlex.quote(os.environ["ECS_COMPACTION_LOCK_PATH"])
+script = (
+    f"if /usr/bin/flock -n -E 75 {lock_path} /usr/local/bin/git-cache compact --all; then "
+    "exit 0; "
+    "else status=$?; "
+    "if [ \"$status\" -eq 75 ]; then echo 'git-cache compaction already running; skipping'; exit 0; fi; "
+    "exit \"$status\"; "
+    "fi"
+)
+
+container = {
+    "name": os.environ["ECS_COMPACTION_CONTAINER_NAME"],
+    "image": os.environ["IMAGE_URI"],
+    "essential": True,
+    "user": os.environ.get("ECS_CONTAINER_USER", "0"),
+    "memoryReservation": int(os.environ["ECS_COMPACTION_MEMORY_RESERVATION"]),
+    "entryPoint": ["/bin/sh", "-c"],
+    "command": [script],
+    "environment": env,
+    "mountPoints": [{
+        "sourceVolume": os.environ["ECS_CACHE_VOLUME_NAME"],
+        "containerPath": "/cache",
+        "readOnly": False,
+    }],
+    "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+            "awslogs-group": os.environ["ECS_LOG_GROUP"],
+            "awslogs-region": os.environ["AWS_REGION"],
+            "awslogs-stream-prefix": os.environ["ECS_COMPACTION_LOG_STREAM_PREFIX"],
+        },
+    },
+}
+if secrets:
+    container["secrets"] = secrets
+
+task = {
+    "family": os.environ["ECS_COMPACTION_TASK_FAMILY"],
+    "taskRoleArn": os.environ["ECS_TASK_ROLE_ARN"],
+    "executionRoleArn": os.environ["ECS_EXECUTION_ROLE_ARN"],
+    "networkMode": "host",
+    "requiresCompatibilities": ["EC2"],
+    "runtimePlatform": {
+        "cpuArchitecture": os.environ["ECS_CPU_ARCHITECTURE"],
+        "operatingSystemFamily": "LINUX",
+    },
+    "containerDefinitions": [container],
+    "volumes": [{
+        "name": os.environ["ECS_CACHE_VOLUME_NAME"],
+        "host": {"sourcePath": "/cache"},
+    }],
+}
+if os.environ.get("ECS_COMPACTION_CPU"):
+    task["cpu"] = os.environ["ECS_COMPACTION_CPU"]
+if os.environ.get("ECS_COMPACTION_MEMORY"):
+    task["memory"] = os.environ["ECS_COMPACTION_MEMORY"]
+
+json.dump(task, open(sys.argv[1], "w"))
+PY
+
+  ECS_TASK_EXECUTION_ROLE_ARN="$execution_role_arn" ECS_TASK_ROLE_ARN="$task_role_arn" \
+    aws_cli ecs register-task-definition \
+      --cli-input-json "file://$tmpdir/compaction-task-definition.json" \
       --query 'taskDefinition.taskDefinitionArn' \
       --output text
+}
+
+ensure_compaction_events_role() {
+  local compaction_task_definition_arn="$1"
+  local execution_role_arn="$2"
+  local task_role_arn="$3"
+
+  cat >"$tmpdir/events-trust.json" <<'JSON'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+JSON
+
+  ensure_role "$ECS_COMPACTION_EVENTS_ROLE_NAME" "$tmpdir/events-trust.json" "EventBridge role for hourly gitmirrorcache compaction" >&2
+
+  ECS_COMPACTION_TASK_DEFINITION_ARN="$compaction_task_definition_arn" \
+  ECS_TASK_EXECUTION_ROLE_ARN="$execution_role_arn" \
+  ECS_TASK_ROLE_ARN="$task_role_arn" \
+  python3 - "$tmpdir/compaction-events-policy.json" <<'PY'
+import json
+import os
+import sys
+
+policy = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": "ecs:RunTask",
+            "Resource": os.environ["ECS_COMPACTION_TASK_DEFINITION_ARN"],
+        },
+        {
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": [
+                os.environ["ECS_TASK_EXECUTION_ROLE_ARN"],
+                os.environ["ECS_TASK_ROLE_ARN"],
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "iam:PassedToService": "ecs-tasks.amazonaws.com",
+                },
+            },
+        },
+    ],
+}
+json.dump(policy, open(sys.argv[1], "w"))
+PY
+
+  aws_cli iam put-role-policy \
+    --role-name "$ECS_COMPACTION_EVENTS_ROLE_NAME" \
+    --policy-name "${NAME_PREFIX}-compaction-run-task" \
+    --policy-document "file://$tmpdir/compaction-events-policy.json" >/dev/null
+
+  role_arn_by_name "$ECS_COMPACTION_EVENTS_ROLE_NAME"
+}
+
+ensure_compaction_schedule() {
+  local compaction_task_definition_arn="$1"
+  local compaction_events_role_arn="$2"
+  local cluster_arn="$3"
+
+  printf 'upserting hourly compaction rule: %s\n' "$ECS_COMPACTION_RULE_NAME"
+  aws_cli events put-rule \
+    --name "$ECS_COMPACTION_RULE_NAME" \
+    --schedule-expression "$ECS_COMPACTION_SCHEDULE_EXPRESSION" \
+    --state "$ECS_COMPACTION_SCHEDULE_STATE" \
+    --description "Runs git-cache compact --all for $NAME_PREFIX" >/dev/null
+
+  ECS_COMPACTION_TASK_DEFINITION_ARN="$compaction_task_definition_arn" \
+  ECS_COMPACTION_EVENTS_ROLE_ARN="$compaction_events_role_arn" \
+  ECS_CLUSTER_ARN="$cluster_arn" \
+  python3 - "$tmpdir/compaction-targets.json" <<'PY'
+import json
+import os
+import sys
+
+target = {
+    "Id": os.environ["ECS_COMPACTION_TARGET_ID"],
+    "Arn": os.environ["ECS_CLUSTER_ARN"],
+    "RoleArn": os.environ["ECS_COMPACTION_EVENTS_ROLE_ARN"],
+    "EcsParameters": {
+        "TaskDefinitionArn": os.environ["ECS_COMPACTION_TASK_DEFINITION_ARN"],
+        "TaskCount": 1,
+        "LaunchType": "EC2",
+        "Group": os.environ.get("ECS_COMPACTION_TASK_GROUP", "git-cache-compaction"),
+        "PlacementConstraints": [{
+            "type": "memberOf",
+            "expression": "attribute:ecs.instance-type == " + os.environ["ECS_EC2_INSTANCE_TYPE"],
+        }],
+    },
+}
+json.dump([target], open(sys.argv[1], "w"))
+PY
+
+  aws_cli events put-targets \
+    --rule "$ECS_COMPACTION_RULE_NAME" \
+    --targets "file://$tmpdir/compaction-targets.json" >/dev/null
 }
 
 write_service_inputs() {
@@ -725,6 +993,7 @@ target_group_arn="$(printf '%s\n' "$lb_output" | sed -n '2p')"
 public_base_url="${PUBLIC_BASE_URL:-http://$(alb_dns_name)}"
 
 container_instance_id="$(ensure_container_instance "$instance_subnet_id" "$instance_sg_id")"
+cache_volume_id="$(ensure_cache_volume_performance "$container_instance_id")"
 build_and_push_image
 
 execution_role_arn="$(role_arn_by_name "$ECS_EXECUTION_ROLE_NAME")"
@@ -733,8 +1002,12 @@ export ECS_EXECUTION_ROLE_ARN="$execution_role_arn"
 export ECS_TASK_ROLE_ARN="$task_role_arn"
 
 task_definition_arn="$(register_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+compaction_task_definition_arn="$(register_compaction_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
 write_service_inputs "$task_definition_arn" "$task_sg_id" "$all_subnets_csv" "$target_group_arn"
 ensure_ecs_service
+cluster_arn="$(cluster_arn_by_name)"
+compaction_events_role_arn="$(ensure_compaction_events_role "$compaction_task_definition_arn" "$execution_role_arn" "$task_role_arn")"
+ensure_compaction_schedule "$compaction_task_definition_arn" "$compaction_events_role_arn" "$cluster_arn"
 
 cat <<EOF
 ECS EC2/EBS deployment complete.
@@ -742,11 +1015,17 @@ IMAGE_URI=$IMAGE_URI
 ECS_CLUSTER_NAME=$ECS_CLUSTER_NAME
 ECS_SERVICE_NAME=$ECS_SERVICE_NAME
 ECS_TASK_DEFINITION_ARN=$task_definition_arn
+ECS_COMPACTION_TASK_DEFINITION_ARN=$compaction_task_definition_arn
+ECS_COMPACTION_RULE_NAME=$ECS_COMPACTION_RULE_NAME
+ECS_COMPACTION_SCHEDULE_EXPRESSION=$ECS_COMPACTION_SCHEDULE_EXPRESSION
 ECS_CONTAINER_INSTANCE_ID=$container_instance_id
 ECS_LOAD_BALANCER_ARN=$load_balancer_arn
 PUBLIC_BASE_URL=$public_base_url
 HEALTH_URL=$public_base_url/healthz
+ECS_CACHE_VOLUME_ID=$cache_volume_id
 ECS_EBS_SIZE_GIB=$ECS_EBS_SIZE_GIB
+ECS_EBS_IOPS=$ECS_EBS_IOPS
+ECS_EBS_THROUGHPUT=$ECS_EBS_THROUGHPUT
 GIT_CACHE_DISK_QUOTA_BYTES=$GIT_CACHE_DISK_QUOTA_BYTES
 S3_RUNTIME_PREFIX=$S3_RUNTIME_PREFIX
 EOF
