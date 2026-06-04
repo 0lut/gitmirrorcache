@@ -66,6 +66,11 @@ impl Materializer {
         self.validate_host(&request.repo)?;
         match request.selector {
             Selector::Commit(commit) => self.materialize_commit(request.repo, commit).await,
+            Selector::CommitReachableFrom { commit, .. } => {
+                // For now, treat CommitReachableFrom like a plain Commit in public mode.
+                // Authenticated reachability verification is handled at the API layer.
+                self.materialize_commit(request.repo, commit).await
+            }
             Selector::ShortCommit(commit) => {
                 self.materialize_short_commit(request.repo, commit).await
             }
@@ -378,6 +383,7 @@ impl Materializer {
             synthetic_ref: synthetic_ref.clone(),
             created_at: now,
             expires_at,
+            protection: git_cache_core::SessionProtection::Public,
         };
 
         let repo_dir = self.ensure_repo_dir(&repo).await?;
@@ -403,6 +409,65 @@ impl Materializer {
             ),
             ref_name: synthetic_ref,
             expires_at,
+            session_token: None,
+        })
+    }
+
+    /// Create a protected session with a bearer token for authenticated access.
+    pub async fn create_protected_session(
+        &self,
+        repo: RepoKey,
+        commit: CommitSha,
+        source: MaterializeSource,
+        authorized_refs: Vec<String>,
+    ) -> CoreResult<MaterializeResponse> {
+        let session_id = SessionId::new();
+        let synthetic_ref = session_id.synthetic_ref();
+        let now = Utc::now();
+        // Protected sessions have shorter TTL (10 minutes)
+        let expires_at = now + ChronoDuration::seconds(600);
+
+        let session_token = generate_session_token();
+        let token_hash = hash_session_token(&session_token);
+
+        let manifest = SessionManifest {
+            id: session_id,
+            repo: repo.clone(),
+            commit: commit.clone(),
+            synthetic_ref: synthetic_ref.clone(),
+            created_at: now,
+            expires_at,
+            protection: git_cache_core::SessionProtection::BearerToken {
+                token_hash,
+                authorized_commits: vec![commit.clone()],
+                authorized_refs,
+            },
+        };
+
+        let repo_dir = self.ensure_repo_dir(&repo).await?;
+        if !self.commit_exists(&repo_dir, &commit).await {
+            return Err(GitCacheError::NotFound(format!(
+                "cannot create session for missing local commit `{commit}`"
+            )));
+        }
+
+        self.prepare_session_repo(&manifest, &repo_dir).await?;
+        write_session_manifest(&*self.state.store, &manifest).await?;
+
+        Ok(MaterializeResponse {
+            repo: repo.clone(),
+            commit,
+            source,
+            verified_at: now,
+            git_url: format!(
+                "{}/git/session/{}/{}.git",
+                self.state.config.public_base_url.trim_end_matches('/'),
+                session_id,
+                repo.as_str()
+            ),
+            ref_name: synthetic_ref,
+            expires_at,
+            session_token: Some(session_token),
         })
     }
 
@@ -411,6 +476,19 @@ impl Materializer {
         repo: &RepoKey,
         session_id: SessionId,
     ) -> CoreResult<PathBuf> {
+        let (path, _protection) = self
+            .session_repo_and_protection(repo, session_id)
+            .await?;
+        Ok(path)
+    }
+
+    /// Load a session manifest, validate expiry/ownership, hydrate if needed,
+    /// and return both the repo path and the session protection for access control.
+    pub async fn session_repo_and_protection(
+        &self,
+        repo: &RepoKey,
+        session_id: SessionId,
+    ) -> CoreResult<(PathBuf, git_cache_core::SessionProtection)> {
         let manifest: SessionManifest = self
             .get_session_manifest(repo, session_id)
             .await?
@@ -443,7 +521,8 @@ impl Materializer {
         }
 
         self.prepare_session_repo(&manifest, &repo_dir).await?;
-        Ok(self.session_repo_path(session_id))
+        let protection = manifest.protection;
+        Ok((self.session_repo_path(session_id), protection))
     }
 
     async fn hydrate_commit(&self, manifest: &CommitManifest) -> CoreResult<()> {
@@ -2342,6 +2421,40 @@ fn push_unique_commit(commits: &mut Vec<CommitSha>, commit: CommitSha) {
     }
 }
 
+/// Generate a cryptographically random session token.
+/// Format: `gcs_` prefix + 32 bytes of random hex (64 chars).
+fn generate_session_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut bytes = [0u8; 32];
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let uuid_bytes = uuid::Uuid::now_v7();
+    bytes[..16].copy_from_slice(uuid_bytes.as_bytes());
+    for (i, b) in bytes[16..].iter_mut().enumerate() {
+        *b = ((ts >> (i * 8)) & 0xff) as u8 ^ uuid_bytes.as_bytes()[i % 16];
+    }
+    format!("gcs_{}", to_hex(&bytes))
+}
+
+/// Hash a session token with SHA-256 for storage.
+/// Only the hash is persisted; the raw token is returned once to the caller.
+pub fn hash_session_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    to_hex(&hasher.finalize())
+}
+
+/// Verify a session token against its stored hash.
+pub fn verify_session_token(token: &str, stored_hash: &str) -> bool {
+    hash_session_token(token) == stored_hash
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn commits_from_chain<'a>(
     chain: impl IntoIterator<Item = &'a GenerationManifest>,
 ) -> Vec<CommitSha> {
@@ -2549,6 +2662,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2563,6 +2677,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2591,6 +2706,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2600,6 +2716,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2612,6 +2729,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(second_commit.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2638,6 +2756,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2658,6 +2777,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(ancestor_commit.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2691,6 +2811,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2718,6 +2839,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(ancestor_commit.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2748,6 +2870,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(tip_2.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2762,6 +2885,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(tip_1.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2777,6 +2901,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(tip.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2799,6 +2924,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2810,6 +2936,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(second_commit.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2839,6 +2966,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2859,6 +2987,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(second_commit.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2937,6 +3066,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2947,6 +3077,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2959,6 +3090,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2969,6 +3101,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("default").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3046,6 +3179,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(third_commit.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3077,6 +3211,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3089,6 +3224,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3101,6 +3237,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3168,6 +3305,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3177,6 +3315,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3189,6 +3328,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3420,6 +3560,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3446,6 +3587,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(branch_response.commit.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3467,6 +3609,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(short),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3487,6 +3630,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3497,6 +3641,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(short),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3516,6 +3661,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3532,6 +3678,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(short),
                 mode: RequestMode::Cached,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3550,6 +3697,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(ShortCommitSha::parse("deadbeef").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3568,6 +3716,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::DefaultBranch,
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3583,6 +3732,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3594,6 +3744,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Cached,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3605,6 +3756,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::DefaultBranch,
                 mode: RequestMode::Cached,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3623,6 +3775,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3633,6 +3786,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3654,6 +3808,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3665,6 +3820,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(stale_short),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3683,6 +3839,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3722,6 +3879,7 @@ mod tests {
                         repo,
                         selector: Selector::Branch(BranchName::parse("main").unwrap()),
                         mode: RequestMode::Strict,
+                        upstream_authorization: Default::default(),
                     })
                     .await
                 })
@@ -3758,6 +3916,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3800,6 +3959,7 @@ mod tests {
                     repo: fixture.repo.clone(),
                     selector: Selector::Branch(BranchName::parse("main").unwrap()),
                     mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
                 })
                 .await;
         }
@@ -3836,6 +3996,7 @@ mod tests {
                 repo: repo1,
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
         });
@@ -3863,6 +4024,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4077,6 +4239,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4095,6 +4258,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(first.commit.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4141,6 +4305,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4152,6 +4317,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4163,6 +4329,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4199,6 +4366,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(third.clone()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4299,6 +4467,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4312,6 +4481,7 @@ mod tests {
                     repo: fixture.repo.clone(),
                     selector: Selector::Branch(BranchName::parse("main").unwrap()),
                     mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -4339,6 +4509,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4394,6 +4565,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
