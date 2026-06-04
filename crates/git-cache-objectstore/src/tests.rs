@@ -115,6 +115,7 @@ fn session_manifest(repo: &RepoKey) -> SessionManifest {
         synthetic_ref: "refs/cache/sessions/test".into(),
         created_at: ts(4),
         expires_at: ts(5),
+        protection: Default::default(),
     }
 }
 

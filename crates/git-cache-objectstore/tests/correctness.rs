@@ -368,6 +368,7 @@ async fn session_manifest_write_read_round_trip() {
         synthetic_ref: sid.synthetic_ref(),
         created_at: ts(4),
         expires_at: ts(5),
+        protection: Default::default(),
     };
 
     write_session_manifest(&store, &manifest).await.unwrap();
@@ -472,6 +473,7 @@ async fn session_manifest_if_absent_or_matches_first_write() {
         synthetic_ref: sid.synthetic_ref(),
         created_at: ts(7),
         expires_at: ts(8),
+        protection: Default::default(),
     };
 
     let first = write_session_manifest_if_absent_or_matches(&store, &manifest)
@@ -496,6 +498,7 @@ async fn session_manifest_if_absent_or_matches_identical_second() {
         synthetic_ref: sid.synthetic_ref(),
         created_at: ts(7),
         expires_at: ts(8),
+        protection: Default::default(),
     };
 
     write_session_manifest_if_absent_or_matches(&store, &manifest)
@@ -523,6 +526,7 @@ async fn session_manifest_if_absent_or_matches_conflicting() {
         synthetic_ref: sid.synthetic_ref(),
         created_at: ts(7),
         expires_at: ts(8),
+        protection: Default::default(),
     };
 
     write_session_manifest_if_absent_or_matches(&store, &manifest)

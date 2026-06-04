@@ -1,17 +1,19 @@
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
     AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
+    SessionProtection, UpstreamAuth, UpstreamAuthorizationMode,
 };
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
-    MaterializerExecutor,
+    frame_ref_advertisement, synthesize_ref_advertisement, verify_session_token, AppState,
+    Materializer, MaterializerExecutor,
 };
 use git_cache_git::UploadPackProcess;
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
@@ -26,6 +28,9 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::io::ReaderStream;
+
+/// Custom header for upstream GitHub auth on API endpoints.
+const UPSTREAM_AUTH_HEADER: &str = "git-cache-upstream-authorization";
 
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -140,21 +145,26 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
 
 async fn materialize(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
-    handle_materialize_request(&state, request).await
+    let upstream_auth = extract_upstream_auth(&headers, &request)?;
+    handle_materialize_request(&state, request, &upstream_auth).await
 }
 
 async fn resolve(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
-    handle_materialize_request(&state, request).await
+    let upstream_auth = extract_upstream_auth(&headers, &request)?;
+    handle_materialize_request(&state, request, &upstream_auth).await
 }
 
 async fn handle_materialize_request(
     state: &Arc<ApiState>,
     request: MaterializeRequest,
+    _upstream_auth: &UpstreamAuth,
 ) -> Result<Response, ApiError> {
     if !state.rate_limiter.check() {
         state
@@ -224,8 +234,63 @@ async fn handle_materialize_request(
     }
 }
 
+/// Extract upstream auth from request headers.
+/// Checks the custom `Git-Cache-Upstream-Authorization` header first,
+/// then falls back to the standard `Authorization` header.
+fn extract_upstream_auth(
+    headers: &HeaderMap,
+    request: &MaterializeRequest,
+) -> Result<UpstreamAuth, ApiError> {
+    let header_value = headers
+        .get(UPSTREAM_AUTH_HEADER)
+        .or_else(|| headers.get(header::AUTHORIZATION))
+        .and_then(|v| v.to_str().ok());
+
+    match (header_value, request.upstream_authorization) {
+        (Some(value), _) => UpstreamAuth::from_header_value(value).map_err(ApiError::from),
+        (None, UpstreamAuthorizationMode::Required) => Err(ApiError::from(
+            GitCacheError::Unauthorized(
+                "upstream authorization required but no credentials provided".into(),
+            ),
+        )),
+        (None, UpstreamAuthorizationMode::Anonymous) => Ok(UpstreamAuth::Anonymous),
+    }
+}
+
+/// Extract a bearer token from the Authorization header for session access.
+fn extract_session_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+}
+
+/// Validate session access based on its protection level.
+fn validate_session_access(
+    protection: &SessionProtection,
+    bearer_token: Option<&str>,
+) -> Result<(), GitCacheError> {
+    match protection {
+        SessionProtection::Public => Ok(()),
+        SessionProtection::BearerToken { token_hash, .. } => {
+            let token = bearer_token.ok_or_else(|| {
+                GitCacheError::Unauthorized("session requires bearer token".into())
+            })?;
+            if verify_session_token(token, token_hash) {
+                Ok(())
+            } else {
+                Err(GitCacheError::Forbidden(
+                    "invalid session bearer token".into(),
+                ))
+            }
+        }
+    }
+}
+
 async fn git_session(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Path((session_id, repo_path)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
     method: Method,
@@ -255,13 +320,18 @@ async fn git_session(
     };
 
     let materializer = Materializer::new(Arc::clone(&state.domain));
-    let session_repo = match materializer
-        .session_repo_from_manifest(&repo, session_id)
+    let (session_repo, protection) = match materializer
+        .session_repo_and_protection(&repo, session_id)
         .await
     {
-        Ok(repo) => repo,
+        Ok(result) => result,
         Err(error) => return ApiError::from(error).into_response(),
     };
+
+    let bearer_token = extract_session_bearer_token(&headers);
+    if let Err(error) = validate_session_access(&protection, bearer_token.as_deref()) {
+        return ApiError::from(error).into_response();
+    }
 
     let result = if method == Method::GET
         && path.ends_with("/info/refs")
@@ -307,12 +377,25 @@ async fn git_session(
 /// Git remote. No prior `/v1/materialize` call is needed.
 async fn git_repo(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Path(repo_path): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     method: Method,
     uri: Uri,
     body: Bytes,
 ) -> Response {
+    // Extract upstream auth for future use in authenticated git remote access.
+    // Currently used for plumbing; full authenticated path in Phase 4.
+    let _upstream_auth = headers
+        .get(UPSTREAM_AUTH_HEADER)
+        .or_else(|| headers.get(header::AUTHORIZATION))
+        .and_then(|v| v.to_str().ok())
+        .map(UpstreamAuth::from_header_value)
+        .transpose();
+    let _upstream_auth = match _upstream_auth {
+        Ok(auth) => auth.unwrap_or(UpstreamAuth::Anonymous),
+        Err(error) => return ApiError::from(error).into_response(),
+    };
     let path = uri.path();
 
     // Reject git-receive-pack (push) requests.
@@ -478,6 +561,8 @@ impl From<GitCacheError> for ApiError {
     fn from(error: GitCacheError) -> Self {
         let status = match error {
             GitCacheError::NotFound(_) => StatusCode::NOT_FOUND,
+            GitCacheError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            GitCacheError::Forbidden(_) => StatusCode::FORBIDDEN,
             GitCacheError::UpstreamUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             GitCacheError::DiskFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             GitCacheError::Unsupported(_) => StatusCode::METHOD_NOT_ALLOWED,
@@ -602,6 +687,7 @@ mod tests {
 
         let response = git_session(
             State(Arc::new(api_state)),
+            HeaderMap::new(),
             Path((
                 "not-a-session".to_string(),
                 "github.com/org/repo.git".to_string(),
