@@ -201,6 +201,7 @@ struct MaterializeResponse {
     commit: String,
     #[serde(rename = "ref")]
     ref_name: String,
+    session_token: Option<String>,
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -318,6 +319,82 @@ async fn session_upload_pack_accepts_large_request_body() {
         pack_resp.status(),
         reqwest::StatusCode::PAYLOAD_TOO_LARGE,
         "git upload-pack requests over Axum's default 2 MiB body limit should reach the handler"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_materialize_session_requires_bearer_token() {
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(server.materialize_url())
+        .header("content-type", "application/json")
+        .header(
+            "Git-Cache-Upstream-Authorization",
+            "Basic dXNlcjpwYXNzd29yZA==",
+        )
+        .body(
+            serde_json::to_string(&serde_json::json!({
+                "repo": "github.com/org/repo",
+                "selector": {"branch": "main"},
+                "upstream_authorization": "required"
+            }))
+            .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mat: MaterializeResponse = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let token = mat
+        .session_token
+        .as_deref()
+        .expect("authenticated materialize should return session_token");
+
+    let refs_url = format!("{}/info/refs?service=git-upload-pack", mat.git_url);
+    let missing = client.get(&refs_url).send().await.unwrap();
+    assert_eq!(missing.status(), 401);
+
+    let wrong = client
+        .get(&refs_url)
+        .header("Authorization", "Bearer wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+
+    let refs_resp = client
+        .get(&refs_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refs_resp.status(), 200);
+    let refs_body = refs_resp.text().await.unwrap();
+    assert!(refs_body.contains(&mat.ref_name));
+    assert!(
+        !refs_body.contains(" filter "),
+        "protected session should not advertise filter capability"
+    );
+
+    let want_line = format!("want {}\n", mat.commit);
+    let pkt_want = format!("{:04x}{}", 4 + want_line.len(), want_line);
+    let pack_body = format!("{pkt_want}00000009done\n");
+    let pack_url = format!("{}/git-upload-pack", mat.git_url);
+    let pack_resp = client
+        .post(&pack_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .body(pack_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pack_resp.status(), 200);
+    let pack_bytes = pack_resp.bytes().await.unwrap();
+    assert!(
+        pack_bytes.windows(4).any(|w| w == b"PACK"),
+        "protected upload-pack response missing PACK"
     );
 }
 

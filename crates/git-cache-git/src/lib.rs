@@ -1,4 +1,4 @@
-use git_cache_core::{CommitSha, GitCacheError, Result};
+use git_cache_core::{CommitSha, GitCacheError, Result, UpstreamAuth};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -80,17 +80,39 @@ impl Git {
         branch: &str,
         local_ref: &str,
     ) -> Result<GitOutput> {
+        self.fetch_branch_with_auth(
+            repo_dir,
+            remote_url,
+            branch,
+            local_ref,
+            &UpstreamAuth::Anonymous,
+        )
+        .await
+    }
+
+    pub async fn fetch_branch_with_auth(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        branch: &str,
+        local_ref: &str,
+        auth: &UpstreamAuth,
+    ) -> Result<GitOutput> {
         reject_ref_arg(branch, "branch")?;
         reject_ref_arg(local_ref, "local ref")?;
+        reject_remote_url(remote_url)?;
         self.check_branch_name(branch).await?;
         self.check_ref_name(local_ref).await?;
 
         let refspec = format!("refs/heads/{branch}:{local_ref}");
-        self.run(
+        self.run_with_upstream_auth(
             Some(repo_dir),
             ["fetch", "--no-tags", "--", remote_url, &refspec],
+            remote_url,
+            auth,
         )
         .await
+        .map_err(|err| map_upstream_git_error(err, auth))
     }
 
     pub async fn rev_parse(&self, repo_dir: &Path, rev: &str) -> Result<String> {
@@ -337,11 +359,20 @@ impl Git {
     /// We intentionally omit `--heads` so that the HEAD symref annotation is
     /// included in the output, and filter to `refs/heads/*` in memory.
     pub async fn ls_remote_heads(&self, remote: &str) -> Result<LsRemoteResult> {
+        self.ls_remote_heads_with_auth(remote, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn ls_remote_heads_with_auth(
+        &self,
+        remote: &str,
+        auth: &UpstreamAuth,
+    ) -> Result<LsRemoteResult> {
         reject_remote_url(remote)?;
         let output = self
-            .run(None, ["ls-remote", "--symref", "--", remote])
+            .run_with_upstream_auth(None, ["ls-remote", "--symref", "--", remote], remote, auth)
             .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+            .map_err(|err| map_upstream_git_error(err, auth))?;
 
         let text = String::from_utf8(output.stdout).map_err(|err| {
             GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
@@ -378,11 +409,25 @@ impl Git {
 
     /// Resolve the default branch via `git ls-remote --symref <remote> HEAD`.
     pub async fn ls_remote_default_branch(&self, remote: &str) -> Result<String> {
+        self.ls_remote_default_branch_with_auth(remote, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn ls_remote_default_branch_with_auth(
+        &self,
+        remote: &str,
+        auth: &UpstreamAuth,
+    ) -> Result<String> {
         reject_remote_url(remote)?;
         let output = self
-            .run(None, ["ls-remote", "--symref", "--", remote, "HEAD"])
+            .run_with_upstream_auth(
+                None,
+                ["ls-remote", "--symref", "--", remote, "HEAD"],
+                remote,
+                auth,
+            )
             .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+            .map_err(|err| map_upstream_git_error(err, auth))?;
 
         let text = String::from_utf8(output.stdout).map_err(|err| {
             GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
@@ -560,6 +605,17 @@ impl Git {
         remote_url: &str,
         refspecs: &[String],
     ) -> Result<GitOutput> {
+        self.fetch_refs_with_auth(repo_dir, remote_url, refspecs, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn fetch_refs_with_auth(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        refspecs: &[String],
+        auth: &UpstreamAuth,
+    ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
         for refspec in refspecs {
             reject_refspec(refspec)?;
@@ -572,9 +628,52 @@ impl Git {
         ];
         args.extend(refspecs.iter().cloned());
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        self.run(Some(repo_dir), args_ref)
+        self.run_with_upstream_auth(Some(repo_dir), args_ref, remote_url, auth)
             .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))
+            .map_err(|err| map_upstream_git_error(err, auth))
+    }
+
+    pub async fn fetch_object_with_auth(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        object_id: &CommitSha,
+        auth: &UpstreamAuth,
+    ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        reject_revision_arg(object_id.as_str())?;
+        self.run_with_upstream_auth(
+            Some(repo_dir),
+            ["fetch", "--no-tags", "--", remote_url, object_id.as_str()],
+            remote_url,
+            auth,
+        )
+        .await
+        .map_err(|err| map_upstream_git_error(err, auth))
+    }
+
+    pub async fn fetch_all_heads_with_auth(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        auth: &UpstreamAuth,
+    ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        self.run_with_upstream_auth(
+            Some(repo_dir),
+            [
+                "fetch",
+                "--no-tags",
+                "--prune",
+                "--",
+                remote_url,
+                "+refs/heads/*:refs/cache/upstream/heads/*",
+            ],
+            remote_url,
+            auth,
+        )
+        .await
+        .map_err(|err| map_upstream_git_error(err, auth))
     }
 
     async fn check_branch_name(&self, branch: &str) -> Result<()> {
@@ -595,6 +694,53 @@ impl Git {
         stdin: Option<&[u8]>,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
+    ) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_stdin_limits_and_auth(
+            cwd,
+            args,
+            stdin,
+            max_stdout_bytes,
+            max_stderr_bytes,
+            None,
+        )
+        .await
+    }
+
+    async fn run_with_upstream_auth<I, S>(
+        &self,
+        cwd: Option<&Path>,
+        args: I,
+        remote_url: &str,
+        auth: &UpstreamAuth,
+    ) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let auth_env = GitAuthEnv::from_upstream_auth(remote_url, auth)?;
+        self.run_with_stdin_limits_and_auth(
+            cwd,
+            args,
+            None,
+            self.output_limit,
+            self.output_limit,
+            auth_env,
+        )
+        .await
+    }
+
+    async fn run_with_stdin_limits_and_auth<I, S>(
+        &self,
+        cwd: Option<&Path>,
+        args: I,
+        stdin: Option<&[u8]>,
+        max_stdout_bytes: usize,
+        max_stderr_bytes: usize,
+        auth_env: Option<GitAuthEnv>,
     ) -> Result<GitOutput>
     where
         I: IntoIterator<Item = S>,
@@ -641,6 +787,9 @@ impl Git {
 
         for (key, value) in &self.extra_env {
             command.env(key, value);
+        }
+        if let Some(auth_env) = auth_env {
+            auth_env.apply(&mut command);
         }
 
         if let Some(cwd) = cwd {
@@ -770,6 +919,60 @@ fn reject_nul(value: &str, kind: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+struct GitAuthEnv {
+    config_key: String,
+    config_value: String,
+}
+
+impl GitAuthEnv {
+    fn from_upstream_auth(remote_url: &str, auth: &UpstreamAuth) -> Result<Option<Self>> {
+        let Some(raw_header) = auth.raw_header() else {
+            return Ok(None);
+        };
+        let config_key = upstream_extra_header_key(remote_url);
+        reject_config_key(&config_key)?;
+        reject_nul(raw_header, "upstream authorization header")?;
+        Ok(Some(Self {
+            config_key,
+            config_value: format!("Authorization: {raw_header}"),
+        }))
+    }
+
+    fn apply(self, command: &mut Command) {
+        command
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", self.config_key)
+            .env("GIT_CONFIG_VALUE_0", self.config_value);
+    }
+}
+
+fn upstream_extra_header_key(remote_url: &str) -> String {
+    if let Some(rest) = remote_url.strip_prefix("https://") {
+        if let Some(host) = rest.split('/').next().filter(|host| !host.is_empty()) {
+            return format!("http.https://{host}/.extraHeader");
+        }
+    }
+    "http.https://github.com/.extraHeader".to_string()
+}
+
+fn map_upstream_git_error(error: GitCacheError, auth: &UpstreamAuth) -> GitCacheError {
+    if auth.is_authenticated() && looks_like_auth_rejection(&error.to_string()) {
+        return GitCacheError::Unauthorized("upstream rejected authorization".into());
+    }
+
+    GitCacheError::UpstreamUnavailable("upstream git command failed".into())
+}
+
+fn looks_like_auth_rejection(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("authentication failed")
+        || lower.contains("could not read username")
+        || lower.contains("terminal prompts disabled")
+        || lower.contains("authentication required")
+        || lower.contains("authorization failed")
+        || lower.contains("permission denied")
 }
 
 #[derive(Debug)]

@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod manifest;
@@ -9,6 +10,7 @@ pub mod update;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use auth::{SecretString, UpstreamAuth, UpstreamAuthorizationMode};
 pub use config::{
     default_max_concurrent_git_processes, AppConfig, BranchRefCheck, CompactionConfig, DiskConfig,
     GitRemoteConfig, ObjectStoreConfig,
@@ -19,8 +21,8 @@ pub use manifest::{
     VerifiedGenerationManifest,
 };
 pub use repo::{CommitSha, RepoKey, ShortCommitSha};
-pub use selector::{BranchName, Selector};
-pub use session::{SessionId, SessionManifest};
+pub use selector::{BranchName, ReachabilitySelector, Selector};
+pub use session::{SessionId, SessionManifest, SessionProtection};
 pub use update::{
     validate_event_ref, UpdateDisposition, UpdateExecutor, UpdateKey, UpdateOutcome, UpdateRequest,
     UpdateSource, UpdateTarget,
@@ -38,6 +40,10 @@ pub enum RequestMode {
 pub enum MaterializeSource {
     GithubVerified,
     CacheVerified,
+    UpstreamAuthorizedCacheHit,
+    UpstreamAuthorizedFetched,
+    PublicCacheHit,
+    PublicFetched,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +52,8 @@ pub struct MaterializeRequest {
     pub selector: Selector,
     #[serde(default = "default_request_mode")]
     pub mode: RequestMode,
+    #[serde(default)]
+    pub upstream_authorization: UpstreamAuthorizationMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +65,19 @@ pub struct MaterializeResponse {
     pub git_url: String,
     #[serde(rename = "ref")]
     pub ref_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveResponse {
+    pub repo: RepoKey,
+    pub selector: Selector,
+    pub commit: CommitSha,
+    pub source: MaterializeSource,
+    pub cache_available: bool,
+    pub authorized_at: DateTime<Utc>,
 }
 
 fn default_request_mode() -> RequestMode {

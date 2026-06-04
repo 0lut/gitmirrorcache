@@ -334,3 +334,105 @@ object-store listings.
 Operators can keep existing config values such as `prefix = "repos"` or
 `root = "./tmp/object-store"`. The domain state builder appends the v2 suffix at
 runtime and avoids double-suffixing if a config already contains `-v2` or `v2`.
+
+---
+
+# Implementation Notes: HTTPS Authorization
+
+## Overview
+
+Implemented the first HTTPS auth slice from `AUTH-PLAN.md`: request-scoped
+GitHub Basic authorization can be forwarded to upstream git commands without
+putting credentials in argv, logs, local repo config, object-store keys, or
+manifests. Authenticated materialization now creates bearer-protected session
+URLs, and direct `/git/...` upload-pack wants are checked against a current
+upstream proof before cached bytes can be served.
+
+## Decisions not in the spec
+
+### 1. Auth type lives in `git-cache-core`
+
+`UpstreamAuth` is in core so API, domain, and git wrapper code share one parser
+and redacted `Debug` implementation. It accepts only `Basic ...` for this plan,
+rejects empty/control/NUL-containing headers, and exposes the raw header only to
+the git wrapper execution boundary.
+
+### 2. Keep anonymous `/v1/resolve` compatibility
+
+Existing `/v1/resolve` behaved like materialize and returned a session URL. I
+kept that behavior for anonymous requests to avoid breaking current tests and
+callers. Authenticated `/v1/resolve` uses the new no-session `ResolveResponse`
+shape with `cache_available` and `authorized_at`.
+
+### 3. Protected sessions reuse the existing session repo layout
+
+Protected sessions still create a per-session bare repo with alternates to the
+shared repo. The difference is session manifest protection, bearer-token
+validation on every session Git request, and stricter upload-pack config:
+`allowFilter=false`, `allowAnySHA1InWant=false`, and
+`allowReachableSHA1InWant=false`.
+
+### 4. Session tokens are returned once
+
+The raw `gcs_...` session token is returned only in the materialize response.
+Only its SHA-256 hash is stored in the session manifest. Public sessions keep
+`session_token: None` and do not require bearer auth.
+
+## Tradeoffs
+
+### T1. Direct authenticated `/git/...` is proof-gated, not fully ephemeral
+
+The plan asks for an ephemeral protected serving repo for authenticated direct
+Git. This implementation does not yet build that separate direct-remote repo.
+Instead, direct upload-pack re-authorizes the request with `ls-remote`, requires
+each want to be an advertised tip or exactly fetchable by upstream with the
+same credential, then serves from the shared repo. This closes the old
+"cached object proves access" hole, but the full ephemeral-repo isolation still
+belongs in a later hardening pass.
+
+### T2. Anonymous direct Git now also gets upstream proof for wants
+
+To prevent authenticated private cache entries from leaking to anonymous exact
+SHA fetches, anonymous `/git/.../git-upload-pack` also checks upstream before
+serving non-advertised wants. Public exact-SHA fetches still work when upstream
+can provide the object anonymously.
+
+### T3. Authenticated exact commits require reachability context
+
+Bare exact and short commit selectors are rejected in authenticated mode. The
+new selector shape `{"commit":"...","reachable_from":{"branch":"main"}}`
+authorizes the branch/default ref first, fetches that ref with the same auth,
+and proves ancestry locally before creating a protected session.
+
+### T4. Process-wide `upstream_auth_token_env` remains trusted-deployment only
+
+I left the existing process-wide bearer-token injection in place for older
+single-tenant/trusted deployments. Request-scoped auth is separate and overrides
+per-command git config env when present.
+
+## Things I changed from the plan
+
+### C1. Added auth-aware git wrapper methods
+
+`ls_remote_heads_with_auth`, `fetch_branch_with_auth`,
+`fetch_refs_with_auth`, `fetch_object_with_auth`, and
+`fetch_all_heads_with_auth` inject `http.https://.../.extraHeader` through
+`GIT_CONFIG_*` env. Tokens stay out of argv and debug logging.
+
+### C2. Added bearer-protected session manifests
+
+`SessionManifest` now has `SessionProtection::{Public,BearerToken}`. Session
+Git endpoints parse `Authorization: Bearer ...`, hash the presented token, and
+reject missing/wrong tokens with 401.
+
+### C3. Added protected direct ref advertisements
+
+Authenticated direct `info/refs` uses a reduced synthesized capability set that
+omits `filter`, `allow-tip-sha1-in-want`, and
+`allow-reachable-sha1-in-want`.
+
+### C4. Added focused regression coverage
+
+New coverage asserts Basic auth redaction, protected session token issuance,
+missing/wrong session-token rejection, protected session upload-pack success,
+and preservation of existing public direct remote behavior.

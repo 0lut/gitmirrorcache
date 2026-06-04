@@ -5,17 +5,17 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
+    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector, UpstreamAuth,
 };
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path, upload_pack};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
-    MaterializerExecutor,
+    frame_ref_advertisement, synthesize_protected_ref_advertisement, synthesize_ref_advertisement,
+    AppState, Materializer, MaterializerExecutor,
 };
 use git_cache_git::UploadPackProcess;
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
-use http::{header, Method, StatusCode, Uri};
+use http::{header, HeaderMap, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -140,21 +140,26 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
 
 async fn materialize(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
-    handle_materialize_request(&state, request).await
+    let auth = upstream_api_auth(&headers)?;
+    handle_materialize_request(&state, request, auth).await
 }
 
 async fn resolve(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
-    handle_materialize_request(&state, request).await
+    let auth = upstream_api_auth(&headers)?;
+    handle_resolve_request(&state, request, auth).await
 }
 
 async fn handle_materialize_request(
     state: &Arc<ApiState>,
     request: MaterializeRequest,
+    auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
     if !state.rate_limiter.check() {
         state
@@ -172,10 +177,13 @@ async fn handle_materialize_request(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
-    let use_coordinator = matches!(
-        request.selector,
-        Selector::Branch(_) | Selector::DefaultBranch
-    );
+    let authenticated = auth.is_authenticated()
+        || request.upstream_authorization == git_cache_core::UpstreamAuthorizationMode::Required;
+    let use_coordinator = !authenticated
+        && matches!(
+            request.selector,
+            Selector::Branch(_) | Selector::DefaultBranch
+        );
 
     let verified_by_coordinator = if use_coordinator {
         let outcome = state
@@ -209,7 +217,7 @@ async fn handle_materialize_request(
             .materialize_after_upstream_validation(request)
             .await
     } else {
-        materializer.materialize(request).await
+        materializer.materialize_with_auth(request, &auth).await
     };
 
     match result {
@@ -224,10 +232,29 @@ async fn handle_materialize_request(
     }
 }
 
+async fn handle_resolve_request(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<Response, ApiError> {
+    let authenticated = auth.is_authenticated()
+        || request.upstream_authorization == git_cache_core::UpstreamAuthorizationMode::Required;
+    if authenticated {
+        let materializer = Materializer::new(Arc::clone(&state.domain));
+        return match materializer.resolve_with_auth(request, &auth).await {
+            Ok(response) => Ok(Json(response).into_response()),
+            Err(error) => Err(error.into()),
+        };
+    }
+
+    handle_materialize_request(state, request, auth).await
+}
+
 async fn git_session(
     State(state): State<Arc<ApiState>>,
     Path((session_id, repo_path)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     method: Method,
     uri: Uri,
     body: Bytes,
@@ -255,8 +282,12 @@ async fn git_session(
     };
 
     let materializer = Materializer::new(Arc::clone(&state.domain));
+    let session_token = match session_bearer_token(&headers) {
+        Ok(token) => token,
+        Err(error) => return error.into_response(),
+    };
     let session_repo = match materializer
-        .session_repo_from_manifest(&repo, session_id)
+        .session_repo_from_manifest(&repo, session_id, session_token.as_deref())
         .await
     {
         Ok(repo) => repo,
@@ -309,6 +340,7 @@ async fn git_repo(
     State(state): State<Arc<ApiState>>,
     Path(repo_path): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     method: Method,
     uri: Uri,
     body: Bytes,
@@ -342,6 +374,10 @@ async fn git_repo(
         && path.ends_with("/info/refs")
         && query.get("service").is_some_and(|s| s == "git-upload-pack")
     {
+        let auth = match direct_git_upstream_auth(&headers) {
+            Ok(auth) => auth,
+            Err(error) => return error.into_response(),
+        };
         state
             .metrics
             .git_remote_refs_total
@@ -351,23 +387,34 @@ async fn git_repo(
         // response directly.  No objects are fetched — the repo may not
         // even exist locally yet.  Objects are fetched lazily when the
         // client actually issues an upload-pack POST.
-        let comparison = match materializer.upstream_refs(&repo).await {
+        let comparison = match materializer.upstream_refs_with_auth(&repo, &auth).await {
             Ok(c) => c,
             Err(error) => return ApiError::from(error).into_response(),
         };
 
-        let output = synthesize_ref_advertisement(&comparison);
+        let output = if auth.is_authenticated() {
+            synthesize_protected_ref_advertisement(&comparison)
+        } else {
+            synthesize_ref_advertisement(&comparison)
+        };
         git_response(
             "application/x-git-upload-pack-advertisement",
             frame_ref_advertisement(&output),
         )
     } else if method == Method::POST && path.ends_with("/git-upload-pack") {
+        let auth = match direct_git_upstream_auth(&headers) {
+            Ok(auth) => auth,
+            Err(error) => return error.into_response(),
+        };
         state
             .metrics
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
 
-        match materializer.handle_upload_pack(&repo, &body).await {
+        match materializer
+            .handle_upload_pack_with_auth(&repo, &body, &auth)
+            .await
+        {
             Ok(process) => stream_upload_pack_response(&state, process),
             Err(error) => ApiError::from(error).into_response(),
         }
@@ -377,6 +424,58 @@ async fn git_repo(
         )))
         .into_response()
     }
+}
+
+fn upstream_api_auth(headers: &HeaderMap) -> Result<UpstreamAuth, ApiError> {
+    parse_optional_upstream_auth_header(headers, "git-cache-upstream-authorization")
+}
+
+fn direct_git_upstream_auth(headers: &HeaderMap) -> Result<UpstreamAuth, ApiError> {
+    parse_optional_upstream_auth_header(headers, header::AUTHORIZATION.as_str())
+}
+
+fn parse_optional_upstream_auth_header(
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<UpstreamAuth, ApiError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(UpstreamAuth::Anonymous);
+    };
+    let value = value.to_str().map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "upstream authorization header must be valid ASCII".into(),
+    })?;
+    UpstreamAuth::parse_header(value).map_err(|error| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: error.to_string(),
+    })
+}
+
+fn session_bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        message: "session authorization header must be valid ASCII".into(),
+    })?;
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "session authorization must use Bearer authentication".into(),
+        });
+    };
+    if token.trim().is_empty()
+        || token
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "session bearer token is invalid".into(),
+        });
+    }
+    Ok(Some(token.trim().to_string()))
 }
 
 fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackProcess) -> Response {
@@ -479,6 +578,8 @@ impl From<GitCacheError> for ApiError {
         let status = match error {
             GitCacheError::NotFound(_) => StatusCode::NOT_FOUND,
             GitCacheError::UpstreamUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            GitCacheError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            GitCacheError::Forbidden(_) => StatusCode::FORBIDDEN,
             GitCacheError::DiskFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             GitCacheError::Unsupported(_) => StatusCode::METHOD_NOT_ALLOWED,
             GitCacheError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
@@ -607,6 +708,7 @@ mod tests {
                 "github.com/org/repo.git".to_string(),
             )),
             Query(query),
+            HeaderMap::new(),
             Method::GET,
             Uri::from_static(
                 "/git/session/not-a-session/github.com/org/repo.git/info/refs?service=git-receive-pack",

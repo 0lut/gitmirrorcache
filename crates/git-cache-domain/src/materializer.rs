@@ -4,9 +4,10 @@ use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use git_cache_core::{
     BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest, GitCacheError,
-    MaterializeRequest, MaterializeResponse, MaterializeSource, RefManifest, RepoGenerationHead,
-    RepoKey, RequestMode, Result as CoreResult, Selector, SessionId, SessionManifest,
-    ShortCommitSha, VerifiedGenerationManifest,
+    MaterializeRequest, MaterializeResponse, MaterializeSource, ReachabilitySelector, RefManifest,
+    RepoGenerationHead, RepoKey, RequestMode, ResolveResponse, Result as CoreResult, Selector,
+    SessionId, SessionManifest, SessionProtection, ShortCommitSha, UpstreamAuth,
+    UpstreamAuthorizationMode, VerifiedGenerationManifest,
 };
 use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use git_cache_disk::RepoLock;
@@ -30,6 +31,7 @@ use std::time::Duration as StdDuration;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 const VERIFIED_GENERATION_SCHEMA_VERSION: u32 = 2;
 const VERIFIED_GENERATION_VERIFIER_VERSION: u32 = 1;
@@ -63,9 +65,26 @@ impl Materializer {
         &self,
         request: MaterializeRequest,
     ) -> CoreResult<MaterializeResponse> {
+        self.materialize_with_auth(request, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn materialize_with_auth(
+        &self,
+        request: MaterializeRequest,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<MaterializeResponse> {
+        self.validate_requested_auth(&request, auth)?;
+        if self.authenticated_mode(&request, auth) {
+            return self.materialize_authenticated(request, auth).await;
+        }
+
         self.validate_host(&request.repo)?;
         match request.selector {
             Selector::Commit(commit) => self.materialize_commit(request.repo, commit).await,
+            Selector::CommitReachableFrom { commit, .. } => {
+                self.materialize_commit(request.repo, commit).await
+            }
             Selector::ShortCommit(commit) => {
                 self.materialize_short_commit(request.repo, commit).await
             }
@@ -90,6 +109,361 @@ impl Materializer {
             Selector::DefaultBranch => self.materialize_local_default_branch(request.repo).await,
             _ => self.materialize(request).await,
         }
+    }
+
+    pub async fn resolve_with_auth(
+        &self,
+        request: MaterializeRequest,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<ResolveResponse> {
+        self.validate_requested_auth(&request, auth)?;
+        if !self.authenticated_mode(&request, auth) {
+            return Err(GitCacheError::Unsupported(
+                "anonymous resolve still uses the materialize-compatible endpoint".into(),
+            ));
+        }
+
+        self.resolve_authenticated(request, auth).await
+    }
+
+    fn validate_requested_auth(
+        &self,
+        request: &MaterializeRequest,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<()> {
+        if request.upstream_authorization == UpstreamAuthorizationMode::Required
+            && !auth.is_authenticated()
+        {
+            return Err(GitCacheError::Unauthorized(
+                "upstream authorization is required".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn authenticated_mode(&self, request: &MaterializeRequest, auth: &UpstreamAuth) -> bool {
+        auth.is_authenticated()
+            || request.upstream_authorization == UpstreamAuthorizationMode::Required
+    }
+
+    async fn materialize_authenticated(
+        &self,
+        request: MaterializeRequest,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<MaterializeResponse> {
+        if !auth.is_authenticated() {
+            return Err(GitCacheError::Unauthorized(
+                "upstream authorization is required".into(),
+            ));
+        }
+
+        self.validate_host(&request.repo)?;
+        match request.selector {
+            Selector::Branch(branch) => {
+                let (branch, commit) = self
+                    .authorized_branch_tip(&request.repo, branch, auth)
+                    .await?;
+                self.materialize_authenticated_branch_tip(request.repo, branch, commit, false, auth)
+                    .await
+            }
+            Selector::DefaultBranch => {
+                let (branch, commit) = self.authorized_default_branch(&request.repo, auth).await?;
+                self.materialize_authenticated_branch_tip(request.repo, branch, commit, true, auth)
+                    .await
+            }
+            Selector::CommitReachableFrom {
+                commit,
+                reachable_from,
+            } => {
+                self.materialize_authenticated_reachable_commit(
+                    request.repo,
+                    commit,
+                    reachable_from,
+                    auth,
+                )
+                .await
+            }
+            Selector::Commit(_) | Selector::ShortCommit(_) => Err(GitCacheError::Validation(
+                "authenticated commit selectors require reachable_from context".into(),
+            )),
+        }
+    }
+
+    async fn resolve_authenticated(
+        &self,
+        request: MaterializeRequest,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<ResolveResponse> {
+        if !auth.is_authenticated() {
+            return Err(GitCacheError::Unauthorized(
+                "upstream authorization is required".into(),
+            ));
+        }
+
+        self.validate_host(&request.repo)?;
+        let now = Utc::now();
+        match request.selector.clone() {
+            Selector::Branch(branch) => {
+                let (_, commit) = self
+                    .authorized_branch_tip(&request.repo, branch, auth)
+                    .await?;
+                let cache_available = self.cache_has_commit(&request.repo, &commit).await?;
+                Ok(ResolveResponse {
+                    repo: request.repo,
+                    selector: request.selector,
+                    commit,
+                    source: if cache_available {
+                        MaterializeSource::UpstreamAuthorizedCacheHit
+                    } else {
+                        MaterializeSource::UpstreamAuthorizedFetched
+                    },
+                    cache_available,
+                    authorized_at: now,
+                })
+            }
+            Selector::DefaultBranch => {
+                let (_, commit) = self.authorized_default_branch(&request.repo, auth).await?;
+                let cache_available = self.cache_has_commit(&request.repo, &commit).await?;
+                Ok(ResolveResponse {
+                    repo: request.repo,
+                    selector: request.selector,
+                    commit,
+                    source: if cache_available {
+                        MaterializeSource::UpstreamAuthorizedCacheHit
+                    } else {
+                        MaterializeSource::UpstreamAuthorizedFetched
+                    },
+                    cache_available,
+                    authorized_at: now,
+                })
+            }
+            Selector::CommitReachableFrom {
+                commit,
+                reachable_from,
+            } => {
+                let (_, tip) = self
+                    .authorized_reachability_tip(&request.repo, reachable_from, auth)
+                    .await?;
+                let repo_dir = self.ensure_repo_dir(&request.repo).await?;
+                let cache_available = self.commit_exists(&repo_dir, &commit).await
+                    && self.commit_exists(&repo_dir, &tip).await
+                    && self.state.git.is_ancestor(&repo_dir, &commit, &tip).await?;
+                if !cache_available {
+                    return Err(GitCacheError::NotFound(format!(
+                        "commit `{commit}` is not available with local reachability proof"
+                    )));
+                }
+                Ok(ResolveResponse {
+                    repo: request.repo,
+                    selector: request.selector,
+                    commit,
+                    source: MaterializeSource::UpstreamAuthorizedCacheHit,
+                    cache_available,
+                    authorized_at: now,
+                })
+            }
+            Selector::Commit(_) | Selector::ShortCommit(_) => Err(GitCacheError::Validation(
+                "authenticated commit selectors require reachable_from context".into(),
+            )),
+        }
+    }
+
+    async fn authorized_branch_tip(
+        &self,
+        repo: &RepoKey,
+        branch: BranchName,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<(BranchName, CommitSha)> {
+        let remote = self.upstream_url(repo)?;
+        let ls = self
+            .state
+            .git
+            .ls_remote_heads_with_auth(&remote, auth)
+            .await?;
+        let sha = ls.refs.get(branch.as_str()).ok_or_else(|| {
+            GitCacheError::NotFound(format!("branch `{branch}` was verified absent upstream"))
+        })?;
+        Ok((branch, CommitSha::parse(sha)?))
+    }
+
+    async fn authorized_default_branch(
+        &self,
+        repo: &RepoKey,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<(BranchName, CommitSha)> {
+        let remote = self.upstream_url(repo)?;
+        let ls = self
+            .state
+            .git
+            .ls_remote_heads_with_auth(&remote, auth)
+            .await?;
+        let branch = ls.default_branch.ok_or_else(|| {
+            GitCacheError::UpstreamUnavailable("upstream did not advertise a symbolic HEAD".into())
+        })?;
+        let sha = ls.refs.get(&branch).ok_or_else(|| {
+            GitCacheError::UpstreamUnavailable("upstream HEAD pointed at a missing branch".into())
+        })?;
+        Ok((BranchName::parse(branch)?, CommitSha::parse(sha)?))
+    }
+
+    async fn authorized_reachability_tip(
+        &self,
+        repo: &RepoKey,
+        reachable_from: ReachabilitySelector,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<(BranchName, CommitSha)> {
+        match reachable_from {
+            ReachabilitySelector::Branch(branch) => {
+                self.authorized_branch_tip(repo, branch, auth).await
+            }
+            ReachabilitySelector::DefaultBranch => self.authorized_default_branch(repo, auth).await,
+        }
+    }
+
+    async fn materialize_authenticated_branch_tip(
+        &self,
+        repo: RepoKey,
+        branch: BranchName,
+        commit: CommitSha,
+        default_branch: bool,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<MaterializeResponse> {
+        let source = self
+            .ensure_authenticated_branch_tip(&repo, &branch, &commit, default_branch, auth)
+            .await?;
+        self.create_protected_session(repo, commit, source, vec![format!("refs/heads/{branch}")])
+            .await
+    }
+
+    async fn ensure_authenticated_branch_tip(
+        &self,
+        repo: &RepoKey,
+        branch: &BranchName,
+        commit: &CommitSha,
+        default_branch: bool,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<MaterializeSource> {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
+
+        if self.cache_has_commit(repo, commit).await? {
+            if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
+                if manifest.complete {
+                    self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
+                }
+            }
+            if !self.commit_exists(&repo_dir, commit).await {
+                return Err(GitCacheError::NotFound(format!(
+                    "authorized commit `{commit}` is marked cached but could not be hydrated"
+                )));
+            }
+            return Ok(MaterializeSource::UpstreamAuthorizedCacheHit);
+        }
+
+        let _repo_lock = self.lock_repo(repo).await?;
+        self.state
+            .git
+            .fetch_branch_with_auth(
+                &repo_dir,
+                &self.upstream_url(repo)?,
+                branch.as_str(),
+                &local_ref,
+                auth,
+            )
+            .await?;
+
+        let fetched = self
+            .state
+            .git
+            .rev_parse(&repo_dir, &local_ref)
+            .await
+            .and_then(CommitSha::parse)?;
+        if fetched != *commit {
+            return Err(GitCacheError::Conflict(format!(
+                "upstream branch `{branch}` moved during authenticated fetch: ls-remote={commit}, fetched={fetched}"
+            )));
+        }
+        if default_branch {
+            self.state
+                .git
+                .symbolic_ref(
+                    &repo_dir,
+                    "HEAD",
+                    &format!("refs/cache/upstream/heads/{branch}"),
+                )
+                .await?;
+        }
+
+        self.publish_generation(
+            repo,
+            &repo_dir,
+            commit,
+            Some(branch.clone()),
+            default_branch,
+        )
+        .await?;
+
+        Ok(MaterializeSource::UpstreamAuthorizedFetched)
+    }
+
+    async fn materialize_authenticated_reachable_commit(
+        &self,
+        repo: RepoKey,
+        commit: CommitSha,
+        reachable_from: ReachabilitySelector,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<MaterializeResponse> {
+        let (branch, tip) = self
+            .authorized_reachability_tip(&repo, reachable_from, auth)
+            .await?;
+        let branch_source = self
+            .ensure_authenticated_branch_tip(&repo, &branch, &tip, false, auth)
+            .await?;
+        let repo_dir = self.ensure_repo_dir(&repo).await?;
+
+        if !self.commit_exists(&repo_dir, &commit).await {
+            if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
+                if manifest.complete {
+                    self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
+                }
+            }
+        }
+        if !self.commit_exists(&repo_dir, &commit).await {
+            return Err(GitCacheError::NotFound(format!(
+                "commit `{commit}` was not found after fetching authorized ref `{branch}`"
+            )));
+        }
+        if !self.state.git.is_ancestor(&repo_dir, &commit, &tip).await? {
+            return Err(GitCacheError::Forbidden(format!(
+                "commit `{commit}` is not reachable from authorized ref `{branch}`"
+            )));
+        }
+
+        if self.get_commit_manifest(&repo, &commit).await?.is_none() {
+            self.publish_generation(&repo, &repo_dir, &commit, None, false)
+                .await?;
+        }
+
+        let source = if branch_source == MaterializeSource::UpstreamAuthorizedCacheHit {
+            MaterializeSource::UpstreamAuthorizedCacheHit
+        } else {
+            MaterializeSource::UpstreamAuthorizedFetched
+        };
+
+        self.create_protected_session(repo, commit, source, vec![format!("refs/heads/{branch}")])
+            .await
+    }
+
+    async fn cache_has_commit(&self, repo: &RepoKey, commit: &CommitSha) -> CoreResult<bool> {
+        if self
+            .get_commit_manifest(repo, commit)
+            .await?
+            .is_some_and(|manifest| manifest.complete)
+        {
+            return Ok(true);
+        }
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        Ok(self.commit_exists(&repo_dir, commit).await)
     }
 
     pub async fn materialize_short_commit(
@@ -378,6 +752,7 @@ impl Materializer {
             synthetic_ref: synthetic_ref.clone(),
             created_at: now,
             expires_at,
+            protection: SessionProtection::Public,
         };
 
         let repo_dir = self.ensure_repo_dir(&repo).await?;
@@ -402,6 +777,61 @@ impl Materializer {
                 repo.as_str()
             ),
             ref_name: synthetic_ref,
+            session_token: None,
+            expires_at,
+        })
+    }
+
+    pub async fn create_protected_session(
+        &self,
+        repo: RepoKey,
+        commit: CommitSha,
+        source: MaterializeSource,
+        authorized_refs: Vec<String>,
+    ) -> CoreResult<MaterializeResponse> {
+        let session_id = SessionId::new();
+        let synthetic_ref = session_id.synthetic_ref();
+        let session_token = new_session_token();
+        let now = Utc::now();
+        let expires_at =
+            now + ChronoDuration::seconds(self.state.config.session_ttl_seconds as i64);
+        let manifest = SessionManifest {
+            id: session_id,
+            repo: repo.clone(),
+            commit: commit.clone(),
+            synthetic_ref: synthetic_ref.clone(),
+            created_at: now,
+            expires_at,
+            protection: SessionProtection::BearerToken {
+                token_hash: hash_session_token(&session_token),
+                authorized_commits: vec![commit.clone()],
+                authorized_refs,
+            },
+        };
+
+        let repo_dir = self.ensure_repo_dir(&repo).await?;
+        if !self.commit_exists(&repo_dir, &commit).await {
+            return Err(GitCacheError::NotFound(format!(
+                "cannot create protected session for missing local commit `{commit}`"
+            )));
+        }
+
+        self.prepare_session_repo(&manifest, &repo_dir).await?;
+        write_session_manifest(&*self.state.store, &manifest).await?;
+
+        Ok(MaterializeResponse {
+            repo: repo.clone(),
+            commit,
+            source,
+            verified_at: now,
+            git_url: format!(
+                "{}/git/session/{}/{}.git",
+                self.state.config.public_base_url.trim_end_matches('/'),
+                session_id,
+                repo.as_str()
+            ),
+            ref_name: synthetic_ref,
+            session_token: Some(session_token),
             expires_at,
         })
     }
@@ -410,6 +840,7 @@ impl Materializer {
         &self,
         repo: &RepoKey,
         session_id: SessionId,
+        presented_token: Option<&str>,
     ) -> CoreResult<PathBuf> {
         let manifest: SessionManifest = self
             .get_session_manifest(repo, session_id)
@@ -426,6 +857,25 @@ impl Materializer {
             return Err(GitCacheError::Validation(format!(
                 "session `{session_id}` does not belong to repo `{repo}`"
             )));
+        }
+
+        match &manifest.protection {
+            SessionProtection::Public => {}
+            SessionProtection::BearerToken { token_hash, .. } => {
+                let Some(presented_token) = presented_token else {
+                    return Err(GitCacheError::Unauthorized(
+                        "session bearer token is required".into(),
+                    ));
+                };
+                if !constant_time_eq(
+                    token_hash.as_bytes(),
+                    hash_session_token(presented_token).as_bytes(),
+                ) {
+                    return Err(GitCacheError::Unauthorized(
+                        "session bearer token is invalid".into(),
+                    ));
+                }
+            }
         }
 
         let repo_dir = self.ensure_repo_dir(&manifest.repo).await?;
@@ -1436,16 +1886,7 @@ impl Materializer {
         let remote = self.upstream_url(repo)?;
         self.state
             .git
-            .run(
-                Some(repo_dir),
-                [
-                    "fetch",
-                    "--no-tags",
-                    "--prune",
-                    &remote,
-                    "+refs/heads/*:refs/cache/upstream/heads/*",
-                ],
-            )
+            .fetch_all_heads_with_auth(repo_dir, &remote, &UpstreamAuth::Anonymous)
             .await
             .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
         Ok(())
@@ -1516,11 +1957,15 @@ impl Materializer {
             format!("ref: {}\n", manifest.synthetic_ref),
         )
         .await?;
-        fs::write(
-            session_repo.join("config"),
-            "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = true\n\tallowAnySHA1InWant = true\n\tallowReachableSHA1InWant = true\n",
-        )
-        .await?;
+        let upload_pack_config = match &manifest.protection {
+            SessionProtection::Public => {
+                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = true\n\tallowAnySHA1InWant = true\n\tallowReachableSHA1InWant = true\n"
+            }
+            SessionProtection::BearerToken { .. } => {
+                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = false\n\tallowAnySHA1InWant = false\n\tallowReachableSHA1InWant = false\n[transfer]\n\thideRefs = refs/cache\n"
+            }
+        };
+        fs::write(session_repo.join("config"), upload_pack_config).await?;
         fs::write(
             objects_dir.join("info/alternates"),
             format!("{}\n", source_repo.join("objects").display()),
@@ -1618,8 +2063,21 @@ impl Materializer {
     /// Returns a map of branches that are missing or have a different SHA
     /// locally, plus the upstream default branch name.
     pub async fn compare_upstream_refs(&self, repo: &RepoKey) -> CoreResult<UpstreamRefComparison> {
+        self.compare_upstream_refs_with_auth(repo, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn compare_upstream_refs_with_auth(
+        &self,
+        repo: &RepoKey,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<UpstreamRefComparison> {
         let upstream_url = self.upstream_url(repo)?;
-        let ls = self.state.git.ls_remote_heads(&upstream_url).await?;
+        let ls = self
+            .state
+            .git
+            .ls_remote_heads_with_auth(&upstream_url, auth)
+            .await?;
         let repo_dir = self.ensure_repo_dir(repo).await?;
 
         let mut changed: HashMap<String, String> = HashMap::new();
@@ -1646,6 +2104,16 @@ impl Materializer {
         repo: &RepoKey,
         comparison: &UpstreamRefComparison,
     ) -> CoreResult<()> {
+        self.fetch_changed_refs_with_auth(repo, comparison, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn fetch_changed_refs_with_auth(
+        &self,
+        repo: &RepoKey,
+        comparison: &UpstreamRefComparison,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<()> {
         if comparison.changed.is_empty() {
             return Ok(());
         }
@@ -1669,7 +2137,7 @@ impl Materializer {
 
         self.state
             .git
-            .fetch_refs(&repo_dir, &upstream_url, &refspecs)
+            .fetch_refs_with_auth(&repo_dir, &upstream_url, &refspecs, auth)
             .await?;
 
         for (branch_name, expected_commit) in &validated {
@@ -1735,9 +2203,22 @@ impl Materializer {
     /// synthesize the pkt-line response directly, avoiding the need to
     /// materialise objects just for ls-remote.
     pub async fn upstream_refs(&self, repo: &RepoKey) -> CoreResult<UpstreamRefComparison> {
+        self.upstream_refs_with_auth(repo, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn upstream_refs_with_auth(
+        &self,
+        repo: &RepoKey,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<UpstreamRefComparison> {
         self.validate_host(repo)?;
         let upstream_url = self.upstream_url(repo)?;
-        let ls = self.state.git.ls_remote_heads(&upstream_url).await?;
+        let ls = self
+            .state
+            .git
+            .ls_remote_heads_with_auth(&upstream_url, auth)
+            .await?;
 
         Ok(UpstreamRefComparison {
             changed: HashMap::new(),
@@ -1776,75 +2257,80 @@ impl Materializer {
     }
 
     /// Ensure all wanted OIDs are available locally. For each want:
-    /// - If the object exists in the local repo, skip.
-    /// - If the commit is known in object-store manifests, hydrate.
-    /// - If unknown and commit_read_through is enabled, fetch from upstream.
-    /// - Otherwise, fail.
+    /// - Ask upstream for the current advertisement.
+    /// - Allow advertised tips directly.
+    /// - For other wants, require upstream to provide the object for this request.
+    /// - Use cached bytes only after that request-scoped upstream proof exists.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
+        let comparison = self.compare_upstream_refs(repo).await?;
+        self.ensure_wants_available_with_auth(repo, wants, &comparison, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn ensure_wants_available_with_auth(
+        &self,
+        repo: &RepoKey,
+        wants: &[String],
+        comparison: &UpstreamRefComparison,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<()> {
+        self.fetch_changed_refs_with_auth(repo, comparison, auth)
+            .await?;
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
+
+        let authorized_tips: HashSet<String> = comparison
+            .all_upstream
+            .values()
+            .map(|sha| sha.to_ascii_lowercase())
+            .collect();
+        let upstream_url = self.upstream_url(repo)?;
         let object_ids: Vec<CommitSha> = wants
             .iter()
-            .filter_map(|want_sha| CommitSha::parse(want_sha.as_str()).ok())
-            .collect();
-        let object_types = self
-            .state
-            .git
-            .cat_file_batch_types(&repo_dir, &object_ids)
-            .await?;
+            .map(|want_sha| CommitSha::parse(want_sha.as_str()))
+            .collect::<CoreResult<_>>()?;
 
         for object_id in object_ids {
-            if let Some(object_type) = object_types.get(&object_id) {
-                if object_type == "commit" {
-                    self.expose_served_commit(&repo_dir, &object_id).await?;
+            let proven_by_advertisement = authorized_tips.contains(object_id.as_str());
+            if !proven_by_advertisement {
+                if !self.state.config.git_remote.commit_read_through {
+                    return Err(GitCacheError::Forbidden(format!(
+                        "object `{object_id}` is not authorized by the current upstream advertisement"
+                    )));
                 }
-                continue;
-            }
 
-            if let Some(manifest) = self.get_commit_manifest(repo, &object_id).await? {
-                if manifest.complete {
-                    self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
-                    self.expose_served_commit(&repo_dir, &object_id).await?;
-                    continue;
-                }
-            }
-
-            if self.state.config.git_remote.commit_read_through {
-                info!(%repo, commit = %object_id, "read-through fetch for unknown commit");
-                let upstream_url = self.upstream_url(repo)?;
-                let fetch_result = self
+                if let Err(err) = self
                     .state
                     .git
-                    .run(
-                        Some(&repo_dir),
-                        [
-                            "fetch",
-                            "--no-tags",
-                            "--",
-                            &upstream_url,
-                            object_id.as_str(),
-                        ],
-                    )
-                    .await;
-
-                if let Err(fetch_err) = fetch_result {
-                    self.fetch_all_refs(repo, &repo_dir).await?;
-                    if self.object_exists(&repo_dir, &object_id).await {
-                        if self.commit_exists(&repo_dir, &object_id).await {
-                            self.expose_served_commit(&repo_dir, &object_id).await?;
-                        }
-                        continue;
+                    .fetch_object_with_auth(&repo_dir, &upstream_url, &object_id, auth)
+                    .await
+                {
+                    if auth.is_authenticated() {
+                        return Err(GitCacheError::Forbidden(format!(
+                            "object `{object_id}` is not authorized by upstream: {err}"
+                        )));
                     }
                     return Err(GitCacheError::NotFound(format!(
-                        "object `{object_id}` could not be fetched from upstream: {fetch_err}"
+                        "object `{object_id}` was not available from upstream: {err}"
                     )));
                 }
+            }
 
-                if !self.commit_exists(&repo_dir, &object_id).await {
-                    return Err(GitCacheError::NotFound(format!(
-                        "commit `{object_id}` not found after upstream fetch"
-                    )));
+            if !self.object_exists(&repo_dir, &object_id).await {
+                if let Some(manifest) = self.get_commit_manifest(repo, &object_id).await? {
+                    if manifest.complete {
+                        self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
+                    }
                 }
+            }
+
+            if !self.object_exists(&repo_dir, &object_id).await {
+                return Err(GitCacheError::NotFound(format!(
+                    "object `{object_id}` is authorized but unavailable locally"
+                )));
+            }
+
+            if self.commit_exists(&repo_dir, &object_id).await {
                 self.expose_served_commit(&repo_dir, &object_id).await?;
 
                 // Create a ref so that `bundle create --all` has something
@@ -1856,12 +2342,10 @@ impl Materializer {
                     .update_ref(&repo_dir, &cache_ref, object_id.as_str())
                     .await?;
 
-                self.publish_generation(repo, &repo_dir, &object_id, None, false)
-                    .await?;
-            } else {
-                return Err(GitCacheError::NotFound(format!(
-                    "commit `{object_id}` is not available and read-through is disabled"
-                )));
+                if self.get_commit_manifest(repo, &object_id).await?.is_none() {
+                    self.publish_generation(repo, &repo_dir, &object_id, None, false)
+                        .await?;
+                }
             }
         }
 
@@ -1936,9 +2420,21 @@ impl Materializer {
         repo: &RepoKey,
         body: &Bytes,
     ) -> CoreResult<UploadPackProcess> {
+        self.handle_upload_pack_with_auth(repo, body, &UpstreamAuth::Anonymous)
+            .await
+    }
+
+    pub async fn handle_upload_pack_with_auth(
+        &self,
+        repo: &RepoKey,
+        body: &Bytes,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<UploadPackProcess> {
         let wants = parse_want_lines(body);
         if !wants.is_empty() {
-            self.ensure_wants_available(repo, &wants).await?;
+            let comparison = self.compare_upstream_refs_with_auth(repo, auth).await?;
+            self.ensure_wants_available_with_auth(repo, &wants, &comparison, auth)
+                .await?;
         }
         let repo_dir = self.ensure_repo_dir(repo).await?;
         self.configure_served_repo(&repo_dir).await?;
@@ -2083,6 +2579,17 @@ pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u
 /// without requiring the objects to exist locally.  The capability set
 /// matches what a standard git 2.x upload-pack would emit.
 pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u8> {
+    synthesize_ref_advertisement_inner(comparison, true)
+}
+
+pub fn synthesize_protected_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u8> {
+    synthesize_ref_advertisement_inner(comparison, false)
+}
+
+fn synthesize_ref_advertisement_inner(
+    comparison: &UpstreamRefComparison,
+    advertise_expanded_wants: bool,
+) -> Vec<u8> {
     let mut out = Vec::new();
 
     // Sort refs for deterministic output.
@@ -2103,11 +2610,15 @@ pub fn synthesize_ref_advertisement(comparison: &UpstreamRefComparison) -> Vec<u
         .map(|(b, _)| format!(" symref=HEAD:refs/heads/{b}"))
         .unwrap_or_default();
 
+    let expanded_want_caps = if advertise_expanded_wants {
+        " filter allow-tip-sha1-in-want allow-reachable-sha1-in-want"
+    } else {
+        ""
+    };
     let caps = format!(
         "multi_ack thin-pack side-band side-band-64k ofs-delta \
          shallow deepen-since deepen-not deepen-relative no-progress \
-         include-tag multi_ack_detailed no-done filter \
-         allow-tip-sha1-in-want allow-reachable-sha1-in-want{symref} \
+         include-tag multi_ack_detailed no-done{expanded_want_caps}{symref} \
          object-format=sha1 agent=git-cache/1.0"
     );
 
@@ -2336,6 +2847,27 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn new_session_token() -> String {
+    format!("gcs_{}", Uuid::now_v7())
+}
+
+fn hash_session_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex_lower(&hasher.finalize())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 fn push_unique_commit(commits: &mut Vec<CommitSha>, commit: CommitSha) {
     if !commits.iter().any(|existing| existing == &commit) {
         commits.push(commit);
@@ -2549,6 +3081,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2563,6 +3096,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2591,6 +3125,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2600,6 +3135,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2612,6 +3148,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(second_commit.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2638,6 +3175,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2658,6 +3196,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(ancestor_commit.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2691,6 +3230,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2718,6 +3258,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(ancestor_commit.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2748,6 +3289,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(tip_2.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2762,6 +3304,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(tip_1.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2777,6 +3320,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(tip.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2799,6 +3343,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2810,6 +3355,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(second_commit.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2839,6 +3385,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2859,6 +3406,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(second_commit.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2937,6 +3485,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2947,6 +3496,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2959,6 +3509,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -2969,6 +3520,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("default").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3046,6 +3598,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(third_commit.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3077,6 +3630,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3089,6 +3643,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3101,6 +3656,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3168,6 +3724,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3177,6 +3734,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3189,6 +3747,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3420,6 +3979,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3446,6 +4006,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(branch_response.commit.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3467,6 +4028,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(short),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3487,6 +4049,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3497,6 +4060,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(short),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3516,6 +4080,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3532,6 +4097,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(short),
                 mode: RequestMode::Cached,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3550,6 +4116,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(ShortCommitSha::parse("deadbeef").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3568,6 +4135,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::DefaultBranch,
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3583,6 +4151,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3594,6 +4163,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Cached,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3605,6 +4175,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::DefaultBranch,
                 mode: RequestMode::Cached,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3623,6 +4194,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3633,6 +4205,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3654,6 +4227,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3665,6 +4239,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::ShortCommit(stale_short),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap_err();
@@ -3683,6 +4258,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3694,7 +4270,7 @@ mod tests {
         )
         .unwrap();
         let session_repo = materializer
-            .session_repo_from_manifest(&fixture.repo, session_id)
+            .session_repo_from_manifest(&fixture.repo, session_id, None)
             .await
             .unwrap();
         let advertised = advertise_refs(&state, &session_repo).await.unwrap();
@@ -3722,6 +4298,7 @@ mod tests {
                         repo,
                         selector: Selector::Branch(BranchName::parse("main").unwrap()),
                         mode: RequestMode::Strict,
+                        upstream_authorization: Default::default(),
                     })
                     .await
                 })
@@ -3758,6 +4335,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -3800,6 +4378,7 @@ mod tests {
                     repo: fixture.repo.clone(),
                     selector: Selector::Branch(BranchName::parse("main").unwrap()),
                     mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
                 })
                 .await;
         }
@@ -3836,6 +4415,7 @@ mod tests {
                 repo: repo1,
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
         });
@@ -3863,6 +4443,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4077,6 +4658,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4095,6 +4677,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(first.commit.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4141,6 +4724,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4152,6 +4736,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4163,6 +4748,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4199,6 +4785,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Commit(third.clone()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4299,6 +4886,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4312,6 +4900,7 @@ mod tests {
                     repo: fixture.repo.clone(),
                     selector: Selector::Branch(BranchName::parse("main").unwrap()),
                     mode: RequestMode::Strict,
+                    upstream_authorization: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -4339,6 +4928,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();
@@ -4394,6 +4984,7 @@ mod tests {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
                 mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
             })
             .await
             .unwrap();

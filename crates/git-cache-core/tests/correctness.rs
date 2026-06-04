@@ -471,6 +471,7 @@ fn materialize_request_serde_round_trip() {
         repo: RepoKey::parse("github.com/org/repo").unwrap(),
         selector: Selector::Branch(BranchName::parse("main").unwrap()),
         mode: RequestMode::Strict,
+        upstream_authorization: Default::default(),
     };
     let json = serde_json::to_string(&req).unwrap();
     let parsed: MaterializeRequest = serde_json::from_str(&json).unwrap();
@@ -569,6 +570,7 @@ fn session_manifest_serde_round_trip_external() {
         synthetic_ref: id.synthetic_ref(),
         created_at: chrono::Utc::now(),
         expires_at: chrono::Utc::now(),
+        protection: Default::default(),
     };
     let json = serde_json::to_string(&manifest).unwrap();
     let parsed: SessionManifest = serde_json::from_str(&json).unwrap();
