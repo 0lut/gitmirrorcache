@@ -1,4 +1,4 @@
-use git_cache_core::{CommitSha, GitCacheError, Result};
+use git_cache_core::{CommitSha, GitCacheError, Result, UpstreamAuth};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -577,6 +577,48 @@ impl Git {
             .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))
     }
 
+    /// Run `git ls-remote --symref` with per-request upstream auth injected via
+    /// environment-based Git config. Auth is NEVER placed in argv or URLs.
+    pub async fn ls_remote_heads_with_auth(
+        &self,
+        remote: &str,
+        auth: &UpstreamAuth,
+    ) -> Result<LsRemoteResult> {
+        reject_remote_url(remote)?;
+        let extra_env = auth_env_vars(remote, auth);
+        self.run_with_extra_env(None, ["ls-remote", "--symref", "--", remote], &extra_env)
+            .await
+            .map_err(|err| classify_auth_error(err, "ls-remote"))
+            .and_then(|output| parse_ls_remote_output(output.stdout))
+    }
+
+    /// Fetch specific refspecs with per-request upstream auth injected via
+    /// environment-based Git config. Auth is NEVER placed in argv or URLs.
+    pub async fn fetch_refs_with_auth(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        refspecs: &[String],
+        auth: &UpstreamAuth,
+    ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        for refspec in refspecs {
+            reject_refspec(refspec)?;
+        }
+        let mut args: Vec<String> = vec![
+            "fetch".to_string(),
+            "--no-tags".to_string(),
+            "--".to_string(),
+            remote_url.to_string(),
+        ];
+        args.extend(refspecs.iter().cloned());
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let extra_env = auth_env_vars(remote_url, auth);
+        self.run_with_extra_env(Some(repo_dir), args_ref, &extra_env)
+            .await
+            .map_err(|err| classify_auth_error(err, "fetch"))
+    }
+
     async fn check_branch_name(&self, branch: &str) -> Result<()> {
         self.run(None, ["check-ref-format", "--branch", branch])
             .await?;
@@ -709,6 +751,110 @@ impl Git {
         self.run_with_stdin_and_limits(cwd, args, None, self.output_limit, self.output_limit)
             .await
     }
+
+    /// Run a git command with additional per-request environment variables.
+    /// Used for injecting per-request auth without modifying the Git struct.
+    async fn run_with_extra_env<I, S>(
+        &self,
+        cwd: Option<&Path>,
+        args: I,
+        request_env: &[(OsString, OsString)],
+    ) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let _permit = self
+            .process_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
+
+        let args: Vec<OsString> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect();
+        debug!(?cwd, ?args, "running git command with request env");
+
+        let mut command = Command::new(&self.binary);
+        command
+            .args(&args)
+            .env_clear()
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false")
+            .env("HOME", "/nonexistent")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", tmpdir);
+        }
+
+        // Instance-level env (e.g. from upstream_auth_token_env config)
+        for (key, value) in &self.extra_env {
+            command.env(key, value);
+        }
+
+        // Per-request env (auth injection) — overrides instance-level
+        for (key, value) in request_env {
+            command.env(key, value);
+        }
+
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GitCacheError::Validation("failed to capture git stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| GitCacheError::Validation("failed to capture git stderr".to_string()))?;
+
+        let max_stdout_bytes = self.output_limit;
+        let max_stderr_bytes = self.output_limit;
+
+        let run = async move {
+            let read_stdout = read_bounded(stdout, max_stdout_bytes, "stdout");
+            let read_stderr = read_bounded(stderr, max_stderr_bytes, "stderr");
+            let wait_child = async move { child.wait().await.map_err(GitCacheError::from) };
+
+            let (stdout, stderr, status) =
+                tokio::try_join!(read_stdout, read_stderr, wait_child)?;
+
+            Ok::<_, GitCacheError>((status, stdout, stderr))
+        };
+
+        let (status, stdout, stderr) = timeout(self.timeout, run).await.map_err(|_| {
+            GitCacheError::Timeout(format!("git command exceeded {:?}", self.timeout))
+        })??;
+
+        let status_code = status.code().unwrap_or(-1);
+        if !status.success() {
+            let stderr_text = String::from_utf8_lossy(&stderr);
+            return Err(GitCacheError::Validation(format!(
+                "git exited with status {status_code}: {stderr_text}"
+            )));
+        }
+
+        Ok(GitOutput {
+            status_code,
+            stdout,
+            stderr,
+        })
+    }
 }
 
 fn path_to_str(path: &Path) -> Result<&str> {
@@ -770,6 +916,94 @@ fn reject_nul(value: &str, kind: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Build environment variables for per-request Git auth injection.
+///
+/// Uses `GIT_CONFIG_COUNT` + `GIT_CONFIG_KEY_N` + `GIT_CONFIG_VALUE_N` to inject
+/// the `http.<url>.extraHeader` setting. This keeps credentials out of argv and
+/// local config files.
+fn auth_env_vars(remote_url: &str, auth: &UpstreamAuth) -> Vec<(OsString, OsString)> {
+    let Some(raw_header) = auth.raw_header_value() else {
+        return Vec::new();
+    };
+
+    // Extract host from URL for scoped config
+    let host = extract_host_from_url(remote_url);
+    let config_url = format!("http.https://{host}/.extraHeader");
+
+    vec![
+        (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
+        (OsString::from("GIT_CONFIG_KEY_0"), OsString::from(config_url)),
+        (
+            OsString::from("GIT_CONFIG_VALUE_0"),
+            OsString::from(format!("Authorization: {raw_header}")),
+        ),
+    ]
+}
+
+/// Extract the host portion from a URL for scoped Git config.
+fn extract_host_from_url(url: &str) -> &str {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    without_scheme.split('/').next().unwrap_or("github.com")
+}
+
+/// Classify a git command error into appropriate auth error types.
+/// If the error message indicates a 401/403 from the remote, map to
+/// Unauthorized/Forbidden. Otherwise preserve as UpstreamUnavailable.
+fn classify_auth_error(err: GitCacheError, _command: &str) -> GitCacheError {
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+
+    if lower.contains("authentication failed")
+        || lower.contains("could not read username")
+        || lower.contains("401")
+        || lower.contains("invalid credentials")
+    {
+        GitCacheError::Unauthorized("upstream rejected credentials".into())
+    } else if lower.contains("403") || lower.contains("access denied") {
+        GitCacheError::Forbidden("upstream denied access to repository".into())
+    } else {
+        GitCacheError::UpstreamUnavailable(format!("upstream git operation failed: {msg}"))
+    }
+}
+
+/// Parse the output of `git ls-remote --symref` into a structured result.
+fn parse_ls_remote_output(stdout: Vec<u8>) -> Result<LsRemoteResult> {
+    let text = String::from_utf8(stdout).map_err(|err| {
+        GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
+    })?;
+
+    let mut refs = HashMap::new();
+    let mut default_branch: Option<String> = None;
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
+            if let Some((branch, target)) = rest.split_once('\t') {
+                if target == "HEAD" {
+                    default_branch = Some(branch.to_string());
+                }
+            }
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() == 2 {
+            let sha = parts[0].trim();
+            let ref_name = parts[1].trim();
+            if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                refs.insert(branch.to_string(), sha.to_string());
+            }
+        }
+    }
+
+    Ok(LsRemoteResult {
+        refs,
+        default_branch,
+    })
 }
 
 #[derive(Debug)]
