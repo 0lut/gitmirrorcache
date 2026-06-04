@@ -247,7 +247,7 @@ async fn full_session_lifecycle() {
 
     // 4. Upload-pack POST with the session commit
     let sha = &mat.commit;
-    let want_line = format!("want {sha}\n");
+    let want_line = format!("want {sha} multi_ack_detailed side-band-64k thin-pack ofs-delta\n");
     let pkt_want = format!("{:04x}{}", 4 + want_line.len(), want_line);
     let pack_body = format!("{pkt_want}00000009done\n");
 
@@ -261,9 +261,16 @@ async fn full_session_lifecycle() {
         .unwrap();
     assert_eq!(pack_resp.status(), 200);
     let pack_bytes = pack_resp.bytes().await.unwrap();
+    let has_nak = pack_bytes.windows(3).any(|w| w == b"NAK");
+    let has_pack = pack_bytes.windows(4).any(|w| w == b"PACK");
     assert!(
-        pack_bytes.windows(4).any(|w| w == b"PACK"),
-        "upload-pack response missing PACK"
+        has_nak,
+        "upload-pack response should contain negotiation data"
+    );
+    assert!(
+        has_pack,
+        "upload-pack response should contain pack data, got {} bytes",
+        pack_bytes.len()
     );
 
     // 5. Actual git clone using session URL

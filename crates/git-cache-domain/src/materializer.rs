@@ -381,9 +381,9 @@ impl Materializer {
         };
 
         let repo_dir = self.ensure_repo_dir(&repo).await?;
-        if !self.commit_exists(&repo_dir, &commit).await {
+        if !self.commit_ready_for_serving(&repo_dir, &commit).await {
             return Err(GitCacheError::NotFound(format!(
-                "cannot create session for missing local commit `{commit}`"
+                "cannot create session for missing or incomplete local commit `{commit}`"
             )));
         }
 
@@ -429,7 +429,10 @@ impl Materializer {
         }
 
         let repo_dir = self.ensure_repo_dir(&manifest.repo).await?;
-        if !self.commit_exists(&repo_dir, &manifest.commit).await {
+        if !self
+            .commit_ready_for_serving(&repo_dir, &manifest.commit)
+            .await
+        {
             let commit_manifest = self
                 .get_commit_manifest(&manifest.repo, &manifest.commit)
                 .await?
@@ -456,15 +459,21 @@ impl Materializer {
         repo_dir: &FsPath,
         manifest: &CommitManifest,
     ) -> CoreResult<()> {
-        if self.commit_exists(repo_dir, &manifest.commit).await {
+        if self
+            .commit_ready_for_serving(repo_dir, &manifest.commit)
+            .await
+        {
             return Ok(());
         }
 
         self.hydrate_generation(&manifest.repo, repo_dir, manifest.generation)
             .await?;
-        if !self.commit_exists(repo_dir, &manifest.commit).await {
+        if !self
+            .commit_ready_for_serving(repo_dir, &manifest.commit)
+            .await
+        {
             return Err(GitCacheError::NotFound(format!(
-                "hydrated generation `{}` did not contain commit `{}`",
+                "hydrated generation `{}` did not contain complete commit `{}`",
                 manifest.generation, manifest.commit
             )));
         }
@@ -1352,6 +1361,22 @@ impl Materializer {
             .is_ok()
     }
 
+    async fn commit_tree_exists(&self, repo_dir: &FsPath, commit: &CommitSha) -> bool {
+        self.state
+            .git
+            .run(
+                Some(repo_dir),
+                ["cat-file", "-e", &format!("{}^{{tree}}", commit.as_str())],
+            )
+            .await
+            .is_ok()
+    }
+
+    async fn commit_ready_for_serving(&self, repo_dir: &FsPath, commit: &CommitSha) -> bool {
+        self.commit_exists(repo_dir, commit).await
+            && self.commit_tree_exists(repo_dir, commit).await
+    }
+
     async fn object_exists(&self, repo_dir: &FsPath, object_id: &CommitSha) -> bool {
         self.state
             .git
@@ -1795,10 +1820,14 @@ impl Materializer {
 
         for object_id in object_ids {
             if let Some(object_type) = object_types.get(&object_id) {
-                if object_type == "commit" {
-                    self.expose_served_commit(&repo_dir, &object_id).await?;
+                if object_type != "commit" {
+                    continue;
                 }
-                continue;
+
+                if self.commit_tree_exists(&repo_dir, &object_id).await {
+                    self.expose_served_commit(&repo_dir, &object_id).await?;
+                    continue;
+                }
             }
 
             if let Some(manifest) = self.get_commit_manifest(repo, &object_id).await? {
@@ -1830,8 +1859,12 @@ impl Materializer {
                 if let Err(fetch_err) = fetch_result {
                     self.fetch_all_refs(repo, &repo_dir).await?;
                     if self.object_exists(&repo_dir, &object_id).await {
-                        if self.commit_exists(&repo_dir, &object_id).await {
+                        if self.commit_ready_for_serving(&repo_dir, &object_id).await {
                             self.expose_served_commit(&repo_dir, &object_id).await?;
+                        } else if self.commit_exists(&repo_dir, &object_id).await {
+                            return Err(GitCacheError::NotFound(format!(
+                                "commit `{object_id}` is incomplete after upstream fetch"
+                            )));
                         }
                         continue;
                     }
@@ -1840,9 +1873,9 @@ impl Materializer {
                     )));
                 }
 
-                if !self.commit_exists(&repo_dir, &object_id).await {
+                if !self.commit_ready_for_serving(&repo_dir, &object_id).await {
                     return Err(GitCacheError::NotFound(format!(
-                        "commit `{object_id}` not found after upstream fetch"
+                        "commit `{object_id}` not found or incomplete after upstream fetch"
                     )));
                 }
                 self.expose_served_commit(&repo_dir, &object_id).await?;
@@ -1942,7 +1975,10 @@ impl Materializer {
         }
         let repo_dir = self.ensure_repo_dir(repo).await?;
         self.configure_served_repo(&repo_dir).await?;
-        self.state.git.upload_pack_spawn(&repo_dir, body).await
+        self.state
+            .git
+            .upload_pack_spawn(&repo_dir, body.clone())
+            .await
     }
 
     pub async fn cleanup_expired_sessions(&self) -> CoreResult<SessionCleanupReport> {
