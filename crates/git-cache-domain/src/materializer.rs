@@ -38,6 +38,7 @@ const PENDING_GENERATION_PREFIX: &str = "pending-generations/";
 const MAX_PENDING_GENERATION_SCAN_KEYS: usize = 10_000;
 const GENERATION_VERIFICATION_MAX_ATTEMPTS: usize = 3;
 const GENERATION_VERIFICATION_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
+const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
 
 #[derive(Clone)]
 pub struct Materializer {
@@ -1874,6 +1875,11 @@ impl Materializer {
     /// - `uploadpack.hideRefs=refs/cache`
     /// - `transfer.hideRefs=refs/cache`
     pub async fn configure_served_repo(&self, repo_dir: &FsPath) -> CoreResult<()> {
+        let marker = repo_dir.join(SERVED_REPO_CONFIG_MARKER);
+        if fs::try_exists(&marker).await? {
+            return Ok(());
+        }
+
         self.state
             .git
             .set_config(repo_dir, "uploadpack.allowAnySHA1InWant", "true")
@@ -1894,6 +1900,31 @@ impl Materializer {
             .git
             .set_config(repo_dir, "transfer.hideRefs", "refs/cache")
             .await?;
+        self.state
+            .git
+            .set_config(repo_dir, "pack.useBitmap", "true")
+            .await?;
+        self.state
+            .git
+            .set_config(repo_dir, "repack.writeBitmaps", "true")
+            .await?;
+        self.state
+            .git
+            .set_config(repo_dir, "pack.compression", "1")
+            .await?;
+        self.state
+            .git
+            .set_config(repo_dir, "core.compression", "1")
+            .await?;
+        fs::write(marker, b"configured\n").await?;
+        Ok(())
+    }
+
+    pub async fn optimize_repo_for_serving(&self, repo: &RepoKey) -> CoreResult<()> {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let _repo_lock = self.lock_repo(repo).await?;
+        self.configure_served_repo(&repo_dir).await?;
+        self.state.git.repack_for_serving(&repo_dir).await?;
         Ok(())
     }
 

@@ -47,8 +47,8 @@ ECS_EC2_INSTANCE_TYPE="${ECS_EC2_INSTANCE_TYPE:-m8g.2xlarge}"
 ECS_CPU_ARCHITECTURE="${ECS_CPU_ARCHITECTURE:-ARM64}"
 ECS_EBS_SIZE_GIB="${ECS_EBS_SIZE_GIB:-128}"
 ECS_EBS_VOLUME_TYPE="${ECS_EBS_VOLUME_TYPE:-gp3}"
-ECS_EBS_IOPS="${ECS_EBS_IOPS:-3000}"
-ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-125}"
+ECS_EBS_IOPS="${ECS_EBS_IOPS:-8000}"
+ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-500}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
 ECS_SKIP_DOCKER_BUILD="${ECS_SKIP_DOCKER_BUILD:-false}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
@@ -558,6 +558,46 @@ EOF
   die "timed out waiting for ECS container instance registration for $instance_id"
 }
 
+cache_volume_id_for_instance() {
+  local instance_id="$1"
+  aws_cli ec2 describe-instances \
+    --instance-ids "$instance_id" \
+    --query "Reservations[0].Instances[0].BlockDeviceMappings[?DeviceName=='$ECS_EBS_DEVICE_NAME'].Ebs.VolumeId | [0]" \
+    --output text
+}
+
+ensure_cache_volume_performance() {
+  local instance_id="$1"
+  local volume_id volume_type iops throughput
+
+  volume_id="$(cache_volume_id_for_instance "$instance_id")"
+  if [[ "$volume_id" == "None" || -z "$volume_id" ]]; then
+    printf 'cache EBS volume not found for %s; skipping volume performance update\n' "$instance_id" >&2
+    return 0
+  fi
+
+  read -r volume_type iops throughput < <(aws_cli ec2 describe-volumes \
+    --volume-ids "$volume_id" \
+    --query 'Volumes[0].[VolumeType,Iops,Throughput]' \
+    --output text)
+
+  if [[ "$volume_type" == "$ECS_EBS_VOLUME_TYPE" && "$iops" == "$ECS_EBS_IOPS" && "$throughput" == "$ECS_EBS_THROUGHPUT" ]]; then
+    printf 'cache EBS volume already tuned: %s type=%s iops=%s throughput=%s\n' \
+      "$volume_id" "$volume_type" "$iops" "$throughput" >&2
+    printf '%s\n' "$volume_id"
+    return 0
+  fi
+
+  printf 'modifying cache EBS volume %s: type=%s iops=%s throughput=%s\n' \
+    "$volume_id" "$ECS_EBS_VOLUME_TYPE" "$ECS_EBS_IOPS" "$ECS_EBS_THROUGHPUT" >&2
+  aws_cli ec2 modify-volume \
+    --volume-id "$volume_id" \
+    --volume-type "$ECS_EBS_VOLUME_TYPE" \
+    --iops "$ECS_EBS_IOPS" \
+    --throughput "$ECS_EBS_THROUGHPUT" >/dev/null
+  printf '%s\n' "$volume_id"
+}
+
 register_task_definition() {
   local execution_role_arn="$1"
   local task_role_arn="$2"
@@ -580,7 +620,7 @@ env = [
     {"name": "GIT_CACHE_GIT_REMOTE_ENABLED", "value": os.environ.get("GIT_REMOTE_ENABLED", "true")},
     {"name": "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "value": os.environ.get("GIT_REMOTE_COMMIT_READ_THROUGH", "true")},
     {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
-    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "4")},
+    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
     {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
     {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "1073741824")},
     {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
@@ -677,7 +717,7 @@ env = [
     {"name": "GIT_CACHE_GIT_REMOTE_ENABLED", "value": os.environ.get("GIT_REMOTE_ENABLED", "true")},
     {"name": "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "value": os.environ.get("GIT_REMOTE_COMMIT_READ_THROUGH", "true")},
     {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
-    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "4")},
+    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
     {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
     {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "1073741824")},
     {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
@@ -953,6 +993,7 @@ target_group_arn="$(printf '%s\n' "$lb_output" | sed -n '2p')"
 public_base_url="${PUBLIC_BASE_URL:-http://$(alb_dns_name)}"
 
 container_instance_id="$(ensure_container_instance "$instance_subnet_id" "$instance_sg_id")"
+cache_volume_id="$(ensure_cache_volume_performance "$container_instance_id")"
 build_and_push_image
 
 execution_role_arn="$(role_arn_by_name "$ECS_EXECUTION_ROLE_NAME")"
@@ -981,7 +1022,10 @@ ECS_CONTAINER_INSTANCE_ID=$container_instance_id
 ECS_LOAD_BALANCER_ARN=$load_balancer_arn
 PUBLIC_BASE_URL=$public_base_url
 HEALTH_URL=$public_base_url/healthz
+ECS_CACHE_VOLUME_ID=$cache_volume_id
 ECS_EBS_SIZE_GIB=$ECS_EBS_SIZE_GIB
+ECS_EBS_IOPS=$ECS_EBS_IOPS
+ECS_EBS_THROUGHPUT=$ECS_EBS_THROUGHPUT
 GIT_CACHE_DISK_QUOTA_BYTES=$GIT_CACHE_DISK_QUOTA_BYTES
 S3_RUNTIME_PREFIX=$S3_RUNTIME_PREFIX
 EOF

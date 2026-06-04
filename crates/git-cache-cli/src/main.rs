@@ -33,6 +33,11 @@ enum Command {
     },
     /// Remove expired sessions from disk and object store.
     SessionCleanup,
+    /// Repack a local cached repo with bitmap indexes for faster upload-pack.
+    Optimize {
+        /// Repository key, e.g. github.com/org/repo
+        repo: String,
+    },
     /// Compact delta generation chains.
     Compact {
         /// Repository key, e.g. github.com/org/repo
@@ -131,6 +136,20 @@ async fn main() -> anyhow::Result<()> {
             let materializer = Materializer::new(state);
             let report = materializer.cleanup_expired_sessions().await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Optimize { repo } => {
+            let repo = git_cache_core::RepoKey::parse(&repo)?;
+            let config = AppConfig::from_env()?;
+            let state = Arc::new(AppState::try_new_async(config).await?);
+            let materializer = Materializer::new(state);
+            materializer.optimize_repo_for_serving(&repo).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "repo": repo,
+                    "optimized": true
+                }))?
+            );
         }
         Command::Compact { repo, all, dry_run } => {
             if repo.is_none() != all {
