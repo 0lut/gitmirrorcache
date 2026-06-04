@@ -247,3 +247,5 @@ GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD=10
 - Local repo corruption is handled by deleting local state and hydrating from object storage.
 - Force-pushed branches update ref manifests after upstream verification; older commit manifests remain available until retention cleanup.
 - Push endpoints are rejected at the HTTP layer and `git-receive-pack` is never served.
+- The detailed conflict-avoidance plan for multiple workers with separate local
+  caches is in [multi-worker-conflict-plan.md](multi-worker-conflict-plan.md).
