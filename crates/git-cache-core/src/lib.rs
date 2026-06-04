@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod manifest;
@@ -9,6 +10,9 @@ pub mod update;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use auth::{
+    ReachabilitySelector, SessionProtection, UpstreamAuth, UpstreamAuthorizationMode,
+};
 pub use config::{
     default_max_concurrent_git_processes, AppConfig, BranchRefCheck, CompactionConfig, DiskConfig,
     GitRemoteConfig, ObjectStoreConfig,
@@ -38,6 +42,10 @@ pub enum RequestMode {
 pub enum MaterializeSource {
     GithubVerified,
     CacheVerified,
+    UpstreamAuthorizedCacheHit,
+    UpstreamAuthorizedFetched,
+    PublicCacheHit,
+    PublicFetched,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +54,8 @@ pub struct MaterializeRequest {
     pub selector: Selector,
     #[serde(default = "default_request_mode")]
     pub mode: RequestMode,
+    #[serde(default)]
+    pub upstream_authorization: UpstreamAuthorizationMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +68,8 @@ pub struct MaterializeResponse {
     #[serde(rename = "ref")]
     pub ref_name: String,
     pub expires_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
 }
 
 fn default_request_mode() -> RequestMode {

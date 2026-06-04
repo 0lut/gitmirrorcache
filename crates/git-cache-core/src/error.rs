@@ -8,6 +8,10 @@ pub enum GitCacheError {
     Validation(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("upstream unavailable: {0}")]
     UpstreamUnavailable(String),
     #[error("insufficient local disk: {0}")]

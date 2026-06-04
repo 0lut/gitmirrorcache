@@ -1,3 +1,4 @@
+use crate::auth::ReachabilitySelector;
 use crate::error::{GitCacheError, Result};
 use crate::repo::{CommitSha, ShortCommitSha};
 use serde::de::Error as _;
@@ -60,6 +61,10 @@ impl<'de> Deserialize<'de> for BranchName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     Commit(CommitSha),
+    CommitReachableFrom {
+        commit: CommitSha,
+        reachable_from: ReachabilitySelector,
+    },
     ShortCommit(ShortCommitSha),
     Branch(BranchName),
     DefaultBranch,
@@ -70,14 +75,37 @@ impl Serialize for Selector {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(1))?;
         match self {
-            Self::Commit(commit) => map.serialize_entry("commit", commit)?,
-            Self::ShortCommit(commit) => map.serialize_entry("short_commit", commit)?,
-            Self::Branch(branch) => map.serialize_entry("branch", branch)?,
-            Self::DefaultBranch => map.serialize_entry("default_branch", &true)?,
+            Self::Commit(commit) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("commit", commit)?;
+                map.end()
+            }
+            Self::CommitReachableFrom {
+                commit,
+                reachable_from,
+            } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("commit", commit)?;
+                map.serialize_entry("reachable_from", reachable_from)?;
+                map.end()
+            }
+            Self::ShortCommit(commit) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("short_commit", commit)?;
+                map.end()
+            }
+            Self::Branch(branch) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("branch", branch)?;
+                map.end()
+            }
+            Self::DefaultBranch => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("default_branch", &true)?;
+                map.end()
+            }
         }
-        map.end()
     }
 }
 
@@ -89,6 +117,7 @@ impl<'de> Deserialize<'de> for Selector {
         #[derive(Deserialize)]
         struct WireSelector {
             commit: Option<CommitSha>,
+            reachable_from: Option<ReachabilitySelector>,
             short_commit: Option<ShortCommitSha>,
             branch: Option<BranchName>,
             #[serde(default)]
@@ -96,19 +125,34 @@ impl<'de> Deserialize<'de> for Selector {
         }
 
         let wire = WireSelector::deserialize(deserializer)?;
-        let selected = wire.commit.is_some() as u8
+
+        // reachable_from is a modifier on commit, not a standalone selector
+        let primary_selected = wire.commit.is_some() as u8
             + wire.short_commit.is_some() as u8
             + wire.branch.is_some() as u8
             + wire.default_branch as u8;
 
-        if selected != 1 {
+        if primary_selected != 1 {
             return Err(D::Error::custom(
                 "selector must include exactly one of commit, short_commit, branch, or default_branch",
             ));
         }
 
+        if wire.reachable_from.is_some() && wire.commit.is_none() {
+            return Err(D::Error::custom(
+                "reachable_from can only be used with commit selector",
+            ));
+        }
+
         if let Some(commit) = wire.commit {
-            Ok(Self::Commit(commit))
+            if let Some(reachable_from) = wire.reachable_from {
+                Ok(Self::CommitReachableFrom {
+                    commit,
+                    reachable_from,
+                })
+            } else {
+                Ok(Self::Commit(commit))
+            }
         } else if let Some(commit) = wire.short_commit {
             Ok(Self::ShortCommit(commit))
         } else if let Some(branch) = wire.branch {

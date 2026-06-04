@@ -1,3 +1,4 @@
+use crate::auth::SessionProtection;
 use crate::error::{GitCacheError, Result};
 use crate::repo::{CommitSha, RepoKey};
 use chrono::{DateTime, Utc};
@@ -56,6 +57,8 @@ pub struct SessionManifest {
     pub synthetic_ref: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub protection: SessionProtection,
 }
 
 #[cfg(test)]
@@ -204,6 +207,7 @@ mod tests {
             synthetic_ref: id.synthetic_ref(),
             created_at: test_ts(),
             expires_at: test_ts(),
+            protection: Default::default(),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: SessionManifest = serde_json::from_str(&json).unwrap();
