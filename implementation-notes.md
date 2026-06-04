@@ -393,3 +393,12 @@ instead of blind overwrites. If a manifest with a strictly newer verification
 timestamp already exists, the older write is skipped. This is a pragmatic
 fencing guard for mutable branch/default state while preserving idempotent
 rewrites of identical content.
+
+### T7. Exact-commit reads can join pending verification
+
+The request path can return from branch/default materialization before the
+background verifier has published canonical commit manifests. Exact-commit
+materialization now scans the repo's bounded pending-generation work queue for a
+matching commit and waits for that generation verification before falling back to
+publishing a new generation. This avoids duplicate generation publication during
+cold-cache rehydrate races.

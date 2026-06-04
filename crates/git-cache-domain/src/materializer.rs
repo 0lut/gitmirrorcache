@@ -127,6 +127,19 @@ impl Materializer {
                     .await;
             }
         }
+        if self
+            .verify_pending_generation_for_commit(&repo, &commit)
+            .await?
+        {
+            if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
+                if manifest.complete {
+                    self.hydrate_commit(&manifest).await?;
+                    return self
+                        .create_session(repo, commit, MaterializeSource::CacheVerified)
+                        .await;
+                }
+            }
+        }
 
         let repo_dir = self.ensure_repo_dir(&repo).await?;
         if self.commit_exists(&repo_dir, &commit).await {
@@ -765,6 +778,58 @@ impl Materializer {
         Ok(queued)
     }
 
+    async fn verify_pending_generation_for_commit(
+        &self,
+        repo: &RepoKey,
+        commit: &CommitSha,
+    ) -> CoreResult<bool> {
+        let keys = self
+            .state
+            .store
+            .list_prefix(
+                &format!("{PENDING_GENERATION_PREFIX}{repo}/"),
+                Some(MAX_PENDING_GENERATION_SCAN_KEYS),
+            )
+            .await?;
+        if keys.len() >= MAX_PENDING_GENERATION_SCAN_KEYS {
+            return Err(GitCacheError::Conflict(format!(
+                "too many pending generations for `{repo}` to scan safely"
+            )));
+        }
+
+        for key in keys {
+            let Some((pending_repo, generation)) = pending_generation_from_key(&key)? else {
+                continue;
+            };
+            if pending_repo != *repo {
+                continue;
+            }
+            let Some(pending) =
+                read_pending_generation_publish(&*self.state.store, repo, generation).await?
+            else {
+                continue;
+            };
+            if !pending
+                .generation
+                .commits
+                .iter()
+                .any(|candidate| candidate == commit)
+                && !pending
+                    .manifests
+                    .commits
+                    .iter()
+                    .any(|manifest| &manifest.commit == commit)
+            {
+                continue;
+            }
+            self.verify_generation_with_semaphore(repo.clone(), generation, true)
+                .await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     async fn verify_generation_with_semaphore(
         &self,
         repo: RepoKey,
@@ -1084,8 +1149,6 @@ impl Materializer {
             )
             .await?;
         }
-        // Use CAS to advance head from the old chain tip to the compacted generation.
-        // The verification step may have already advanced it; if CAS fails, that is fine.
         let _ = advance_generation_head(&*self.state.store, Some(head.generation), None, &new_head)
             .await?;
         let retained_generations = self
