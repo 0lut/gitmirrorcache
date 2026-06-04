@@ -2423,18 +2423,14 @@ fn push_unique_commit(commits: &mut Vec<CommitSha>, commit: CommitSha) {
 
 /// Generate a cryptographically random session token.
 /// Format: `gcs_` prefix + 32 bytes of random hex (64 chars).
+/// Uses two independent UUID v4s (each providing 122 random bits)
+/// to ensure at least 128 bits of entropy as recommended by OWASP.
 fn generate_session_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
     let mut bytes = [0u8; 32];
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let uuid_bytes = uuid::Uuid::now_v7();
-    bytes[..16].copy_from_slice(uuid_bytes.as_bytes());
-    for (i, b) in bytes[16..].iter_mut().enumerate() {
-        *b = ((ts >> (i * 8)) & 0xff) as u8 ^ uuid_bytes.as_bytes()[i % 16];
-    }
+    let a = uuid::Uuid::new_v4();
+    let b = uuid::Uuid::new_v4();
+    bytes[..16].copy_from_slice(a.as_bytes());
+    bytes[16..].copy_from_slice(b.as_bytes());
     format!("gcs_{}", to_hex(&bytes))
 }
 

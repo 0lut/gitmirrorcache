@@ -247,7 +247,12 @@ fn extract_upstream_auth(
         .and_then(|v| v.to_str().ok());
 
     match (header_value, request.upstream_authorization) {
-        (Some(value), _) => UpstreamAuth::from_header_value(value).map_err(ApiError::from),
+        (Some(value), UpstreamAuthorizationMode::Required) => {
+            UpstreamAuth::from_header_value(value).map_err(ApiError::from)
+        }
+        (Some(value), UpstreamAuthorizationMode::Anonymous) => {
+            Ok(UpstreamAuth::from_header_value(value).unwrap_or(UpstreamAuth::Anonymous))
+        }
         (None, UpstreamAuthorizationMode::Required) => Err(ApiError::from(
             GitCacheError::Unauthorized(
                 "upstream authorization required but no credentials provided".into(),
