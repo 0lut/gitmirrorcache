@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-const LOCAL_LOCK_RETRY_COUNT: usize = 200;
+const LOCAL_LOCK_RETRY_COUNT: usize = 3_200;
 const LOCAL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LOCAL_PIDLESS_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 

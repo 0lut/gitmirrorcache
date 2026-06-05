@@ -577,3 +577,34 @@ Pending generation publishes can depend on both the bundle parent chain and the
 now walks both seeds before deleting old generation manifests, which keeps
 force-push/full-bundle pending publishes verifiable after compaction replaces the
 visible head.
+
+### T16. Background verifiers reacquire `repo-write`
+
+Queued generation verification still runs asynchronously, but token-less
+background workers now acquire their own durable `repo-write` lease before
+publishing verified metadata, advancing the generation head, or writing
+branch/default manifests. Verifiers that are already running inside a fenced
+materializer reuse the existing token.
+
+### T17. Pending public-ref observations are revalidated
+
+Pending branch/default publishes now re-check the upstream branch/default ref
+before advancing `generation-head.json` or writing public ref manifests. If the
+upstream observation changed while verification was pending, the bundle can still
+be verified and indexed for exact commits, but stale branch/default observations
+are dropped instead of promoting old refs.
+
+### T18. Exact local descendants do not depend on head publication timing
+
+`index_local_commit_from_known_generation` now checks local cache refs with
+complete commit manifests even when `generation-head.json` has not been
+published yet. This closes the timing leak where a verified full bundle could be
+visible via commit manifests before the background verifier finished the head CAS,
+causing exact descendant requests to fall back to a new GitHub-verified publish.
+
+### T19. PID-less local lock retry budget matches stale threshold
+
+The local object-store lock retry budget now spans the PID-less stale-lock
+threshold. A crash that leaves a lock before PID metadata is written should be
+reclaimed by the first waiting acquire attempt rather than producing a short
+failure window followed by later recovery.

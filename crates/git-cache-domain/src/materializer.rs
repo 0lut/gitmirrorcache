@@ -23,7 +23,8 @@ use git_cache_objectstore::{
     read_verified_generation_manifest, verified_generation_manifest_key, write_commit_manifest,
     write_commit_manifest_if_absent_or_matches, write_json, write_json_if_absent,
     write_ref_manifest, write_ref_manifest_if_version_matches, write_session_manifest,
-    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, PublishManifests,
+    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish,
+    PendingGenerationPublish, PublishManifests,
 };
 use git_cache_worker::{LeaseAcquire, ObjectStoreRepoLeaseManager, RepoLeaseManager};
 use serde::Serialize;
@@ -298,18 +299,22 @@ impl Materializer {
         repo_dir: &FsPath,
         commit: &CommitSha,
     ) -> CoreResult<Option<GenerationId>> {
-        let Some(head) = read_repo_generation_head(&*self.state.store, repo).await? else {
-            return Ok(None);
-        };
-
         let mut checked_tips = Vec::new();
-        for tip in head.tip_commits.iter().rev() {
-            push_unique_commit(&mut checked_tips, tip.clone());
-            if self
-                .index_local_commit_if_ancestor_of_tip(repo, repo_dir, commit, tip, head.generation)
-                .await?
-            {
-                return Ok(Some(head.generation));
+        if let Some(head) = read_repo_generation_head(&*self.state.store, repo).await? {
+            for tip in head.tip_commits.iter().rev() {
+                push_unique_commit(&mut checked_tips, tip.clone());
+                if self
+                    .index_local_commit_if_ancestor_of_tip(
+                        repo,
+                        repo_dir,
+                        commit,
+                        tip,
+                        head.generation,
+                    )
+                    .await?
+                {
+                    return Ok(Some(head.generation));
+                }
             }
         }
 
@@ -1068,12 +1073,84 @@ impl Materializer {
                 "verification for generation `{generation}` was not produced"
             ))
         })?;
+        let publish_result = self
+            .publish_verified_pending_generation(repo.clone(), generation, pending, verification)
+            .await;
+        reservation.release().await?;
+        publish_result?;
+        info!(%repo, %generation, "generation verified");
+        Ok(())
+    }
+
+    async fn publish_verified_pending_generation(
+        &self,
+        repo: RepoKey,
+        generation: GenerationId,
+        pending: PendingGenerationPublish,
+        verification: VerifiedGenerationManifest,
+    ) -> CoreResult<()> {
+        let Some((lease_token, verification_lease)) =
+            self.acquire_repo_write_lease_for_mutation(&repo).await?
+        else {
+            return Err(GitCacheError::LeaseBusy(format!(
+                "repo-write lease busy while verifying generation `{generation}`"
+            )));
+        };
+        let fenced_materializer =
+            Materializer::with_lease_token(Arc::clone(&self.state), lease_token);
+        let publish_result = fenced_materializer
+            .publish_verified_pending_generation_with_lease(repo, generation, pending, verification)
+            .await;
+
+        if let Some(lease) = verification_lease {
+            let release_result = lease.release().await;
+            return match (publish_result, release_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(err), Ok(())) => Err(err),
+                (Ok(()), Err(err)) => Err(err),
+                (Err(err), Err(release_err)) => {
+                    warn!(%release_err, "failed to release generation verification repo lease after error");
+                    Err(err)
+                }
+            };
+        }
+
+        publish_result
+    }
+
+    async fn publish_verified_pending_generation_with_lease(
+        &self,
+        repo: RepoKey,
+        generation: GenerationId,
+        pending: PendingGenerationPublish,
+        verification: VerifiedGenerationManifest,
+    ) -> CoreResult<()> {
+        if read_pending_generation_publish(&*self.state.store, &repo, generation)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        self.verify_lease_held(&repo).await?;
         let mut publish_manifests = pending.manifests.clone();
         let ref_manifests = std::mem::take(&mut publish_manifests.refs);
         GenerationPublish::with_manifests(pending.generation.clone(), publish_manifests)
             .with_verification(verification)
             .publish_verified_metadata(&*self.state.store)
             .await?;
+
+        let has_public_refs = !ref_manifests.is_empty() || pending.default_ref.is_some();
+        if has_public_refs
+            && !self
+                .pending_ref_observation_still_current(&pending, &ref_manifests)
+                .await?
+        {
+            debug!(%repo, %generation, "skipping stale pending generation ref publication");
+            self.delete_pending_generation_publish(&repo, generation)
+                .await;
+            return Ok(());
+        }
 
         let current_head = read_repo_generation_head(&*self.state.store, &repo).await?;
         let current_gen = current_head.as_ref().map(|h| h.generation);
@@ -1126,35 +1203,79 @@ impl Materializer {
                 debug!(%repo, %generation, "head already includes verified generation");
             } else {
                 warn!(%repo, %generation, "generation head CAS conflict; head is not the expected parent");
-                reservation.release().await?;
                 return Err(GitCacheError::Conflict(format!(
                     "generation head CAS conflict while verifying `{generation}`"
                 )));
             }
         }
 
-        if head_accepts_pending && (!ref_manifests.is_empty() || pending.default_ref.is_some()) {
+        if head_accepts_pending && has_public_refs {
             self.verify_lease_held(&repo).await?;
             for manifest in &ref_manifests {
                 self.write_ref_manifest_monotonic(manifest).await?;
             }
             if let Some(default_ref) = pending.default_ref {
                 self.write_ref_manifest_monotonic(&default_ref).await?;
-                self.write_default_ref_manifest(&default_ref).await?;
+                self.write_default_ref_manifest_monotonic(&default_ref)
+                    .await?;
             }
         }
 
+        self.delete_pending_generation_publish(&repo, generation)
+            .await;
+        Ok(())
+    }
+
+    async fn pending_ref_observation_still_current(
+        &self,
+        pending: &PendingGenerationPublish,
+        ref_manifests: &[RefManifest],
+    ) -> CoreResult<bool> {
+        let mut checked_branches = HashSet::new();
+        for manifest in ref_manifests {
+            let Some(branch) = manifest.ref_name.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            if !checked_branches.insert(branch.to_string()) {
+                continue;
+            }
+            let branch = BranchName::parse(branch)?;
+            match self
+                .ls_remote_branch(&pending.generation.repo, &branch)
+                .await
+            {
+                Ok(current) if current == manifest.commit => {}
+                Ok(_) | Err(GitCacheError::NotFound(_)) => return Ok(false),
+                Err(err) => return Err(err),
+            }
+        }
+
+        if let Some(default_ref) = &pending.default_ref {
+            let default_branch = self
+                .resolve_default_branch(&pending.generation.repo)
+                .await?;
+            match self
+                .ls_remote_branch(&pending.generation.repo, &default_branch)
+                .await
+            {
+                Ok(current) if current == default_ref.commit => {}
+                Ok(_) | Err(GitCacheError::NotFound(_)) => return Ok(false),
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn delete_pending_generation_publish(&self, repo: &RepoKey, generation: GenerationId) {
         if let Err(err) = self
             .state
             .store
-            .delete(&pending_generation_publish_key(&repo, generation))
+            .delete(&pending_generation_publish_key(repo, generation))
             .await
         {
             warn!(%repo, %generation, %err, "failed to delete pending generation publish");
         }
-        reservation.release().await?;
-        info!(%repo, %generation, "generation verified");
-        Ok(())
     }
 
     async fn generation_chain_contains(
@@ -1501,7 +1622,7 @@ impl Materializer {
             updated_at: now,
         };
         let Some((lease_token, compaction_lease)) =
-            self.acquire_compaction_cleanup_lease(repo).await?
+            self.acquire_repo_write_lease_for_mutation(repo).await?
         else {
             debug!(%repo, "compaction skipped mutable publish because repo-write lease was busy");
             reservation.release().await?;
@@ -1756,7 +1877,7 @@ impl Materializer {
         Ok(())
     }
 
-    async fn acquire_compaction_cleanup_lease(
+    async fn acquire_repo_write_lease_for_mutation(
         &self,
         repo: &RepoKey,
     ) -> CoreResult<Option<(String, Option<Box<dyn git_cache_worker::RepoLease>>)>> {
@@ -4027,6 +4148,117 @@ mod tests {
             .await
             .expect("pending full bundle should verify after expected-head compaction");
         let _ = wait_for_generation_head(&state, &fixture.repo, replacement_generation).await;
+    }
+
+    #[tokio::test]
+    async fn pending_branch_publish_revalidates_upstream_before_advancing_head() {
+        let fixture = GitFixture::new();
+        let initial_commit = fixture.head_commit();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let initial = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let initial_manifest =
+            wait_for_commit_manifest(&state, &fixture.repo, &initial.commit).await;
+        let initial_head =
+            wait_for_generation_head(&state, &fixture.repo, initial_manifest.generation).await;
+
+        let stale_commit = fixture.replace_history_and_push("stale-replacement");
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        run_git(
+            &repo_dir,
+            [
+                "fetch",
+                "--no-tags",
+                fixture.upstream_path().to_str().unwrap(),
+                "+refs/heads/main:refs/cache/upstream/heads/main",
+            ],
+        );
+
+        let stale_generation = GenerationId::new();
+        let reservation = state.disk.reserve(1024 * 1024 * 64).await.unwrap();
+        let temp_path = reservation.temp_path().unwrap();
+        fs::create_dir_all(&temp_path).await.unwrap();
+        let bundle_path = temp_path.join("pending-stale.bundle");
+        state
+            .git
+            .bundle_create_all(&repo_dir, &bundle_path)
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let stale_manifest = GenerationManifest {
+            repo: fixture.repo.clone(),
+            generation: stale_generation,
+            bundle_key: bundle_key(&fixture.repo, stale_generation),
+            parent_generation: None,
+            created_at: now,
+            commits: vec![stale_commit.clone()],
+        };
+        let ref_manifest = RefManifest {
+            repo: fixture.repo.clone(),
+            ref_name: "refs/heads/main".into(),
+            commit: stale_commit.clone(),
+            generation: stale_generation,
+            verified_at: now,
+        };
+        let stale_head = RepoGenerationHead {
+            repo: fixture.repo.clone(),
+            generation: stale_generation,
+            tip_commits: vec![stale_commit.clone()],
+            updated_at: now,
+        };
+        let stale_manifests = PublishManifests {
+            commits: vec![CommitManifest {
+                repo: fixture.repo.clone(),
+                commit: stale_commit.clone(),
+                generation: stale_generation,
+                complete: true,
+                verified_at: now,
+            }],
+            refs: vec![ref_manifest],
+            sessions: Vec::new(),
+        };
+        GenerationPublish::with_manifests(stale_manifest, stale_manifests)
+            .publish_pending_bundle_file(
+                &*state.store,
+                &bundle_path,
+                stale_head,
+                Some(initial_head.generation),
+                None,
+            )
+            .await
+            .unwrap();
+        reservation.release().await.unwrap();
+
+        run_git(
+            &fixture.work_path(),
+            ["reset", "--hard", initial_commit.as_str()],
+        );
+        run_git(&fixture.work_path(), ["push", "--force", "origin", "main"]);
+
+        materializer
+            .verify_generation_with_semaphore(fixture.repo.clone(), stale_generation, false)
+            .await
+            .unwrap();
+
+        let head = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.generation, initial_head.generation);
+        let branch_ref = read_ref_manifest(&*state.store, &fixture.repo, "refs/heads/main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(branch_ref.commit, initial_commit);
     }
 
     // ── upstream_url tests ───────────────────────────────────────────
