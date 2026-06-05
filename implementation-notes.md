@@ -651,11 +651,10 @@ present, so materialize/resolve/direct Git continue with
 
 If the public probe fails and request auth is present for GitHub, the API uses
 GitHub REST as the private-repo fallback: it reads repository metadata and the
-default branch ref with the request token. Direct Git POST remains stateless,
-so repo-level authorization is not enough to authorize arbitrary wants from the
-shared cache. The materializer re-fetches upstream ref proof for POST wants
-using the effective auth, then separately hydrates manifests or fetches objects
-needed to serve the proven wants.
+default branch ref with the request token. Direct Git POST normally consumes
+the short-lived upstream advertisement proof created by the immediately
+preceding direct Git GET. If that proof handoff is absent, expired, or scoped to
+different credentials, POST falls back to the full repo-access gate.
 
 GitLab, Bitbucket, and generic HTTPS origins use the same anonymous Smart HTTP
 public probe. When that fails and request auth is present, they fall back to
@@ -666,9 +665,9 @@ preserving the no-token public path.
 Anonymous requests deliberately do not use provider REST APIs. The public,
 auth-free mode remains available, and anonymous proof stays on the provider's
 Git transport so large public clones do not consume REST quota. For direct Git
-POSTs, both anonymous and credentialed requests validate wants against fresh
-upstream ref proof before serving from the shared repo; object existence alone
-is never authorization.
+POSTs, both anonymous and credentialed requests validate wants against a
+request-scoped upstream ref proof before serving from the shared repo; object
+existence alone is never authorization.
 
 This is intentionally a first provider layer rather than a full provider
 interface. The next shape should move these decisions behind explicit origin
@@ -686,24 +685,24 @@ trusted object existence, but that is the SHA-guess leak the auth work is meant
 to close. The auth branch therefore needs a bridge that restores serving proof
 without treating raw object presence as authorization.
 
-After the simplification pass, direct Git POST first obtains fresh upstream ref
-proof for the request. Persisted public ref manifests may still help
-availability after that proof is established. A ref manifest can publish public
-serving refs only when its `refs/heads/<branch> -> commit` mapping exactly
-matches the current upstream advertisement for this request. In that case the
-materializer hydrates the verified generation if needed, restores both
-`refs/cache/upstream/heads/<branch>` and public `refs/heads/<branch>`, updates
-`HEAD` for the advertised default branch, and then serves the proven want.
+After the simplification pass, direct Git POST first obtains request-scoped
+upstream ref proof either from the fresh GET->POST proof handoff or from the
+fallback upstream gate. Direct Git then treats persisted manifests only as
+fetch negotiation hints when the referenced commit is already complete locally.
+It does not hydrate verified generations, verify pending generations, or
+publish new generation metadata while satisfying upload-pack wants. If a proven
+advertised tip is missing or incomplete locally, direct Git fetches that
+advertised ref from upstream using the request's effective auth.
 
-Stale public ref manifests are still useful, but only as hidden fetch
-negotiation bases. Before materialize/direct-Git fetches a newer advertised
-branch tip, it may hydrate the last verified generation for that branch and
-restore only `refs/cache/upstream/heads/<branch>`. It does not restore public
-`refs/heads/<branch>` for stale manifests, because stale refs must not become
-anonymous serving proof.
+Stale public ref manifests are still useful to materialize, but direct Git uses
+them only when they are already hot locally. Before fetching a newer advertised
+branch tip, direct Git may restore `refs/cache/upstream/heads/<branch>` from a
+manifest only if that commit's tree is already present in the shared repo. It
+does not restore public `refs/heads/<branch>` for stale manifests, because
+stale refs must not become anonymous serving proof.
 
-This deliberately is not a visibility cache or a way to skip direct Git POST
-proof. If GitHub/GitLab/Bitbucket now advertises a different tip, the manifest
-is stale for this request and can only help Git negotiate a smaller fetch.
-Public serving refs are restored only for commits whose public ref mapping is
-still current.
+The GET->POST proof handoff deliberately is not a repo visibility cache. It is
+an in-memory, short-TTL record of the exact upstream advertisement just sent to
+a Git client, keyed by repo and anonymous/auth credential fingerprint. It exists
+so the POST can validate wants against the same proof without making a second
+upstream call on the clone hot path.

@@ -13,12 +13,13 @@ use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
     frame_ref_advertisement, synthesize_protected_ref_advertisement, synthesize_ref_advertisement,
-    AppState, Materializer, MaterializerExecutor,
+    AppState, Materializer, MaterializerExecutor, UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
 use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
 use http::{header, HeaderMap, Method, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -32,6 +33,7 @@ use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const DIRECT_GIT_PROOF_TTL: Duration = Duration::from_secs(30);
 
 pub fn app(config: AppConfig) -> Router {
     app_result(config).expect("failed to initialize git-cache-api")
@@ -76,6 +78,7 @@ struct ApiState {
     domain: Arc<AppState>,
     coordinator: UpdateCoordinator,
     repo_authorizer: RepoAuthorizer,
+    direct_git_proofs: Arc<DirectGitProofCache>,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -101,10 +104,123 @@ impl ApiState {
             domain,
             coordinator,
             repo_authorizer: RepoAuthorizer::new(),
+            direct_git_proofs: Arc::new(DirectGitProofCache::new(DIRECT_GIT_PROOF_TTL)),
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectGitProofKey {
+    repo: RepoKey,
+    auth: DirectGitProofAuth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DirectGitProofAuth {
+    Anonymous,
+    Authenticated(String),
+}
+
+#[derive(Debug, Clone)]
+struct DirectGitProof {
+    inserted_at: Instant,
+    comparison: UpstreamRefComparison,
+}
+
+#[derive(Debug)]
+struct DirectGitProofCache {
+    ttl: Duration,
+    entries: Mutex<HashMap<DirectGitProofKey, DirectGitProof>>,
+}
+
+impl DirectGitProofCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, repo: &RepoKey, auth: &UpstreamAuth, comparison: UpstreamRefComparison) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        self.prune_locked(&mut entries, now);
+        entries.insert(
+            DirectGitProofKey::new(repo, auth),
+            DirectGitProof {
+                inserted_at: now,
+                comparison,
+            },
+        );
+    }
+
+    fn get(
+        &self,
+        repo: &RepoKey,
+        auth: &UpstreamAuth,
+    ) -> Option<(UpstreamAuth, UpstreamRefComparison)> {
+        let Ok(mut entries) = self.entries.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        self.prune_locked(&mut entries, now);
+
+        if let Some(proof) = entries.get(&DirectGitProofKey::anonymous(repo)) {
+            return Some((UpstreamAuth::Anonymous, proof.comparison.clone()));
+        }
+
+        if auth.is_authenticated() {
+            if let Some(proof) = entries.get(&DirectGitProofKey::new(repo, auth)) {
+                return Some((auth.clone(), proof.comparison.clone()));
+            }
+        }
+
+        None
+    }
+
+    fn prune_locked(&self, entries: &mut HashMap<DirectGitProofKey, DirectGitProof>, now: Instant) {
+        entries.retain(|_, proof| now.duration_since(proof.inserted_at) <= self.ttl);
+    }
+}
+
+impl DirectGitProofKey {
+    fn anonymous(repo: &RepoKey) -> Self {
+        Self {
+            repo: repo.clone(),
+            auth: DirectGitProofAuth::Anonymous,
+        }
+    }
+
+    fn new(repo: &RepoKey, auth: &UpstreamAuth) -> Self {
+        Self {
+            repo: repo.clone(),
+            auth: DirectGitProofAuth::from_auth(auth),
+        }
+    }
+}
+
+impl DirectGitProofAuth {
+    fn from_auth(auth: &UpstreamAuth) -> Self {
+        let Some(raw) = auth.raw_header() else {
+            return Self::Anonymous;
+        };
+        let digest = Sha256::digest(raw.as_bytes());
+        Self::Authenticated(hex_lower(&digest))
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -814,12 +930,17 @@ async fn git_repo(
         let materializer = materializer.using_upstream_auth(&auth);
 
         // Fetch upstream refs via ls-remote and synthesize the pkt-line
-        // response directly. No objects are fetched here. POST is stateless
-        // and re-runs request-scoped upstream proof before serving wants.
+        // response directly. No objects are fetched here. The advertisement
+        // is a short-lived repo-access proof for the matching upload-pack
+        // POST; the fallback POST path re-runs upstream proof when the handoff
+        // has expired or the request credentials differ.
         let comparison = match materializer.upstream_refs(&repo).await {
             Ok(c) => c,
             Err(error) => return ApiError::from(error).into_response(),
         };
+        state
+            .direct_git_proofs
+            .insert(&repo, &auth, comparison.clone());
 
         let output = if auth.is_authenticated() {
             synthesize_protected_ref_advertisement(&comparison)
@@ -839,22 +960,36 @@ async fn git_repo(
             .metrics
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
-        // Direct Git POST is stateless, so it must establish repo access here
-        // instead of relying on the prior info/refs request. The fast public
-        // gate is provider-neutral Smart HTTP; private GitHub requests use
-        // REST, and other private providers fall back to authenticated Git
-        // proof until provider-specific adapters exist.
-        let auth = match state
-            .repo_authorizer
-            .authorize(&state.domain, &repo, &auth)
-            .await
-        {
-            Ok(authorization) => authorization.into_effective_auth(),
-            Err(error) => return ApiError::from(error).into_response(),
+        let cached_proof = state.direct_git_proofs.get(&repo, &auth);
+        let (auth, comparison) = match cached_proof {
+            Some((auth, comparison)) => (auth, Some(comparison)),
+            None => {
+                // Direct Git POSTs can arrive without the matching GET, so
+                // fall back to a full repo-access gate. The fast public gate is
+                // provider-neutral Smart HTTP; private GitHub requests use
+                // REST, and other private providers fall back to authenticated
+                // Git proof until provider-specific adapters exist.
+                let auth = match state
+                    .repo_authorizer
+                    .authorize(&state.domain, &repo, &auth)
+                    .await
+                {
+                    Ok(authorization) => authorization.into_effective_auth(),
+                    Err(error) => return ApiError::from(error).into_response(),
+                };
+                (auth, None)
+            }
         };
         let materializer = materializer.using_upstream_auth(&auth);
 
-        match Box::pin(materializer.handle_upload_pack(&repo, &body)).await {
+        let result = if let Some(comparison) = comparison {
+            Box::pin(materializer.handle_upload_pack_with_comparison(&repo, &body, &comparison))
+                .await
+        } else {
+            Box::pin(materializer.handle_upload_pack(&repo, &body)).await
+        };
+
+        match result {
             Ok(process) => stream_upload_pack_response(&state, process),
             Err(error) => ApiError::from(error).into_response(),
         }
@@ -1143,6 +1278,67 @@ mod tests {
         assert!(limiter.check());
         assert!(limiter.check());
         assert!(!limiter.check());
+    }
+
+    #[test]
+    fn direct_git_proof_cache_prefers_public_proof_for_basic_auth() {
+        let cache = DirectGitProofCache::new(Duration::from_secs(30));
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap();
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: Some("main".into()),
+            all_upstream: HashMap::from([("main".into(), "a".repeat(40))]),
+        };
+
+        cache.insert(&repo, &UpstreamAuth::Anonymous, comparison.clone());
+
+        let (effective_auth, cached) = cache
+            .get(&repo, &auth)
+            .expect("public proof should satisfy a Basic-auth POST");
+        assert_eq!(effective_auth, UpstreamAuth::Anonymous);
+        assert_eq!(cached.default_branch, comparison.default_branch);
+        assert_eq!(cached.all_upstream, comparison.all_upstream);
+    }
+
+    #[test]
+    fn direct_git_proof_cache_keeps_authenticated_proof_scoped() {
+        let cache = DirectGitProofCache::new(Duration::from_secs(30));
+        let repo = RepoKey::parse("github.com/org/private").unwrap();
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap();
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: Some("main".into()),
+            all_upstream: HashMap::from([("main".into(), "b".repeat(40))]),
+        };
+
+        cache.insert(&repo, &auth, comparison.clone());
+
+        assert!(
+            cache.get(&repo, &UpstreamAuth::Anonymous).is_none(),
+            "authenticated proof must not satisfy anonymous POSTs"
+        );
+        let (effective_auth, cached) = cache
+            .get(&repo, &auth)
+            .expect("same Basic auth should reuse proof");
+        assert_eq!(effective_auth, auth);
+        assert_eq!(cached.all_upstream, comparison.all_upstream);
+    }
+
+    #[test]
+    fn direct_git_proof_cache_expires_entries() {
+        let cache = DirectGitProofCache::new(Duration::from_millis(1));
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let comparison = UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch: None,
+            all_upstream: HashMap::from([("main".into(), "c".repeat(40))]),
+        };
+
+        cache.insert(&repo, &UpstreamAuth::Anonymous, comparison);
+        std::thread::sleep(Duration::from_millis(2));
+
+        assert!(cache.get(&repo, &UpstreamAuth::Anonymous).is_none());
     }
 
     #[test]
