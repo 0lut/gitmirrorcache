@@ -7,7 +7,7 @@ use git_cache_core::{
     MaterializeRequest, MaterializeResponse, MaterializeSource, ReachabilitySelector, RefManifest,
     RepoGenerationHead, RepoKey, RequestMode, ResolveResponse, Result as CoreResult, Selector,
     SessionId, SessionManifest, SessionProtection, ShortCommitSha, UpstreamAuth,
-    UpstreamAuthorizationMode, VerifiedGenerationManifest,
+    VerifiedGenerationManifest,
 };
 use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use git_cache_disk::RepoLock;
@@ -57,6 +57,94 @@ pub struct CompactionReport {
     pub bytes_reclaimed: u64,
 }
 
+#[derive(Debug, Clone)]
+struct MaterializePlan {
+    repo: RepoKey,
+    access: RepoAccess,
+    target: MaterializeTarget,
+}
+
+#[derive(Debug, Clone)]
+enum MaterializeTarget {
+    Commit {
+        commit: CommitSha,
+        source: MaterializeSource,
+    },
+    BranchTip {
+        branch: BranchName,
+        commit: CommitSha,
+        default_branch: bool,
+    },
+    ReachableCommit {
+        commit: CommitSha,
+        branch: BranchName,
+        tip: CommitSha,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ResolvePlan {
+    repo: RepoKey,
+    selector: Selector,
+    target: ResolveTarget,
+    access: RepoAccess,
+}
+
+#[derive(Debug, Clone)]
+enum ResolveTarget {
+    Commit { commit: CommitSha },
+    ReachableCommit { commit: CommitSha, tip: CommitSha },
+}
+
+#[derive(Debug, Clone)]
+enum RepoAccess {
+    Public,
+    Upstream { refs: Vec<String> },
+}
+
+impl RepoAccess {
+    fn from_request(request: &MaterializeRequest, auth: &UpstreamAuth) -> CoreResult<Self> {
+        if request.requires_upstream_auth() && !auth.is_authenticated() {
+            return Err(GitCacheError::Unauthorized(
+                "upstream authorization is required".into(),
+            ));
+        }
+        if auth.is_authenticated() {
+            Ok(Self::Upstream { refs: Vec::new() })
+        } else {
+            Ok(Self::Public)
+        }
+    }
+
+    fn with_ref(self, ref_name: String) -> Self {
+        match self {
+            Self::Public => Self::Public,
+            Self::Upstream { mut refs } => {
+                refs.push(ref_name);
+                Self::Upstream { refs }
+            }
+        }
+    }
+
+    fn is_upstream(&self) -> bool {
+        matches!(self, Self::Upstream { .. })
+    }
+
+    fn cache_hit_source(&self) -> MaterializeSource {
+        match self {
+            Self::Public => MaterializeSource::CacheVerified,
+            Self::Upstream { .. } => MaterializeSource::UpstreamAuthorizedCacheHit,
+        }
+    }
+
+    fn fetched_source(&self) -> MaterializeSource {
+        match self {
+            Self::Public => MaterializeSource::GithubVerified,
+            Self::Upstream { .. } => MaterializeSource::UpstreamAuthorizedFetched,
+        }
+    }
+}
+
 impl Materializer {
     pub fn new(state: Arc<AppState>) -> Self {
         Self {
@@ -76,102 +164,172 @@ impl Materializer {
         &self,
         request: MaterializeRequest,
     ) -> CoreResult<MaterializeResponse> {
-        self.validate_requested_auth(&request)?;
-        if self.authenticated_mode(&request) {
-            return self.materialize_authenticated(request).await;
-        }
-
-        self.validate_host(&request.repo)?;
-        match request.selector {
-            Selector::Commit(commit) => self.materialize_commit(request.repo, commit).await,
-            Selector::CommitReachableFrom { commit, .. } => {
-                self.materialize_commit(request.repo, commit).await
-            }
-            Selector::ShortCommit(commit) => {
-                self.materialize_short_commit(request.repo, commit).await
-            }
-            Selector::Branch(branch) => {
-                self.materialize_branch(request.repo, branch, request.mode, false)
-                    .await
-            }
-            Selector::DefaultBranch => {
-                self.materialize_default_branch(request.repo, request.mode)
-                    .await
-            }
-        }
+        let plan = self.plan_materialize(request).await?;
+        self.materialize_plan(plan).await
     }
 
     pub async fn materialize_after_upstream_validation(
         &self,
         request: MaterializeRequest,
     ) -> CoreResult<MaterializeResponse> {
-        self.validate_host(&request.repo)?;
-        match request.selector {
-            Selector::Branch(branch) => self.materialize_local_branch(request.repo, &branch).await,
-            Selector::DefaultBranch => self.materialize_local_default_branch(request.repo).await,
-            _ => self.materialize(request).await,
-        }
+        let plan = self
+            .plan_materialize_after_upstream_validation(request)
+            .await?;
+        self.materialize_plan(plan).await
     }
 
     pub async fn resolve(&self, request: MaterializeRequest) -> CoreResult<ResolveResponse> {
-        self.validate_requested_auth(&request)?;
-        if !self.authenticated_mode(&request) {
-            return Err(GitCacheError::Unsupported(
-                "anonymous resolve still uses the materialize-compatible endpoint".into(),
-            ));
+        let plan = self.plan_resolve(request).await?;
+        self.resolve_plan(plan).await
+    }
+
+    async fn plan_materialize(&self, request: MaterializeRequest) -> CoreResult<MaterializePlan> {
+        self.validate_host(&request.repo)?;
+        let access = RepoAccess::from_request(&request, &self.upstream_auth)?;
+        if access.is_upstream() {
+            return self.plan_upstream_materialize(request, access).await;
         }
-
-        self.resolve_authenticated(request).await
+        self.plan_public_materialize(request, access).await
     }
 
-    fn validate_requested_auth(&self, request: &MaterializeRequest) -> CoreResult<()> {
-        if request.upstream_authorization == UpstreamAuthorizationMode::Required
-            && !self.upstream_auth.is_authenticated()
-        {
-            return Err(GitCacheError::Unauthorized(
-                "upstream authorization is required".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn authenticated_mode(&self, request: &MaterializeRequest) -> bool {
-        self.upstream_auth.is_authenticated()
-            || request.upstream_authorization == UpstreamAuthorizationMode::Required
-    }
-
-    async fn materialize_authenticated(
+    async fn plan_materialize_after_upstream_validation(
         &self,
         request: MaterializeRequest,
-    ) -> CoreResult<MaterializeResponse> {
-        if !self.upstream_auth.is_authenticated() {
-            return Err(GitCacheError::Unauthorized(
-                "upstream authorization is required".into(),
-            ));
+    ) -> CoreResult<MaterializePlan> {
+        self.validate_host(&request.repo)?;
+        let access = RepoAccess::from_request(&request, &self.upstream_auth)?;
+        if access.is_upstream() {
+            return self.plan_upstream_materialize(request, access).await;
         }
 
-        self.validate_host(&request.repo)?;
         match request.selector {
             Selector::Branch(branch) => {
-                let (branch, commit) = self.authorized_branch_tip(&request.repo, branch).await?;
-                self.materialize_authenticated_branch_tip(request.repo, branch, commit, false)
-                    .await
+                let commit = self.local_branch_tip(&request.repo, &branch).await?;
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::Commit {
+                        commit,
+                        source: MaterializeSource::GithubVerified,
+                    },
+                })
             }
             Selector::DefaultBranch => {
-                let (branch, commit) = self.authorized_default_branch(&request.repo).await?;
-                self.materialize_authenticated_branch_tip(request.repo, branch, commit, true)
-                    .await
+                let branch = self.resolve_default_branch(&request.repo).await?;
+                let commit = self.local_branch_tip(&request.repo, &branch).await?;
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::Commit {
+                        commit,
+                        source: MaterializeSource::GithubVerified,
+                    },
+                })
+            }
+            _ => self.plan_public_materialize(request, access).await,
+        }
+    }
+
+    async fn plan_public_materialize(
+        &self,
+        request: MaterializeRequest,
+        access: RepoAccess,
+    ) -> CoreResult<MaterializePlan> {
+        match request.selector {
+            Selector::Commit(commit) | Selector::CommitReachableFrom { commit, .. } => {
+                let source = self.ensure_public_commit(&request.repo, &commit).await?;
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::Commit { commit, source },
+                })
+            }
+            Selector::ShortCommit(short_commit) => {
+                let (commit, source) = self
+                    .ensure_public_short_commit(&request.repo, short_commit)
+                    .await?;
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::Commit { commit, source },
+                })
+            }
+            Selector::Branch(branch) => {
+                let (branch, commit) = self.resolve_branch_tip(&request.repo, branch).await?;
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::BranchTip {
+                        branch,
+                        commit,
+                        default_branch: false,
+                    },
+                })
+            }
+            Selector::DefaultBranch => {
+                let (branch, commit) = self.resolve_default_branch_tip(&request.repo).await?;
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::BranchTip {
+                        branch,
+                        commit,
+                        default_branch: true,
+                    },
+                })
+            }
+        }
+    }
+
+    async fn plan_upstream_materialize(
+        &self,
+        request: MaterializeRequest,
+        access: RepoAccess,
+    ) -> CoreResult<MaterializePlan> {
+        match request.selector {
+            Selector::Branch(branch) => {
+                let (branch, commit) = self.resolve_branch_tip(&request.repo, branch).await?;
+                let access = access.with_ref(format!("refs/heads/{branch}"));
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::BranchTip {
+                        branch,
+                        commit,
+                        default_branch: false,
+                    },
+                })
+            }
+            Selector::DefaultBranch => {
+                let (branch, commit) = self.resolve_default_branch_tip(&request.repo).await?;
+                let access = access.with_ref(format!("refs/heads/{branch}"));
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::BranchTip {
+                        branch,
+                        commit,
+                        default_branch: true,
+                    },
+                })
             }
             Selector::CommitReachableFrom {
                 commit,
                 reachable_from,
             } => {
-                self.materialize_authenticated_reachable_commit(
-                    request.repo,
-                    commit,
-                    reachable_from,
-                )
-                .await
+                let (branch, tip) = self
+                    .resolve_reachability_tip(&request.repo, reachable_from)
+                    .await?;
+                let access = access.with_ref(format!("refs/heads/{branch}"));
+                Ok(MaterializePlan {
+                    repo: request.repo,
+                    access,
+                    target: MaterializeTarget::ReachableCommit {
+                        commit,
+                        branch,
+                        tip,
+                    },
+                })
             }
             Selector::Commit(_) | Selector::ShortCommit(_) => Err(GitCacheError::Validation(
                 "authenticated commit selectors require reachable_from context".into(),
@@ -179,49 +337,33 @@ impl Materializer {
         }
     }
 
-    async fn resolve_authenticated(
-        &self,
-        request: MaterializeRequest,
-    ) -> CoreResult<ResolveResponse> {
-        if !self.upstream_auth.is_authenticated() {
-            return Err(GitCacheError::Unauthorized(
-                "upstream authorization is required".into(),
+    async fn plan_resolve(&self, request: MaterializeRequest) -> CoreResult<ResolvePlan> {
+        self.validate_host(&request.repo)?;
+        let access = RepoAccess::from_request(&request, &self.upstream_auth)?;
+        if !access.is_upstream() {
+            return Err(GitCacheError::Unsupported(
+                "anonymous resolve still uses the materialize-compatible endpoint".into(),
             ));
         }
 
-        self.validate_host(&request.repo)?;
-        let now = Utc::now();
-        match request.selector.clone() {
+        let selector = request.selector.clone();
+        match selector.clone() {
             Selector::Branch(branch) => {
-                let (_, commit) = self.authorized_branch_tip(&request.repo, branch).await?;
-                let cache_available = self.cache_has_commit(&request.repo, &commit).await?;
-                Ok(ResolveResponse {
+                let (_, commit) = self.resolve_branch_tip(&request.repo, branch).await?;
+                Ok(ResolvePlan {
                     repo: request.repo,
-                    selector: request.selector,
-                    commit,
-                    source: if cache_available {
-                        MaterializeSource::UpstreamAuthorizedCacheHit
-                    } else {
-                        MaterializeSource::UpstreamAuthorizedFetched
-                    },
-                    cache_available,
-                    authorized_at: now,
+                    selector,
+                    target: ResolveTarget::Commit { commit },
+                    access,
                 })
             }
             Selector::DefaultBranch => {
-                let (_, commit) = self.authorized_default_branch(&request.repo).await?;
-                let cache_available = self.cache_has_commit(&request.repo, &commit).await?;
-                Ok(ResolveResponse {
+                let (_, commit) = self.resolve_default_branch_tip(&request.repo).await?;
+                Ok(ResolvePlan {
                     repo: request.repo,
-                    selector: request.selector,
-                    commit,
-                    source: if cache_available {
-                        MaterializeSource::UpstreamAuthorizedCacheHit
-                    } else {
-                        MaterializeSource::UpstreamAuthorizedFetched
-                    },
-                    cache_available,
-                    authorized_at: now,
+                    selector,
+                    target: ResolveTarget::Commit { commit },
+                    access,
                 })
             }
             Selector::CommitReachableFrom {
@@ -229,9 +371,72 @@ impl Materializer {
                 reachable_from,
             } => {
                 let (_, tip) = self
-                    .authorized_reachability_tip(&request.repo, reachable_from)
+                    .resolve_reachability_tip(&request.repo, reachable_from)
                     .await?;
-                let repo_dir = self.ensure_repo_dir(&request.repo).await?;
+                Ok(ResolvePlan {
+                    repo: request.repo,
+                    selector,
+                    target: ResolveTarget::ReachableCommit { commit, tip },
+                    access,
+                })
+            }
+            Selector::Commit(_) | Selector::ShortCommit(_) => Err(GitCacheError::Validation(
+                "authenticated commit selectors require reachable_from context".into(),
+            )),
+        }
+    }
+
+    async fn materialize_plan(&self, plan: MaterializePlan) -> CoreResult<MaterializeResponse> {
+        match plan.target {
+            MaterializeTarget::Commit { commit, source } => {
+                self.create_session_for_access(plan.repo, commit, source, plan.access)
+                    .await
+            }
+            MaterializeTarget::BranchTip {
+                branch,
+                commit,
+                default_branch,
+            } => {
+                let source = self
+                    .ensure_branch_tip(&plan.repo, &branch, &commit, default_branch, &plan.access)
+                    .await?;
+                self.create_session_for_access(plan.repo, commit, source, plan.access)
+                    .await
+            }
+            MaterializeTarget::ReachableCommit {
+                commit,
+                branch,
+                tip,
+            } => {
+                let source = self
+                    .ensure_reachable_commit(&plan.repo, &commit, &branch, &tip, &plan.access)
+                    .await?;
+                self.create_session_for_access(plan.repo, commit, source, plan.access)
+                    .await
+            }
+        }
+    }
+
+    async fn resolve_plan(&self, plan: ResolvePlan) -> CoreResult<ResolveResponse> {
+        let now = Utc::now();
+        match plan.target {
+            ResolveTarget::Commit { commit } => {
+                let cache_available = self.cache_has_commit(&plan.repo, &commit).await?;
+                Ok(ResolveResponse {
+                    repo: plan.repo,
+                    selector: plan.selector,
+                    commit,
+                    source: if cache_available {
+                        plan.access.cache_hit_source()
+                    } else {
+                        plan.access.fetched_source()
+                    },
+                    cache_available,
+                    authorized_at: now,
+                })
+            }
+            ResolveTarget::ReachableCommit { commit, tip } => {
+                let repo_dir = self.ensure_repo_dir(&plan.repo).await?;
                 let cache_available = self.commit_exists(&repo_dir, &commit).await
                     && self.commit_exists(&repo_dir, &tip).await
                     && self.state.git.is_ancestor(&repo_dir, &commit, &tip).await?;
@@ -241,21 +446,18 @@ impl Materializer {
                     )));
                 }
                 Ok(ResolveResponse {
-                    repo: request.repo,
-                    selector: request.selector,
+                    repo: plan.repo,
+                    selector: plan.selector,
                     commit,
-                    source: MaterializeSource::UpstreamAuthorizedCacheHit,
+                    source: plan.access.cache_hit_source(),
                     cache_available,
                     authorized_at: now,
                 })
             }
-            Selector::Commit(_) | Selector::ShortCommit(_) => Err(GitCacheError::Validation(
-                "authenticated commit selectors require reachable_from context".into(),
-            )),
         }
     }
 
-    async fn authorized_branch_tip(
+    async fn resolve_branch_tip(
         &self,
         repo: &RepoKey,
         branch: BranchName,
@@ -268,7 +470,7 @@ impl Materializer {
         Ok((branch, CommitSha::parse(sha)?))
     }
 
-    async fn authorized_default_branch(
+    async fn resolve_default_branch_tip(
         &self,
         repo: &RepoKey,
     ) -> CoreResult<(BranchName, CommitSha)> {
@@ -283,15 +485,25 @@ impl Materializer {
         Ok((BranchName::parse(branch)?, CommitSha::parse(sha)?))
     }
 
-    async fn authorized_reachability_tip(
+    async fn resolve_reachability_tip(
         &self,
         repo: &RepoKey,
         reachable_from: ReachabilitySelector,
     ) -> CoreResult<(BranchName, CommitSha)> {
         match reachable_from {
-            ReachabilitySelector::Branch(branch) => self.authorized_branch_tip(repo, branch).await,
-            ReachabilitySelector::DefaultBranch => self.authorized_default_branch(repo).await,
+            ReachabilitySelector::Branch(branch) => self.resolve_branch_tip(repo, branch).await,
+            ReachabilitySelector::DefaultBranch => self.resolve_default_branch_tip(repo).await,
         }
+    }
+
+    async fn local_branch_tip(&self, repo: &RepoKey, branch: &BranchName) -> CoreResult<CommitSha> {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
+        self.state
+            .git
+            .rev_parse(&repo_dir, &local_ref)
+            .await
+            .and_then(CommitSha::parse)
     }
 
     fn upstream_git(&self, remote_url: &str) -> CoreResult<git_cache_git::Git> {
@@ -300,30 +512,17 @@ impl Materializer {
             .with_upstream_auth(remote_url, &self.upstream_auth)
     }
 
-    async fn materialize_authenticated_branch_tip(
-        &self,
-        repo: RepoKey,
-        branch: BranchName,
-        commit: CommitSha,
-        default_branch: bool,
-    ) -> CoreResult<MaterializeResponse> {
-        let source = self
-            .ensure_authenticated_branch_tip(&repo, &branch, &commit, default_branch)
-            .await?;
-        self.create_protected_session(repo, commit, source, vec![format!("refs/heads/{branch}")])
-            .await
-    }
-
-    async fn ensure_authenticated_branch_tip(
+    async fn ensure_branch_tip(
         &self,
         repo: &RepoKey,
         branch: &BranchName,
         commit: &CommitSha,
         default_branch: bool,
+        access: &RepoAccess,
     ) -> CoreResult<MaterializeSource> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
 
-        if self.cache_has_commit(repo, commit).await? {
+        if access.is_upstream() && self.cache_has_commit(repo, commit).await? {
             if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
                 if manifest.complete {
                     self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
@@ -331,62 +530,76 @@ impl Materializer {
             }
             if !self.commit_exists(&repo_dir, commit).await {
                 return Err(GitCacheError::NotFound(format!(
-                    "authorized commit `{commit}` is marked cached but could not be hydrated"
+                    "commit `{commit}` is marked cached but could not be hydrated"
                 )));
             }
-            return Ok(MaterializeSource::UpstreamAuthorizedCacheHit);
+            return Ok(access.cache_hit_source());
         }
 
         self.ensure_branch_from_verified_tip(repo, branch, commit, default_branch)
             .await?;
-        Ok(MaterializeSource::UpstreamAuthorizedFetched)
+        Ok(access.fetched_source())
     }
 
-    async fn materialize_authenticated_reachable_commit(
+    async fn ensure_reachable_commit(
         &self,
-        repo: RepoKey,
-        commit: CommitSha,
-        reachable_from: ReachabilitySelector,
-    ) -> CoreResult<MaterializeResponse> {
-        let (branch, tip) = self
-            .authorized_reachability_tip(&repo, reachable_from)
-            .await?;
+        repo: &RepoKey,
+        commit: &CommitSha,
+        branch: &BranchName,
+        tip: &CommitSha,
+        access: &RepoAccess,
+    ) -> CoreResult<MaterializeSource> {
         let branch_source = self
-            .ensure_authenticated_branch_tip(&repo, &branch, &tip, false)
+            .ensure_branch_tip(repo, branch, tip, false, access)
             .await?;
-        let repo_dir = self.ensure_repo_dir(&repo).await?;
+        let repo_dir = self.ensure_repo_dir(repo).await?;
 
-        if !self.commit_exists(&repo_dir, &commit).await {
-            if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
+        if !self.commit_exists(&repo_dir, commit).await {
+            if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
                 if manifest.complete {
                     self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
                 }
             }
         }
-        if !self.commit_exists(&repo_dir, &commit).await {
+        if !self.commit_exists(&repo_dir, commit).await {
             return Err(GitCacheError::NotFound(format!(
                 "commit `{commit}` was not found after fetching authorized ref `{branch}`"
             )));
         }
-        if !self.state.git.is_ancestor(&repo_dir, &commit, &tip).await? {
+        if !self.state.git.is_ancestor(&repo_dir, commit, tip).await? {
             return Err(GitCacheError::Forbidden(format!(
                 "commit `{commit}` is not reachable from authorized ref `{branch}`"
             )));
         }
 
-        if self.get_commit_manifest(&repo, &commit).await?.is_none() {
-            self.publish_generation(&repo, &repo_dir, &commit, None, false)
+        if self.get_commit_manifest(repo, commit).await?.is_none() {
+            self.publish_generation(repo, &repo_dir, commit, None, false)
                 .await?;
         }
 
-        let source = if branch_source == MaterializeSource::UpstreamAuthorizedCacheHit {
-            MaterializeSource::UpstreamAuthorizedCacheHit
+        let source = if branch_source == access.cache_hit_source() {
+            access.cache_hit_source()
         } else {
-            MaterializeSource::UpstreamAuthorizedFetched
+            access.fetched_source()
         };
 
-        self.create_protected_session(repo, commit, source, vec![format!("refs/heads/{branch}")])
-            .await
+        Ok(source)
+    }
+
+    async fn create_session_for_access(
+        &self,
+        repo: RepoKey,
+        commit: CommitSha,
+        source: MaterializeSource,
+        access: RepoAccess,
+    ) -> CoreResult<MaterializeResponse> {
+        match access {
+            RepoAccess::Public => self.create_session(repo, commit, source).await,
+            RepoAccess::Upstream { refs } => {
+                self.create_protected_session(repo, commit, source, refs)
+                    .await
+            }
+        }
     }
 
     async fn cache_has_commit(&self, repo: &RepoKey, commit: &CommitSha) -> CoreResult<bool> {
@@ -406,18 +619,8 @@ impl Materializer {
         repo: RepoKey,
         short_commit: ShortCommitSha,
     ) -> CoreResult<MaterializeResponse> {
-        let repo_dir = self.ensure_repo_dir(&repo).await?;
-        self.fetch_all_refs(&repo, &repo_dir).await?;
-        let commit = self
-            .resolve_short_commit_from_upstream_refs(&repo_dir, &short_commit)
-            .await?;
-        self.materialize_existing_local_commit(
-            repo,
-            &repo_dir,
-            commit,
-            MaterializeSource::GithubVerified,
-        )
-        .await
+        let (commit, source) = self.ensure_public_short_commit(&repo, short_commit).await?;
+        self.create_session(repo, commit, source).await
     }
 
     pub async fn materialize_commit(
@@ -425,47 +628,70 @@ impl Materializer {
         repo: RepoKey,
         commit: CommitSha,
     ) -> CoreResult<MaterializeResponse> {
-        if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
+        let source = self.ensure_public_commit(&repo, &commit).await?;
+        self.create_session(repo, commit, source).await
+    }
+
+    async fn ensure_public_short_commit(
+        &self,
+        repo: &RepoKey,
+        short_commit: ShortCommitSha,
+    ) -> CoreResult<(CommitSha, MaterializeSource)> {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        self.fetch_all_refs(repo, &repo_dir).await?;
+        let commit = self
+            .resolve_short_commit_from_upstream_refs(&repo_dir, &short_commit)
+            .await?;
+        self.publish_existing_local_commit(
+            repo,
+            &repo_dir,
+            &commit,
+            MaterializeSource::GithubVerified,
+        )
+        .await?;
+        Ok((commit, MaterializeSource::GithubVerified))
+    }
+
+    async fn ensure_public_commit(
+        &self,
+        repo: &RepoKey,
+        commit: &CommitSha,
+    ) -> CoreResult<MaterializeSource> {
+        if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
             if manifest.complete {
                 self.hydrate_commit(&manifest).await?;
-                return self
-                    .create_session(repo, commit, MaterializeSource::CacheVerified)
-                    .await;
+                return Ok(MaterializeSource::CacheVerified);
             }
         }
 
-        let repo_dir = self.ensure_repo_dir(&repo).await?;
-        if self.commit_exists(&repo_dir, &commit).await {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        if self.commit_exists(&repo_dir, commit).await {
             if let Some(generation) = self
-                .index_local_commit_from_known_generation(&repo, &repo_dir, &commit)
+                .index_local_commit_from_known_generation(repo, &repo_dir, commit)
                 .await?
             {
                 debug!(%repo, %commit, %generation, "indexed exact commit from known generation");
-                return self
-                    .create_session(repo, commit, MaterializeSource::CacheVerified)
-                    .await;
+                return Ok(MaterializeSource::CacheVerified);
             }
         }
 
-        self.fetch_all_refs(&repo, &repo_dir).await?;
+        self.fetch_all_refs(repo, &repo_dir).await?;
 
-        if !self.commit_exists(&repo_dir, &commit).await {
+        if !self.commit_exists(&repo_dir, commit).await {
             return Err(GitCacheError::NotFound(format!(
                 "commit `{commit}` was not found after upstream verification"
             )));
         }
 
         if let Some(generation) = self
-            .index_local_commit_from_known_generation(&repo, &repo_dir, &commit)
+            .index_local_commit_from_known_generation(repo, &repo_dir, commit)
             .await?
         {
             debug!(%repo, %commit, %generation, "indexed exact commit from known generation after upstream fetch");
-            return self
-                .create_session(repo, commit, MaterializeSource::CacheVerified)
-                .await;
+            return Ok(MaterializeSource::CacheVerified);
         }
 
-        self.materialize_existing_local_commit(
+        self.publish_existing_local_commit(
             repo,
             &repo_dir,
             commit,
@@ -474,18 +700,18 @@ impl Materializer {
         .await
     }
 
-    async fn materialize_existing_local_commit(
+    async fn publish_existing_local_commit(
         &self,
-        repo: RepoKey,
+        repo: &RepoKey,
         repo_dir: &FsPath,
-        commit: CommitSha,
+        commit: &CommitSha,
         source: MaterializeSource,
-    ) -> CoreResult<MaterializeResponse> {
+    ) -> CoreResult<MaterializeSource> {
         let generation = self
-            .publish_generation(&repo, repo_dir, &commit, None, false)
+            .publish_generation(repo, repo_dir, commit, None, false)
             .await?;
         debug!(%repo, %commit, %generation, "published generation for exact commit");
-        self.create_session(repo, commit, source).await
+        Ok(source)
     }
 
     async fn index_local_commit_from_known_generation(
@@ -1684,31 +1910,6 @@ impl Materializer {
         read_commit_manifest(&*self.state.store, repo, commit).await
     }
 
-    async fn materialize_local_branch(
-        &self,
-        repo: RepoKey,
-        branch: &BranchName,
-    ) -> CoreResult<MaterializeResponse> {
-        let repo_dir = self.ensure_repo_dir(&repo).await?;
-        let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
-        let commit = self
-            .state
-            .git
-            .rev_parse(&repo_dir, &local_ref)
-            .await
-            .and_then(CommitSha::parse)?;
-        self.create_session(repo, commit, MaterializeSource::GithubVerified)
-            .await
-    }
-
-    async fn materialize_local_default_branch(
-        &self,
-        repo: RepoKey,
-    ) -> CoreResult<MaterializeResponse> {
-        let branch = self.resolve_default_branch(&repo).await?;
-        self.materialize_local_branch(repo, &branch).await
-    }
-
     async fn get_generation_manifest(
         &self,
         repo: &RepoKey,
@@ -2181,6 +2382,11 @@ impl Materializer {
             .values()
             .map(|sha| sha.to_ascii_lowercase())
             .collect();
+        let upstream_tips: Vec<CommitSha> = comparison
+            .all_upstream
+            .values()
+            .map(|sha| CommitSha::parse(sha.as_str()))
+            .collect::<CoreResult<_>>()?;
         let upstream_url = self.upstream_url(repo)?;
         let upstream_git = self.upstream_git(&upstream_url)?;
         let object_ids: Vec<CommitSha> = wants
@@ -2208,7 +2414,11 @@ impl Materializer {
                             .fetch_all_heads(&repo_dir, &upstream_url)
                             .await?;
                         if !self
-                            .commit_reachable_from_fetched_upstream_refs(&repo_dir, &object_id)
+                            .object_reachable_from_upstream_tips(
+                                &repo_dir,
+                                &object_id,
+                                &upstream_tips,
+                            )
                             .await?
                         {
                             return self.unproven_want_error(&object_id, None);
@@ -2219,7 +2429,11 @@ impl Materializer {
                             .fetch_all_heads(&repo_dir, &upstream_url)
                             .await?;
                         if !self
-                            .commit_reachable_from_fetched_upstream_refs(&repo_dir, &object_id)
+                            .object_reachable_from_upstream_tips(
+                                &repo_dir,
+                                &object_id,
+                                &upstream_tips,
+                            )
                             .await?
                         {
                             return self.unproven_want_error(&object_id, Some(&err));
@@ -2285,14 +2499,17 @@ impl Materializer {
         Ok(())
     }
 
-    async fn commit_reachable_from_fetched_upstream_refs(
+    async fn object_reachable_from_upstream_tips(
         &self,
         repo_dir: &FsPath,
-        commit: &CommitSha,
+        object_id: &CommitSha,
+        upstream_tips: &[CommitSha],
     ) -> CoreResult<bool> {
-        Ok(self.commit_exists(repo_dir, commit).await
+        Ok(self.object_exists(repo_dir, object_id).await
             && self
-                .commit_reachable_from_upstream_refs(repo_dir, commit)
+                .state
+                .git
+                .object_reachable_from_commits(repo_dir, object_id, upstream_tips)
                 .await?)
     }
 
@@ -4334,6 +4551,41 @@ mod tests {
             .ensure_wants_available(&fixture.repo, &[first.commit.to_string()])
             .await
             .expect("anonymous wants should allow commits reachable from public upstream refs");
+    }
+
+    #[tokio::test]
+    async fn anonymous_direct_want_allows_cached_public_blob() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        let blob = CommitSha::parse(git_stdout(
+            &fixture.work_path(),
+            ["rev-parse", "HEAD:README.md"],
+        ))
+        .unwrap();
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let object_types = state
+            .git
+            .cat_file_batch_types(&repo_dir, std::slice::from_ref(&blob))
+            .await
+            .unwrap();
+        assert_eq!(object_types.get(&blob).map(String::as_str), Some("blob"));
+
+        materializer
+            .ensure_wants_available(&fixture.repo, &[blob.to_string()])
+            .await
+            .expect("anonymous wants should allow blobs reachable from public upstream refs");
     }
 
     #[tokio::test]

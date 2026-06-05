@@ -57,6 +57,16 @@ pub struct MaterializeRequest {
     pub upstream_authorization: UpstreamAuthorizationMode,
 }
 
+impl MaterializeRequest {
+    pub fn requires_upstream_auth(&self) -> bool {
+        self.upstream_authorization.is_required()
+    }
+
+    pub fn uses_upstream_auth(&self, auth: &UpstreamAuth) -> bool {
+        auth.is_authenticated() || self.requires_upstream_auth()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializeResponse {
     pub repo: RepoKey,

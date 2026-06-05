@@ -197,6 +197,39 @@ impl Git {
             .collect()
     }
 
+    pub async fn object_reachable_from_commits(
+        &self,
+        repo_dir: &Path,
+        object_id: &CommitSha,
+        commits: &[CommitSha],
+    ) -> Result<bool> {
+        reject_revision_arg(object_id.as_str())?;
+        if commits.is_empty() {
+            return Ok(false);
+        }
+
+        let mut stdin = Vec::with_capacity(commits.len() * 41);
+        for commit in commits {
+            reject_revision_arg(commit.as_str())?;
+            stdin.extend_from_slice(commit.as_str().as_bytes());
+            stdin.push(b'\n');
+        }
+
+        let output = self
+            .run_with_stdin_and_limits(
+                Some(repo_dir),
+                ["rev-list", "--objects", "--no-object-names", "--stdin"],
+                Some(&stdin),
+                self.output_limit,
+                self.output_limit,
+            )
+            .await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git rev-list returned non-utf8: {err}"))
+        })?;
+        Ok(text.lines().any(|line| line.trim() == object_id.as_str()))
+    }
+
     pub async fn cat_file_batch_types(
         &self,
         repo_dir: &Path,

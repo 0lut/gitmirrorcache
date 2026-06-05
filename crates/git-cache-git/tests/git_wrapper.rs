@@ -271,6 +271,38 @@ async fn is_ancestor_reports_commit_reachability() {
 }
 
 #[tokio::test]
+async fn object_reachable_from_commits_reports_blob_reachability() {
+    let temp = TempTree::new("object-reachability");
+    let (source_repo, source_sha) = create_source_repo(&temp.path);
+    let cache_repo = temp.path.join("cache.git");
+    let git = test_git();
+
+    git.init_bare(&cache_repo).await.expect("init cache repo");
+    git.fetch_branch(
+        &cache_repo,
+        path_arg(&source_repo),
+        "main",
+        "refs/cache/main",
+    )
+    .await
+    .expect("fetch main");
+
+    let tip = CommitSha::parse(&source_sha).unwrap();
+    let blob =
+        CommitSha::parse(run_git(Some(&source_repo), ["rev-parse", "HEAD:README.md"])).unwrap();
+    assert!(git
+        .object_reachable_from_commits(&cache_repo, &blob, std::slice::from_ref(&tip))
+        .await
+        .expect("check blob reachability"));
+
+    let unrelated = CommitSha::parse("f".repeat(40)).unwrap();
+    assert!(!git
+        .object_reachable_from_commits(&cache_repo, &unrelated, &[tip])
+        .await
+        .expect("check unrelated object reachability"));
+}
+
+#[tokio::test]
 async fn for_each_ref_commits_lists_matching_refs() {
     let temp = TempTree::new("for-each-ref");
     let (source_repo, source_sha) = create_source_repo(&temp.path);

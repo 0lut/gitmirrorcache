@@ -544,3 +544,32 @@ newly fetched wants may still rely on upstream providing the object. Regression
 tests cover both sides: anonymous wants reject locally cached unadvertised
 commits, while cached commits reachable from current public upstream refs still
 work without auth.
+
+### D6. Domain materialization now plans repo access before serving
+
+Raw `UpstreamAuth` stays out of `MaterializeRequest` because it is transport
+context with secret-bearing data, not JSON request data. The domain now turns a
+request plus upstream auth context into a `RepoAccess`/`MaterializePlan` first:
+`RepoAccess::Public` for empty auth and `RepoAccess::Upstream` for request
+credentials. Materialization then serves that plan without asking whether it is
+on an authenticated path again. This keeps the auth-free public option while
+making the principle explicit: once code reaches the serving/materialization
+stage, it is operating on an already checked repo intent and may only fail if
+upstream/cache state changes underneath it.
+
+The API layer also uses helper predicates on `MaterializeRequest` and
+`UpstreamAuthorizationMode` instead of repeating direct enum comparisons. The
+old authenticated materialization method family was collapsed into shared
+helpers that ensure a branch tip, ensure a reachable commit, and create either a
+public or protected session based on `RepoAccess`.
+
+### D7. Direct Git blob wants use graph proof, not commit-only proof
+
+Partial clones can later ask upload-pack for blob objects that are not advertised
+as ref tips. The tightened direct-want check originally proved only commit wants,
+which rejected cached public blobs during checkout. Non-advertised wants now get
+checked against the exact upstream tips from the current advertisement with a
+bounded `git rev-list --objects` pass. This keeps the private-object guard: a
+cached object is not served merely because it exists locally; it must be in the
+currently authorized upstream graph or be newly provided by upstream for that
+request.

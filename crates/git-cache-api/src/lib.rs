@@ -179,9 +179,7 @@ async fn handle_materialize_request(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
-    let authenticated = auth.is_authenticated()
-        || request.upstream_authorization == git_cache_core::UpstreamAuthorizationMode::Required;
-    let use_coordinator = !authenticated
+    let use_coordinator = !request.uses_upstream_auth(&auth)
         && matches!(
             request.selector,
             Selector::Branch(_) | Selector::DefaultBranch
@@ -239,9 +237,7 @@ async fn handle_resolve_request(
     request: MaterializeRequest,
     auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
-    let authenticated = auth.is_authenticated()
-        || request.upstream_authorization == git_cache_core::UpstreamAuthorizationMode::Required;
-    if authenticated {
+    if request.uses_upstream_auth(&auth) {
         if !state.rate_limiter.check() {
             state
                 .metrics

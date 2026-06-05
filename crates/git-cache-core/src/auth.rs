@@ -85,6 +85,12 @@ pub enum UpstreamAuthorizationMode {
     Required,
 }
 
+impl UpstreamAuthorizationMode {
+    pub fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
 fn validate_auth_header(value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(GitCacheError::Validation(
