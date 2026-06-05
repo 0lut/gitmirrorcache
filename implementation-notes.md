@@ -643,3 +643,13 @@ after the lock file is created, before writing lock metadata. That closes a
 cancellation-safety gap where aborting a task in the metadata-write window could
 leave a same-PID lock file behind; same-PID locks are intentionally not stolen
 by stale-lock recovery.
+
+### T21. API integration CI timeout now matches retry semantics
+
+The integration-test workflow previously capped the whole matrix job at 3
+minutes while each test command was allowed to run for 120 seconds and retry up
+to three times. With bounded repo-write wait/retry semantics, the API integration
+shard can legitimately run longer under slow GitHub-hosted runners, especially
+the many-branch load test. The workflow timeout is now 8 minutes and each cargo
+attempt is capped at 240 seconds. No tests were edited for this; the CI budget
+now reflects the retry behavior introduced for transient lease contention.
