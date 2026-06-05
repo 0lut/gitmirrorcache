@@ -614,4 +614,7 @@ failure window followed by later recovery.
 Explicit compaction no longer reports `Ok(None)` when the `repo-write` lease is
 temporarily busy. It waits for the configured lease-busy retry window and then
 either compacts under the acquired lease or returns `LeaseBusy`, keeping
-"contention" distinct from "chain below threshold / no compaction needed".
+"contention" distinct from "chain below threshold / no compaction needed". The
+same distinction applies when the generation-head CAS loses to another verifier:
+explicit compaction retries against the refreshed head, then returns the
+remaining CAS conflict instead of reporting an ordinary no-op.

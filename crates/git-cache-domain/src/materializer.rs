@@ -44,6 +44,7 @@ const PENDING_GENERATION_PREFIX: &str = "pending-generations/";
 const MAX_PENDING_GENERATION_SCAN_KEYS: usize = 10_000;
 const GENERATION_VERIFICATION_MAX_ATTEMPTS: usize = 3;
 const GENERATION_VERIFICATION_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
+const COMPACTION_MAX_ATTEMPTS: usize = 3;
 const COMPACTION_LEASE_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
 const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
 
@@ -1546,8 +1547,21 @@ impl Materializer {
         repo: &RepoKey,
     ) -> CoreResult<Option<CompactionReport>> {
         let threshold = self.state.config.compaction.chain_depth_threshold as usize;
-        self.compact_generation_chain_inner(repo, threshold, false)
-            .await
+        for attempt in 1..=COMPACTION_MAX_ATTEMPTS {
+            match self
+                .compact_generation_chain_inner(repo, threshold, false)
+                .await
+            {
+                Err(GitCacheError::CasConflict(err)) if attempt < COMPACTION_MAX_ATTEMPTS => {
+                    warn!(%repo, attempt, %err, "compaction conflict; retrying with refreshed head");
+                    tokio::time::sleep(COMPACTION_LEASE_RETRY_DELAY).await;
+                }
+                result => return result,
+            }
+        }
+        Err(GitCacheError::Internal(
+            "compaction retry loop exhausted unexpectedly".into(),
+        ))
     }
 
     pub async fn compact_generation_chain_dry_run(
@@ -1652,11 +1666,11 @@ impl Materializer {
             if !advance_generation_head(&*self.state.store, Some(head.generation), None, &new_head)
                 .await?
             {
-                // Another worker advanced the head after our snapshot; abort
-                // cleanup to avoid deleting generations the new head still needs.
                 warn!(%repo, "compaction head CAS lost; aborting cleanup");
                 reservation.release().await?;
-                return Ok(None);
+                return Err(GitCacheError::CasConflict(format!(
+                    "generation head changed while compacting `{repo}`"
+                )));
             }
 
             fenced_materializer
