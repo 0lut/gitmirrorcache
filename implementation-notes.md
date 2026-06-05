@@ -608,3 +608,10 @@ The local object-store lock retry budget now spans the PID-less stale-lock
 threshold. A crash that leaves a lock before PID metadata is written should be
 reclaimed by the first waiting acquire attempt rather than producing a short
 failure window followed by later recovery.
+
+### T20. Compaction lease contention is retryable, not a no-op
+
+Explicit compaction no longer reports `Ok(None)` when the `repo-write` lease is
+temporarily busy. It waits for the configured lease-busy retry window and then
+either compacts under the acquired lease or returns `LeaseBusy`, keeping
+"contention" distinct from "chain below threshold / no compaction needed".

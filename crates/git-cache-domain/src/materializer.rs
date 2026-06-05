@@ -44,6 +44,7 @@ const PENDING_GENERATION_PREFIX: &str = "pending-generations/";
 const MAX_PENDING_GENERATION_SCAN_KEYS: usize = 10_000;
 const GENERATION_VERIFICATION_MAX_ATTEMPTS: usize = 3;
 const GENERATION_VERIFICATION_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
+const COMPACTION_LEASE_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
 const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
 
 #[derive(Clone)]
@@ -1621,12 +1622,16 @@ impl Materializer {
             tip_commits: head.tip_commits.clone(),
             updated_at: now,
         };
-        let Some((lease_token, compaction_lease)) =
-            self.acquire_repo_write_lease_for_mutation(repo).await?
-        else {
-            debug!(%repo, "compaction skipped mutable publish because repo-write lease was busy");
-            reservation.release().await?;
-            return Ok(None);
+        let (lease_token, compaction_lease) =
+            match self.acquire_compaction_mutation_lease(repo).await {
+                Ok(lease) => lease,
+                Err(err) => {
+                    reservation.release().await?;
+                    return Err(err);
+                }
+            };
+        if compaction_lease.is_none() {
+            self.verify_lease_held(repo).await?;
         };
         let fenced_materializer =
             Materializer::with_lease_token(Arc::clone(&self.state), lease_token.clone());
@@ -1893,6 +1898,25 @@ impl Materializer {
         match manager.acquire(repo).await? {
             LeaseAcquire::Acquired(lease) => Ok(Some((lease.token().to_string(), Some(lease)))),
             LeaseAcquire::Busy => Ok(None),
+        }
+    }
+
+    async fn acquire_compaction_mutation_lease(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<(String, Option<Box<dyn git_cache_worker::RepoLease>>)> {
+        let retry_for = StdDuration::from_secs(self.state.config.leases.busy_retry_after_seconds);
+        let deadline = tokio::time::Instant::now() + retry_for;
+        loop {
+            if let Some(lease) = self.acquire_repo_write_lease_for_mutation(repo).await? {
+                return Ok(lease);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(GitCacheError::LeaseBusy(format!(
+                    "repo-write lease busy while compacting `{repo}`"
+                )));
+            }
+            tokio::time::sleep(COMPACTION_LEASE_RETRY_DELAY).await;
         }
     }
 
