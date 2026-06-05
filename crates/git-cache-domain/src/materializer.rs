@@ -2197,24 +2197,33 @@ impl Materializer {
                     )));
                 }
 
-                if let Err(err) = upstream_git
+                let existed_before_fetch = self.object_exists(&repo_dir, &object_id).await;
+                match upstream_git
                     .fetch_object(&repo_dir, &upstream_url, &object_id)
                     .await
                 {
-                    upstream_git
-                        .fetch_all_heads(&repo_dir, &upstream_url)
-                        .await?;
-                    if self.object_exists(&repo_dir, &object_id).await {
-                        // The object is reachable from refs that upstream just served
-                        // with this request credential.
-                    } else if self.upstream_auth.is_authenticated() {
-                        return Err(GitCacheError::Forbidden(format!(
-                            "object `{object_id}` is not authorized by upstream: {err}"
-                        )));
-                    } else {
-                        return Err(GitCacheError::NotFound(format!(
-                            "object `{object_id}` was not available from upstream: {err}"
-                        )));
+                    Ok(_) if !existed_before_fetch => {}
+                    Ok(_) => {
+                        upstream_git
+                            .fetch_all_heads(&repo_dir, &upstream_url)
+                            .await?;
+                        if !self
+                            .commit_reachable_from_fetched_upstream_refs(&repo_dir, &object_id)
+                            .await?
+                        {
+                            return self.unproven_want_error(&object_id, None);
+                        }
+                    }
+                    Err(err) => {
+                        upstream_git
+                            .fetch_all_heads(&repo_dir, &upstream_url)
+                            .await?;
+                        if !self
+                            .commit_reachable_from_fetched_upstream_refs(&repo_dir, &object_id)
+                            .await?
+                        {
+                            return self.unproven_want_error(&object_id, Some(&err));
+                        }
                     }
                 }
             }
@@ -2274,6 +2283,36 @@ impl Materializer {
         }
 
         Ok(())
+    }
+
+    async fn commit_reachable_from_fetched_upstream_refs(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> CoreResult<bool> {
+        Ok(self.commit_exists(repo_dir, commit).await
+            && self
+                .commit_reachable_from_upstream_refs(repo_dir, commit)
+                .await?)
+    }
+
+    fn unproven_want_error(
+        &self,
+        object_id: &CommitSha,
+        upstream_error: Option<&GitCacheError>,
+    ) -> CoreResult<()> {
+        let suffix = upstream_error
+            .map(|err| format!(": {err}"))
+            .unwrap_or_default();
+        if self.upstream_auth.is_authenticated() {
+            Err(GitCacheError::Forbidden(format!(
+                "object `{object_id}` is not authorized by upstream{suffix}"
+            )))
+        } else {
+            Err(GitCacheError::NotFound(format!(
+                "object `{object_id}` was not available from upstream{suffix}"
+            )))
+        }
     }
 
     /// Configure a bare repo for serving via the direct Git remote:
@@ -4232,6 +4271,69 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, GitCacheError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn anonymous_direct_want_rejects_locally_cached_unadvertised_commit() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+
+        stdfs::write(fixture.work_path().join("private.txt"), "private\n").unwrap();
+        run_git(&fixture.work_path(), ["add", "private.txt"]);
+        run_git(
+            &fixture.work_path(),
+            ["commit", "-m", "private local commit"],
+        );
+        let private_commit =
+            CommitSha::parse(git_stdout(&fixture.work_path(), ["rev-parse", "HEAD"])).unwrap();
+        run_git(
+            &repo_dir,
+            [
+                "fetch",
+                fixture.work_path().to_str().unwrap(),
+                "HEAD:refs/cache/private",
+            ],
+        );
+
+        assert!(materializer.commit_exists(&repo_dir, &private_commit).await);
+
+        let error = materializer
+            .ensure_wants_available(&fixture.repo, &[private_commit.to_string()])
+            .await
+            .expect_err("anonymous wants must not trust locally cached private commits");
+
+        assert!(
+            matches!(
+                error,
+                GitCacheError::NotFound(_) | GitCacheError::Forbidden(_)
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_direct_want_allows_cached_public_ancestor() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        fixture.commit_and_push("public descendant");
+
+        materializer
+            .ensure_wants_available(&fixture.repo, &[first.commit.to_string()])
+            .await
+            .expect("anonymous wants should allow commits reachable from public upstream refs");
     }
 
     #[tokio::test]

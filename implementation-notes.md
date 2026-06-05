@@ -519,4 +519,28 @@ had focused repro tests: `MaterializeResponse` debug output now redacts
 `session_token`, and session Bearer parsing accepts case-insensitive schemes
 while ignoring unrelated auth schemes so public sessions are not rejected by
 cached Basic credentials. The direct Git shared-repo / request-scoped proof
-concerns remain known hardening tradeoffs pending ephemeral repo isolation.
+concerns remain known hardening tradeoffs pending ephemeral repo isolation, with
+the request-scoped proof fallback tightened in D5.
+
+### D5. Preserve auth-free public access while tightening direct want proof
+
+The auth model remains two separate gates: service auth is deployment/app
+access control, while upstream repo auth is request-scoped proof that the caller
+can reach a repo/ref. This code currently has no in-app service-auth gate, so
+auth-free deployments still work. `/v1/*` keeps upstream repo credentials in
+`Git-Cache-Upstream-Authorization` so a service `Authorization` header can
+coexist. Direct Git still uses `Authorization: Basic ...` as repo credentials
+because that is what Git credential helpers naturally send, so any future
+in-app service-auth gate needs a separate convention or a gateway that does not
+forward its own service token as the direct Git upstream credential.
+
+A static-review finding correctly reproduced one multitenant edge: if a
+non-advertised want already existed in the shared repo, `git fetch <sha>` or the
+fallback could return success without proving the current anonymous request was
+allowed to receive that object. The direct want path now records whether the
+object existed before the upstream fetch. Pre-existing cached wants must be
+reachable from refs fetched from upstream for the current request credential;
+newly fetched wants may still rely on upstream providing the object. Regression
+tests cover both sides: anonymous wants reject locally cached unadvertised
+commits, while cached commits reachable from current public upstream refs still
+work without auth.
