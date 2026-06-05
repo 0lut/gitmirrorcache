@@ -517,3 +517,47 @@ repositories while other tests run concurrently. CI exposed intermittent
 repository corruption from Git auto maintenance/gc during those synthetic setup
 loops, so the test fixture disables `gc.auto` and `maintenance.auto` for those
 temporary repos.
+
+### T9. Pending generation verification never rewinds head
+
+Out-of-order background verifiers now first check whether the current
+`generation-head.json` already descends from the pending generation. Pending
+publish metadata records the head observed at publish time (`expected_head`) so
+verification CASes only from that expected head or a safe compaction replacement
+that preserves the same tips. If a newer descendant is already head, the older
+verifier skips public ref publication and leaves the newer head/ref state intact.
+
+### T10. Lease fencing checks released and expired manifests
+
+`verify_lease_held` now treats a matching token as necessary but not sufficient:
+released leases and expired leases are rejected before shared-state writes. The
+expiry check uses object-store metadata time when available, mirroring the
+lease manager's skew-resistant acquisition logic.
+
+### T11. Compaction uses the repo-write lease manager
+
+Compaction cleanup now acquires `repo-write` through `ObjectStoreRepoLeaseManager`
+instead of hand-rolling lease acquisition/stealing. This gives compaction the
+same renewal, skew handling, and release behavior as coordinated read-through
+updates. When compaction is already running under a fenced materializer, it
+reuses the existing token rather than reacquiring.
+
+### T12. Short commit resolution is carried across the coordinator boundary
+
+`UpdateExecutor` can now return a request-scoped `resolved_commit`. The
+short-commit coordinator path stores the full commit resolved while holding
+`repo-write`, and the post-coordinator response path uses that exact commit
+instead of resolving the abbreviation again after lease release.
+
+### T13. Local object locks are not reclaimed by age alone
+
+Local object-store lock recovery no longer deletes a lock just because it is
+old. A waiter only removes a lock when the recorded owner PID is proven dead,
+avoiding concurrent critical sections during valid long-running bundle writes.
+
+### T14. Direct Git lease exhaustion is retryable
+
+If `/git/.../git-upload-pack` exhausts its internal repo-write wait, it now
+returns the same retryable `LeaseBusy` class as materialize rather than a
+generic conflict. Generic `LeaseBusy` API errors include `Retry-After` so Git
+clients/callers receive a retryable 503 signal.

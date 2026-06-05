@@ -647,6 +647,7 @@ async fn pending_publish_writes_only_bundle_and_pending_metadata() {
             &store,
             &bundle_path,
             head.clone(),
+            generation.parent_generation,
             Some(default_ref.clone()),
         )
         .await
@@ -664,6 +665,7 @@ async fn pending_publish_writes_only_bundle_and_pending_metadata() {
             generation: generation.clone(),
             manifests: publish.manifests.clone(),
             head,
+            expected_head: generation.parent_generation,
             default_ref: Some(default_ref)
         })
     );

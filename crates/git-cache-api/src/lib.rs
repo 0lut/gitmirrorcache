@@ -151,7 +151,7 @@ async fn acquire_repo_write_lease_for_git_client(
                 tokio::time::sleep(LEASE_BUSY_RETRY_INTERVAL).await;
             }
             LeaseAcquire::Busy => {
-                return Err(GitCacheError::Conflict(format!(
+                return Err(GitCacheError::LeaseBusy(format!(
                     "timed out waiting for repo-write lease for `{repo}`"
                 )));
             }
@@ -221,6 +221,7 @@ async fn handle_materialize_request(
         return Err(ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: "rate limit exceeded".into(),
+            retry_after: None,
         });
     }
 
@@ -257,7 +258,7 @@ async fn handle_materialize_request(
 
     let outcome =
         read_through_with_busy_wait(state, request.repo.clone(), request.selector.clone()).await;
-    match outcome {
+    let resolved_commit = match outcome {
         Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
             let retry_after = state.domain.config.leases.busy_retry_after_seconds;
             return Ok(Response::builder()
@@ -279,11 +280,11 @@ async fn handle_materialize_request(
                 .fetch_add(1, Ordering::Relaxed);
             return Err(error.into());
         }
-        Ok(_) => {}
-    }
+        Ok(o) => o.resolved_commit,
+    };
 
     let result = materializer
-        .materialize_after_upstream_validation(request)
+        .materialize_after_upstream_validation(request, resolved_commit)
         .await;
 
     match result {
@@ -576,6 +577,7 @@ impl RateLimiter {
 struct ApiError {
     status: StatusCode,
     message: String,
+    retry_after: Option<u64>,
 }
 
 impl From<GitCacheError> for ApiError {
@@ -600,9 +602,15 @@ impl From<GitCacheError> for ApiError {
             | GitCacheError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
+        let retry_after = match error {
+            GitCacheError::LeaseBusy(_) => Some(1),
+            _ => None,
+        };
+
         Self {
             status,
             message: error.to_string(),
+            retry_after,
         }
     }
 }
@@ -614,13 +622,19 @@ impl IntoResponse for ApiError {
             error: &'a str,
         }
 
-        (
+        let mut response = (
             self.status,
             Json(ErrorBody {
                 error: &self.message,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(retry_after) = self.retry_after {
+            if let Ok(value) = http::HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 

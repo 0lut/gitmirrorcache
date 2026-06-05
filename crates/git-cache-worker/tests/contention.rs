@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use git_cache_core::{BranchName, RepoKey, Result, Selector};
 use git_cache_worker::{
     InMemoryRepoLeaseManager, LeaseAcquire, ReadThroughUpdatePath, RepoLeaseManager,
-    UpdateCoordinator, UpdateDisposition, UpdateExecutor, UpdateRequest,
+    UpdateCoordinator, UpdateDisposition, UpdateExecutor, UpdateRequest, UpdateResult,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -48,13 +48,13 @@ impl RecordingExecutor {
 
 #[async_trait]
 impl UpdateExecutor for RecordingExecutor {
-    async fn update(&self, _request: UpdateRequest) -> Result<()> {
+    async fn update(&self, _request: UpdateRequest) -> Result<UpdateResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_waiters();
         if self.hold {
             self.release.notified().await;
         }
-        Ok(())
+        Ok(UpdateResult::default())
     }
 }
 
@@ -79,10 +79,10 @@ impl SlowExecutor {
 
 #[async_trait]
 impl UpdateExecutor for SlowExecutor {
-    async fn update(&self, _request: UpdateRequest) -> Result<()> {
+    async fn update(&self, _request: UpdateRequest) -> Result<UpdateResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
-        Ok(())
+        Ok(UpdateResult::default())
     }
 }
 

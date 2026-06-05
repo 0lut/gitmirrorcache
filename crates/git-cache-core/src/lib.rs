@@ -23,7 +23,7 @@ pub use selector::{BranchName, Selector};
 pub use session::{SessionId, SessionManifest};
 pub use update::{
     validate_event_ref, UpdateDisposition, UpdateExecutor, UpdateKey, UpdateOutcome, UpdateRequest,
-    UpdateSource, UpdateTarget,
+    UpdateResult, UpdateSource, UpdateTarget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

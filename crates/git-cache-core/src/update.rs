@@ -100,19 +100,30 @@ pub enum UpdateDisposition {
     LeaseBusy,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateResult {
+    /// Full commit resolved during the update (e.g. from a short-commit
+    /// abbreviation).  Carried back so the post-coordinator materializer
+    /// can skip a second resolution after the lease is released.
+    pub resolved_commit: Option<CommitSha>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateOutcome {
     pub key: UpdateKey,
     pub source: UpdateSource,
     pub disposition: UpdateDisposition,
+    /// Resolved commit carried from the executor, if any.
+    pub resolved_commit: Option<CommitSha>,
 }
 
 impl UpdateOutcome {
-    pub fn updated(request: &UpdateRequest) -> Self {
+    pub fn updated(request: &UpdateRequest, result: UpdateResult) -> Self {
         Self {
             key: request.key(),
             source: request.source,
             disposition: UpdateDisposition::Updated,
+            resolved_commit: result.resolved_commit,
         }
     }
 
@@ -121,13 +132,14 @@ impl UpdateOutcome {
             key: request.key(),
             source: request.source,
             disposition: UpdateDisposition::LeaseBusy,
+            resolved_commit: None,
         }
     }
 }
 
 #[async_trait]
 pub trait UpdateExecutor: Send + Sync {
-    async fn update(&self, request: UpdateRequest) -> Result<()>;
+    async fn update(&self, request: UpdateRequest) -> Result<UpdateResult>;
 }
 
 pub fn validate_event_ref(ref_name: &str) -> Result<()> {

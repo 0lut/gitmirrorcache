@@ -1303,6 +1303,7 @@ dependencies = [
  "git-cache-disk",
  "git-cache-git",
  "git-cache-objectstore",
+ "git-cache-worker",
  "serde",
  "sha2 0.10.9",
  "tempfile",

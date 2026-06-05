@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 pub use git_cache_core::{
     validate_event_ref, UpdateDisposition, UpdateExecutor, UpdateKey, UpdateOutcome, UpdateRequest,
-    UpdateSource, UpdateTarget,
+    UpdateResult, UpdateSource, UpdateTarget,
 };
 #[cfg(test)]
 use git_cache_core::{BranchName, CommitSha, ShortCommitSha};
@@ -75,8 +75,8 @@ pub struct NoopUpdateExecutor;
 
 #[async_trait]
 impl UpdateExecutor for NoopUpdateExecutor {
-    async fn update(&self, _request: UpdateRequest) -> Result<()> {
-        Ok(())
+    async fn update(&self, _request: UpdateRequest) -> Result<UpdateResult> {
+        Ok(UpdateResult::default())
     }
 }
 
@@ -480,9 +480,9 @@ impl UpdateCoordinator {
         let release_result = lease.release().await;
 
         match (update_result, release_result) {
-            (Ok(()), Ok(())) => Ok(UpdateOutcome::updated(&request)),
+            (Ok(result), Ok(())) => Ok(UpdateOutcome::updated(&request, result)),
             (Err(err), Ok(())) => Err(err),
-            (Ok(()), Err(err)) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
             (Err(err), Err(release_err)) => {
                 warn!(%release_err, "failed to release repo lease after update error");
                 Err(err)
@@ -912,7 +912,7 @@ mod tests {
 
     #[async_trait]
     impl UpdateExecutor for RecordingExecutor {
-        async fn update(&self, request: UpdateRequest) -> Result<()> {
+        async fn update(&self, request: UpdateRequest) -> Result<UpdateResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.requests.lock().await.push(request);
             self.started.notify_waiters();
@@ -921,7 +921,7 @@ mod tests {
                 self.release.notified().await;
             }
 
-            Ok(())
+            Ok(UpdateResult::default())
         }
     }
 
@@ -1597,7 +1597,7 @@ mod tests {
 
     #[async_trait]
     impl UpdateExecutor for PanicExecutor {
-        async fn update(&self, _request: UpdateRequest) -> Result<()> {
+        async fn update(&self, _request: UpdateRequest) -> Result<UpdateResult> {
             panic!("executor panicked intentionally");
         }
     }

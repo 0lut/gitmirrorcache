@@ -42,6 +42,8 @@ pub struct PendingGenerationPublish {
     pub generation: GenerationManifest,
     pub manifests: PublishManifests,
     pub head: RepoGenerationHead,
+    #[serde(default)]
+    pub expected_head: Option<GenerationId>,
     pub default_ref: Option<RefManifest>,
 }
 
@@ -113,6 +115,7 @@ impl GenerationPublish {
         store: &S,
         path: impl AsRef<Path>,
         head: RepoGenerationHead,
+        expected_head: Option<GenerationId>,
         default_ref: Option<RefManifest>,
     ) -> Result<()>
     where
@@ -123,6 +126,7 @@ impl GenerationPublish {
             generation: self.generation.clone(),
             manifests: self.manifests.clone(),
             head,
+            expected_head,
             default_ref,
         };
         validate_pending_publish(&pending)?;

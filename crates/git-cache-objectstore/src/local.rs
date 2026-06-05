@@ -10,7 +10,6 @@ use tokio::io::AsyncWriteExt;
 
 const LOCAL_LOCK_RETRY_COUNT: usize = 200;
 const LOCAL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
-const LOCAL_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct LocalObjectStore {
@@ -153,29 +152,18 @@ impl LocalObjectStore {
     }
 
     async fn recover_stale_lock(&self, lock_path: &Path) -> Result<()> {
-        let metadata = match fs::metadata(lock_path).await {
-            Ok(metadata) => metadata,
+        let contents = match fs::read_to_string(lock_path).await {
+            Ok(contents) => contents,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(err.into()),
         };
-
-        let lock_age = metadata
-            .modified()
-            .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
-        let pid_dead = match fs::read_to_string(lock_path).await {
-            Ok(contents) => lock_owner_pid(&contents).is_some_and(|pid| !process_is_alive(pid)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        if lock_owner_pid(&contents).is_none_or(process_is_alive) {
+            return Ok(());
+        }
+        match fs::remove_file(lock_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
-        };
-        let stale_by_age = lock_age.is_some_and(|age| age >= LOCAL_LOCK_STALE_AFTER);
-
-        if pid_dead || stale_by_age {
-            match fs::remove_file(lock_path).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
         }
         Ok(())
     }
