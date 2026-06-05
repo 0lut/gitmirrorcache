@@ -72,6 +72,8 @@
 
 7. **Retry-After header on lease busy.** API 503 responses for `LeaseBusy` now
    include a `Retry-After` header populated from `config.leases.busy_retry_after_seconds`.
+   API handlers also wait/retry for up to this configured window before returning
+   503 so transient multi-worker contention does not unnecessarily fail requests.
 
 8. **All materialize selectors routed through coordinator.** Previously only
    `Branch`/`DefaultBranch` selectors went through `UpdateCoordinator`;

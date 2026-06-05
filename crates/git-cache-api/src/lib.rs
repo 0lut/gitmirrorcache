@@ -4,7 +4,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
-use git_cache_core::{AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult};
+use git_cache_core::{
+    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
+};
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
@@ -32,6 +34,7 @@ use tokio_util::io::ReaderStream;
 use tracing::warn;
 
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const LEASE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 pub fn app(config: AppConfig) -> Router {
     app_result(config).expect("failed to initialize git-cache-api")
@@ -111,6 +114,48 @@ impl ApiState {
     }
 }
 
+async fn read_through_with_busy_wait(
+    state: &Arc<ApiState>,
+    repo: git_cache_core::RepoKey,
+    selector: Selector,
+) -> CoreResult<git_cache_worker::UpdateOutcome> {
+    let max_wait = Duration::from_secs(state.domain.config.leases.busy_retry_after_seconds);
+    let started_at = Instant::now();
+
+    loop {
+        let outcome = state
+            .coordinator
+            .read_through(repo.clone(), selector.clone())
+            .await?;
+        if outcome.disposition != UpdateDisposition::LeaseBusy || started_at.elapsed() >= max_wait {
+            return Ok(outcome);
+        }
+        tokio::time::sleep(
+            LEASE_BUSY_RETRY_INTERVAL.min(max_wait.saturating_sub(started_at.elapsed())),
+        )
+        .await;
+    }
+}
+
+async fn acquire_repo_write_lease_with_busy_wait(
+    state: &Arc<ApiState>,
+    repo: &git_cache_core::RepoKey,
+) -> CoreResult<LeaseAcquire> {
+    let max_wait = Duration::from_secs(state.domain.config.leases.busy_retry_after_seconds);
+    let started_at = Instant::now();
+
+    loop {
+        let lease = state.leases.acquire(repo).await?;
+        if !matches!(lease, LeaseAcquire::Busy) || started_at.elapsed() >= max_wait {
+            return Ok(lease);
+        }
+        tokio::time::sleep(
+            LEASE_BUSY_RETRY_INTERVAL.min(max_wait.saturating_sub(started_at.elapsed())),
+        )
+        .await;
+    }
+}
+
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
@@ -181,10 +226,8 @@ async fn handle_materialize_request(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
-    let outcome = state
-        .coordinator
-        .read_through(request.repo.clone(), request.selector.clone())
-        .await;
+    let outcome =
+        read_through_with_busy_wait(state, request.repo.clone(), request.selector.clone()).await;
     match outcome {
         Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
             let retry_after = state.domain.config.leases.busy_retry_after_seconds;
@@ -373,11 +416,12 @@ async fn git_repo(
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
 
-        // Hold the repo-write lease while processing unknown wants. This keeps
-        // ensure_wants_available() and any publish_generation() it triggers under
-        // durable coordination, and passes the fencing token into Materializer so
-        // publish writes can verify ownership immediately before mutation.
-        let lease = match state.leases.acquire(&repo).await {
+        // Wait briefly for repo-write before falling back to 503, then hold the
+        // lease while processing wants. This keeps ensure_wants_available() and
+        // any publish_generation() it triggers under durable coordination, and
+        // passes the fencing token into Materializer so publish writes can verify
+        // ownership immediately before mutation.
+        let lease = match acquire_repo_write_lease_with_busy_wait(&state, &repo).await {
             Ok(LeaseAcquire::Acquired(lease)) => lease,
             Ok(LeaseAcquire::Busy) => {
                 let retry_after = state.domain.config.leases.busy_retry_after_seconds;
