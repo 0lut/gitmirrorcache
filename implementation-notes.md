@@ -653,3 +653,27 @@ shard can legitimately run longer under slow GitHub-hosted runners, especially
 the many-branch load test. The workflow timeout is now 8 minutes and each cargo
 attempt is capped at 240 seconds. No tests were edited for this; the CI budget
 now reflects the retry behavior introduced for transient lease contention.
+
+### T22. Steal clock recomputed after reading existing lease
+
+The expiry check in `ObjectStoreRepoLeaseManager::acquire` previously used the
+`now` timestamp captured before the failed `acquire_lease_with_token` and
+`read_lease_with_version` round-trip. With a zero or very short TTL (or slow
+object-store reads / coarse metadata granularity), the elapsed time between
+`version.updated_at` and the stale `now` could be negative or too small,
+treating a genuinely expired lease as live. The steal path now captures a fresh
+timestamp (`steal_now`) after reading the existing lease. Non-positive computed
+TTLs (`expires_at <= renewed_at`) are treated as unambiguously expired,
+preventing any clock comparison from keeping a dead lease alive.
+
+### T23. Thundering-herd test uses explicit joiner barrier
+
+The `inflight_dedup_thundering_herd` test previously used a single
+`yield_now()` to ensure all 99 spawned callers had joined the existing
+in-flight entry before releasing the held executor. On a `multi_thread`
+runtime, `yield_now` only yields the current task; some spawned tasks may
+still be unscheduled when the owner completes and removes the inflight entry,
+causing late arrivals to become new owners and block forever. The test now
+polls `inflight_waiter_count()` (backed by `watch::Sender::receiver_count()`)
+until all 99 joiners have cloned the inflight receiver before releasing, with a
+bounded 5-second deadline to prevent silent hangs.

@@ -229,24 +229,31 @@ impl RepoLeaseManager for ObjectStoreRepoLeaseManager {
             )));
         };
 
+        // Fresh timestamp after the read so elapsed time accounts for
+        // object-store latency and metadata granularity.
+        let steal_now = Utc::now();
+
         let expired = existing.released_at.is_some() || {
             let renewed_at_by_holder = existing.renewed_at.unwrap_or(existing.acquired_at);
             let ttl_at_write = existing.expires_at - renewed_at_by_holder;
-            if let Some(obj_updated) = version.updated_at {
+            if ttl_at_write <= ChronoDuration::zero() {
+                // Non-positive TTL means the lease expired at or before it was written.
+                true
+            } else if let Some(obj_updated) = version.updated_at {
                 // Use object-store metadata time to avoid inter-worker clock skew.
                 // obj_updated is the server-side timestamp of the last lease write;
                 // the lease should have expired ttl_at_write after that moment.
-                let elapsed = now - obj_updated;
+                let elapsed = steal_now - obj_updated;
                 elapsed >= ttl_at_write + self.steal_skew
             } else {
-                now >= existing.expires_at + self.steal_skew
+                steal_now >= existing.expires_at + self.steal_skew
             }
         };
         if !expired {
             return Ok(LeaseAcquire::Busy);
         }
 
-        let stolen = self.lease_manifest(repo, token, now);
+        let stolen = self.lease_manifest(repo, token, steal_now);
         if !steal_expired_lease_if_version_matches(
             &*self.store,
             repo,
@@ -499,6 +506,15 @@ impl UpdateCoordinator {
             inflight.remove(key);
         }
     }
+
+    #[cfg(test)]
+    async fn inflight_waiter_count(&self, key: &UpdateKey) -> usize {
+        let inflight = self.inner.inflight.lock().await;
+        inflight
+            .get(key)
+            .map(|entry| entry.waiter_count())
+            .unwrap_or(0)
+    }
 }
 
 struct InflightUpdate {
@@ -512,6 +528,11 @@ impl InflightUpdate {
     fn new() -> Self {
         let (sender, receiver) = watch::channel(None);
         Self { sender, receiver }
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.sender.receiver_count()
     }
 
     async fn wait(&self) -> SharedUpdateResult {
@@ -1621,7 +1642,26 @@ mod tests {
             }));
         }
 
-        tokio::task::yield_now().await;
+        // Wait until all 99 joiners have cloned the inflight receiver
+        // (receiver_count == 100, including the entry's stored receiver) before
+        // releasing. This eliminates the scheduler race where late-spawned
+        // callers miss the existing entry, become new owners, and block forever.
+        let key = UpdateKey {
+            repo: repo(),
+            target: UpdateTarget::Branch(BranchName::parse("main").unwrap()),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = coord.inflight_waiter_count(&key).await;
+            if count >= 100 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for all joiners to register; got {count}/100"
+            );
+            tokio::task::yield_now().await;
+        }
         assert_eq!(executor.calls(), 1, "executor called exactly once");
 
         executor.release_one();
