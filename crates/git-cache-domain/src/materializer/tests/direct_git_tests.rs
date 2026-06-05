@@ -162,7 +162,7 @@ async fn anonymous_direct_want_uses_public_refs_without_upstream_probe() {
 }
 
 #[tokio::test]
-async fn authenticated_direct_want_still_requires_upstream_probe() {
+async fn authenticated_direct_want_uses_local_cache_after_repo_authorization() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -184,21 +184,11 @@ async fn authenticated_direct_want_still_requires_upstream_probe() {
     .unwrap();
 
     let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
-    let error = materializer
+    materializer
         .using_upstream_auth(&auth)
         .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
         .await
-        .expect_err("authenticated direct wants should keep request-scoped upstream proof");
-
-    assert!(
-        matches!(
-            error,
-            GitCacheError::NotFound(_)
-                | GitCacheError::UpstreamUnavailable(_)
-                | GitCacheError::Timeout(_)
-        ),
-        "unexpected error: {error}"
-    );
+        .expect("repo-authorized authenticated direct wants should use local cache availability");
 }
 
 #[tokio::test]

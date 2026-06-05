@@ -345,8 +345,9 @@ Implemented the first HTTPS auth slice from `AUTH-PLAN.md`: request-scoped
 GitHub Basic authorization can be forwarded to upstream git commands without
 putting credentials in argv, logs, local repo config, object-store keys, or
 manifests. Authenticated materialization now creates bearer-protected session
-URLs, and direct `/git/...` upload-pack wants are checked against a current
-upstream proof before cached bytes can be served.
+URLs. Direct `/git/...` now has a repo-access gate before upload-pack serving:
+authenticated GitHub requests use GitHub REST to prove repository access,
+anonymous and non-GitHub requests use Git protocol proof.
 
 ## Decisions not in the spec
 
@@ -380,15 +381,16 @@ Only its SHA-256 hash is stored in the session manifest. Public sessions keep
 
 ## Tradeoffs
 
-### T1. Direct authenticated `/git/...` is proof-gated, not fully ephemeral
+### T1. Direct authenticated `/git/...` is repo-gated, not fully ephemeral
 
 The plan asks for an ephemeral protected serving repo for authenticated direct
 Git. This implementation does not yet build that separate direct-remote repo.
-Instead, direct upload-pack re-authorizes the request with `ls-remote`, requires
-each want to be an advertised tip or exactly fetchable by upstream with the
-same credential, then serves from the shared repo. This closes the old
-"cached object proves access" hole, but the full ephemeral-repo isolation still
-belongs in a later hardening pass.
+Instead, direct upload-pack proves repo-level access at the API boundary and
+then serves from the shared repo. Authenticated GitHub requests prove access via
+REST before entering the domain path; anonymous and non-GitHub requests still
+use `git ls-remote`. This closes the old "cached object proves access" hole for
+anonymous callers while avoiding duplicated authorized/unauthed domain methods.
+The full ephemeral-repo isolation still belongs in a later hardening pass.
 
 ### T2. Anonymous direct Git now also gets upstream proof for wants
 
@@ -629,8 +631,7 @@ upstream branch advertisement. We removed that GET-side sweep: anonymous GETs
 still fetch a fresh upstream advertisement so branch movement is detected, but
 they do not walk/update local public refs. POST uses existing public refs for
 the fast path and falls back to request-scoped upstream proof when they are
-missing or stale. Authenticated direct Git still requires request-scoped
-upstream proof and does not populate public refs.
+missing or stale. Authenticated direct Git also avoids populating public refs.
 
 One more AWS split test isolated the remaining LLVM direct-clone cost:
 `info/refs` and GitHub `ls-remote` were ~1-2s, and a protected session clone was
@@ -639,3 +640,31 @@ wants with `for-each-ref --contains` over LLVM's public branch set. The common
 shallow-clone want is the advertised default-branch tip, so the fast path now
 answers exact public-tip wants from the already-loaded `refs/heads/*` tip list
 and only uses reachability for cached ancestors and non-commit wants.
+
+### D10. Repo authorization is now an API gate for direct Git POST
+
+The revised auth model separates the future service-auth gate from the current
+upstream repo-access gate. Service auth answers "can this caller use the cache
+service at all" and is still out of scope for this branch. Repo auth answers
+"can this request reach this upstream repo" and now happens before
+materialize/resolve/direct upload-pack serving.
+
+For authenticated GitHub requests, the API uses GitHub REST as the repo gate:
+it reads repository metadata and the default branch ref with the request token.
+After that succeeds, domain code treats the repo as authorized for this request
+and does not run a second per-object upstream proof for direct upload-pack
+wants. This keeps the implementation explicit without carrying a second
+`*_authorized` method family through the materializer.
+
+Anonymous GitHub requests deliberately do not use GitHub REST. The public,
+auth-free mode remains available, and anonymous proof stays on Git protocol so
+large public clones do not consume GitHub's unauthenticated REST quota. For
+anonymous direct POSTs, the hot path serves only wants already proven reachable
+from locally published public refs/manifests. If that proof is missing or stale,
+the request falls back to anonymous `git ls-remote`/fetch proof or fails rather
+than trusting object existence in the shared repo.
+
+Non-GitHub origins also use `git ls-remote` for the repo gate for now, even
+when request auth is present. This is intentionally provider-neutral until we
+introduce a proper origin/provider interface, likely something like
+`GitHubOrigin`, `BitBucketOrigin`, and `PrivateGitServerOrigin`.

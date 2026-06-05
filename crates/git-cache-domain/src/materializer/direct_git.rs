@@ -170,12 +170,21 @@ impl Materializer {
         Ok(())
     }
 
-    /// Ensure all wanted OIDs are available locally. For each want:
-    /// - Ask upstream for the current advertisement.
-    /// - Allow advertised tips directly.
-    /// - For other wants, require upstream to provide the object for this request.
-    /// - Use cached bytes only after that request-scoped upstream proof exists.
+    /// Ensure all wanted OIDs are available locally.
+    ///
+    /// Authenticated requests arrive here only after the API layer has proven
+    /// repo-level read access for the request. They do not need per-object
+    /// upstream auth proof; this path only hydrates/fetches missing objects.
+    ///
+    /// Anonymous requests are different: object existence in the shared
+    /// repo-local cache is not authorization. The hot path may serve only wants
+    /// that are locally proven reachable from public refs. If that proof is
+    /// missing, we fall back to an anonymous upstream proof/fetch or fail.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
+        if self.upstream_auth.is_authenticated() {
+            return self.ensure_authorized_wants_available(repo, wants).await;
+        }
+
         if !self.upstream_auth.is_authenticated()
             && self
                 .ensure_cached_public_wants_available(repo, wants)
@@ -187,6 +196,105 @@ impl Materializer {
         let comparison = self.compare_upstream_refs(repo).await?;
         self.ensure_wants_available_from_comparison(repo, wants, &comparison)
             .await
+    }
+
+    async fn ensure_authorized_wants_available(
+        &self,
+        repo: &RepoKey,
+        wants: &[String],
+    ) -> CoreResult<()> {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let object_ids: Vec<CommitSha> = wants
+            .iter()
+            .map(|want_sha| CommitSha::parse(want_sha.as_str()))
+            .collect::<CoreResult<_>>()?;
+        if object_ids.is_empty() {
+            return Ok(());
+        }
+
+        let upstream_url = self.upstream_url(repo)?;
+        let upstream_git = self.upstream_git(&upstream_url)?;
+
+        for object_id in object_ids {
+            let _repo_lock = self.lock_repo(repo).await?;
+            self.hydrate_complete_manifest_for_want(repo, &repo_dir, &object_id)
+                .await?;
+
+            let mut last_fetch_error = None;
+            if !self.want_ready_for_serving(&repo_dir, &object_id).await? {
+                last_fetch_error = upstream_git
+                    .fetch_object(&repo_dir, &upstream_url, &object_id)
+                    .await
+                    .err();
+
+                self.hydrate_complete_manifest_for_want(repo, &repo_dir, &object_id)
+                    .await?;
+
+                if !self.want_ready_for_serving(&repo_dir, &object_id).await? {
+                    match upstream_git.fetch_all_heads(&repo_dir, &upstream_url).await {
+                        Ok(_) => {}
+                        Err(fetch_all_error) => {
+                            if let Some(fetch_object_error) = &last_fetch_error {
+                                debug!(
+                                    %repo,
+                                    %object_id,
+                                    object_error = %fetch_object_error,
+                                    all_heads_error = %fetch_all_error,
+                                    "authorized direct Git fallback fetch failed"
+                                );
+                            }
+                            last_fetch_error = Some(fetch_all_error);
+                        }
+                    }
+                }
+            }
+
+            if !self.want_ready_for_serving(&repo_dir, &object_id).await? {
+                if let Some(error) = last_fetch_error {
+                    return Err(error);
+                }
+                return Err(GitCacheError::NotFound(format!(
+                    "object `{object_id}` is authorized but unavailable locally"
+                )));
+            }
+
+            if self.commit_exists(&repo_dir, &object_id).await {
+                self.expose_served_commit(&repo_dir, &object_id).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn hydrate_complete_manifest_for_want(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        object_id: &CommitSha,
+    ) -> CoreResult<()> {
+        if self.want_ready_for_serving(repo_dir, object_id).await? {
+            return Ok(());
+        }
+        if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
+            if manifest.complete {
+                self.hydrate_commit_in_repo(repo_dir, &manifest).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn want_ready_for_serving(
+        &self,
+        repo_dir: &FsPath,
+        object_id: &CommitSha,
+    ) -> CoreResult<bool> {
+        if !self.object_exists(repo_dir, object_id).await {
+            return Ok(false);
+        }
+        if self.commit_exists(repo_dir, object_id).await {
+            return Ok(self.commit_ready_for_serving(repo_dir, object_id).await);
+        }
+        Ok(true)
     }
 
     async fn ensure_cached_public_wants_available(
