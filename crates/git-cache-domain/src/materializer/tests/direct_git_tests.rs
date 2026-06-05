@@ -327,6 +327,54 @@ async fn anonymous_direct_want_restores_public_refs_from_matching_manifest() {
 }
 
 #[tokio::test]
+async fn public_ref_manifest_restore_seeds_hidden_base_without_public_ref() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let cached = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let manifest = wait_for_commit_manifest(&state, &fixture.repo, &cached.commit).await;
+    wait_for_verified_generation(&state, &fixture.repo, manifest.generation).await;
+
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    stdfs::remove_dir_all(&repo_dir).unwrap();
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    let branch = BranchName::parse("main").unwrap();
+
+    assert_eq!(
+        materializer
+            .restore_upstream_ref_base_from_manifest(&fixture.repo, &repo_dir, &branch)
+            .await
+            .unwrap(),
+        Some(cached.commit.clone())
+    );
+    assert_eq!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
+            .await
+            .unwrap(),
+        cached.commit.to_string()
+    );
+    assert!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/heads/main")
+            .await
+            .is_err(),
+        "stale-base restore must not publish public serving refs"
+    );
+}
+
+#[tokio::test]
 async fn authenticated_direct_want_uses_local_cache_after_repo_authorization() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());

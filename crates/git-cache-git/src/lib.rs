@@ -165,6 +165,42 @@ impl Git {
             .collect()
     }
 
+    pub async fn for_each_ref(
+        &self,
+        repo_dir: &Path,
+        ref_prefix: &str,
+    ) -> Result<Vec<(String, CommitSha)>> {
+        reject_ref_arg(ref_prefix, "ref prefix")?;
+        let output = self
+            .run(
+                Some(repo_dir),
+                [
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "--",
+                    ref_prefix,
+                ],
+            )
+            .await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
+        })?;
+        let mut refs = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((ref_name, commit)) = line.split_once(' ') else {
+                return Err(GitCacheError::Validation(format!(
+                    "malformed git for-each-ref output line: {line:?}"
+                )));
+            };
+            refs.push((ref_name.to_string(), CommitSha::parse(commit)?));
+        }
+        Ok(refs)
+    }
+
     pub async fn for_each_ref_containing_commit(
         &self,
         repo_dir: &Path,
@@ -464,6 +500,12 @@ impl Git {
         reject_ref_arg(ref_name, "ref")?;
         reject_revision_arg(sha)?;
         self.run(Some(repo_dir), ["update-ref", "--", ref_name, sha])
+            .await
+    }
+
+    pub async fn delete_ref(&self, repo_dir: &Path, ref_name: &str) -> Result<GitOutput> {
+        reject_ref_arg(ref_name, "ref")?;
+        self.run(Some(repo_dir), ["update-ref", "-d", "--", ref_name])
             .await
     }
 
@@ -1420,6 +1462,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn for_each_ref_rejects_dash_ref_prefix() {
+        let git = test_git();
+        assert!(git
+            .for_each_ref(Path::new("/unused"), "-evil")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn for_each_ref_containing_commit_rejects_dash_ref_prefix() {
         let git = test_git();
         let commit = CommitSha::parse("a".repeat(40)).unwrap();
@@ -1436,6 +1487,12 @@ mod tests {
             .update_ref(Path::new("/unused"), "-evil", "abc123")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_ref_rejects_dash_ref_name() {
+        let git = test_git();
+        assert!(git.delete_ref(Path::new("/unused"), "-evil").await.is_err());
     }
 
     #[tokio::test]

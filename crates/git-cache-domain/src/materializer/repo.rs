@@ -74,6 +74,121 @@ impl Materializer {
         Ok(())
     }
 
+    pub(super) async fn restore_upstream_ref_base_from_manifest(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        branch: &BranchName,
+    ) -> CoreResult<Option<CommitSha>> {
+        let ref_name = branch.ref_name();
+        let Some(ref_manifest) = self.manifests().ref_manifest(repo, &ref_name).await? else {
+            return Ok(None);
+        };
+        Box::pin(self.restore_ref_manifest_in_repo(
+            repo,
+            repo_dir,
+            branch,
+            &ref_manifest,
+            false,
+            false,
+        ))
+        .await?;
+        Ok(Some(ref_manifest.commit))
+    }
+
+    pub(super) async fn restore_ref_manifest_in_repo(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        branch: &BranchName,
+        ref_manifest: &RefManifest,
+        publish_public_ref: bool,
+        set_public_head: bool,
+    ) -> CoreResult<()> {
+        let commit_manifest = self
+            .get_commit_manifest(repo, &ref_manifest.commit)
+            .await?
+            .filter(|manifest| manifest.complete)
+            .unwrap_or_else(|| CommitManifest {
+                repo: repo.clone(),
+                commit: ref_manifest.commit.clone(),
+                generation: ref_manifest.generation,
+                complete: true,
+                verified_at: ref_manifest.verified_at,
+            });
+
+        let _repo_lock = self.lock_repo(repo).await?;
+        let public_refs_before = self
+            .state
+            .git
+            .for_each_ref(repo_dir, "refs/heads")
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        Box::pin(self.hydrate_commit_in_repo(repo_dir, &commit_manifest)).await?;
+        if !self
+            .commit_ready_for_serving(repo_dir, &ref_manifest.commit)
+            .await
+        {
+            return Err(GitCacheError::NotFound(format!(
+                "ref manifest `{}` restored generation `{}` but commit `{}` is incomplete",
+                ref_manifest.ref_name, ref_manifest.generation, ref_manifest.commit
+            )));
+        }
+
+        if self
+            .get_commit_manifest(repo, &ref_manifest.commit)
+            .await?
+            .is_none()
+        {
+            self.manifests().write_commit(&commit_manifest).await?;
+        }
+
+        for (ref_name, commit) in self.state.git.for_each_ref(repo_dir, "refs/heads").await? {
+            match public_refs_before.get(&ref_name) {
+                Some(previous) if previous != &commit => {
+                    self.state
+                        .git
+                        .update_ref(repo_dir, &ref_name, previous.as_str())
+                        .await?;
+                }
+                Some(_) => {}
+                None => {
+                    self.state.git.delete_ref(repo_dir, &ref_name).await?;
+                }
+            }
+        }
+
+        self.state
+            .git
+            .update_ref(
+                repo_dir,
+                &format!("refs/cache/upstream/heads/{branch}"),
+                ref_manifest.commit.as_str(),
+            )
+            .await?;
+
+        if publish_public_ref {
+            self.state
+                .git
+                .update_ref(
+                    repo_dir,
+                    &ref_manifest.ref_name,
+                    ref_manifest.commit.as_str(),
+                )
+                .await?;
+
+            if set_public_head {
+                self.state
+                    .git
+                    .symbolic_ref(repo_dir, "HEAD", &ref_manifest.ref_name)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub(super) async fn resolve_short_commit(
         &self,
         repo_dir: &FsPath,

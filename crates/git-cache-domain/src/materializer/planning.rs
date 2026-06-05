@@ -94,23 +94,21 @@ impl Materializer {
         &self,
         request: MaterializeRequest,
     ) -> CoreResult<MaterializeResponse> {
-        let plan = self.plan_materialize(request).await?;
-        self.materialize_plan(plan).await
+        let plan = Box::pin(self.plan_materialize(request)).await?;
+        Box::pin(self.materialize_plan(plan)).await
     }
 
     pub async fn materialize_after_upstream_validation(
         &self,
         request: MaterializeRequest,
     ) -> CoreResult<MaterializeResponse> {
-        let plan = self
-            .plan_materialize_after_upstream_validation(request)
-            .await?;
-        self.materialize_plan(plan).await
+        let plan = Box::pin(self.plan_materialize_after_upstream_validation(request)).await?;
+        Box::pin(self.materialize_plan(plan)).await
     }
 
     pub async fn resolve(&self, request: MaterializeRequest) -> CoreResult<ResolveResponse> {
-        let plan = self.plan_resolve(request).await?;
-        self.resolve_plan(plan).await
+        let plan = Box::pin(self.plan_resolve(request)).await?;
+        Box::pin(self.resolve_plan(plan)).await
     }
 
     async fn plan_materialize(&self, request: MaterializeRequest) -> CoreResult<MaterializePlan> {
@@ -809,6 +807,48 @@ impl Materializer {
                     }
                 }
                 return Ok(upstream_commit.clone());
+            }
+        }
+
+        if !self.upstream_auth.is_authenticated() {
+            if let Some(restored_commit) =
+                Box::pin(self.restore_upstream_ref_base_from_manifest(repo, &repo_dir, branch))
+                    .await?
+            {
+                debug!(
+                    %repo,
+                    %branch,
+                    %restored_commit,
+                    upstream_commit = %upstream_commit,
+                    "restored public ref manifest before branch fetch"
+                );
+
+                if restored_commit == *upstream_commit
+                    && self
+                        .commit_ready_for_serving(&repo_dir, upstream_commit)
+                        .await
+                {
+                    let _repo_lock = self.lock_repo(repo).await?;
+                    self.state
+                        .git
+                        .update_ref(&repo_dir, &local_ref, upstream_commit.as_str())
+                        .await?;
+                    self.state
+                        .git
+                        .update_ref(
+                            &repo_dir,
+                            &format!("refs/heads/{branch}"),
+                            upstream_commit.as_str(),
+                        )
+                        .await?;
+                    if default_branch {
+                        self.state
+                            .git
+                            .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{branch}"))
+                            .await?;
+                    }
+                    return Ok(upstream_commit.clone());
+                }
             }
         }
 

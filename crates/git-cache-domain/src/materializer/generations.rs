@@ -403,8 +403,7 @@ impl Materializer {
             .map_err(|_| {
                 GitCacheError::Internal("generation verification semaphore closed".into())
             })?;
-        self.verify_generation_inner(repo.clone(), generation)
-            .await?;
+        Box::pin(self.verify_generation_inner(repo.clone(), generation)).await?;
         drop(permit);
 
         if inline_compaction && self.state.config.compaction.inline {
@@ -593,8 +592,7 @@ impl Materializer {
         repo: &RepoKey,
     ) -> CoreResult<Option<CompactionReport>> {
         let threshold = self.state.config.compaction.chain_depth_threshold as usize;
-        self.compact_generation_chain_inner(repo, threshold, false)
-            .await
+        Box::pin(self.compact_generation_chain_inner(repo, threshold, false)).await
     }
 
     pub async fn compact_generation_chain_dry_run(
@@ -602,8 +600,7 @@ impl Materializer {
         repo: &RepoKey,
     ) -> CoreResult<Option<CompactionReport>> {
         let threshold = self.state.config.compaction.chain_depth_threshold as usize;
-        self.compact_generation_chain_inner(repo, threshold, true)
-            .await
+        Box::pin(self.compact_generation_chain_inner(repo, threshold, true)).await
     }
 
     pub(super) async fn compact_generation_chain_inner(
@@ -639,10 +636,9 @@ impl Materializer {
 
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
-        self.verify_generation_with_semaphore(repo.clone(), head.generation, false)
+        Box::pin(self.verify_generation_with_semaphore(repo.clone(), head.generation, false))
             .await?;
-        self.hydrate_generation(repo, &repo_dir, head.generation)
-            .await?;
+        Box::pin(self.hydrate_generation(repo, &repo_dir, head.generation)).await?;
         let reservation = self.state.disk.reserve(1024 * 1024 * 64).await?;
         let temp_path = reservation.temp_path()?;
         fs::create_dir_all(&temp_path).await?;
@@ -672,7 +668,7 @@ impl Materializer {
         GenerationPublish::new(generation_manifest.clone())
             .publish_pending_bundle_file(&*self.state.store, &bundle_path, new_head.clone(), None)
             .await?;
-        self.verify_generation_with_semaphore(repo.clone(), new_generation, false)
+        Box::pin(self.verify_generation_with_semaphore(repo.clone(), new_generation, false))
             .await?;
 
         self.repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)

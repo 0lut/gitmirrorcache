@@ -699,14 +699,22 @@ to close. The auth branch therefore needs a bridge that restores serving proof
 without treating raw object presence as authorization.
 
 Anonymous direct Git POST now checks persisted public ref manifests before it
-fetches an advertised tip from upstream. A ref manifest is only used when its
-`refs/heads/<branch> -> commit` mapping exactly matches the current upstream
-advertisement for this request. In that case the materializer hydrates the
-verified generation if needed, restores both `refs/cache/upstream/heads/<branch>`
-and public `refs/heads/<branch>`, updates `HEAD` for the advertised default
-branch, and then continues through the normal local public-reachability path.
+fetches an advertised tip from upstream. A ref manifest can publish public
+serving refs only when its `refs/heads/<branch> -> commit` mapping exactly
+matches the current upstream advertisement for this request. In that case the
+materializer hydrates the verified generation if needed, restores both
+`refs/cache/upstream/heads/<branch>` and public `refs/heads/<branch>`, updates
+`HEAD` for the advertised default branch, and then continues through the normal
+local public-reachability path.
+
+Stale public ref manifests are still useful, but only as hidden fetch
+negotiation bases. Before materialize/direct-Git fetches a newer advertised
+branch tip, it may hydrate the last verified generation for that branch and
+restore only `refs/cache/upstream/heads/<branch>`. It does not restore public
+`refs/heads/<branch>` for stale manifests, because stale refs must not become
+anonymous serving proof.
 
 This deliberately is not a visibility cache. If GitHub/GitLab/Bitbucket now
-advertises a different tip, the manifest is stale for this request and the path
-falls back to upstream proof/fetch. The restored refs only recover the hot path
-for commits whose public ref mapping is still current.
+advertises a different tip, the manifest is stale for this request and can only
+help Git negotiate a smaller fetch. Public serving refs are restored only for
+commits whose public ref mapping is still current.

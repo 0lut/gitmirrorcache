@@ -39,9 +39,8 @@ impl Materializer {
             return Ok(());
         }
 
-        let repo_dir = self.ensure_repo_dir(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
         let upstream_url = self.upstream_url(repo)?;
+        let repo_dir = self.ensure_repo_dir(repo).await?;
 
         // Validate all branch names and SHAs from network before passing to git.
         let mut validated: Vec<(BranchName, CommitSha)> = Vec::new();
@@ -51,11 +50,28 @@ impl Materializer {
             validated.push((branch_name, commit));
         }
 
+        if !self.upstream_auth.is_authenticated() {
+            for (branch, _) in &validated {
+                if let Some(commit) =
+                    Box::pin(self.restore_upstream_ref_base_from_manifest(repo, &repo_dir, branch))
+                        .await?
+                {
+                    debug!(
+                        %repo,
+                        %branch,
+                        %commit,
+                        "restored public ref manifest as hidden fetch negotiation base"
+                    );
+                }
+            }
+        }
+
         let refspecs: Vec<String> = validated
             .iter()
             .map(|(branch, _)| format!("+refs/heads/{branch}:refs/cache/upstream/heads/{branch}"))
             .collect();
 
+        let _repo_lock = self.lock_repo(repo).await?;
         self.upstream_git(&upstream_url)?
             .fetch_refs(&repo_dir, &upstream_url, &refspecs)
             .await?;
@@ -551,51 +567,15 @@ impl Materializer {
             // the current upstream advertisement, then restore local refs so
             // future anonymous wants can prove reachability without trusting
             // raw object presence.
-            let commit_manifest = self
-                .get_commit_manifest(repo, object_id)
-                .await?
-                .filter(|manifest| manifest.complete)
-                .unwrap_or_else(|| CommitManifest {
-                    repo: repo.clone(),
-                    commit: object_id.clone(),
-                    generation: ref_manifest.generation,
-                    complete: true,
-                    verified_at: ref_manifest.verified_at,
-                });
-
-            let _repo_lock = self.lock_repo(repo).await?;
-            self.hydrate_commit_in_repo(repo_dir, &commit_manifest)
-                .await?;
-            if !self.commit_ready_for_serving(repo_dir, object_id).await {
-                return Err(GitCacheError::NotFound(format!(
-                    "ref manifest `{ref_name}` restored generation `{}` but commit `{object_id}` is incomplete",
-                    ref_manifest.generation
-                )));
-            }
-
-            if self.get_commit_manifest(repo, object_id).await?.is_none() {
-                self.manifests().write_commit(&commit_manifest).await?;
-            }
-
-            self.state
-                .git
-                .update_ref(
-                    repo_dir,
-                    &format!("refs/cache/upstream/heads/{branch}"),
-                    object_id.as_str(),
-                )
-                .await?;
-            self.state
-                .git
-                .update_ref(repo_dir, &ref_name, object_id.as_str())
-                .await?;
-
-            if comparison.default_branch.as_deref() == Some(branch.as_str()) {
-                self.state
-                    .git
-                    .symbolic_ref(repo_dir, "HEAD", &ref_name)
-                    .await?;
-            }
+            Box::pin(self.restore_ref_manifest_in_repo(
+                repo,
+                repo_dir,
+                &branch,
+                &ref_manifest,
+                true,
+                comparison.default_branch.as_deref() == Some(branch.as_str()),
+            ))
+            .await?;
             restored = true;
         }
 
