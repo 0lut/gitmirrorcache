@@ -4,9 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
-use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
-};
+use git_cache_core::{AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult};
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
@@ -14,7 +12,10 @@ use git_cache_domain::{
     MaterializerExecutor,
 };
 use git_cache_git::UploadPackProcess;
-use git_cache_worker::{ObjectStoreRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
+use git_cache_worker::{
+    LeaseAcquire, ObjectStoreRepoLeaseManager, RepoLeaseManager, UpdateCoordinator,
+    UpdateDisposition,
+};
 use http::{header, Method, StatusCode, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -74,6 +75,7 @@ fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> 
 struct ApiState {
     domain: Arc<AppState>,
     coordinator: UpdateCoordinator,
+    leases: Arc<dyn RepoLeaseManager>,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -93,15 +95,16 @@ impl ApiState {
 
     fn with_domain(rate_limiter: RateLimiter, domain: Arc<AppState>) -> CoreResult<Self> {
         let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
-        let leases = Arc::new(ObjectStoreRepoLeaseManager::new(
+        let leases: Arc<dyn RepoLeaseManager> = Arc::new(ObjectStoreRepoLeaseManager::new(
             Arc::clone(&domain.store),
             &domain.config.leases,
         ));
-        let coordinator = UpdateCoordinator::new(executor, leases);
+        let coordinator = UpdateCoordinator::new(executor, Arc::clone(&leases));
         Materializer::new(Arc::clone(&domain)).enqueue_pending_generation_scan();
         Ok(Self {
             domain,
             coordinator,
+            leases,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
         })
@@ -178,50 +181,39 @@ async fn handle_materialize_request(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
-    let use_coordinator = true;
-
-    let verified_by_coordinator = if use_coordinator {
-        let outcome = state
-            .coordinator
-            .read_through(request.repo.clone(), request.selector.clone())
-            .await;
-        match outcome {
-            Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
-                let retry_after = state.domain.config.leases.busy_retry_after_seconds;
-                return Ok(Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header(header::RETRY_AFTER, retry_after.to_string())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::to_string(&serde_json::json!({
-                            "error": "update in progress, retry later"
-                        }))
-                        .expect("json serialization"),
-                    ))
-                    .expect("lease busy response"));
-            }
-            Err(error) => {
-                state
-                    .metrics
-                    .materialize_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(error.into());
-            }
-            Ok(_) => {}
+    let outcome = state
+        .coordinator
+        .read_through(request.repo.clone(), request.selector.clone())
+        .await;
+    match outcome {
+        Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
+            let retry_after = state.domain.config.leases.busy_retry_after_seconds;
+            return Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::RETRY_AFTER, retry_after.to_string())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "error": "update in progress, retry later"
+                    }))
+                    .expect("json serialization"),
+                ))
+                .expect("lease busy response"));
         }
-        true
-    } else {
-        false
-    };
+        Err(error) => {
+            state
+                .metrics
+                .materialize_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(error.into());
+        }
+        Ok(_) => {}
+    }
 
     let materializer = Materializer::new(Arc::clone(&state.domain));
-    let result = if verified_by_coordinator {
-        materializer
-            .materialize_after_upstream_validation(request)
-            .await
-    } else {
-        materializer.materialize(request).await
-    };
+    let result = materializer
+        .materialize_after_upstream_validation(request)
+        .await;
 
     match result {
         Ok(response) => Ok(Json(response).into_response()),
@@ -381,15 +373,13 @@ async fn git_repo(
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
 
-        // Acquire the repo-write lease before processing unknown-want
-        // fetches so that any publish_generation calls inside
-        // ensure_wants_available run under durable coordination.
-        let outcome = state
-            .coordinator
-            .read_through(repo.clone(), Selector::DefaultBranch)
-            .await;
-        match outcome {
-            Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
+        // Hold the repo-write lease while processing unknown wants. This keeps
+        // ensure_wants_available() and any publish_generation() it triggers under
+        // durable coordination, and passes the fencing token into Materializer so
+        // publish writes can verify ownership immediately before mutation.
+        let lease = match state.leases.acquire(&repo).await {
+            Ok(LeaseAcquire::Acquired(lease)) => lease,
+            Ok(LeaseAcquire::Busy) => {
                 let retry_after = state.domain.config.leases.busy_retry_after_seconds;
                 return Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -398,15 +388,21 @@ async fn git_repo(
                     .body(Body::from(r#"{"error":"update in progress, retry later"}"#))
                     .expect("lease busy response");
             }
-            Err(error) => {
-                warn!(%repo, ?error, "coordinator pre-fetch for upload-pack failed; proceeding without lease");
-            }
-            Ok(_) => {}
-        }
+            Err(error) => return ApiError::from(error).into_response(),
+        };
+        let token = lease.token().to_string();
+        let leased_materializer = Materializer::with_lease_token(Arc::clone(&state.domain), token);
+        let process_result = leased_materializer.handle_upload_pack(&repo, &body).await;
+        let release_result = lease.release().await;
 
-        match materializer.handle_upload_pack(&repo, &body).await {
-            Ok(process) => stream_upload_pack_response(&state, process),
-            Err(error) => ApiError::from(error).into_response(),
+        match (process_result, release_result) {
+            (Ok(process), Ok(())) => stream_upload_pack_response(&state, process),
+            (Err(error), Ok(())) => ApiError::from(error).into_response(),
+            (Ok(_), Err(error)) => ApiError::from(error).into_response(),
+            (Err(error), Err(release_error)) => {
+                warn!(%repo, %release_error, "failed to release repo lease after upload-pack error");
+                ApiError::from(error).into_response()
+            }
         }
     } else {
         ApiError::from(GitCacheError::Unsupported(format!(

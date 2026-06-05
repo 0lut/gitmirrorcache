@@ -24,21 +24,16 @@
 
 ### Tradeoffs / follow-ups
 
-1. The first implementation keeps the existing asynchronous verification model.
-   That is less strict than holding `repo-write` through verification, but
-   monotonic head CAS prevents stale/sibling head overwrites. Fully serializing
-   publish through verification remains a follow-up if contention proves
-   problematic.
-2. Direct `/git/...` read-through still needs deeper integration with the durable
-   lease manager for unknown wants. The shared object-store CAS and production
-   `repo-write` manager are in place first so the direct path can reuse them
-   without inventing a second coordination primitive.
-3. Existing compaction still has explicit call sites that mutate manifests. The
-   durable lease/CAS primitives are available, but compaction fencing is only
-   partially wired in this pass and should be completed before enabling
-   aggressive GC/deletion in production.
-
-
+1. The implementation keeps asynchronous background verification for already
+   published pending generations. Verification no longer uses wall-clock
+   timestamps as conflict winners, and stale head advances lose CAS rather than
+   replacing newer durable state.
+2. Direct `/git/...` unknown-want read-through now holds the durable
+   `repo-write` lease while `ensure_wants_available()` runs and passes the lease
+   token into the materializer. This keeps fetch/publish under the same fencing
+   path as `/v1/materialize`.
+3. Compaction now checks the generation-head CAS result before cleanup and aborts
+   deletion/repointing when another worker wins the head race.
 
 ### Hardening pass (review feedback)
 
@@ -83,17 +78,19 @@
    `Commit`/`ShortCommit` bypassed coordination entirely. Now all selectors
    acquire the repo-write lease before materializing.
 
-9. **Direct `/git/` upload-pack pre-acquires repo-write lease.** The
+9. **Direct `/git/` upload-pack holds repo-write lease.** The
    `handle_upload_pack` → `ensure_wants_available` path can fetch and publish
-   generations. It now acquires the repo-write lease via the coordinator before
-   processing, so any `publish_generation` calls run under durable coordination.
+   generations. The API now acquires and holds the durable repo-write lease
+   while processing upload-pack wants and constructs the materializer with that
+   lease token, so any `publish_generation` calls verify ownership before
+   mutating shared state.
 
 10. **Lease token threaded through materializer.** `UpdateRequest` now carries
     an optional `lease_token` set by `execute_with_lease`. `Materializer` stores
     the token and calls `verify_lease_held()` before publishing shared state.
     `RepoLease` trait exposes `token()` to surface the fencing token.
 
-------
+---
 
 # Implementation Notes: Read-Through Git Remote
 
