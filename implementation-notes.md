@@ -524,8 +524,11 @@ Out-of-order background verifiers now first check whether the current
 `generation-head.json` already descends from the pending generation. Pending
 publish metadata records the head observed at publish time (`expected_head`) so
 verification CASes only from that expected head or a safe compaction replacement
-that preserves the same tips. If a newer descendant is already head, the older
-verifier skips public ref publication and leaves the newer head/ref state intact.
+that preserves the same tips. Leased verifiers re-check `repo-write` ownership
+immediately before advancing `generation-head.json`, and branch/default refs are
+attempted whenever the accepted head contains the pending generation. Ref writes
+remain monotonic, so stale manifests are skipped by the helper rather than by
+omitting all refs for an older pending verifier.
 
 ### T10. Lease fencing checks released and expired manifests
 
@@ -553,13 +556,24 @@ instead of resolving the abbreviation again after lease release.
 
 ### T13. Local object locks are not reclaimed by age alone
 
-Local object-store lock recovery no longer deletes a lock just because it is
-old. A waiter only removes a lock when the recorded owner PID is proven dead,
-avoiding concurrent critical sections during valid long-running bundle writes.
+Local object-store lock recovery no longer deletes PID-owned locks just because
+they are old. A waiter removes a PID-owned lock only when the recorded owner PID
+is proven dead, avoiding concurrent critical sections during valid long-running
+bundle writes. PID-less locks from a crash before metadata write are reclaimed
+only after a conservative stale threshold using `created_at_unix_ms` or file
+mtime.
 
 ### T14. Direct Git lease exhaustion is retryable
 
 If `/git/.../git-upload-pack` exhausts its internal repo-write wait, it now
 returns the same retryable `LeaseBusy` class as materialize rather than a
-generic conflict. Generic `LeaseBusy` API errors include `Retry-After` so Git
-clients/callers receive a retryable 503 signal.
+generic conflict. Direct Git and materialize `LeaseBusy` API responses use the
+configured `leases.busy_retry_after_seconds` value for `Retry-After`.
+
+### T15. Compaction preserves pending expected heads
+
+Pending generation publishes can depend on both the bundle parent chain and the
+`expected_head` recorded when the worker observed the repo. Compaction retention
+now walks both seeds before deleting old generation manifests, which keeps
+force-push/full-bundle pending publishes verifiable after compaction replaces the
+visible head.

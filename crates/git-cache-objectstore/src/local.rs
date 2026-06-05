@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 
 const LOCAL_LOCK_RETRY_COUNT: usize = 200;
 const LOCAL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const LOCAL_PIDLESS_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct LocalObjectStore {
@@ -157,8 +158,20 @@ impl LocalObjectStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(err.into()),
         };
-        if lock_owner_pid(&contents).is_none_or(process_is_alive) {
-            return Ok(());
+        match lock_owner_pid(&contents) {
+            Some(pid) if process_is_alive(pid) => return Ok(()),
+            Some(_) => {}
+            None => {
+                let created_at_ms = lock_created_at_unix_millis(&contents)
+                    .or_else(|| lock_file_modified_unix_millis(lock_path).ok().flatten());
+                let Some(created_at_ms) = created_at_ms else {
+                    return Ok(());
+                };
+                let age_ms = now_unix_millis().saturating_sub(created_at_ms);
+                if age_ms < LOCAL_PIDLESS_LOCK_STALE_AFTER.as_millis() {
+                    return Ok(());
+                }
+            }
         }
         match fs::remove_file(lock_path).await {
             Ok(()) => {}
@@ -461,6 +474,22 @@ fn lock_owner_pid(contents: &str) -> Option<u32> {
     })
 }
 
+fn lock_created_at_unix_millis(contents: &str) -> Option<u128> {
+    contents.lines().find_map(|line| {
+        line.strip_prefix("created_at_unix_ms=")
+            .and_then(|timestamp| timestamp.trim().parse().ok())
+    })
+}
+
+fn lock_file_modified_unix_millis(path: &Path) -> Result<Option<u128>> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis()))
+}
+
 fn process_is_alive(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
@@ -520,4 +549,47 @@ async fn write_temp_file(parent: &Path, final_path: &Path, value: Bytes) -> Resu
 fn sync_directory(path: &Path) -> Result<()> {
     std::fs::File::open(path)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn pidless_lock_is_kept_until_stale_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        let lock_path = store.lock_path("repos/example/object").unwrap();
+        fs::create_dir_all(lock_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(
+            &lock_path,
+            format!("created_at_unix_ms={}\n", now_unix_millis()),
+        )
+        .await
+        .unwrap();
+
+        store.recover_stale_lock(&lock_path).await.unwrap();
+
+        assert!(fs::try_exists(&lock_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_pidless_lock_is_reclaimed() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        let lock_path = store.lock_path("repos/example/object").unwrap();
+        fs::create_dir_all(lock_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&lock_path, "created_at_unix_ms=1\n")
+            .await
+            .unwrap();
+
+        store.recover_stale_lock(&lock_path).await.unwrap();
+
+        assert!(!fs::try_exists(&lock_path).await.unwrap());
+    }
 }

@@ -1081,10 +1081,8 @@ impl Materializer {
             .expected_head
             .or(pending.generation.parent_generation);
         let mut head_accepts_pending = false;
-        let mut publish_public_refs = false;
         if current_gen == Some(pending.head.generation) {
             head_accepts_pending = true;
-            publish_public_refs = true;
         } else if let Some(head) = &current_head {
             if self
                 .generation_chain_contains(&repo, head.generation, pending.head.generation)
@@ -1093,19 +1091,27 @@ impl Materializer {
                 head_accepts_pending = true;
                 debug!(%repo, %generation, "head already includes verified generation");
             } else if self
-                .head_can_accept_pending_generation(&repo, head, expected_parent, &pending.head)
+                .head_can_accept_pending_generation(
+                    &repo,
+                    head,
+                    expected_parent,
+                    &pending.generation,
+                    &pending.head,
+                )
                 .await?
-                && advance_generation_head(&*self.state.store, current_gen, None, &pending.head)
-                    .await?
             {
-                head_accepts_pending = true;
-                publish_public_refs = true;
+                self.verify_lease_held(&repo).await?;
+                if advance_generation_head(&*self.state.store, current_gen, None, &pending.head)
+                    .await?
+                {
+                    head_accepts_pending = true;
+                }
             }
-        } else if expected_parent.is_none()
-            && advance_generation_head(&*self.state.store, None, None, &pending.head).await?
-        {
-            head_accepts_pending = true;
-            publish_public_refs = true;
+        } else if expected_parent.is_none() {
+            self.verify_lease_held(&repo).await?;
+            if advance_generation_head(&*self.state.store, None, None, &pending.head).await? {
+                head_accepts_pending = true;
+            }
         }
 
         if !head_accepts_pending {
@@ -1127,7 +1133,7 @@ impl Materializer {
             }
         }
 
-        if publish_public_refs {
+        if head_accepts_pending && (!ref_manifests.is_empty() || pending.default_ref.is_some()) {
             self.verify_lease_held(&repo).await?;
             for manifest in &ref_manifests {
                 self.write_ref_manifest_monotonic(manifest).await?;
@@ -1136,8 +1142,6 @@ impl Materializer {
                 self.write_ref_manifest_monotonic(&default_ref).await?;
                 self.write_default_ref_manifest(&default_ref).await?;
             }
-        } else if !ref_manifests.is_empty() || pending.default_ref.is_some() {
-            debug!(%repo, %generation, "skipping public ref publication for generation already behind head");
         }
 
         if let Err(err) = self
@@ -1183,6 +1187,7 @@ impl Materializer {
         repo: &RepoKey,
         current_head: &RepoGenerationHead,
         expected_parent: Option<GenerationId>,
+        pending_generation: &GenerationManifest,
         pending_head: &RepoGenerationHead,
     ) -> CoreResult<bool> {
         if Some(current_head.generation) == expected_parent {
@@ -1191,6 +1196,11 @@ impl Materializer {
         let Some(expected_parent) = expected_parent else {
             return Ok(false);
         };
+        if pending_generation.parent_generation.is_none() {
+            return self
+                .generation_chain_contains_commits(repo, expected_parent, &current_head.tip_commits)
+                .await;
+        }
         let pending_tips = pending_head.tip_commits.iter().collect::<HashSet<_>>();
         if !current_head
             .tip_commits
@@ -1201,6 +1211,19 @@ impl Materializer {
         }
         self.generation_contains_generation_commits(repo, current_head.generation, expected_parent)
             .await
+    }
+
+    async fn generation_chain_contains_commits(
+        &self,
+        repo: &RepoKey,
+        generation: GenerationId,
+        commits: &[CommitSha],
+    ) -> CoreResult<bool> {
+        let chain = self.generation_chain(repo, generation).await?;
+        let chain_commits = commits_from_chain(chain.iter())
+            .into_iter()
+            .collect::<HashSet<_>>();
+        Ok(commits.iter().all(|commit| chain_commits.contains(commit)))
     }
 
     async fn generation_contains_generation_commits(
@@ -1638,23 +1661,30 @@ impl Materializer {
             };
 
             let mut seen = HashSet::new();
-            let mut next = pending.generation.parent_generation;
-            while let Some(current) = next {
-                if !seen.insert(current) {
-                    return Err(GitCacheError::Conflict(format!(
-                        "pending generation chain for `{repo}` contains a cycle at `{current}`"
-                    )));
-                }
-                if old_generations.contains(&current) {
-                    needed.insert(current);
-                }
-                let Some(manifest) = self.get_generation_manifest(repo, current).await? else {
-                    if old_generations.contains(&current) {
-                        warn!(%repo, generation = %current, pending_generation = %generation, "pending generation references missing old generation manifest");
+            let mut next_generations =
+                [pending.expected_head, pending.generation.parent_generation];
+            for next in &mut next_generations {
+                let mut chain_seen = HashSet::new();
+                while let Some(current) = *next {
+                    if !chain_seen.insert(current) {
+                        return Err(GitCacheError::Conflict(format!(
+                            "pending generation chain for `{repo}` contains a cycle at `{current}`"
+                        )));
                     }
-                    break;
-                };
-                next = manifest.parent_generation;
+                    if !seen.insert(current) {
+                        break;
+                    }
+                    if old_generations.contains(&current) {
+                        needed.insert(current);
+                    }
+                    let Some(manifest) = self.get_generation_manifest(repo, current).await? else {
+                        if old_generations.contains(&current) {
+                            warn!(%repo, generation = %current, pending_generation = %generation, "pending generation references missing old generation manifest");
+                        }
+                        break;
+                    };
+                    *next = manifest.parent_generation;
+                }
             }
         }
 
@@ -3879,6 +3909,124 @@ mod tests {
             .verify_generation_with_semaphore(fixture.repo.clone(), child_generation, false)
             .await
             .expect("pending generation should verify after parent chain compaction");
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_expected_head_for_pending_full_bundle_verification() {
+        let fixture = GitFixture::new();
+        let config = AppConfig {
+            compaction: git_cache_core::CompactionConfig {
+                chain_depth_threshold: 1,
+                inline: false,
+            },
+            ..fixture.state_config()
+        };
+        let state = Arc::new(AppState::try_new(config).unwrap());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
+
+        let second_commit = fixture.commit_and_push("second");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                mode: RequestMode::Strict,
+            })
+            .await
+            .unwrap();
+        let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second_commit).await;
+        let parent_head =
+            wait_for_generation_head(&state, &fixture.repo, second_manifest.generation).await;
+
+        let replacement_commit = fixture.replace_history_and_push("replacement");
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        run_git(
+            &repo_dir,
+            [
+                "fetch",
+                "--no-tags",
+                fixture.upstream_path().to_str().unwrap(),
+                "+refs/heads/main:refs/cache/upstream/heads/main",
+            ],
+        );
+
+        let replacement_generation = GenerationId::new();
+        let reservation = state.disk.reserve(1024 * 1024 * 64).await.unwrap();
+        let temp_path = reservation.temp_path().unwrap();
+        fs::create_dir_all(&temp_path).await.unwrap();
+        let bundle_path = temp_path.join("pending-replacement.bundle");
+        state
+            .git
+            .bundle_create_all(&repo_dir, &bundle_path)
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let replacement_manifest = GenerationManifest {
+            repo: fixture.repo.clone(),
+            generation: replacement_generation,
+            bundle_key: bundle_key(&fixture.repo, replacement_generation),
+            parent_generation: None,
+            created_at: now,
+            commits: vec![replacement_commit.clone()],
+        };
+        let replacement_head = RepoGenerationHead {
+            repo: fixture.repo.clone(),
+            generation: replacement_generation,
+            tip_commits: vec![replacement_commit.clone()],
+            updated_at: now,
+        };
+        let replacement_manifests = PublishManifests {
+            commits: vec![CommitManifest {
+                repo: fixture.repo.clone(),
+                commit: replacement_commit,
+                generation: replacement_generation,
+                complete: true,
+                verified_at: now,
+            }],
+            refs: Vec::new(),
+            sessions: Vec::new(),
+        };
+        GenerationPublish::with_manifests(replacement_manifest, replacement_manifests)
+            .publish_pending_bundle_file(
+                &*state.store,
+                &bundle_path,
+                replacement_head,
+                Some(parent_head.generation),
+                None,
+            )
+            .await
+            .unwrap();
+        reservation.release().await.unwrap();
+
+        let report = materializer
+            .compact_generation_chain(&fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.old_generations.contains(&parent_head.generation));
+        assert!(
+            read_generation_manifest(&*state.store, &fixture.repo, parent_head.generation)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        materializer
+            .verify_generation_with_semaphore(fixture.repo.clone(), replacement_generation, false)
+            .await
+            .expect("pending full bundle should verify after expected-head compaction");
+        let _ = wait_for_generation_head(&state, &fixture.repo, replacement_generation).await;
     }
 
     // ── upstream_url tests ───────────────────────────────────────────

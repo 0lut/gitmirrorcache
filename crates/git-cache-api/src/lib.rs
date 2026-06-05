@@ -278,7 +278,10 @@ async fn handle_materialize_request(
                 .metrics
                 .materialize_errors_total
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(error.into());
+            return Err(ApiError::from_error(
+                error,
+                Some(state.domain.config.leases.busy_retry_after_seconds),
+            ));
         }
         Ok(o) => o.resolved_commit,
     };
@@ -431,7 +434,13 @@ async fn git_repo(
         // client actually issues an upload-pack POST.
         let comparison = match materializer.upstream_refs(&repo).await {
             Ok(c) => c,
-            Err(error) => return ApiError::from(error).into_response(),
+            Err(error) => {
+                return ApiError::from_error(
+                    error,
+                    Some(state.domain.config.leases.busy_retry_after_seconds),
+                )
+                .into_response()
+            }
         };
 
         let output = synthesize_ref_advertisement(&comparison);
@@ -454,7 +463,13 @@ async fn git_repo(
 
         let lease = match acquire_repo_write_lease_for_git_client(&state, &repo).await {
             Ok(lease) => lease,
-            Err(error) => return ApiError::from(error).into_response(),
+            Err(error) => {
+                return ApiError::from_error(
+                    error,
+                    Some(state.domain.config.leases.busy_retry_after_seconds),
+                )
+                .into_response()
+            }
         };
         let token = lease.token().to_string();
         let leased_materializer = Materializer::with_lease_token(Arc::clone(&state.domain), token);
@@ -582,6 +597,12 @@ struct ApiError {
 
 impl From<GitCacheError> for ApiError {
     fn from(error: GitCacheError) -> Self {
+        Self::from_error(error, None)
+    }
+}
+
+impl ApiError {
+    fn from_error(error: GitCacheError, lease_busy_retry_after: Option<u64>) -> Self {
         let status = match error {
             GitCacheError::NotFound(_) => StatusCode::NOT_FOUND,
             GitCacheError::UpstreamUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -603,7 +624,7 @@ impl From<GitCacheError> for ApiError {
         };
 
         let retry_after = match error {
-            GitCacheError::LeaseBusy(_) => Some(1),
+            GitCacheError::LeaseBusy(_) => Some(lease_busy_retry_after.unwrap_or(1)),
             _ => None,
         };
 
@@ -713,6 +734,14 @@ mod tests {
         assert!(limiter.check());
         assert!(limiter.check());
         assert!(!limiter.check());
+    }
+
+    #[test]
+    fn lease_busy_error_uses_configured_retry_after() {
+        let error = ApiError::from_error(GitCacheError::LeaseBusy("busy".into()), Some(7));
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(7));
     }
 
     #[tokio::test]
