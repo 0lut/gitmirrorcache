@@ -1,4 +1,4 @@
-use super::generations::{pending_generation_from_key, push_unique_commit};
+use super::generations::{bundle_key, pending_generation_from_key, push_unique_commit};
 use super::sessions::new_session_token;
 use super::*;
 #[cfg(feature = "s3-tests")]

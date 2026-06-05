@@ -105,10 +105,12 @@ impl Materializer {
         publish_public_ref: bool,
         set_public_head: bool,
     ) -> CoreResult<()> {
-        let commit_manifest = self
+        let existing_commit_manifest = self
             .get_commit_manifest(repo, &ref_manifest.commit)
             .await?
-            .filter(|manifest| manifest.complete)
+            .filter(|manifest| manifest.complete);
+        let commit_manifest = existing_commit_manifest
+            .clone()
             .unwrap_or_else(|| CommitManifest {
                 repo: repo.clone(),
                 commit: ref_manifest.commit.clone(),
@@ -116,6 +118,28 @@ impl Materializer {
                 complete: true,
                 verified_at: ref_manifest.verified_at,
             });
+
+        // A matching ref manifest is the durable public proof; if the commit
+        // is already complete locally, do not hydrate the generation bundle
+        // again on hot anonymous direct-Git paths.
+        if self
+            .commit_ready_for_serving(repo_dir, &ref_manifest.commit)
+            .await
+        {
+            if existing_commit_manifest.is_none() {
+                self.manifests().write_commit(&commit_manifest).await?;
+            }
+            let _repo_lock = self.lock_repo(repo).await?;
+            self.apply_restored_ref_manifest_refs(
+                repo_dir,
+                branch,
+                ref_manifest,
+                publish_public_ref,
+                set_public_head,
+            )
+            .await?;
+            return Ok(());
+        }
 
         let _repo_lock = self.lock_repo(repo).await?;
         let public_refs_before = self
@@ -136,11 +160,7 @@ impl Materializer {
             )));
         }
 
-        if self
-            .get_commit_manifest(repo, &ref_manifest.commit)
-            .await?
-            .is_none()
-        {
+        if existing_commit_manifest.is_none() {
             self.manifests().write_commit(&commit_manifest).await?;
         }
 
@@ -159,6 +179,26 @@ impl Materializer {
             }
         }
 
+        self.apply_restored_ref_manifest_refs(
+            repo_dir,
+            branch,
+            ref_manifest,
+            publish_public_ref,
+            set_public_head,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn apply_restored_ref_manifest_refs(
+        &self,
+        repo_dir: &FsPath,
+        branch: &BranchName,
+        ref_manifest: &RefManifest,
+        publish_public_ref: bool,
+        set_public_head: bool,
+    ) -> CoreResult<()> {
         self.state
             .git
             .update_ref(

@@ -327,6 +327,66 @@ async fn anonymous_direct_want_restores_public_refs_from_matching_manifest() {
 }
 
 #[tokio::test]
+async fn anonymous_direct_want_skips_manifest_restore_when_ref_is_already_hot() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let cached = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let manifest = wait_for_commit_manifest(&state, &fixture.repo, &cached.commit).await;
+    wait_for_verified_generation(&state, &fixture.repo, manifest.generation).await;
+
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    assert_eq!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/heads/main")
+            .await
+            .unwrap(),
+        cached.commit.to_string()
+    );
+    assert!(
+        materializer
+            .commit_ready_for_serving(&repo_dir, &cached.commit)
+            .await
+    );
+
+    state
+        .store
+        .delete(&bundle_key(&fixture.repo, manifest.generation))
+        .await
+        .unwrap();
+    stdfs::rename(
+        fixture.upstream_path(),
+        fixture.tmp.path().join("offline.git"),
+    )
+    .unwrap();
+
+    let comparison = UpstreamRefComparison {
+        changed: HashMap::new(),
+        default_branch: Some("main".to_string()),
+        all_upstream: HashMap::from([("main".to_string(), cached.commit.to_string())]),
+    };
+
+    materializer
+        .ensure_wants_available_from_comparison(
+            &fixture.repo,
+            &[cached.commit.to_string()],
+            &comparison,
+        )
+        .await
+        .expect("hot public refs should not rehydrate the already-present manifest commit");
+}
+
+#[tokio::test]
 async fn public_ref_manifest_restore_seeds_hidden_base_without_public_ref() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
