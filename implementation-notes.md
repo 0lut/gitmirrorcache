@@ -342,13 +342,14 @@ runtime and avoids double-suffixing if a config already contains `-v2` or `v2`.
 ## Overview
 
 Implemented the first HTTPS auth slice from `AUTH-PLAN.md`: request-scoped
-GitHub Basic authorization can be forwarded to upstream git commands without
-putting credentials in argv, logs, local repo config, object-store keys, or
-manifests. Authenticated materialization now creates bearer-protected session
-URLs. Direct `/git/...` now has a repo-access gate before upload-pack serving:
-GitHub requests first use anonymous Smart HTTP protocol v2 to prove public
-reachability, authenticated GitHub requests fall back to REST only when that
-public probe fails, and non-GitHub requests use Git protocol proof.
+Basic authorization can be forwarded to upstream git commands without putting
+credentials in argv, logs, local repo config, object-store keys, or manifests.
+Authenticated materialization now creates bearer-protected session URLs. Direct
+`/git/...` now has a repo-access gate before upload-pack serving: all HTTPS
+providers first use anonymous Smart HTTP protocol v2 to prove public
+reachability, GitHub private requests fall back to REST only when that public
+probe fails, and GitLab/Bitbucket/generic private requests fall back to
+request-scoped Git protocol proof.
 
 ## Decisions not in the spec
 
@@ -388,8 +389,9 @@ The plan asks for an ephemeral protected serving repo for authenticated direct
 Git. This implementation does not yet build that separate direct-remote repo.
 Instead, direct upload-pack proves repo-level access at the API boundary and
 then serves from the shared repo. Authenticated GitHub requests prove access via
-REST before entering the domain path; anonymous and non-GitHub requests still
-use `git ls-remote`. This closes the old "cached object proves access" hole for
+REST before entering the domain path; GitLab/Bitbucket/generic private requests
+prove access with authenticated `git ls-remote`; public requests use anonymous
+Smart HTTP proof. This closes the old "cached object proves access" hole for
 anonymous callers while avoiding duplicated authorized/unauthed domain methods.
 The full ephemeral-repo isolation still belongs in a later hardening pass.
 
@@ -650,30 +652,38 @@ service at all" and is still out of scope for this branch. Repo auth answers
 "can this request reach this upstream repo" and now happens before
 materialize/resolve/direct upload-pack serving.
 
-GitHub requests first perform an anonymous Smart HTTP v2 public probe:
-`GET https://github.com/{owner}/{repo}.git/info/refs?service=git-upload-pack`
-with `Git-Protocol: version=2`. This is intentionally not GitHub REST and does
-not send the request token. If the probe returns `200`, the request is treated
-as public even when Basic auth was present, so materialize/resolve/direct Git
-continue with `UpstreamAuth::Anonymous` and public session behavior.
+Requests first perform an anonymous Smart HTTP v2 public probe:
+`GET https://{host}/{owner}/{repo}.git/info/refs?service=git-upload-pack` with
+`Git-Protocol: version=2`. This does not send the request token. If the probe
+returns `200`, the request is treated as public even when Basic auth was
+present, so materialize/resolve/direct Git continue with
+`UpstreamAuth::Anonymous` and public session behavior.
 
-If the public probe fails and request auth is present, the API uses GitHub REST
-as the private-repo fallback: it reads repository metadata and the default
-branch ref with the request token. After that succeeds, domain code treats the
-repo as authorized for this request and does not run a second per-object
-upstream proof for direct upload-pack wants. This keeps the implementation
-explicit without carrying a second `*_authorized` method family through the
-materializer.
+If the public probe fails and request auth is present for GitHub, the API uses
+GitHub REST as the private-repo fallback: it reads repository metadata and the
+default branch ref with the request token. After that succeeds, domain code
+treats the repo as authorized for this request and does not run a second
+per-object upstream proof for direct upload-pack wants. This keeps the
+implementation explicit without carrying a second `*_authorized` method family
+through the materializer.
 
-Anonymous GitHub requests deliberately do not use GitHub REST. The public,
-auth-free mode remains available, and anonymous proof stays on GitHub's Git
-transport so large public clones do not consume GitHub's unauthenticated REST
-quota. For anonymous direct POSTs, the hot path serves only wants already
-proven reachable from locally published public refs/manifests. If that proof is
-missing or stale, the request falls back to anonymous `git ls-remote`/fetch
-proof or fails rather than trusting object existence in the shared repo.
+GitLab, Bitbucket, and generic HTTPS origins use the same anonymous Smart HTTP
+public probe. When that fails and request auth is present, they fall back to
+authenticated `git ls-remote` because we do not yet have provider-specific REST
+adapters for them. This intentionally keeps provider support open while
+preserving the no-token public path.
 
-Non-GitHub origins also use `git ls-remote` for the repo gate for now, even
-when request auth is present. This is intentionally provider-neutral until we
-introduce a proper origin/provider interface, likely something like
-`GitHubOrigin`, `BitBucketOrigin`, and `PrivateGitServerOrigin`.
+Anonymous requests deliberately do not use provider REST APIs. The public,
+auth-free mode remains available, and anonymous proof stays on the provider's
+Git transport so large public clones do not consume REST quota. For anonymous
+direct POSTs, the hot path serves only wants already proven reachable from
+locally published public refs/manifests. If that proof is missing or stale, the
+request falls back to anonymous `git ls-remote`/fetch proof or fails rather
+than trusting object existence in the shared repo.
+
+This is intentionally a first provider layer rather than a full provider
+interface. The next shape should move these decisions behind explicit origin
+types, likely something like `GitHubOrigin`, `GitLabOrigin`,
+`BitbucketOrigin`, and `PrivateGitServerOrigin`. The existing `RepoKey` remains
+the three-segment `host/owner/name` shape in this branch, so GitLab nested
+groups still need that later origin/key model.
