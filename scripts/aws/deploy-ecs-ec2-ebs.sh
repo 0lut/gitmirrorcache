@@ -771,7 +771,7 @@ ecs_optimized_ami_id() {
   ami_parameter="${ECS_EC2_AMI_PARAMETER:-}"
   if [[ -z "$ami_parameter" ]]; then
     [[ "$ECS_CPU_ARCHITECTURE" == "ARM64" ]] || die "ECS_EC2_AMI_PARAMETER must be set for $ECS_CPU_ARCHITECTURE"
-    ami_parameter="/aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id"
+    ami_parameter="/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
   fi
 
   aws_cli ssm get-parameter \
