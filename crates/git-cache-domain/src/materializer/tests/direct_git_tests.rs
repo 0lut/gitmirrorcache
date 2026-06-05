@@ -162,6 +162,99 @@ async fn anonymous_direct_want_uses_public_refs_without_upstream_probe() {
 }
 
 #[tokio::test]
+async fn anonymous_direct_want_verifies_pending_generation_before_upstream_fetch() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    let commit = fixture.head_commit();
+
+    run_git(
+        &repo_dir,
+        [
+            "fetch",
+            "--no-tags",
+            fixture.upstream_path().to_str().unwrap(),
+            "+refs/heads/main:refs/cache/upstream/heads/main",
+        ],
+    );
+    let generation = GenerationId::new();
+    let reservation = state.disk.reserve(1024 * 1024 * 64).await.unwrap();
+    let temp_path = reservation.temp_path().unwrap();
+    fs::create_dir_all(&temp_path).await.unwrap();
+    let bundle_path = temp_path.join("pending.bundle");
+    state
+        .git
+        .bundle_create_all(&repo_dir, &bundle_path)
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let generation_manifest = GenerationManifest {
+        repo: fixture.repo.clone(),
+        generation,
+        bundle_key: bundle_key(&fixture.repo, generation),
+        parent_generation: None,
+        created_at: now,
+        commits: vec![commit.clone()],
+    };
+    let publish_manifests = PublishManifests {
+        commits: vec![CommitManifest {
+            repo: fixture.repo.clone(),
+            commit: commit.clone(),
+            generation,
+            complete: true,
+            verified_at: now,
+        }],
+        refs: Vec::new(),
+        sessions: Vec::new(),
+    };
+    let head = RepoGenerationHead {
+        repo: fixture.repo.clone(),
+        generation,
+        tip_commits: vec![commit.clone()],
+        updated_at: now,
+    };
+    GenerationPublish::with_manifests(generation_manifest, publish_manifests)
+        .publish_pending_bundle_file(&*state.store, &bundle_path, head, None)
+        .await
+        .unwrap();
+    reservation.release().await.unwrap();
+
+    stdfs::remove_dir_all(&repo_dir).unwrap();
+    stdfs::rename(
+        fixture.upstream_path(),
+        fixture.tmp.path().join("offline.git"),
+    )
+    .unwrap();
+
+    let comparison = UpstreamRefComparison {
+        changed: HashMap::new(),
+        default_branch: Some("main".to_string()),
+        all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+    };
+    materializer
+        .ensure_wants_available_from_comparison(&fixture.repo, &[commit.to_string()], &comparison)
+        .await
+        .expect("pending generation should satisfy advertised want without upstream fetch");
+
+    let repo_dir = materializer.repo_dir(&fixture.repo);
+    assert!(
+        materializer
+            .commit_ready_for_serving(&repo_dir, &commit)
+            .await
+    );
+    assert!(
+        materializer
+            .get_commit_manifest(&fixture.repo, &commit)
+            .await
+            .unwrap()
+            .is_some(),
+        "pending generation verification should publish the commit manifest"
+    );
+}
+
+#[tokio::test]
 async fn authenticated_direct_want_uses_local_cache_after_repo_authorization() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());

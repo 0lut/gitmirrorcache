@@ -763,8 +763,56 @@ impl Materializer {
         default_branch: bool,
     ) -> CoreResult<CommitSha> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
         let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
+        if self
+            .verify_pending_generation_for_commit(repo, upstream_commit)
+            .await?
+        {
+            if let Some(manifest) = self.get_commit_manifest(repo, upstream_commit).await? {
+                if manifest.complete {
+                    self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
+                }
+            }
+            if self
+                .commit_ready_for_serving(&repo_dir, upstream_commit)
+                .await
+            {
+                let _repo_lock = self.lock_repo(repo).await?;
+                self.state
+                    .git
+                    .update_ref(&repo_dir, &local_ref, upstream_commit.as_str())
+                    .await?;
+                if default_branch {
+                    self.state
+                        .git
+                        .symbolic_ref(
+                            &repo_dir,
+                            "HEAD",
+                            &format!("refs/cache/upstream/heads/{branch}"),
+                        )
+                        .await?;
+                }
+                if !self.upstream_auth.is_authenticated() {
+                    self.state
+                        .git
+                        .update_ref(
+                            &repo_dir,
+                            &format!("refs/heads/{branch}"),
+                            upstream_commit.as_str(),
+                        )
+                        .await?;
+                    if default_branch {
+                        self.state
+                            .git
+                            .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{branch}"))
+                            .await?;
+                    }
+                }
+                return Ok(upstream_commit.clone());
+            }
+        }
+
+        let _repo_lock = self.lock_repo(repo).await?;
         let upstream_url = self.upstream_url(repo)?;
         self.upstream_git(&upstream_url)?
             .fetch_branch(&repo_dir, &upstream_url, branch.as_str(), &local_ref)

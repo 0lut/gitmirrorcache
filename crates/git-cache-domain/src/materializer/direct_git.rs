@@ -221,6 +221,14 @@ impl Materializer {
                 .await?;
 
             let mut last_fetch_error = None;
+            if !self.want_ready_for_serving(&repo_dir, &object_id).await?
+                && self
+                    .verify_pending_generation_for_commit(repo, &object_id)
+                    .await?
+            {
+                self.hydrate_complete_manifest_for_want(repo, &repo_dir, &object_id)
+                    .await?;
+            }
             if !self.want_ready_for_serving(&repo_dir, &object_id).await? {
                 last_fetch_error = upstream_git
                     .fetch_object(&repo_dir, &upstream_url, &object_id)
@@ -441,6 +449,9 @@ impl Materializer {
                 && (!self.object_exists(&repo_dir, &object_id).await
                     || (self.commit_exists(&repo_dir, &object_id).await
                         && !self.commit_ready_for_serving(&repo_dir, &object_id).await))
+                && !self
+                    .verify_pending_generation_for_commit(repo, &object_id)
+                    .await?
             {
                 self.fetch_refs_for_advertised_want(repo, comparison, &object_id)
                     .await?;

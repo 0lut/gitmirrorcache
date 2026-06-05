@@ -330,6 +330,64 @@ impl Materializer {
         Ok(queued)
     }
 
+    pub(super) async fn verify_pending_generation_for_commit(
+        &self,
+        repo: &RepoKey,
+        commit: &CommitSha,
+    ) -> CoreResult<bool> {
+        let keys = self
+            .state
+            .store
+            .list_prefix(
+                &format!("{PENDING_GENERATION_PREFIX}{repo}/"),
+                Some(MAX_PENDING_GENERATION_SCAN_KEYS),
+            )
+            .await?;
+        for key in keys {
+            let Some((pending_repo, generation)) = pending_generation_from_key(&key)? else {
+                continue;
+            };
+            if pending_repo != *repo {
+                continue;
+            }
+            let Some(pending) = self
+                .manifests()
+                .pending_generation(repo, generation)
+                .await?
+            else {
+                continue;
+            };
+            if !pending
+                .manifests
+                .commits
+                .iter()
+                .any(|manifest| manifest.complete && manifest.commit == *commit)
+            {
+                continue;
+            }
+
+            match self
+                .verify_generation_with_semaphore(repo.clone(), generation, true)
+                .await
+            {
+                Ok(()) => {
+                    return Ok(self.get_commit_manifest(repo, commit).await?.is_some());
+                }
+                Err(err) => {
+                    warn!(
+                        %repo,
+                        %generation,
+                        %commit,
+                        %err,
+                        "pending generation verification failed while satisfying foreground request"
+                    );
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     pub(super) async fn verify_generation_with_semaphore(
         &self,
         repo: RepoKey,
