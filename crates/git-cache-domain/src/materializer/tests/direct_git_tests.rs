@@ -166,7 +166,7 @@ async fn anonymous_direct_want_requires_upstream_proof_even_when_public_ref_is_c
 }
 
 #[tokio::test]
-async fn anonymous_direct_want_verifies_pending_generation_before_upstream_fetch() {
+async fn anonymous_direct_want_does_not_verify_pending_generation_on_post() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -237,29 +237,34 @@ async fn anonymous_direct_want_verifies_pending_generation_before_upstream_fetch
         default_branch: Some("main".to_string()),
         all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
     };
-    materializer
+    let result = materializer
         .ensure_wants_available_from_comparison(&fixture.repo, &[commit.to_string()], &comparison)
-        .await
-        .expect("pending generation should satisfy advertised want without upstream fetch");
+        .await;
+
+    assert!(
+        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
+        "direct Git POST should fetch proved refs instead of verifying pending generations: {result:?}"
+    );
 
     let repo_dir = materializer.repo_dir(&fixture.repo);
     assert!(
-        materializer
+        !materializer
             .commit_ready_for_serving(&repo_dir, &commit)
-            .await
+            .await,
+        "direct Git POST must not hydrate pending generations"
     );
     assert!(
         materializer
             .get_commit_manifest(&fixture.repo, &commit)
             .await
             .unwrap()
-            .is_some(),
-        "pending generation verification should publish the commit manifest"
+            .is_none(),
+        "direct Git POST must not verify and publish pending generations"
     );
 }
 
 #[tokio::test]
-async fn anonymous_direct_want_restores_public_refs_from_matching_manifest() {
+async fn anonymous_direct_want_does_not_hydrate_public_ref_manifest_on_post() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -290,36 +295,33 @@ async fn anonymous_direct_want_restores_public_refs_from_matching_manifest() {
         all_upstream: HashMap::from([("main".to_string(), cached.commit.to_string())]),
     };
 
-    materializer
+    let result = materializer
         .ensure_wants_available_from_comparison(
             &fixture.repo,
             &[cached.commit.to_string()],
             &comparison,
         )
-        .await
-        .expect("matching public ref manifest should restore local proof without upstream fetch");
+        .await;
+
+    assert!(
+        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
+        "direct Git POST should fetch proved refs instead of hydrating generation manifests: {result:?}"
+    );
 
     let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
-    assert_eq!(
-        state
-            .git
-            .rev_parse(&repo_dir, "refs/heads/main")
-            .await
-            .unwrap(),
-        cached.commit.to_string()
-    );
-    assert_eq!(
+    assert!(
         state
             .git
             .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
             .await
-            .unwrap(),
-        cached.commit.to_string()
+            .is_err(),
+        "direct Git POST must not restore hidden refs by hydrating a manifest"
     );
     assert!(
-        materializer
+        !materializer
             .commit_ready_for_serving(&repo_dir, &cached.commit)
-            .await
+            .await,
+        "direct Git POST must not hydrate public ref manifests"
     );
 
     let result = materializer

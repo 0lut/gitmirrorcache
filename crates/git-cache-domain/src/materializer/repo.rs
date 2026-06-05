@@ -96,6 +96,34 @@ impl Materializer {
         Ok(Some(ref_manifest.commit))
     }
 
+    pub(super) async fn restore_hot_upstream_ref_base_from_manifest(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        branch: &BranchName,
+    ) -> CoreResult<Option<CommitSha>> {
+        let ref_name = branch.ref_name();
+        let Some(ref_manifest) = self.manifests().ref_manifest(repo, &ref_name).await? else {
+            return Ok(None);
+        };
+
+        // Direct Git may use an already-complete public ref manifest as a
+        // fetch negotiation hint, but it must not hydrate generation bundles
+        // on the upload-pack request path.
+        if !self
+            .commit_ready_for_serving(repo_dir, &ref_manifest.commit)
+            .await
+        {
+            return Ok(None);
+        }
+
+        let commit = ref_manifest.commit.clone();
+        let _repo_lock = self.lock_repo(repo).await?;
+        self.apply_restored_ref_manifest_refs(repo_dir, branch, &ref_manifest, false, false)
+            .await?;
+        Ok(Some(commit))
+    }
+
     pub(super) async fn restore_ref_manifest_in_repo(
         &self,
         repo: &RepoKey,

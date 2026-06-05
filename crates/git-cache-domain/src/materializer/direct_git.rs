@@ -28,8 +28,13 @@ impl Materializer {
         })
     }
 
-    /// Fetch only the branches that changed (from compare_upstream_refs),
-    /// update both internal cache refs and public refs, and publish manifests.
+    /// Fetch only the branches that changed (from compare_upstream_refs) and
+    /// update serving refs.
+    ///
+    /// Direct Git is a stateless serving path, not a materialization path:
+    /// it may fetch objects needed for the request, but it must not hydrate
+    /// durable generation bundles or publish new generation metadata while
+    /// satisfying upload-pack wants.
     pub async fn fetch_changed_refs(
         &self,
         repo: &RepoKey,
@@ -52,9 +57,10 @@ impl Materializer {
 
         if !self.upstream_auth.is_authenticated() {
             for (branch, _) in &validated {
-                if let Some(commit) =
-                    Box::pin(self.restore_upstream_ref_base_from_manifest(repo, &repo_dir, branch))
-                        .await?
+                if let Some(commit) = Box::pin(
+                    self.restore_hot_upstream_ref_base_from_manifest(repo, &repo_dir, branch),
+                )
+                .await?
                 {
                     debug!(
                         %repo,
@@ -95,17 +101,6 @@ impl Materializer {
                 );
                 continue;
             }
-
-            let is_default_branch =
-                comparison.default_branch.as_deref() == Some(branch_name.as_str());
-            self.publish_generation(
-                repo,
-                &repo_dir,
-                expected_commit,
-                Some(branch_name.clone()),
-                is_default_branch,
-            )
-            .await?;
 
             if !self.upstream_auth.is_authenticated() {
                 self.state
@@ -190,8 +185,10 @@ impl Materializer {
     ///
     /// Repo-level auth is not enough to authorize arbitrary wants in the
     /// shared cache. Direct Git POSTs first get a fresh upstream ref proof
-    /// using the request's effective auth, then availability work may hydrate
-    /// manifests or fetch objects from that proof.
+    /// using the request's effective auth, then fetch only from that proof if
+    /// local objects are missing or incomplete. Generation hydrate/publish
+    /// stays on the materialize path so upload-pack does not unexpectedly
+    /// import or verify multi-GB bundles.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
         let comparison = Box::pin(self.compare_upstream_refs(repo)).await?;
         Box::pin(self.ensure_wants_available_from_comparison(repo, wants, &comparison)).await
@@ -271,18 +268,9 @@ impl Materializer {
                         }
                     }
                 }
-            } else if !self
-                .restore_public_refs_from_matching_manifests(
-                    repo, &repo_dir, comparison, &object_id,
-                )
-                .await?
-                && self.get_commit_manifest(repo, &object_id).await?.is_none()
-                && (!self.object_exists(&repo_dir, &object_id).await
-                    || (self.commit_exists(&repo_dir, &object_id).await
-                        && !self.commit_ready_for_serving(&repo_dir, &object_id).await))
-                && !self
-                    .verify_pending_generation_for_commit(repo, &object_id)
-                    .await?
+            } else if !self.object_exists(&repo_dir, &object_id).await
+                || (self.commit_exists(&repo_dir, &object_id).await
+                    && !self.commit_ready_for_serving(&repo_dir, &object_id).await)
             {
                 self.fetch_refs_for_advertised_want(repo, comparison, &object_id)
                     .await?;
@@ -293,11 +281,9 @@ impl Materializer {
                 || (self.commit_exists(&repo_dir, &object_id).await
                     && !self.commit_ready_for_serving(&repo_dir, &object_id).await)
             {
-                if let Some(manifest) = self.get_commit_manifest(repo, &object_id).await? {
-                    if manifest.complete {
-                        self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
-                    }
-                }
+                return Err(GitCacheError::NotFound(format!(
+                    "object `{object_id}` is authorized but unavailable locally"
+                )));
             }
 
             if !self.object_exists(&repo_dir, &object_id).await {
@@ -336,60 +322,9 @@ impl Materializer {
                 .git
                 .update_ref(&repo_dir, &cache_ref, object_id.as_str())
                 .await?;
-
-            if self.get_commit_manifest(repo, &object_id).await?.is_none() {
-                self.publish_generation(repo, &repo_dir, &object_id, None, false)
-                    .await?;
-            }
         }
 
         Ok(())
-    }
-
-    async fn restore_public_refs_from_matching_manifests(
-        &self,
-        repo: &RepoKey,
-        repo_dir: &FsPath,
-        comparison: &UpstreamRefComparison,
-        object_id: &CommitSha,
-    ) -> CoreResult<bool> {
-        if self.upstream_auth.is_authenticated() {
-            return Ok(false);
-        }
-
-        let mut restored = false;
-        for (branch, advertised_sha) in &comparison.all_upstream {
-            if !advertised_sha.eq_ignore_ascii_case(object_id.as_str()) {
-                continue;
-            }
-
-            let branch = BranchName::parse(branch.as_str())?;
-            let ref_name = branch.ref_name();
-            let Some(ref_manifest) = self.manifests().ref_manifest(repo, &ref_name).await? else {
-                continue;
-            };
-            if ref_manifest.commit != *object_id {
-                continue;
-            }
-
-            // A public ref manifest is durable proof that this ref->commit
-            // mapping was publicly verified. We only use it when it matches
-            // the current upstream advertisement, then restore local refs so
-            // future anonymous wants can prove reachability without trusting
-            // raw object presence.
-            Box::pin(self.restore_ref_manifest_in_repo(
-                repo,
-                repo_dir,
-                &branch,
-                &ref_manifest,
-                true,
-                comparison.default_branch.as_deref() == Some(branch.as_str()),
-            ))
-            .await?;
-            restored = true;
-        }
-
-        Ok(restored)
     }
 
     async fn fetch_refs_for_advertised_want(
