@@ -613,3 +613,29 @@ advertised branch or branches that point at that exact object. A regression test
 first reproduced the old behavior by adding an unrequested changed side branch:
 the old code fetched `refs/heads/side` for a `main` want, while the fixed path
 does not publish or fetch that side branch.
+
+After an AWS control run against current `main`, public LLVM direct clones were
+~1.5s while the first version of this fix was ~45s. The regression was not the
+targeted fetch; it was doing full upstream ref proof twice per direct clone:
+once for `info/refs`, then again for `git-upload-pack` POST. A follow-up fix
+made anonymous POST trust wants reachable from public `refs/heads/*`, which are
+published by prior anonymous materialization/fetches, and skip that second
+upstream comparison.
+
+That follow-up briefly refreshed every ready public ref from every anonymous
+GET advertisement. AWS smoke testing still showed LLVM direct clones around
+15s and Linux around 7s, because the GET path scaled with the size of the
+upstream branch advertisement. We removed that GET-side sweep: anonymous GETs
+still fetch a fresh upstream advertisement so branch movement is detected, but
+they do not walk/update local public refs. POST uses existing public refs for
+the fast path and falls back to request-scoped upstream proof when they are
+missing or stale. Authenticated direct Git still requires request-scoped
+upstream proof and does not populate public refs.
+
+One more AWS split test isolated the remaining LLVM direct-clone cost:
+`info/refs` and GitHub `ls-remote` were ~1-2s, and a protected session clone was
+~1.2s, but direct clone POST stayed around 11s. That came from checking commit
+wants with `for-each-ref --contains` over LLVM's public branch set. The common
+shallow-clone want is the advertised default-branch tip, so the fast path now
+answers exact public-tip wants from the already-loaded `refs/heads/*` tip list
+and only uses reachability for cached ancestors and non-commit wants.

@@ -397,9 +397,10 @@ async fn git_repo(
         let materializer = materializer.using_upstream_auth(&auth);
 
         // Fetch upstream refs via ls-remote and synthesize the pkt-line
-        // response directly.  No objects are fetched — the repo may not
-        // even exist locally yet.  Objects are fetched lazily when the
-        // client actually issues an upload-pack POST.
+        // response directly. No objects are fetched here. Anonymous POSTs can
+        // use refs published by prior public materialization/fetches to avoid
+        // a second upstream comparison; misses still fall back to request
+        // scoped upstream proof in handle_upload_pack.
         let comparison = match materializer.upstream_refs(&repo).await {
             Ok(c) => c,
             Err(error) => return ApiError::from(error).into_response(),

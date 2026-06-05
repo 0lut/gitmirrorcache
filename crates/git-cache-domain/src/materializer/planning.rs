@@ -794,6 +794,19 @@ impl Materializer {
                 .await?;
         }
 
+        if !self.upstream_auth.is_authenticated() {
+            self.state
+                .git
+                .update_ref(&repo_dir, &format!("refs/heads/{branch}"), commit.as_str())
+                .await?;
+            if default_branch {
+                self.state
+                    .git
+                    .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{branch}"))
+                    .await?;
+            }
+        }
+
         self.publish_generation(
             repo,
             &repo_dir,

@@ -91,22 +91,26 @@ impl Materializer {
             )
             .await?;
 
-            self.state
-                .git
-                .update_ref(
-                    &repo_dir,
-                    &format!("refs/heads/{branch_name}"),
-                    expected_commit.as_str(),
-                )
-                .await?;
+            if !self.upstream_auth.is_authenticated() {
+                self.state
+                    .git
+                    .update_ref(
+                        &repo_dir,
+                        &format!("refs/heads/{branch_name}"),
+                        expected_commit.as_str(),
+                    )
+                    .await?;
+            }
         }
 
-        if let Some(default_branch) = &comparison.default_branch {
-            let db = BranchName::parse(default_branch.as_str())?;
-            self.state
-                .git
-                .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{db}"))
-                .await?;
+        if !self.upstream_auth.is_authenticated() {
+            if let Some(default_branch) = &comparison.default_branch {
+                let db = BranchName::parse(default_branch.as_str())?;
+                self.state
+                    .git
+                    .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{db}"))
+                    .await?;
+            }
         }
 
         info!(
@@ -172,9 +176,83 @@ impl Materializer {
     /// - For other wants, require upstream to provide the object for this request.
     /// - Use cached bytes only after that request-scoped upstream proof exists.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
+        if !self.upstream_auth.is_authenticated()
+            && self
+                .ensure_cached_public_wants_available(repo, wants)
+                .await?
+        {
+            return Ok(());
+        }
+
         let comparison = self.compare_upstream_refs(repo).await?;
         self.ensure_wants_available_from_comparison(repo, wants, &comparison)
             .await
+    }
+
+    async fn ensure_cached_public_wants_available(
+        &self,
+        repo: &RepoKey,
+        wants: &[String],
+    ) -> CoreResult<bool> {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let object_ids: Vec<CommitSha> = wants
+            .iter()
+            .map(|want_sha| CommitSha::parse(want_sha.as_str()))
+            .collect::<CoreResult<_>>()?;
+        if object_ids.is_empty() {
+            return Ok(true);
+        }
+
+        let _repo_lock = self.lock_repo(repo).await?;
+        let public_tips = self
+            .state
+            .git
+            .for_each_ref_commits(&repo_dir, "refs/heads")
+            .await?;
+        if public_tips.is_empty() {
+            return Ok(false);
+        }
+
+        let object_types = self
+            .state
+            .git
+            .cat_file_batch_types(&repo_dir, &object_ids)
+            .await?;
+
+        for object_id in object_ids {
+            let Some(object_type) = object_types.get(&object_id) else {
+                return Ok(false);
+            };
+
+            if object_type == "commit" {
+                if !self.commit_ready_for_serving(&repo_dir, &object_id).await {
+                    return Ok(false);
+                }
+                if public_tips.iter().any(|tip| tip == &object_id)
+                    || self
+                        .state
+                        .git
+                        .object_reachable_from_commits(&repo_dir, &object_id, &public_tips)
+                        .await?
+                {
+                    self.expose_served_commit(&repo_dir, &object_id).await?;
+                    continue;
+                }
+
+                return Ok(false);
+            }
+
+            if !self
+                .state
+                .git
+                .object_reachable_from_commits(&repo_dir, &object_id, &public_tips)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     pub(super) async fn ensure_wants_available_from_comparison(
@@ -445,9 +523,7 @@ impl Materializer {
     ) -> CoreResult<UploadPackProcess> {
         let wants = parse_want_lines(body);
         if !wants.is_empty() {
-            let comparison = self.compare_upstream_refs(repo).await?;
-            self.ensure_wants_available_from_comparison(repo, &wants, &comparison)
-                .await?;
+            self.ensure_wants_available(repo, &wants).await?;
         }
         let repo_dir = self.ensure_repo_dir(repo).await?;
         self.configure_served_repo(&repo_dir).await?;

@@ -126,6 +126,82 @@ async fn anonymous_direct_want_allows_cached_public_ancestor() {
 }
 
 #[tokio::test]
+async fn anonymous_direct_want_uses_public_refs_without_upstream_probe() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let cached = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    let public_main = state
+        .git
+        .rev_parse(&repo_dir, "refs/heads/main")
+        .await
+        .unwrap();
+    assert_eq!(public_main, cached.commit.to_string());
+
+    stdfs::rename(
+        fixture.upstream_path(),
+        fixture.tmp.path().join("offline.git"),
+    )
+    .unwrap();
+
+    materializer
+        .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
+        .await
+        .expect("anonymous cached public want should not need a second upstream probe");
+}
+
+#[tokio::test]
+async fn authenticated_direct_want_still_requires_upstream_probe() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let cached = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    stdfs::rename(
+        fixture.upstream_path(),
+        fixture.tmp.path().join("offline.git"),
+    )
+    .unwrap();
+
+    let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+    let error = materializer
+        .using_upstream_auth(&auth)
+        .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
+        .await
+        .expect_err("authenticated direct wants should keep request-scoped upstream proof");
+
+    assert!(
+        matches!(
+            error,
+            GitCacheError::NotFound(_)
+                | GitCacheError::UpstreamUnavailable(_)
+                | GitCacheError::Timeout(_)
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn anonymous_direct_want_does_not_fetch_unrequested_changed_refs() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
