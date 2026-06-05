@@ -7,7 +7,7 @@ use base64::Engine;
 use futures::Stream;
 use git_cache_core::{
     AppConfig, BranchName, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult,
-    Selector, UpstreamAuth,
+    Selector, UpstreamAuth, UpstreamAuthorizationMode,
 };
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
@@ -112,6 +112,7 @@ impl ApiState {
 struct RepoAuthorizer {
     client: reqwest::Client,
     github_api_base_url: String,
+    github_git_base_url: String,
 }
 
 impl RepoAuthorizer {
@@ -119,14 +120,16 @@ impl RepoAuthorizer {
         Self {
             client: reqwest::Client::new(),
             github_api_base_url: "https://api.github.com".to_string(),
+            github_git_base_url: "https://github.com".to_string(),
         }
     }
 
     #[cfg(test)]
-    fn with_github_api_base_url(base_url: String) -> Self {
+    fn with_github_base_urls(api_base_url: String, git_base_url: String) -> Self {
         Self {
             client: reqwest::Client::new(),
-            github_api_base_url: base_url,
+            github_api_base_url: api_base_url,
+            github_git_base_url: git_base_url,
         }
     }
 
@@ -135,26 +138,50 @@ impl RepoAuthorizer {
         domain: &Arc<AppState>,
         repo: &RepoKey,
         auth: &UpstreamAuth,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<RepoAuthorization> {
         let materializer = Materializer::new(Arc::clone(domain)).using_upstream_auth(auth);
         materializer.validate_host(repo)?;
 
-        // Anonymous callers deliberately stay on Git protocol proof instead of
-        // GitHub REST. GitHub's unauthenticated REST quota is tiny, and direct
-        // public clones already need Git protocol advertisement/fetch behavior.
-        //
-        // Authenticated GitHub callers get a cheap REST gate: once the token
-        // proves repository contents-read access, domain code may treat the
-        // request as repo-authorized and must not redo per-object auth proof on
-        // hot upload-pack POSTs.
+        if repo.host() == "github.com" && domain.config.upstream_root.is_none() {
+            if self.github_public_git_probe(repo).await? {
+                return Ok(RepoAuthorization::public());
+            }
+
+            if auth.is_authenticated() {
+                // Public reachability failed, so the request token is now the
+                // repo-access fallback. Once this succeeds, domain code may
+                // treat the request as repo-authorized and skip duplicate
+                // per-object upstream proof on hot upload-pack POSTs.
+                self.authorize_github(repo, auth).await?;
+                return Ok(RepoAuthorization::upstream(auth.clone()));
+            }
+
+            return Err(GitCacheError::Unauthorized(
+                "repository is not publicly reachable".into(),
+            ));
+        }
+
+        self.authorize_with_git_probe(domain, repo, auth).await?;
+        Ok(RepoAuthorization::upstream(auth.clone()))
+    }
+
+    async fn effective_auth_for_ref_advertisement(
+        &self,
+        domain: &Arc<AppState>,
+        repo: &RepoKey,
+        auth: &UpstreamAuth,
+    ) -> CoreResult<UpstreamAuth> {
+        let materializer = Materializer::new(Arc::clone(domain)).using_upstream_auth(auth);
+        materializer.validate_host(repo)?;
+
         if auth.is_authenticated()
             && repo.host() == "github.com"
             && domain.config.upstream_root.is_none()
+            && self.github_public_git_probe(repo).await?
         {
-            self.authorize_github(repo, auth).await
-        } else {
-            self.authorize_with_git_probe(domain, repo, auth).await
+            return Ok(UpstreamAuth::Anonymous);
         }
+        Ok(auth.clone())
     }
 
     async fn authorize_with_git_probe(
@@ -171,6 +198,42 @@ impl RepoAuthorizer {
             .ls_remote_default_branch(&remote)
             .await?;
         Ok(())
+    }
+
+    async fn github_public_git_probe(&self, repo: &RepoKey) -> CoreResult<bool> {
+        let url = format!(
+            "{}/{}/{}.git/info/refs?service=git-upload-pack",
+            self.github_git_base_url.trim_end_matches('/'),
+            repo.owner(),
+            repo.name()
+        );
+        let response = self
+            .client
+            .get(url)
+            .header("Git-Protocol", "version=2")
+            .header(header::USER_AGENT, "git-cache-api")
+            .send()
+            .await
+            .map_err(|err| {
+                GitCacheError::UpstreamUnavailable(format!(
+                    "github public git reachability check failed: {err}"
+                ))
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if matches!(status.as_u16(), 401 | 403 | 404) {
+            return Ok(false);
+        }
+        if status.as_u16() == 429 || status.is_server_error() {
+            return Err(GitCacheError::UpstreamUnavailable(format!(
+                "github public git reachability check returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        Ok(false)
     }
 
     async fn authorize_github(&self, repo: &RepoKey, auth: &UpstreamAuth) -> CoreResult<()> {
@@ -255,6 +318,29 @@ impl RepoAuthorizer {
                 "github {endpoint} access check returned HTTP {code}"
             ))),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RepoAuthorization {
+    effective_auth: UpstreamAuth,
+}
+
+impl RepoAuthorization {
+    fn public() -> Self {
+        Self {
+            effective_auth: UpstreamAuth::Anonymous,
+        }
+    }
+
+    fn upstream(auth: UpstreamAuth) -> Self {
+        Self {
+            effective_auth: auth,
+        }
+    }
+
+    fn into_effective_auth(self) -> UpstreamAuth {
+        self.effective_auth
     }
 }
 
@@ -379,14 +465,26 @@ async fn handle_materialize_request(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
-    if let Err(error) = authorize_materialize_repo(state, &request, &auth).await {
-        state
-            .metrics
-            .materialize_errors_total
-            .fetch_add(1, Ordering::Relaxed);
-        return Err(error);
-    }
+    let AuthorizedMaterializeRequest { request, auth } =
+        match authorize_materialize_repo(state, request, auth).await {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                state
+                    .metrics
+                    .materialize_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
 
+    materialize_authorized_request(state, request, auth).await
+}
+
+async fn materialize_authorized_request(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<Response, ApiError> {
     let use_coordinator = !request.uses_upstream_auth(&auth)
         && matches!(
             request.selector,
@@ -462,12 +560,20 @@ async fn handle_resolve_request(
             .materialize_total
             .fetch_add(1, Ordering::Relaxed);
 
-        if let Err(error) = authorize_materialize_repo(state, &request, &auth).await {
-            state
-                .metrics
-                .materialize_errors_total
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(error);
+        let AuthorizedMaterializeRequest { request, auth } =
+            match authorize_materialize_repo(state, request, auth).await {
+                Ok(authorized) => authorized,
+                Err(error) => {
+                    state
+                        .metrics
+                        .materialize_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+
+        if !request.uses_upstream_auth(&auth) {
+            return materialize_authorized_request(state, request, auth).await;
         }
 
         let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
@@ -486,21 +592,31 @@ async fn handle_resolve_request(
     handle_materialize_request(state, request, auth).await
 }
 
+struct AuthorizedMaterializeRequest {
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+}
+
 async fn authorize_materialize_repo(
     state: &Arc<ApiState>,
-    request: &MaterializeRequest,
-    auth: &UpstreamAuth,
-) -> Result<(), ApiError> {
+    mut request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<AuthorizedMaterializeRequest, ApiError> {
     if request.requires_upstream_auth() && !auth.is_authenticated() {
         return Err(
             GitCacheError::Unauthorized("upstream authorization is required".into()).into(),
         );
     }
-    state
+    let auth = state
         .repo_authorizer
-        .authorize(&state.domain, &request.repo, auth)
+        .authorize(&state.domain, &request.repo, &auth)
         .await
-        .map_err(ApiError::from)
+        .map(RepoAuthorization::into_effective_auth)
+        .map_err(ApiError::from)?;
+    if !auth.is_authenticated() {
+        request.upstream_authorization = UpstreamAuthorizationMode::Anonymous;
+    }
+    Ok(AuthorizedMaterializeRequest { request, auth })
 }
 
 async fn git_session(
@@ -638,6 +754,14 @@ async fn git_repo(
             .metrics
             .git_remote_refs_total
             .fetch_add(1, Ordering::Relaxed);
+        let auth = match state
+            .repo_authorizer
+            .effective_auth_for_ref_advertisement(&state.domain, &repo, &auth)
+            .await
+        {
+            Ok(auth) => auth,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
         let materializer = materializer.using_upstream_auth(&auth);
 
         // Fetch upstream refs via ls-remote and synthesize the pkt-line
@@ -673,13 +797,14 @@ async fn git_repo(
         // the domain path can assume the repo is authorized for this request:
         // authenticated GitHub uses REST, while anonymous/non-GitHub stays on
         // git ls-remote proof and does not consume unauthenticated REST quota.
-        if let Err(error) = state
+        let auth = match state
             .repo_authorizer
             .authorize(&state.domain, &repo, &auth)
             .await
         {
-            return ApiError::from(error).into_response();
-        }
+            Ok(authorization) => authorization.into_effective_auth(),
+            Err(error) => return ApiError::from(error).into_response(),
+        };
         let materializer = materializer.using_upstream_auth(&auth);
 
         match materializer.handle_upload_pack(&repo, &body).await {
@@ -1026,9 +1151,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_github_authorizer_uses_rest_gate() {
+    async fn authenticated_public_github_authorizer_ignores_token_without_rest() {
         let tmp = TempDir::new().unwrap();
-        let (base_url, hits, server) = start_github_authorizer_mock().await;
+        let (base_url, hits, server) = start_github_authorizer_mock(StatusCode::OK).await;
         let domain = Arc::new(
             AppState::try_new(api_test_config(
                 &tmp,
@@ -1038,29 +1163,61 @@ mod tests {
             ))
             .unwrap(),
         );
-        let authorizer = RepoAuthorizer::with_github_api_base_url(base_url);
+        let authorizer = RepoAuthorizer::with_github_base_urls(base_url.clone(), base_url);
         let repo = RepoKey::parse("github.com/org/repo").unwrap();
         let auth =
             UpstreamAuth::parse_header(&basic_header("x-access-token", "ghp_secret")).unwrap();
 
-        authorizer.authorize(&domain, &repo, &auth).await.unwrap();
+        let authorization = authorizer.authorize(&domain, &repo, &auth).await.unwrap();
         server.abort();
 
+        assert_eq!(authorization.into_effective_auth(), UpstreamAuth::Anonymous);
+        let hits = hits.lock().unwrap().clone();
+        assert_eq!(
+            hits,
+            vec!["/org/repo.git/info/refs auth= git-protocol=version=2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_private_github_authorizer_uses_rest_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let (base_url, hits, server) = start_github_authorizer_mock(StatusCode::UNAUTHORIZED).await;
+        let domain = Arc::new(
+            AppState::try_new(api_test_config(
+                &tmp,
+                None,
+                PathBuf::from("git"),
+                vec!["github.com".into()],
+            ))
+            .unwrap(),
+        );
+        let authorizer = RepoAuthorizer::with_github_base_urls(base_url.clone(), base_url);
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let auth =
+            UpstreamAuth::parse_header(&basic_header("x-access-token", "ghp_secret")).unwrap();
+
+        let authorization = authorizer.authorize(&domain, &repo, &auth).await.unwrap();
+        server.abort();
+
+        assert_eq!(authorization.into_effective_auth(), auth);
         let hits = hits.lock().unwrap().clone();
         assert_eq!(
             hits,
             vec![
-                "/repos/org/repo Bearer ghp_secret".to_string(),
-                "/repos/org/repo/git/ref/heads/main Bearer ghp_secret".to_string(),
+                "/org/repo.git/info/refs auth= git-protocol=version=2".to_string(),
+                "/repos/org/repo auth=Bearer ghp_secret git-protocol=".to_string(),
+                "/repos/org/repo/git/ref/heads/main auth=Bearer ghp_secret git-protocol="
+                    .to_string(),
             ]
         );
     }
 
     #[tokio::test]
-    async fn anonymous_github_authorizer_uses_git_probe_not_rest() {
+    async fn anonymous_github_authorizer_uses_public_probe_not_git_or_rest() {
         let tmp = TempDir::new().unwrap();
         let (fake_git, git_log) = fake_git_binary(&tmp);
-        let (base_url, hits, server) = start_github_authorizer_mock().await;
+        let (base_url, hits, server) = start_github_authorizer_mock(StatusCode::OK).await;
         let domain = Arc::new(
             AppState::try_new(api_test_config(
                 &tmp,
@@ -1070,23 +1227,95 @@ mod tests {
             ))
             .unwrap(),
         );
-        let authorizer = RepoAuthorizer::with_github_api_base_url(base_url);
+        let authorizer = RepoAuthorizer::with_github_base_urls(base_url.clone(), base_url);
         let repo = RepoKey::parse("github.com/org/repo").unwrap();
 
-        authorizer
+        let authorization = authorizer
             .authorize(&domain, &repo, &UpstreamAuth::Anonymous)
             .await
             .unwrap();
         server.abort();
 
-        assert!(
-            hits.lock().unwrap().is_empty(),
-            "anonymous GitHub access should not use REST"
+        assert_eq!(authorization.into_effective_auth(), UpstreamAuth::Anonymous);
+        assert_eq!(
+            hits.lock().unwrap().clone(),
+            vec!["/org/repo.git/info/refs auth= git-protocol=version=2".to_string()]
         );
-        let git_args = std::fs::read_to_string(git_log).unwrap();
         assert!(
-            git_args.contains("ls-remote --symref -- https://github.com/org/repo.git HEAD"),
-            "unexpected fake git args: {git_args}"
+            !git_log.exists(),
+            "public GitHub probe should not spawn git"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_authorization_downgrades_public_github_auth_to_public_request() {
+        let tmp = TempDir::new().unwrap();
+        let (base_url, hits, server) = start_github_authorizer_mock(StatusCode::OK).await;
+        let domain = Arc::new(
+            AppState::try_new(api_test_config(
+                &tmp,
+                None,
+                PathBuf::from("git"),
+                vec!["github.com".into()],
+            ))
+            .unwrap(),
+        );
+        let mut state = ApiState::with_domain(RateLimiter::new(1), domain).unwrap();
+        state.repo_authorizer = RepoAuthorizer::with_github_base_urls(base_url.clone(), base_url);
+        let state = Arc::new(state);
+        let request = MaterializeRequest {
+            repo: RepoKey::parse("github.com/org/repo").unwrap(),
+            selector: Selector::DefaultBranch,
+            mode: Default::default(),
+            upstream_authorization: UpstreamAuthorizationMode::Required,
+        };
+        let auth =
+            UpstreamAuth::parse_header(&basic_header("x-access-token", "ghp_secret")).unwrap();
+
+        let authorized = authorize_materialize_repo(&state, request, auth)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(authorized.auth, UpstreamAuth::Anonymous);
+        assert_eq!(
+            authorized.request.upstream_authorization,
+            UpstreamAuthorizationMode::Anonymous
+        );
+        assert_eq!(
+            hits.lock().unwrap().clone(),
+            vec!["/org/repo.git/info/refs auth= git-protocol=version=2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_github_ref_advertisement_downgrades_auth_without_rest() {
+        let tmp = TempDir::new().unwrap();
+        let (base_url, hits, server) = start_github_authorizer_mock(StatusCode::OK).await;
+        let domain = Arc::new(
+            AppState::try_new(api_test_config(
+                &tmp,
+                None,
+                PathBuf::from("git"),
+                vec!["github.com".into()],
+            ))
+            .unwrap(),
+        );
+        let authorizer = RepoAuthorizer::with_github_base_urls(base_url.clone(), base_url);
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let auth =
+            UpstreamAuth::parse_header(&basic_header("x-access-token", "ghp_secret")).unwrap();
+
+        let effective_auth = authorizer
+            .effective_auth_for_ref_advertisement(&domain, &repo, &auth)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(effective_auth, UpstreamAuth::Anonymous);
+        assert_eq!(
+            hits.lock().unwrap().clone(),
+            vec!["/org/repo.git/info/refs auth= git-protocol=version=2".to_string()]
         );
     }
 
@@ -1094,7 +1323,7 @@ mod tests {
     async fn non_github_authorizer_uses_git_probe_with_request_auth() {
         let tmp = TempDir::new().unwrap();
         let (fake_git, git_log) = fake_git_binary(&tmp);
-        let (base_url, hits, server) = start_github_authorizer_mock().await;
+        let (base_url, hits, server) = start_github_authorizer_mock(StatusCode::OK).await;
         let domain = Arc::new(
             AppState::try_new(api_test_config(
                 &tmp,
@@ -1104,13 +1333,14 @@ mod tests {
             ))
             .unwrap(),
         );
-        let authorizer = RepoAuthorizer::with_github_api_base_url(base_url);
+        let authorizer = RepoAuthorizer::with_github_base_urls(base_url.clone(), base_url);
         let repo = RepoKey::parse("gitlab.com/org/repo").unwrap();
         let auth = UpstreamAuth::parse_header(&basic_header("user", "token")).unwrap();
 
-        authorizer.authorize(&domain, &repo, &auth).await.unwrap();
+        let authorization = authorizer.authorize(&domain, &repo, &auth).await.unwrap();
         server.abort();
 
+        assert_eq!(authorization.into_effective_auth(), auth);
         assert!(
             hits.lock().unwrap().is_empty(),
             "non-GitHub access should not use GitHub REST"
@@ -1317,7 +1547,9 @@ mod tests {
         (script, log)
     }
 
-    async fn start_github_authorizer_mock() -> (
+    async fn start_github_authorizer_mock(
+        public_probe_status: StatusCode,
+    ) -> (
         String,
         Arc<StdMutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
@@ -1333,9 +1565,24 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_string();
-                    hits.lock()
-                        .unwrap()
-                        .push(format!("{} {}", uri.path(), auth));
+                    let git_protocol = headers
+                        .get("Git-Protocol")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    hits.lock().unwrap().push(format!(
+                        "{} auth={} git-protocol={}",
+                        uri.path(),
+                        auth,
+                        git_protocol
+                    ));
+                    if uri.path() == "/org/repo.git/info/refs" {
+                        return if public_probe_status == StatusCode::OK {
+                            Body::from("001e# service=git-upload-pack\n0000").into_response()
+                        } else {
+                            public_probe_status.into_response()
+                        };
+                    }
                     if auth != "Bearer ghp_secret" {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }

@@ -377,14 +377,23 @@ impl Git {
         .await
     }
 
-    /// Run `git ls-remote --symref <remote>` and return a map of
+    /// Run `git ls-remote --symref <remote> HEAD refs/heads/*` and return a map of
     /// `refs/heads/<branch>` → commit SHA, plus the optional default branch name.
-    /// We intentionally omit `--heads` so that the HEAD symref annotation is
-    /// included in the output, and filter to `refs/heads/*` in memory.
+    /// The explicit patterns include the HEAD symref without downloading tags.
     pub async fn ls_remote_heads(&self, remote: &str) -> Result<LsRemoteResult> {
         reject_remote_url(remote)?;
         let output = self
-            .run_upstream(None, ["ls-remote", "--symref", "--", remote])
+            .run_upstream(
+                None,
+                [
+                    "ls-remote",
+                    "--symref",
+                    "--",
+                    remote,
+                    "HEAD",
+                    "refs/heads/*",
+                ],
+            )
             .await?;
 
         let text = String::from_utf8(output.stdout).map_err(|err| {

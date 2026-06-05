@@ -346,8 +346,9 @@ GitHub Basic authorization can be forwarded to upstream git commands without
 putting credentials in argv, logs, local repo config, object-store keys, or
 manifests. Authenticated materialization now creates bearer-protected session
 URLs. Direct `/git/...` now has a repo-access gate before upload-pack serving:
-authenticated GitHub requests use GitHub REST to prove repository access,
-anonymous and non-GitHub requests use Git protocol proof.
+GitHub requests first use anonymous Smart HTTP protocol v2 to prove public
+reachability, authenticated GitHub requests fall back to REST only when that
+public probe fails, and non-GitHub requests use Git protocol proof.
 
 ## Decisions not in the spec
 
@@ -649,20 +650,28 @@ service at all" and is still out of scope for this branch. Repo auth answers
 "can this request reach this upstream repo" and now happens before
 materialize/resolve/direct upload-pack serving.
 
-For authenticated GitHub requests, the API uses GitHub REST as the repo gate:
-it reads repository metadata and the default branch ref with the request token.
-After that succeeds, domain code treats the repo as authorized for this request
-and does not run a second per-object upstream proof for direct upload-pack
-wants. This keeps the implementation explicit without carrying a second
-`*_authorized` method family through the materializer.
+GitHub requests first perform an anonymous Smart HTTP v2 public probe:
+`GET https://github.com/{owner}/{repo}.git/info/refs?service=git-upload-pack`
+with `Git-Protocol: version=2`. This is intentionally not GitHub REST and does
+not send the request token. If the probe returns `200`, the request is treated
+as public even when Basic auth was present, so materialize/resolve/direct Git
+continue with `UpstreamAuth::Anonymous` and public session behavior.
+
+If the public probe fails and request auth is present, the API uses GitHub REST
+as the private-repo fallback: it reads repository metadata and the default
+branch ref with the request token. After that succeeds, domain code treats the
+repo as authorized for this request and does not run a second per-object
+upstream proof for direct upload-pack wants. This keeps the implementation
+explicit without carrying a second `*_authorized` method family through the
+materializer.
 
 Anonymous GitHub requests deliberately do not use GitHub REST. The public,
-auth-free mode remains available, and anonymous proof stays on Git protocol so
-large public clones do not consume GitHub's unauthenticated REST quota. For
-anonymous direct POSTs, the hot path serves only wants already proven reachable
-from locally published public refs/manifests. If that proof is missing or stale,
-the request falls back to anonymous `git ls-remote`/fetch proof or fails rather
-than trusting object existence in the shared repo.
+auth-free mode remains available, and anonymous proof stays on GitHub's Git
+transport so large public clones do not consume GitHub's unauthenticated REST
+quota. For anonymous direct POSTs, the hot path serves only wants already
+proven reachable from locally published public refs/manifests. If that proof is
+missing or stale, the request falls back to anonymous `git ls-remote`/fetch
+proof or fails rather than trusting object existence in the shared repo.
 
 Non-GitHub origins also use `git ls-remote` for the repo gate for now, even
 when request auth is present. This is intentionally provider-neutral until we
