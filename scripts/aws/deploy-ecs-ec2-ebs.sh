@@ -79,6 +79,7 @@ ECS_CONTAINER_STOP_TIMEOUT_SECONDS="${ECS_CONTAINER_STOP_TIMEOUT_SECONDS:-30}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
 LATEST_URI="${ECR_REPOSITORY_URI}:latest"
+DEFAULT_AL2023_ARM64_ECS_AMI_ID="ami-0ac01d3c8b7a34f9d"
 
 case "$ECS_EBS_DELETE_ON_TERMINATION" in
   true | false) ;;
@@ -767,11 +768,22 @@ build_and_push_image() {
 }
 
 ecs_optimized_ami_id() {
-  local ami_parameter
+  local ami_id ami_parameter
+  ami_id="${ECS_EC2_AMI_ID:-}"
   ami_parameter="${ECS_EC2_AMI_PARAMETER:-}"
+
+  [[ -z "$ami_id" || -z "$ami_parameter" ]] || die "set only one of ECS_EC2_AMI_ID or ECS_EC2_AMI_PARAMETER"
+  if [[ -n "$ami_id" ]]; then
+    [[ "$ami_id" =~ ^ami-[a-f0-9]+$ ]] || die "invalid ECS_EC2_AMI_ID: $ami_id"
+    printf '%s\n' "$ami_id"
+    return
+  fi
+
   if [[ -z "$ami_parameter" ]]; then
-    [[ "$ECS_CPU_ARCHITECTURE" == "ARM64" ]] || die "ECS_EC2_AMI_PARAMETER must be set for $ECS_CPU_ARCHITECTURE"
-    ami_parameter="/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
+    [[ "$ECS_CPU_ARCHITECTURE" == "ARM64" ]] || die "ECS_EC2_AMI_ID or ECS_EC2_AMI_PARAMETER must be set for $ECS_CPU_ARCHITECTURE"
+    [[ "$AWS_REGION" == "us-west-2" ]] || die "default pinned ECS_EC2_AMI_ID is for us-west-2; set ECS_EC2_AMI_ID or ECS_EC2_AMI_PARAMETER for $AWS_REGION"
+    printf '%s\n' "$DEFAULT_AL2023_ARM64_ECS_AMI_ID"
+    return
   fi
 
   aws_cli ssm get-parameter \

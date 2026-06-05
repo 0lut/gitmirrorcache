@@ -8,18 +8,26 @@ source "$SCRIPT_DIR/common.sh"
 
 init_aws_context
 
-AL2023_ARM64_ECS_AMI_PARAMETER="/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
+PINNED_AL2023_ARM64_ECS_AMI_ID="ami-0ac01d3c8b7a34f9d"
 
 ECS_CLUSTER_NAME="${ECS_CLUSTER_NAME:-$NAME_PREFIX-ec2}"
 ECS_SERVICE_NAME="${ECS_SERVICE_NAME:-$NAME_PREFIX-ec2-api}"
 ECS_INSTANCE_NAME="${ECS_INSTANCE_NAME:-$NAME_PREFIX-ecs-cache}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
-ECS_EC2_AMI_PARAMETER="${ECS_EC2_AMI_PARAMETER:-$AL2023_ARM64_ECS_AMI_PARAMETER}"
 CREATE_CACHE_SNAPSHOT="${CREATE_CACHE_SNAPSHOT:-false}"
 
-if [[ "$ECS_EC2_AMI_PARAMETER" != *"amazon-linux-2023"* ]]; then
-  [[ "${CONFIRM_AL2_ROLLBACK:-false}" == "true" && "$ECS_EC2_AMI_PARAMETER" == *"amazon-linux-2"* ]] \
-    || die "ECS_EC2_AMI_PARAMETER must point at AL2023 unless CONFIRM_AL2_ROLLBACK=true is set for rollback"
+if [[ -n "${ECS_EC2_AMI_PARAMETER:-}" ]]; then
+  if [[ "$ECS_EC2_AMI_PARAMETER" == *"amazon-linux-2"* ]]; then
+    [[ "${CONFIRM_AL2_ROLLBACK:-false}" == "true" ]] \
+      || die "set CONFIRM_AL2_ROLLBACK=true to use an AL2 AMI parameter"
+  else
+    [[ "$ECS_EC2_AMI_PARAMETER" == *"amazon-linux-2023"* ]] \
+      || die "ECS_EC2_AMI_PARAMETER must point at AL2023 unless CONFIRM_AL2_ROLLBACK=true is set for rollback"
+  fi
+  unset ECS_EC2_AMI_ID
+else
+  ECS_EC2_AMI_ID="${ECS_EC2_AMI_ID:-$PINNED_AL2023_ARM64_ECS_AMI_ID}"
+  [[ "$ECS_EC2_AMI_ID" =~ ^ami-[a-f0-9]+$ ]] || die "invalid ECS_EC2_AMI_ID: $ECS_EC2_AMI_ID"
 fi
 
 current_desired_count="$(aws_cli ecs describe-services \
@@ -31,7 +39,12 @@ current_desired_count="$(aws_cli ecs describe-services \
 
 ECS_DESIRED_COUNT="${ECS_DESIRED_COUNT:-$current_desired_count}"
 [[ "$ECS_DESIRED_COUNT" =~ ^[1-9][0-9]*$ ]] || die "ECS_DESIRED_COUNT must be greater than zero for redeploy; got $ECS_DESIRED_COUNT"
-export ECS_DESIRED_COUNT ECS_EC2_AMI_PARAMETER
+export ECS_DESIRED_COUNT
+if [[ -n "${ECS_EC2_AMI_PARAMETER:-}" ]]; then
+  export ECS_EC2_AMI_PARAMETER
+else
+  export ECS_EC2_AMI_ID
+fi
 
 instance_id="$(aws_cli ec2 describe-instances \
   --filters "Name=tag:Name,Values=$ECS_INSTANCE_NAME" Name=instance-state-name,Values=pending,running,stopping,stopped \
@@ -71,5 +84,9 @@ else
   aws_cli ec2 wait instance-terminated --instance-ids "$instance_id"
 fi
 
-printf 'Deploying replacement ECS host with AMI parameter: %s\n' "$ECS_EC2_AMI_PARAMETER"
+if [[ -n "${ECS_EC2_AMI_PARAMETER:-}" ]]; then
+  printf 'Deploying replacement ECS host with AMI parameter: %s\n' "$ECS_EC2_AMI_PARAMETER"
+else
+  printf 'Deploying replacement ECS host with pinned AMI ID: %s\n' "$ECS_EC2_AMI_ID"
+fi
 "$SCRIPT_DIR/deploy-and-smoke.sh"
