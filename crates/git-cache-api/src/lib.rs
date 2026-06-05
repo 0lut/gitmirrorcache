@@ -97,7 +97,6 @@ impl ApiState {
         let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
         let leases = Arc::new(InMemoryRepoLeaseManager::new());
         let coordinator = UpdateCoordinator::new(executor, leases);
-        Materializer::new(Arc::clone(&domain)).enqueue_pending_generation_scan();
         Ok(Self {
             domain,
             coordinator,

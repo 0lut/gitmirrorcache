@@ -321,13 +321,14 @@ repoints canonical manifests and updates the head.
 
 ## Tradeoffs added during final implementation
 
-### T3. Startup pending scan resumes interrupted verification
+### T3. Pending generation recovery is request-driven
 
-The verifier is enqueue-on-publish, and API startup also scans the global
-`pending-generations/` prefix and re-enqueues any leftover pending generations.
-This covers process exits after the request path writes pending metadata but
-before background verification finishes. The scan is bounded to avoid unbounded
-object-store listings.
+The verifier is enqueue-on-publish, but API startup no longer scans the global
+`pending-generations/` prefix. That eager scan could turn a deploy into minutes
+of unsolicited LLVM-scale bundle verification and mask otherwise-hot direct Git
+requests. Foreground materialize and direct Git want handling now check for a
+matching pending generation before fetching from upstream, so a process exit
+after writing pending metadata is recovered by the next request for that commit.
 
 ### T4. Configured object-store namespace remains the base name
 
