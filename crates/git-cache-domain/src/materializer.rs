@@ -102,9 +102,9 @@ impl Materializer {
                 let renewed_at_by_holder = manifest.renewed_at.unwrap_or(manifest.acquired_at);
                 let ttl_at_write = manifest.expires_at - renewed_at_by_holder;
                 let expired = if let Some(obj_updated) = version.updated_at {
-                    now - obj_updated > ttl_at_write
+                    now - obj_updated >= ttl_at_write
                 } else {
-                    now > manifest.expires_at
+                    now >= manifest.expires_at
                 };
                 if expired {
                     return Err(GitCacheError::LeaseLost(format!(
@@ -3157,6 +3157,7 @@ mod tests {
             .await
             .unwrap();
         let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
         let first_generation =
             generation_manifest_for(&state, &fixture.repo, first_manifest.generation).await;
         assert_eq!(first_generation.parent_generation, None);
@@ -3407,6 +3408,7 @@ mod tests {
             .await
             .unwrap();
         let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
         let second_commit = fixture.commit_and_push("second");
 
         let response = materializer
@@ -3446,6 +3448,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
         stdfs::remove_dir_all(materializer.repo_dir(&fixture.repo)).unwrap();
         let second_commit = fixture.replace_history_and_push("replacement");
         let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
@@ -3468,7 +3472,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.commit, second_commit);
 
-        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
         let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second_commit).await;
         let second_generation =
             generation_manifest_for(&state, &fixture.repo, second_manifest.generation).await;
@@ -3767,7 +3770,7 @@ mod tests {
         let state = Arc::new(AppState::try_new(config).unwrap());
         let materializer = Materializer::new(Arc::clone(&state));
 
-        materializer
+        let first = materializer
             .materialize(MaterializeRequest {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
@@ -3775,6 +3778,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
         let second_commit = fixture.commit_and_push("second");
         materializer
             .materialize(MaterializeRequest {

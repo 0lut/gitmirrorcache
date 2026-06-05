@@ -237,9 +237,9 @@ impl RepoLeaseManager for ObjectStoreRepoLeaseManager {
                 // obj_updated is the server-side timestamp of the last lease write;
                 // the lease should have expired ttl_at_write after that moment.
                 let elapsed = now - obj_updated;
-                elapsed > ttl_at_write + self.steal_skew
+                elapsed >= ttl_at_write + self.steal_skew
             } else {
-                now > existing.expires_at + self.steal_skew
+                now >= existing.expires_at + self.steal_skew
             }
         };
         if !expired {

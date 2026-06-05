@@ -532,7 +532,9 @@ verifier skips public ref publication and leaves the newer head/ref state intact
 `verify_lease_held` now treats a matching token as necessary but not sufficient:
 released leases and expired leases are rejected before shared-state writes. The
 expiry check uses object-store metadata time when available, mirroring the
-lease manager's skew-resistant acquisition logic.
+lease manager's skew-resistant acquisition logic. TTL comparisons use `>=` so
+zero-second or exact-boundary leases are treated as expired consistently by both
+acquisition/steal and fencing checks.
 
 ### T11. Compaction uses the repo-write lease manager
 
