@@ -3799,6 +3799,7 @@ mod tests {
             .await
             .unwrap();
         let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
         let second_commit = fixture.commit_and_push("second");
         materializer
             .materialize(MaterializeRequest {
