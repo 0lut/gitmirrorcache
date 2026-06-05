@@ -542,14 +542,16 @@ where
 
 fn object_version(
     e_tag: Option<&str>,
-    version_id: Option<&str>,
+    _version_id: Option<&str>,
     updated_at: Option<DateTime<Utc>>,
     key: &str,
 ) -> Result<ObjectVersion> {
-    let token = version_id.or(e_tag).ok_or_else(|| {
-        GitCacheError::UpstreamUnavailable(format!(
-            "s3 object `{key}` returned no etag or version id"
-        ))
+    // Always use ETag: put_if_version_matches/delete_if_version_matches use
+    // S3 If-Match which compares ETags, not version IDs. On versioned
+    // buckets VersionId != ETag so using VersionId here would break every
+    // CAS operation.
+    let token = e_tag.ok_or_else(|| {
+        GitCacheError::UpstreamUnavailable(format!("s3 object `{key}` returned no etag"))
     })?;
     Ok(ObjectVersion {
         token: token.to_string(),

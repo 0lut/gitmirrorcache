@@ -38,7 +38,62 @@
    partially wired in this pass and should be completed before enabling
    aggressive GC/deletion in production.
 
----
+
+
+### Hardening pass (review feedback)
+
+1. **S3 CAS token always uses ETag.** `object_version()` previously preferred
+   `VersionId` over `ETag`, but `put_if_version_matches`/`delete_if_version_matches`
+   use S3 `If-Match` which compares ETags. On versioned buckets VersionId ≠ ETag,
+   so every CAS operation would silently fail. Fixed to always use ETag.
+
+2. **Local CAS crash consistency.** `put_inner` previously wrote the data file
+   (rename) *before* the version sidecar token. A crash between rename and
+   `write_version` left new bytes guarded by the old token — a stale CAS holder
+   could overwrite data it never read. Fixed: version token is now written
+   *before* data rename. A crash between version write and data rename leaves a
+   new token guarding old bytes; any CAS holder with the previous token fails.
+
+3. **Ref manifest conflict resolution uses generation ordering.** Previously
+   `write_ref_manifest` and `write_default_ref_manifest` compared `verified_at`
+   wall-clock timestamps to resolve concurrent writes. A skewed/stale verifier
+   could write an older commit with a later timestamp. Replaced with monotonic
+   `GenerationId` ordering (UUID v7, time-sortable). No wall-clock dependency.
+
+4. **Compaction aborts on head CAS loss.** `compact_generation_chain_inner`
+   previously discarded the return value of `advance_generation_head` (`let _ =
+   ...`). If another worker advanced the head, compaction still repointed
+   manifests and deleted old generations. Now aborts cleanup and returns `None`
+   when the CAS fails.
+
+5. **Lease guard Drop aborts renewal task.** `ObjectStoreRepoLease` now
+   implements `Drop` to abort the renewal `JoinHandle`. Previously a panic or
+   early return could leak the renewal task indefinitely.
+
+6. **Clock-skew-resistant lease steal.** Lease expiry check now uses the
+   object-store `updated_at` metadata (server-side timestamp) when available
+   instead of comparing holder-authored `expires_at` with the local clock.
+   This avoids inter-worker clock skew causing premature lease theft.
+
+7. **Retry-After header on lease busy.** API 503 responses for `LeaseBusy` now
+   include a `Retry-After` header populated from `config.leases.busy_retry_after_seconds`.
+
+8. **All materialize selectors routed through coordinator.** Previously only
+   `Branch`/`DefaultBranch` selectors went through `UpdateCoordinator`;
+   `Commit`/`ShortCommit` bypassed coordination entirely. Now all selectors
+   acquire the repo-write lease before materializing.
+
+9. **Direct `/git/` upload-pack pre-acquires repo-write lease.** The
+   `handle_upload_pack` → `ensure_wants_available` path can fetch and publish
+   generations. It now acquires the repo-write lease via the coordinator before
+   processing, so any `publish_generation` calls run under durable coordination.
+
+10. **Lease token threaded through materializer.** `UpdateRequest` now carries
+    an optional `lease_token` set by `execute_with_lease`. `Materializer` stores
+    the token and calls `verify_lease_held()` before publishing shared state.
+    `RepoLease` trait exposes `token()` to surface the fencing token.
+
+------
 
 # Implementation Notes: Read-Through Git Remote
 

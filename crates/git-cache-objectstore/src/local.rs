@@ -95,10 +95,15 @@ impl LocalObjectStore {
         fs::create_dir_all(parent).await?;
 
         let tmp_path = write_temp_file(parent, &path, value).await?;
+        // Write version token BEFORE renaming data so that a crash between
+        // the version write and the data rename leaves a new token guarding
+        // old bytes.  Any CAS holder with the previous token will fail,
+        // preventing writes against data they never read.
+        let version = self.write_version(key).await?;
         match fs::rename(&tmp_path, &path).await {
             Ok(()) => {
                 sync_directory(parent)?;
-                self.write_version(key).await
+                Ok(version)
             }
             Err(err) => {
                 let _ = fs::remove_file(&tmp_path).await;
@@ -337,10 +342,11 @@ impl ObjectStore for LocalObjectStore {
         let tmp_file = fs::File::open(&tmp_path).await?;
         tmp_file.sync_all().await?;
         drop(tmp_file);
+        // Write version before data rename for crash consistency (see put_inner).
+        self.write_version(key).await?;
         match fs::rename(&tmp_path, &dest).await {
             Ok(()) => {
                 sync_directory(parent)?;
-                self.write_version(key).await?;
                 Ok(())
             }
             Err(err) => {

@@ -83,6 +83,9 @@ pub struct UpdateRequest {
     pub repo: RepoKey,
     pub target: UpdateTarget,
     pub source: UpdateSource,
+    /// Fencing token from the currently-held repo-write lease.
+    /// The executor should verify this token before mutable writes.
+    pub lease_token: Option<String>,
 }
 
 impl UpdateRequest {

@@ -28,6 +28,7 @@ use tokio::io::AsyncRead;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
+use tracing::warn;
 
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -177,10 +178,7 @@ async fn handle_materialize_request(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
-    let use_coordinator = matches!(
-        request.selector,
-        Selector::Branch(_) | Selector::DefaultBranch
-    );
+    let use_coordinator = true;
 
     let verified_by_coordinator = if use_coordinator {
         let outcome = state
@@ -189,10 +187,18 @@ async fn handle_materialize_request(
             .await;
         match outcome {
             Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
-                return Err(ApiError {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    message: "update in progress, retry later".into(),
-                });
+                let retry_after = state.domain.config.leases.busy_retry_after_seconds;
+                return Ok(Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(header::RETRY_AFTER, retry_after.to_string())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "error": "update in progress, retry later"
+                        }))
+                        .expect("json serialization"),
+                    ))
+                    .expect("lease busy response"));
             }
             Err(error) => {
                 state
@@ -374,6 +380,29 @@ async fn git_repo(
             .metrics
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
+
+        // Acquire the repo-write lease before processing unknown-want
+        // fetches so that any publish_generation calls inside
+        // ensure_wants_available run under durable coordination.
+        let outcome = state
+            .coordinator
+            .read_through(repo.clone(), Selector::DefaultBranch)
+            .await;
+        match outcome {
+            Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
+                let retry_after = state.domain.config.leases.busy_retry_after_seconds;
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header(header::RETRY_AFTER, retry_after.to_string())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error":"update in progress, retry later"}"#))
+                    .expect("lease busy response");
+            }
+            Err(error) => {
+                warn!(%repo, ?error, "coordinator pre-fetch for upload-pack failed; proceeding without lease");
+            }
+            Ok(_) => {}
+        }
 
         match materializer.handle_upload_pack(&repo, &body).await {
             Ok(process) => stream_upload_pack_response(&state, process),

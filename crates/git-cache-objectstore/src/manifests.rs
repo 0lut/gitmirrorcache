@@ -573,7 +573,12 @@ where
     loop {
         match read_json_with_version::<_, RefManifest>(store, &key).await? {
             Some((existing, version)) => {
-                if existing == *manifest || existing.verified_at > manifest.verified_at {
+                if existing == *manifest {
+                    return Ok(());
+                }
+                // Use monotonic generation ordering (UUID v7) instead of
+                // wall-clock verified_at to resolve concurrent writes.
+                if existing.generation >= manifest.generation {
                     return Ok(());
                 }
                 if put_json_if_version_matches(store, &key, &version, manifest).await? {

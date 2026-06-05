@@ -18,10 +18,11 @@ use git_cache_objectstore::write_repo_generation_head;
 use git_cache_objectstore::{
     advance_generation_head, generation_manifest_key, pending_generation_publish_key,
     put_json_if_version_matches, read_commit_manifest, read_generation_manifest, read_json,
-    read_json_with_version, read_pending_generation_publish, read_repo_generation_head,
-    read_session_manifest, read_verified_generation_manifest, verified_generation_manifest_key,
-    write_commit_manifest, write_commit_manifest_if_absent_or_matches, write_json,
-    write_json_if_absent, write_ref_manifest, write_session_manifest,
+    read_json_with_version, read_lease_with_version, read_pending_generation_publish,
+    read_repo_generation_head, read_session_manifest, read_verified_generation_manifest,
+    verified_generation_manifest_key, write_commit_manifest,
+    write_commit_manifest_if_absent_or_matches, write_json, write_json_if_absent,
+    write_ref_manifest, write_session_manifest,
     write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, PublishManifests,
 };
 use serde::Serialize;
@@ -46,6 +47,7 @@ const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
 #[derive(Clone)]
 pub struct Materializer {
     state: Arc<AppState>,
+    lease_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -59,7 +61,43 @@ pub struct CompactionReport {
 
 impl Materializer {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            lease_token: None,
+        }
+    }
+
+    pub fn with_lease_token(state: Arc<AppState>, token: String) -> Self {
+        Self {
+            state,
+            lease_token: Some(token),
+        }
+    }
+
+    /// Verify that the repo-write lease is still held by us.  Returns
+    /// `Err(LeaseLost)` when the durable lease token no longer matches
+    /// the token that was passed in at construction.  This is a no-op
+    /// when the materializer was created without a lease token (e.g.
+    /// the unfenced API path before coordinator routing was added).
+    async fn verify_lease_held(&self, repo: &RepoKey) -> CoreResult<()> {
+        let expected = match &self.lease_token {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let lease_name = "repo-write";
+        match read_lease_with_version(&*self.state.store, repo, lease_name).await? {
+            Some((manifest, _version)) => {
+                if manifest.token != *expected {
+                    return Err(GitCacheError::LeaseLost(format!(
+                        "repo-write lease for {repo} was taken over by another worker"
+                    )));
+                }
+                Ok(())
+            }
+            None => Err(GitCacheError::LeaseLost(format!(
+                "repo-write lease for {repo} was released"
+            ))),
+        }
     }
 
     pub async fn materialize(
@@ -700,6 +738,9 @@ impl Materializer {
             updated_at: now,
         };
 
+        // Verify the lease is still held before publishing shared state.
+        self.verify_lease_held(repo).await?;
+
         GenerationPublish::with_manifests(generation_manifest, manifests)
             .publish_pending_bundle_file(&*self.state.store, &bundle_path, head, default_ref)
             .await?;
@@ -1134,6 +1175,16 @@ impl Materializer {
         self.verify_generation_with_semaphore(repo.clone(), new_generation, false)
             .await?;
 
+        if !advance_generation_head(&*self.state.store, Some(head.generation), None, &new_head)
+            .await?
+        {
+            // Another worker advanced the head after our snapshot; abort
+            // cleanup to avoid deleting generations the new head still needs.
+            warn!(%repo, "compaction head CAS lost; aborting cleanup");
+            reservation.release().await?;
+            return Ok(None);
+        }
+
         self.repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)
             .await?;
         for commit in commits {
@@ -1149,8 +1200,6 @@ impl Materializer {
             )
             .await?;
         }
-        let _ = advance_generation_head(&*self.state.store, Some(head.generation), None, &new_head)
-            .await?;
         let retained_generations = self
             .old_generations_needed_by_pending_publishes(repo, &old_generation_set)
             .await?;
@@ -1369,7 +1418,12 @@ impl Materializer {
         loop {
             match read_json_with_version::<_, RefManifest>(&*self.state.store, &key).await? {
                 Some((existing, version)) => {
-                    if existing == *manifest || existing.verified_at > manifest.verified_at {
+                    if existing == *manifest {
+                        return Ok(());
+                    }
+                    // Use monotonic generation ordering (UUID v7) instead of
+                    // wall-clock verified_at.
+                    if existing.generation >= manifest.generation {
                         return Ok(());
                     }
                     if put_json_if_version_matches(&*self.state.store, &key, &version, manifest)
@@ -2169,7 +2223,11 @@ impl MaterializerExecutor {
 #[async_trait]
 impl UpdateExecutor for MaterializerExecutor {
     async fn update(&self, request: UpdateRequest) -> CoreResult<()> {
-        let materializer = Materializer::new(Arc::clone(&self.state));
+        let materializer = if let Some(token) = request.lease_token.clone() {
+            Materializer::with_lease_token(Arc::clone(&self.state), token)
+        } else {
+            Materializer::new(Arc::clone(&self.state))
+        };
         match request.target {
             UpdateTarget::Branch(ref branch) => {
                 materializer

@@ -36,16 +36,19 @@ impl UpdateHint {
                 repo,
                 target: UpdateTarget::from_selector(&selector),
                 source: UpdateSource::Cron,
+                lease_token: None,
             }),
             Self::ReadThrough { repo, selector } => Ok(UpdateRequest {
                 repo,
                 target: UpdateTarget::from_selector(&selector),
                 source: UpdateSource::ReadThrough,
+                lease_token: None,
             }),
             Self::Event { repo, ref_name } => Ok(UpdateRequest {
                 repo,
                 target: UpdateTarget::from_event_ref(ref_name)?,
                 source: UpdateSource::Event,
+                lease_token: None,
             }),
         }
     }
@@ -58,6 +61,7 @@ pub trait RepoLeaseManager: Send + Sync {
 
 #[async_trait]
 pub trait RepoLease: Send + Sync {
+    fn token(&self) -> &str;
     async fn release(self: Box<Self>) -> Result<()>;
 }
 
@@ -116,6 +120,10 @@ struct InMemoryRepoLease {
 
 #[async_trait]
 impl RepoLease for InMemoryRepoLease {
+    fn token(&self) -> &str {
+        ""
+    }
+
     async fn release(mut self: Box<Self>) -> Result<()> {
         self.release_sync()?;
         Ok(())
@@ -221,7 +229,19 @@ impl RepoLeaseManager for ObjectStoreRepoLeaseManager {
             )));
         };
 
-        let expired = existing.released_at.is_some() || now > existing.expires_at + self.steal_skew;
+        let expired = existing.released_at.is_some() || {
+            let renewed_at_by_holder = existing.renewed_at.unwrap_or(existing.acquired_at);
+            let ttl_at_write = existing.expires_at - renewed_at_by_holder;
+            if let Some(obj_updated) = version.updated_at {
+                // Use object-store metadata time to avoid inter-worker clock skew.
+                // obj_updated is the server-side timestamp of the last lease write;
+                // the lease should have expired ttl_at_write after that moment.
+                let elapsed = now - obj_updated;
+                elapsed > ttl_at_write + self.steal_skew
+            } else {
+                now > existing.expires_at + self.steal_skew
+            }
+        };
         if !expired {
             return Ok(LeaseAcquire::Busy);
         }
@@ -285,8 +305,18 @@ impl ObjectStoreRepoLease {
     }
 }
 
+impl Drop for ObjectStoreRepoLease {
+    fn drop(&mut self) {
+        self.renew_task.abort();
+    }
+}
+
 #[async_trait]
 impl RepoLease for ObjectStoreRepoLease {
+    fn token(&self) -> &str {
+        &self.token
+    }
+
     async fn release(self: Box<Self>) -> Result<()> {
         self.renew_task.abort();
         if release_lease_if_token_matches(
@@ -439,6 +469,8 @@ impl UpdateCoordinator {
             LeaseAcquire::Busy => return Ok(UpdateOutcome::lease_busy(&request)),
         };
 
+        let mut request = request;
+        request.lease_token = Some(lease.token().to_string());
         let update_result = self.inner.executor.update(request.clone()).await;
         let release_result = lease.release().await;
 
