@@ -289,7 +289,7 @@ commit_read_through = true
         materialized = self.materialize({"branch": self.branch})
 
         self.assertEqual(materialized["repo"], self.repo)
-        self.assertEqual(materialized["source"], "github_verified")
+        self.assertEqual(materialized["source"], "upstream_verified")
         self.assertEqual(materialized["commit"], self.expected_branch_commit())
 
         fetched = self.fetch_session_ref(materialized, "strict-main")
@@ -315,7 +315,7 @@ commit_read_through = true
         short = str(branch["commit"])[:8]
 
         resolved = self.materialize({"short_commit": short})
-        self.assertEqual(resolved["source"], "github_verified")
+        self.assertEqual(resolved["source"], "upstream_verified")
         self.assertEqual(resolved["commit"], branch["commit"])
 
         fetched = self.fetch_session_ref(resolved, "short-commit")
@@ -325,7 +325,7 @@ commit_read_through = true
         materialized = self.materialize({"default_branch": True})
 
         self.assertEqual(materialized["repo"], self.repo)
-        self.assertEqual(materialized["source"], "github_verified")
+        self.assertEqual(materialized["source"], "upstream_verified")
         self.assertEqual(materialized["commit"], self.expected_branch_commit())
 
 

@@ -221,7 +221,7 @@ async fn exact_descendants_after_cold_ancestor_fetch_reuse_full_bundle() {
         .await
         .unwrap();
     assert_eq!(first.commit, tip_2);
-    assert_eq!(first.source, MaterializeSource::GithubVerified);
+    assert_eq!(first.source, MaterializeSource::UpstreamVerified);
     let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &tip_2).await;
     wait_for_verified_generation(&state, &fixture.repo, first_manifest.generation).await;
     let generation_keys_after_first = generation_object_keys(&state, &fixture.repo).await;
@@ -287,7 +287,7 @@ async fn exact_commit_ahead_of_known_generation_publishes_incremental_bundle() {
         .await
         .unwrap();
     assert_eq!(response.commit, second_commit);
-    assert_eq!(response.source, MaterializeSource::GithubVerified);
+    assert_eq!(response.source, MaterializeSource::UpstreamVerified);
 
     let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second_commit).await;
     let second_generation =

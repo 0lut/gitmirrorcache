@@ -15,7 +15,7 @@ async fn cached_exact_commit_survives_upstream_offline() {
         })
         .await
         .unwrap();
-    assert_eq!(branch_response.source, MaterializeSource::GithubVerified);
+    assert_eq!(branch_response.source, MaterializeSource::UpstreamVerified);
     let commit_manifest =
         wait_for_commit_manifest(&materializer.state, &fixture.repo, &branch_response.commit).await;
     wait_for_verified_generation(
@@ -64,7 +64,7 @@ async fn short_commit_selector_resolves_to_full_commit_from_upstream() {
         .await
         .unwrap();
 
-    assert_eq!(response.source, MaterializeSource::GithubVerified);
+    assert_eq!(response.source, MaterializeSource::UpstreamVerified);
     assert_eq!(response.commit, head);
     let _ = wait_for_commit_manifest(&materializer.state, &fixture.repo, &head).await;
 }
@@ -96,7 +96,7 @@ async fn short_commit_selector_revalidates_even_when_commit_is_cached() {
         .await
         .unwrap();
 
-    assert_eq!(short_response.source, MaterializeSource::GithubVerified);
+    assert_eq!(short_response.source, MaterializeSource::UpstreamVerified);
     assert_eq!(short_response.commit, branch_response.commit);
 }
 
@@ -170,7 +170,7 @@ async fn branch_and_default_selectors_require_upstream_for_all_modes() {
         })
         .await
         .unwrap();
-    assert_eq!(default_response.source, MaterializeSource::GithubVerified);
+    assert_eq!(default_response.source, MaterializeSource::UpstreamVerified);
 
     stdfs::rename(
         fixture.upstream_path(),

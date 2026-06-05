@@ -83,7 +83,7 @@ impl RepoAccess {
 
     fn fetched_source(&self) -> MaterializeSource {
         match self {
-            Self::Public => MaterializeSource::GithubVerified,
+            Self::Public => MaterializeSource::UpstreamVerified,
             Self::Upstream { .. } => MaterializeSource::UpstreamAuthorizedFetched,
         }
     }
@@ -140,7 +140,7 @@ impl Materializer {
                     access,
                     target: MaterializeTarget::Commit {
                         commit,
-                        source: MaterializeSource::GithubVerified,
+                        source: MaterializeSource::UpstreamVerified,
                     },
                 })
             }
@@ -152,7 +152,7 @@ impl Materializer {
                     access,
                     target: MaterializeTarget::Commit {
                         commit,
-                        source: MaterializeSource::GithubVerified,
+                        source: MaterializeSource::UpstreamVerified,
                     },
                 })
             }
@@ -570,10 +570,10 @@ impl Materializer {
             repo,
             &repo_dir,
             &commit,
-            MaterializeSource::GithubVerified,
+            MaterializeSource::UpstreamVerified,
         )
         .await?;
-        Ok((commit, MaterializeSource::GithubVerified))
+        Ok((commit, MaterializeSource::UpstreamVerified))
     }
 
     async fn ensure_public_commit(
@@ -619,7 +619,7 @@ impl Materializer {
             repo,
             &repo_dir,
             commit,
-            MaterializeSource::GithubVerified,
+            MaterializeSource::UpstreamVerified,
         )
         .await
     }
@@ -737,7 +737,7 @@ impl Materializer {
         default_branch: bool,
     ) -> CoreResult<MaterializeResponse> {
         let commit = self.ensure_branch(&repo, &branch, default_branch).await?;
-        self.create_session(repo, commit, MaterializeSource::GithubVerified)
+        self.create_session(repo, commit, MaterializeSource::UpstreamVerified)
             .await
     }
 
@@ -825,7 +825,7 @@ impl Materializer {
         _mode: RequestMode,
     ) -> CoreResult<MaterializeResponse> {
         let commit = self.ensure_default_branch(&repo).await?;
-        self.create_session(repo, commit, MaterializeSource::GithubVerified)
+        self.create_session(repo, commit, MaterializeSource::UpstreamVerified)
             .await
     }
 
