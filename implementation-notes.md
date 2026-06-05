@@ -621,29 +621,18 @@ the old code fetched `refs/heads/side` for a `main` want, while the fixed path
 does not publish or fetch that side branch.
 
 After an AWS control run against current `main`, public LLVM direct clones were
-~1.5s while the first version of this fix was ~45s. The regression was not the
-targeted fetch; it was doing full upstream ref proof twice per direct clone:
-once for `info/refs`, then again for `git-upload-pack` POST. A follow-up fix
-made anonymous POST trust wants reachable from public `refs/heads/*`, which are
-published by prior anonymous materialization/fetches, and skip that second
-upstream comparison.
+~1.5s while the first version of this fix was ~45s. Several follow-up
+optimizations tried to recover that latency by using locally published public
+refs/manifests as direct Git POST proof. Those optimizations were subtle and
+easy to get wrong in the shared repo model, especially once credentialed and
+anonymous requests shared code paths.
 
-That follow-up briefly refreshed every ready public ref from every anonymous
-GET advertisement. AWS smoke testing still showed LLVM direct clones around
-15s and Linux around 7s, because the GET path scaled with the size of the
-upstream branch advertisement. We removed that GET-side sweep: anonymous GETs
-still fetch a fresh upstream advertisement so branch movement is detected, but
-they do not walk/update local public refs. POST uses existing public refs for
-the fast path and falls back to request-scoped upstream proof when they are
-missing or stale. Authenticated direct Git also avoids populating public refs.
-
-One more AWS split test isolated the remaining LLVM direct-clone cost:
-`info/refs` and GitHub `ls-remote` were ~1-2s, and a protected session clone was
-~1.2s, but direct clone POST stayed around 11s. That came from checking commit
-wants with `for-each-ref --contains` over LLVM's public branch set. The common
-shallow-clone want is the advertised default-branch tip, so the fast path now
-answers exact public-tip wants from the already-loaded `refs/heads/*` tip list
-and only uses reachability for cached ancestors and non-commit wants.
+The current simplification intentionally removes that local-only direct POST
+proof shortcut. Direct Git GET still fetches a fresh upstream advertisement
+without materializing objects. Direct Git POST re-runs upstream ref proof using
+the request's effective auth before serving wants. Public manifests and hidden
+negotiation refs remain availability/fetch-size aids after proof, not
+authorization shortcuts.
 
 ### D10. Repo authorization is now an API gate for direct Git POST
 
@@ -662,11 +651,11 @@ present, so materialize/resolve/direct Git continue with
 
 If the public probe fails and request auth is present for GitHub, the API uses
 GitHub REST as the private-repo fallback: it reads repository metadata and the
-default branch ref with the request token. After that succeeds, domain code
-treats the repo as authorized for this request and does not run a second
-per-object upstream proof for direct upload-pack wants. This keeps the
-implementation explicit without carrying a second `*_authorized` method family
-through the materializer.
+default branch ref with the request token. Direct Git POST remains stateless,
+so repo-level authorization is not enough to authorize arbitrary wants from the
+shared cache. The materializer re-fetches upstream ref proof for POST wants
+using the effective auth, then separately hydrates manifests or fetches objects
+needed to serve the proven wants.
 
 GitLab, Bitbucket, and generic HTTPS origins use the same anonymous Smart HTTP
 public probe. When that fails and request auth is present, they fall back to
@@ -676,11 +665,10 @@ preserving the no-token public path.
 
 Anonymous requests deliberately do not use provider REST APIs. The public,
 auth-free mode remains available, and anonymous proof stays on the provider's
-Git transport so large public clones do not consume REST quota. For anonymous
-direct POSTs, the hot path serves only wants already proven reachable from
-locally published public refs/manifests. If that proof is missing or stale, the
-request falls back to anonymous `git ls-remote`/fetch proof or fails rather
-than trusting object existence in the shared repo.
+Git transport so large public clones do not consume REST quota. For direct Git
+POSTs, both anonymous and credentialed requests validate wants against fresh
+upstream ref proof before serving from the shared repo; object existence alone
+is never authorization.
 
 This is intentionally a first provider layer rather than a full provider
 interface. The next shape should move these decisions behind explicit origin
@@ -689,7 +677,7 @@ types, likely something like `GitHubOrigin`, `GitLabOrigin`,
 the three-segment `host/owner/name` shape in this branch, so GitLab nested
 groups still need that later origin/key model.
 
-### D11. Anonymous direct Git can restore public proof from matching manifests
+### D11. Public ref manifests are availability hints after proof
 
 AWS LLVM smoke testing exposed a ref-cold/object-warm state: the local bare repo
 held large packs, but did not have `refs/heads/*` or
@@ -698,14 +686,14 @@ trusted object existence, but that is the SHA-guess leak the auth work is meant
 to close. The auth branch therefore needs a bridge that restores serving proof
 without treating raw object presence as authorization.
 
-Anonymous direct Git POST now checks persisted public ref manifests before it
-fetches an advertised tip from upstream. A ref manifest can publish public
+After the simplification pass, direct Git POST first obtains fresh upstream ref
+proof for the request. Persisted public ref manifests may still help
+availability after that proof is established. A ref manifest can publish public
 serving refs only when its `refs/heads/<branch> -> commit` mapping exactly
 matches the current upstream advertisement for this request. In that case the
 materializer hydrates the verified generation if needed, restores both
 `refs/cache/upstream/heads/<branch>` and public `refs/heads/<branch>`, updates
-`HEAD` for the advertised default branch, and then continues through the normal
-local public-reachability path.
+`HEAD` for the advertised default branch, and then serves the proven want.
 
 Stale public ref manifests are still useful, but only as hidden fetch
 negotiation bases. Before materialize/direct-Git fetches a newer advertised
@@ -714,7 +702,8 @@ restore only `refs/cache/upstream/heads/<branch>`. It does not restore public
 `refs/heads/<branch>` for stale manifests, because stale refs must not become
 anonymous serving proof.
 
-This deliberately is not a visibility cache. If GitHub/GitLab/Bitbucket now
-advertises a different tip, the manifest is stale for this request and can only
-help Git negotiate a smaller fetch. Public serving refs are restored only for
-commits whose public ref mapping is still current.
+This deliberately is not a visibility cache or a way to skip direct Git POST
+proof. If GitHub/GitLab/Bitbucket now advertises a different tip, the manifest
+is stale for this request and can only help Git negotiate a smaller fetch.
+Public serving refs are restored only for commits whose public ref mapping is
+still current.

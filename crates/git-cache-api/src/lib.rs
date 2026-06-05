@@ -814,10 +814,8 @@ async fn git_repo(
         let materializer = materializer.using_upstream_auth(&auth);
 
         // Fetch upstream refs via ls-remote and synthesize the pkt-line
-        // response directly. No objects are fetched here. Anonymous POSTs can
-        // use refs published by prior public materialization/fetches to avoid
-        // a second upstream comparison; misses still fall back to request
-        // scoped upstream proof in handle_upload_pack.
+        // response directly. No objects are fetched here. POST is stateless
+        // and re-runs request-scoped upstream proof before serving wants.
         let comparison = match materializer.upstream_refs(&repo).await {
             Ok(c) => c,
             Err(error) => return ApiError::from(error).into_response(),
@@ -856,7 +854,7 @@ async fn git_repo(
         };
         let materializer = materializer.using_upstream_auth(&auth);
 
-        match materializer.handle_upload_pack(&repo, &body).await {
+        match Box::pin(materializer.handle_upload_pack(&repo, &body)).await {
             Ok(process) => stream_upload_pack_response(&state, process),
             Err(error) => ApiError::from(error).into_response(),
         }

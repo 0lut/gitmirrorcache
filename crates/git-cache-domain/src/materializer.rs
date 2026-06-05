@@ -31,6 +31,7 @@ use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+mod access;
 mod direct_git;
 mod executor;
 mod generations;

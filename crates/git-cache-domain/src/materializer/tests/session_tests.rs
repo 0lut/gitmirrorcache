@@ -1,3 +1,4 @@
+use super::super::access::RepoAccessContext;
 use super::*;
 
 #[test]
@@ -20,7 +21,7 @@ fn protected_session_token_uses_32_random_bytes_of_hex() {
 }
 
 #[tokio::test]
-async fn create_protected_session_rejects_commit_without_tree_object() {
+async fn create_authenticated_session_rejects_commit_without_tree_object() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -55,11 +56,15 @@ async fn create_protected_session_rejects_commit_without_tree_object() {
     );
 
     let result = materializer
-        .create_protected_session(
-            fixture.repo.clone(),
+        .create_session_from_access(
+            RepoAccessContext::authenticated_ref(
+                fixture.repo.clone(),
+                UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap(),
+                "refs/heads/main".into(),
+                commit.clone(),
+            ),
             commit,
             MaterializeSource::UpstreamAuthorizedCacheHit,
-            vec!["refs/heads/main".into()],
         )
         .await;
 

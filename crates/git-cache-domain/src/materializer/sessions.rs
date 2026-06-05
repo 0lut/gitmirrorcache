@@ -1,33 +1,6 @@
+use super::access::RepoAccessContext;
 use super::util::hex_lower;
 use super::*;
-
-enum SessionAccess {
-    Public,
-    BearerToken { authorized_refs: Vec<String> },
-}
-
-impl SessionAccess {
-    fn is_protected(&self) -> bool {
-        matches!(self, Self::BearerToken { .. })
-    }
-
-    fn into_protection(self, commit: &CommitSha) -> (SessionProtection, Option<String>) {
-        match self {
-            Self::Public => (SessionProtection::Public, None),
-            Self::BearerToken { authorized_refs } => {
-                let session_token = new_session_token();
-                (
-                    SessionProtection::BearerToken {
-                        token_hash: hash_session_token(&session_token),
-                        authorized_commits: vec![commit.clone()],
-                        authorized_refs,
-                    },
-                    Some(session_token),
-                )
-            }
-        }
-    }
-}
 
 impl Materializer {
     pub async fn create_session(
@@ -36,40 +9,60 @@ impl Materializer {
         commit: CommitSha,
         source: MaterializeSource,
     ) -> CoreResult<MaterializeResponse> {
-        self.create_session_with_access(repo, commit, source, SessionAccess::Public)
+        let access = RepoAccessContext::public_commit(repo, commit.clone());
+        self.create_session_from_access(access, commit, source)
             .await
     }
 
-    pub async fn create_protected_session(
+    pub(super) async fn create_session_from_access(
         &self,
-        repo: RepoKey,
+        access: RepoAccessContext,
         commit: CommitSha,
         source: MaterializeSource,
-        authorized_refs: Vec<String>,
     ) -> CoreResult<MaterializeResponse> {
-        self.create_session_with_access(
-            repo,
-            commit,
-            source,
-            SessionAccess::BearerToken { authorized_refs },
-        )
-        .await
+        debug_assert_eq!(access.proof_commit(), &commit);
+        debug_assert_eq!(
+            access.upstream_auth.is_authenticated(),
+            access.is_authenticated()
+        );
+        debug!(
+            repo = %access.repo,
+            %commit,
+            authenticated = access.is_authenticated(),
+            ref_name = ?access.proof_ref_name(),
+            reachable_from = ?access.reachability_proof().map(|(selector, _)| selector),
+            "creating session from repo access proof"
+        );
+        self.create_session_with_access(access, commit, source)
+            .await
     }
 
     async fn create_session_with_access(
         &self,
-        repo: RepoKey,
+        access: RepoAccessContext,
         commit: CommitSha,
         source: MaterializeSource,
-        access: SessionAccess,
     ) -> CoreResult<MaterializeResponse> {
-        let protected = access.is_protected();
+        let repo = access.repo.clone();
+        let protected = access.is_authenticated();
         let session_id = SessionId::new();
         let synthetic_ref = session_id.synthetic_ref();
         let now = Utc::now();
         let expires_at =
             now + ChronoDuration::seconds(self.state.config.session_ttl_seconds as i64);
-        let (protection, session_token) = access.into_protection(&commit);
+        let (protection, session_token) = if protected {
+            let session_token = new_session_token();
+            (
+                SessionProtection::BearerToken {
+                    token_hash: hash_session_token(&session_token),
+                    authorized_commits: vec![commit.clone()],
+                    authorized_refs: access.session_authorized_refs(),
+                },
+                Some(session_token),
+            )
+        } else {
+            (SessionProtection::Public, None)
+        };
         let manifest = SessionManifest {
             id: session_id,
             repo: repo.clone(),

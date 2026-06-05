@@ -126,7 +126,7 @@ async fn anonymous_direct_want_allows_cached_public_ancestor() {
 }
 
 #[tokio::test]
-async fn anonymous_direct_want_uses_public_refs_without_upstream_probe() {
+async fn anonymous_direct_want_requires_upstream_proof_even_when_public_ref_is_cached() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -155,10 +155,14 @@ async fn anonymous_direct_want_uses_public_refs_without_upstream_probe() {
     )
     .unwrap();
 
-    materializer
+    let result = materializer
         .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
-        .await
-        .expect("anonymous cached public want should not need a second upstream probe");
+        .await;
+
+    assert!(
+        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
+        "direct Git POST wants must not use cached public refs as fresh upstream proof: {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -318,12 +322,14 @@ async fn anonymous_direct_want_restores_public_refs_from_matching_manifest() {
             .await
     );
 
-    materializer
+    let result = materializer
         .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
-        .await
-        .expect(
-            "restored public refs should keep subsequent anonymous wants on the local hot path",
-        );
+        .await;
+
+    assert!(
+        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
+        "restored public refs are availability hints, not fresh direct-Git POST proof: {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -435,7 +441,7 @@ async fn public_ref_manifest_restore_seeds_hidden_base_without_public_ref() {
 }
 
 #[tokio::test]
-async fn authenticated_direct_want_uses_local_cache_after_repo_authorization() {
+async fn authenticated_direct_want_requires_upstream_proof_after_repo_authorization() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -457,11 +463,15 @@ async fn authenticated_direct_want_uses_local_cache_after_repo_authorization() {
     .unwrap();
 
     let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
-    materializer
+    let result = materializer
         .using_upstream_auth(&auth)
         .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
-        .await
-        .expect("repo-authorized authenticated direct wants should use local cache availability");
+        .await;
+
+    assert!(
+        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
+        "repo authorization alone must not make cached objects valid direct-Git wants: {result:?}"
+    );
 }
 
 #[tokio::test]
