@@ -573,3 +573,22 @@ bounded `git rev-list --objects` pass. This keeps the private-object guard: a
 cached object is not served merely because it exists locally; it must be in the
 currently authorized upstream graph or be newly provided by upstream for that
 request.
+
+### D8. Materializer split keeps behavior intact while reducing local coupling
+
+`materializer.rs` is now a facade over focused modules for planning, repo
+operations, generation publishing/compaction, direct Git serving, session
+creation/cleanup, manifest access, executor wiring, and small shared utilities.
+This was intentionally a structural refactor: it did not change the public/auth
+model or add ephemeral direct-Git repos. The direct Git and generation modules
+are still the largest pieces, but their responsibilities are now separated
+enough for smaller follow-up refactors.
+
+Session creation now goes through one `create_session_with_access` path with a
+small `SessionAccess` enum, so public and bearer-protected sessions share the
+readiness checks, repo preparation, manifest write, and response construction.
+Manifest reads/writes used by materialization now go through `ManifestStore`;
+raw prefix scans still exist for cleanup/compaction, but key deserialization is
+centralized in the wrapper. Materializer tests were split into behavior modules
+so future changes can add focused coverage without growing one monolithic test
+file again.

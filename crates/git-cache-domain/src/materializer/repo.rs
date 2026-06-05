@@ -1,0 +1,297 @@
+use super::*;
+
+impl Materializer {
+    pub(super) fn upstream_git(&self, remote_url: &str) -> CoreResult<git_cache_git::Git> {
+        self.state
+            .git
+            .with_upstream_auth(remote_url, &self.upstream_auth)
+    }
+
+    pub async fn ensure_repo_dir(&self, repo: &RepoKey) -> CoreResult<PathBuf> {
+        let repo_dir = self.repo_dir(repo);
+        if !repo_dir.join("config").exists() {
+            self.reset_invalid_repo_cache(repo).await?;
+            if let Some(parent) = repo_dir.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            self.state.git.init_bare(&repo_dir).await?;
+            self.record_repo_access(repo).await?;
+        } else {
+            self.touch_repo_access(repo).await?;
+        }
+        Ok(repo_dir)
+    }
+
+    pub(super) async fn commit_exists(&self, repo_dir: &FsPath, commit: &CommitSha) -> bool {
+        self.state
+            .git
+            .run(
+                Some(repo_dir),
+                ["cat-file", "-e", &format!("{}^{{commit}}", commit.as_str())],
+            )
+            .await
+            .is_ok()
+    }
+
+    pub(super) async fn commit_tree_exists(&self, repo_dir: &FsPath, commit: &CommitSha) -> bool {
+        self.state
+            .git
+            .run(
+                Some(repo_dir),
+                ["cat-file", "-e", &format!("{}^{{tree}}", commit.as_str())],
+            )
+            .await
+            .is_ok()
+    }
+
+    pub(super) async fn commit_ready_for_serving(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> bool {
+        self.commit_exists(repo_dir, commit).await
+            && self.commit_tree_exists(repo_dir, commit).await
+    }
+
+    pub(super) async fn object_exists(&self, repo_dir: &FsPath, object_id: &CommitSha) -> bool {
+        self.state
+            .git
+            .run(Some(repo_dir), ["cat-file", "-e", object_id.as_str()])
+            .await
+            .is_ok()
+    }
+
+    pub(super) async fn expose_served_commit(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> CoreResult<()> {
+        let served_ref = format!("refs/git-cache-served/commits/{commit}");
+        self.state
+            .git
+            .update_ref(repo_dir, &served_ref, commit.as_str())
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn resolve_short_commit(
+        &self,
+        repo_dir: &FsPath,
+        short_commit: &ShortCommitSha,
+    ) -> CoreResult<CommitSha> {
+        let rev = format!("{}^{{commit}}", short_commit.as_str());
+        let output = self
+            .state
+            .git
+            .rev_parse(repo_dir, &rev)
+            .await
+            .map_err(|err| {
+                GitCacheError::NotFound(format!(
+                    "short commit `{short_commit}` could not be resolved unambiguously: {err}"
+                ))
+            })?;
+        CommitSha::parse(output)
+    }
+
+    pub(super) async fn resolve_short_commit_from_upstream_refs(
+        &self,
+        repo_dir: &FsPath,
+        short_commit: &ShortCommitSha,
+    ) -> CoreResult<CommitSha> {
+        let commit = self.resolve_short_commit(repo_dir, short_commit).await?;
+        if self
+            .commit_reachable_from_upstream_refs(repo_dir, &commit)
+            .await?
+        {
+            return Ok(commit);
+        }
+
+        Err(GitCacheError::NotFound(format!(
+            "short commit `{short_commit}` was not found in freshly fetched upstream refs"
+        )))
+    }
+
+    pub(super) async fn commit_reachable_from_upstream_refs(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> CoreResult<bool> {
+        let contains = format!("--contains={}", commit.as_str());
+        let output = self
+            .state
+            .git
+            .run(
+                Some(repo_dir),
+                [
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    contains.as_str(),
+                    "refs/cache/upstream/heads",
+                ],
+            )
+            .await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
+        })?;
+        Ok(text.lines().any(|line| !line.trim().is_empty()))
+    }
+
+    pub async fn fetch_all_refs(&self, repo: &RepoKey, repo_dir: &FsPath) -> CoreResult<()> {
+        let _repo_lock = self.lock_repo(repo).await?;
+        let remote = self.upstream_url(repo)?;
+        self.upstream_git(&remote)?
+            .fetch_all_heads(repo_dir, &remote)
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn ls_remote_branch(
+        &self,
+        repo: &RepoKey,
+        branch: &BranchName,
+    ) -> CoreResult<CommitSha> {
+        let remote = self.upstream_url(repo)?;
+        let refs = self.upstream_git(&remote)?.ls_remote_heads(&remote).await?;
+        let sha = refs.refs.get(branch.as_str()).ok_or_else(|| {
+            GitCacheError::NotFound(format!("branch `{branch}` was verified absent upstream"))
+        })?;
+        CommitSha::parse(sha)
+    }
+
+    pub(super) async fn resolve_default_branch(&self, repo: &RepoKey) -> CoreResult<BranchName> {
+        let remote = self.upstream_url(repo)?;
+        self.upstream_git(&remote)?
+            .ls_remote_default_branch(&remote)
+            .await
+            .and_then(BranchName::parse)
+    }
+
+    pub(super) async fn prepare_session_repo(
+        &self,
+        manifest: &SessionManifest,
+        source_repo: &FsPath,
+    ) -> CoreResult<()> {
+        let session_repo = self.session_repo_path(manifest.id);
+        let objects_dir = session_repo.join("objects");
+        let refs_dir = session_repo.join("refs/cache/sessions");
+        fs::create_dir_all(objects_dir.join("info")).await?;
+        fs::create_dir_all(&refs_dir).await?;
+        fs::write(
+            session_repo.join("HEAD"),
+            format!("ref: {}\n", manifest.synthetic_ref),
+        )
+        .await?;
+        let upload_pack_config = match &manifest.protection {
+            SessionProtection::Public => {
+                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = true\n\tallowAnySHA1InWant = true\n\tallowReachableSHA1InWant = true\n"
+            }
+            SessionProtection::BearerToken { .. } => {
+                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = false\n\tallowAnySHA1InWant = false\n\tallowReachableSHA1InWant = false\n"
+            }
+        };
+        fs::write(session_repo.join("config"), upload_pack_config).await?;
+        fs::write(
+            objects_dir.join("info/alternates"),
+            format!("{}\n", source_repo.join("objects").display()),
+        )
+        .await?;
+
+        let ref_file = session_repo.join(&manifest.synthetic_ref);
+        if let Some(parent) = ref_file.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(ref_file, format!("{}\n", manifest.commit)).await?;
+        Ok(())
+    }
+
+    pub fn repo_dir(&self, repo: &RepoKey) -> PathBuf {
+        self.state
+            .config
+            .cache_root
+            .join("repos")
+            .join(repo.local_bare_path())
+    }
+
+    pub fn session_repo_path(&self, session_id: SessionId) -> PathBuf {
+        self.state
+            .config
+            .cache_root
+            .join("sessions")
+            .join(format!("{session_id}.git"))
+    }
+
+    pub(super) fn repo_disk_path(&self, repo: &RepoKey) -> PathBuf {
+        PathBuf::from(repo.local_bare_path())
+    }
+
+    pub(super) async fn record_repo_access(&self, repo: &RepoKey) -> CoreResult<()> {
+        self.state
+            .disk
+            .record_repo_access(self.repo_disk_path(repo))
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn touch_repo_access(&self, repo: &RepoKey) -> CoreResult<()> {
+        self.state
+            .disk
+            .touch_repo_access(self.repo_disk_path(repo))
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn lock_repo(&self, repo: &RepoKey) -> CoreResult<RepoLock> {
+        self.state.disk.lock_repo(self.repo_disk_path(repo)).await
+    }
+
+    pub(super) async fn reset_invalid_repo_cache(&self, repo: &RepoKey) -> CoreResult<()> {
+        self.state
+            .disk
+            .invalidate_repo(self.repo_disk_path(repo))
+            .await
+    }
+
+    pub fn validate_host(&self, repo: &RepoKey) -> CoreResult<()> {
+        if self
+            .state
+            .config
+            .allowed_upstream_hosts
+            .iter()
+            .any(|host| host == repo.host())
+        {
+            Ok(())
+        } else {
+            Err(GitCacheError::Validation(format!(
+                "upstream host `{}` is not allowlisted",
+                repo.host()
+            )))
+        }
+    }
+
+    pub fn upstream_url(&self, repo: &RepoKey) -> CoreResult<String> {
+        if let Some(root) = &self.state.config.upstream_root {
+            return Ok(root.join(repo.local_bare_path()).display().to_string());
+        }
+
+        Ok(format!(
+            "https://{}/{}/{}.git",
+            repo.host(),
+            repo.owner(),
+            repo.name()
+        ))
+    }
+}
+
+pub fn repo_from_git_path(repo_path: &str) -> CoreResult<RepoKey> {
+    let Some((repo, suffix)) = repo_path.split_once(".git") else {
+        return Err(GitCacheError::Validation(format!(
+            "session repo path `{repo_path}` must end in .git"
+        )));
+    };
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return Err(GitCacheError::Validation(format!(
+            "session repo path `{repo_path}` has an invalid .git suffix"
+        )));
+    }
+    RepoKey::parse(repo)
+}
