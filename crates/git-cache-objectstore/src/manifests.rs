@@ -569,29 +569,12 @@ pub async fn write_ref_manifest<S>(store: &S, manifest: &RefManifest) -> Result<
 where
     S: ObjectStore + ?Sized,
 {
-    let key = ref_manifest_key(&manifest.repo, &manifest.ref_name)?;
-    loop {
-        match read_json_with_version::<_, RefManifest>(store, &key).await? {
-            Some((existing, version)) => {
-                if existing == *manifest {
-                    return Ok(());
-                }
-                // Use monotonic generation ordering (UUID v7) instead of
-                // wall-clock verified_at to resolve concurrent writes.
-                if existing.generation >= manifest.generation {
-                    return Ok(());
-                }
-                if put_json_if_version_matches(store, &key, &version, manifest).await? {
-                    return Ok(());
-                }
-            }
-            None => {
-                if write_json_if_absent(store, &key, manifest).await? {
-                    return Ok(());
-                }
-            }
-        }
-    }
+    write_json(
+        store,
+        &ref_manifest_key(&manifest.repo, &manifest.ref_name)?,
+        manifest,
+    )
+    .await
 }
 
 pub async fn write_ref_manifest_if_version_matches<S>(
@@ -791,16 +774,23 @@ where
     S: ObjectStore + ?Sized,
 {
     let key = lease_key(repo, name)?;
-    let Some((mut lease, version)) =
-        read_json_with_version::<_, LeaseManifest>(store, &key).await?
-    else {
-        return Ok(false);
-    };
-    if lease.token != token || lease.released_at.is_some() {
-        return Ok(false);
+    loop {
+        let Some((mut lease, version)) =
+            read_json_with_version::<_, LeaseManifest>(store, &key).await?
+        else {
+            return Ok(false);
+        };
+        if lease.token != token {
+            return Ok(false);
+        }
+        if lease.released_at.is_some() {
+            return Ok(true);
+        }
+        lease.released_at = Some(released_at);
+        if put_json_if_version_matches(store, &key, &version, &lease).await? {
+            return Ok(true);
+        }
     }
-    lease.released_at = Some(released_at);
-    put_json_if_version_matches(store, &key, &version, &lease).await
 }
 
 pub async fn steal_expired_lease_if_version_matches<S>(

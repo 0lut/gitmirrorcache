@@ -49,11 +49,11 @@
    *before* data rename. A crash between version write and data rename leaves a
    new token guarding old bytes; any CAS holder with the previous token fails.
 
-3. **Ref manifest conflict resolution uses generation ordering.** Previously
-   `write_ref_manifest` and `write_default_ref_manifest` compared `verified_at`
-   wall-clock timestamps to resolve concurrent writes. A skewed/stale verifier
-   could write an older commit with a later timestamp. Replaced with monotonic
-   `GenerationId` ordering (UUID v7, time-sortable). No wall-clock dependency.
+3. **Ref manifest conflict resolution moved away from wall-clock timestamps.**
+   This was first replaced with `GenerationId` ordering, then superseded by the
+   later hardening pass below: mutable ref/default manifests are written only
+   after lease/head-context checks, so freshness no longer depends on raw UUID
+   ordering either.
 
 4. **Compaction aborts on head CAS loss.** `compact_generation_chain_inner`
    previously discarded the return value of `advance_generation_head` (`let _ =
@@ -91,6 +91,59 @@
     an optional `lease_token` set by `execute_with_lease`. `Materializer` stores
     the token and calls `verify_lease_held()` before publishing shared state.
     `RepoLease` trait exposes `token()` to surface the fencing token.
+
+### Second hardening pass (review feedback)
+
+1. **Materialize validation and fast path scope.** `/v1/materialize` now validates
+   the repo host before entering the coordinator. Exact-commit requests with a
+   complete manifest hydrate/create the session directly outside the durable
+   repo-write lease; missing or incomplete state still goes through coordinated
+   read-through.
+
+2. **Session-free coordinator execution.** Coordinator execution for exact and
+   short commits now uses `ensure_commit` / `ensure_short_commit` helpers that
+   warm or publish cache state without creating throwaway session manifests.
+   The API creates the user-facing session only after the coordinated pass.
+
+3. **Short-commit resolution stays local after coordination.** The coordinated
+   pass still fetches upstream refs and resolves the abbreviation under the
+   lease. The post-coordinator response path resolves against local refs only,
+   avoiding a second upstream fetch/resolution outside the lease.
+
+4. **Git upload-pack hides ordinary repo-write contention.** Lazy want hydration
+   now waits internally for the repo-write lease for up to the git operation
+   timeout instead of surfacing the short API busy window as a Git-protocol
+   503/409. Empty-want upload-pack requests skip the lease.
+
+5. **Lease release quiesces renewal.** `ObjectStoreRepoLease::release` now aborts
+   and awaits the renewal task before writing `released_at`, and the object-store
+   release helper retries CAS conflicts while the same token still owns the
+   lease.
+
+6. **Local object-store lock recovery.** Local per-key lock files now record
+   owner PID and creation time. Acquisition attempts remove locks whose owner PID
+   is gone (on `/proc` platforms) or whose mtime exceeds a conservative stale
+   threshold, avoiding permanent lockout after process crashes.
+
+7. **Compaction cleanup is fenced.** Compaction still repoints manifests and
+   advances generation head by CAS, but old-generation deletion now requires the
+   repo-write lease. If another writer holds the lease, compaction skips deletion
+   rather than racing a pending publisher.
+
+8. **Ref/default manifest writes no longer use raw `GenerationId` ordering.**
+   Ref/default manifests are direct writes performed after lease verification
+   and/or generation-head acceptance. Pending verification strips ref writes
+   from `publish_verified_metadata`, advances or validates generation-head
+   ancestry first, and only then writes ref/default manifests.
+
+9. **Pending publish records survive head CAS conflicts.** If verification cannot
+   advance generation head and the refreshed head does not descend from the
+   pending generation, verification now returns a conflict and leaves the pending
+   record intact for a later verifier/repair pass.
+
+10. **Lease checks cover existing-generation writes.** Existing-complete
+    `publish_generation` paths verify the held repo-write lease before updating
+    branch/default manifests, matching the new-generation publish path.
 
 ---
 

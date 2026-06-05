@@ -8,6 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
+const LOCAL_LOCK_RETRY_COUNT: usize = 200;
+const LOCAL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const LOCAL_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
+
 #[derive(Debug, Clone)]
 pub struct LocalObjectStore {
     root: PathBuf,
@@ -116,7 +120,7 @@ impl LocalObjectStore {
         let lock_path = self.lock_path(key)?;
         let parent = parent_dir(&lock_path)?;
         fs::create_dir_all(parent).await?;
-        for _ in 0..200 {
+        for _ in 0..LOCAL_LOCK_RETRY_COUNT {
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -124,13 +128,21 @@ impl LocalObjectStore {
                 .await
             {
                 Ok(mut file) => {
-                    file.write_all(format!("{}\n", std::process::id()).as_bytes())
-                        .await?;
+                    let created_at_ms = now_unix_millis();
+                    file.write_all(
+                        format!(
+                            "pid={}\ncreated_at_unix_ms={created_at_ms}\n",
+                            std::process::id()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
                     file.sync_all().await?;
                     return Ok(LocalObjectLock { path: lock_path });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    self.recover_stale_lock(&lock_path).await?;
+                    tokio::time::sleep(LOCAL_LOCK_RETRY_DELAY).await;
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -138,6 +150,34 @@ impl LocalObjectStore {
         Err(GitCacheError::Conflict(format!(
             "timed out acquiring local object lock for `{key}`"
         )))
+    }
+
+    async fn recover_stale_lock(&self, lock_path: &Path) -> Result<()> {
+        let metadata = match fs::metadata(lock_path).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+
+        let lock_age = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+        let pid_dead = match fs::read_to_string(lock_path).await {
+            Ok(contents) => lock_owner_pid(&contents).is_some_and(|pid| !process_is_alive(pid)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        let stale_by_age = lock_age.is_some_and(|age| age >= LOCAL_LOCK_STALE_AFTER);
+
+        if pid_dead || stale_by_age {
+            match fs::remove_file(lock_path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -417,6 +457,31 @@ fn system_time_to_utc(time: SystemTime) -> Option<DateTime<Utc>> {
     time.duration_since(UNIX_EPOCH).ok().and_then(|duration| {
         DateTime::<Utc>::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
     })
+}
+
+fn now_unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn lock_owner_pid(contents: &str) -> Option<u32> {
+    contents.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|pid| pid.trim().parse().ok())
+    })
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    let proc_root = std::path::Path::new("/proc");
+    if !proc_root.exists() {
+        return true;
+    }
+    proc_root.join(pid.to_string()).exists()
 }
 
 fn hex_key(key: &str) -> String {

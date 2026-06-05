@@ -275,7 +275,7 @@ struct ObjectStoreRepoLease {
     repo: RepoKey,
     name: String,
     token: String,
-    renew_task: JoinHandle<()>,
+    renew_task: Option<JoinHandle<()>>,
 }
 
 impl ObjectStoreRepoLease {
@@ -300,14 +300,16 @@ impl ObjectStoreRepoLease {
             repo,
             name,
             token,
-            renew_task,
+            renew_task: Some(renew_task),
         }
     }
 }
 
 impl Drop for ObjectStoreRepoLease {
     fn drop(&mut self) {
-        self.renew_task.abort();
+        if let Some(renew_task) = &self.renew_task {
+            renew_task.abort();
+        }
     }
 }
 
@@ -317,8 +319,11 @@ impl RepoLease for ObjectStoreRepoLease {
         &self.token
     }
 
-    async fn release(self: Box<Self>) -> Result<()> {
-        self.renew_task.abort();
+    async fn release(mut self: Box<Self>) -> Result<()> {
+        if let Some(renew_task) = self.renew_task.take() {
+            renew_task.abort();
+            let _ = renew_task.await;
+        }
         if release_lease_if_token_matches(
             &*self.store,
             &self.repo,

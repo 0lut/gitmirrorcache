@@ -7,7 +7,7 @@ use futures::Stream;
 use git_cache_core::{
     AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
 };
-use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
+use git_cache_domain::materializer::{advertise_refs, parse_want_lines, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
     frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
@@ -137,22 +137,25 @@ async fn read_through_with_busy_wait(
     }
 }
 
-async fn acquire_repo_write_lease_with_busy_wait(
+async fn acquire_repo_write_lease_for_git_client(
     state: &Arc<ApiState>,
     repo: &git_cache_core::RepoKey,
-) -> CoreResult<LeaseAcquire> {
-    let max_wait = Duration::from_secs(state.domain.config.leases.busy_retry_after_seconds);
+) -> CoreResult<Box<dyn git_cache_worker::RepoLease>> {
+    let max_wait = Duration::from_secs(state.domain.config.git_timeout_seconds.max(1));
     let started_at = Instant::now();
 
     loop {
-        let lease = state.leases.acquire(repo).await?;
-        if !matches!(lease, LeaseAcquire::Busy) || started_at.elapsed() >= max_wait {
-            return Ok(lease);
+        match state.leases.acquire(repo).await? {
+            LeaseAcquire::Acquired(lease) => return Ok(lease),
+            LeaseAcquire::Busy if started_at.elapsed() < max_wait => {
+                tokio::time::sleep(LEASE_BUSY_RETRY_INTERVAL).await;
+            }
+            LeaseAcquire::Busy => {
+                return Err(GitCacheError::Conflict(format!(
+                    "timed out waiting for repo-write lease for `{repo}`"
+                )));
+            }
         }
-        tokio::time::sleep(
-            LEASE_BUSY_RETRY_INTERVAL.min(max_wait.saturating_sub(started_at.elapsed())),
-        )
-        .await;
     }
 }
 
@@ -226,6 +229,32 @@ async fn handle_materialize_request(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
+    let materializer = Materializer::new(Arc::clone(&state.domain));
+    if let Err(error) = materializer.validate_host(&request.repo) {
+        state
+            .metrics
+            .materialize_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        return Err(error.into());
+    }
+
+    if let Selector::Commit(commit) = &request.selector {
+        match materializer
+            .try_materialize_complete_commit_from_cache(request.repo.clone(), commit)
+            .await
+        {
+            Ok(Some(response)) => return Ok(Json(response).into_response()),
+            Ok(None) => {}
+            Err(error) => {
+                state
+                    .metrics
+                    .materialize_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(error.into());
+            }
+        }
+    }
+
     let outcome =
         read_through_with_busy_wait(state, request.repo.clone(), request.selector.clone()).await;
     match outcome {
@@ -253,7 +282,6 @@ async fn handle_materialize_request(
         Ok(_) => {}
     }
 
-    let materializer = Materializer::new(Arc::clone(&state.domain));
     let result = materializer
         .materialize_after_upstream_validation(request)
         .await;
@@ -416,22 +444,15 @@ async fn git_repo(
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
 
-        // Wait briefly for repo-write before falling back to 503, then hold the
-        // lease while processing wants. This keeps ensure_wants_available() and
-        // any publish_generation() it triggers under durable coordination, and
-        // passes the fencing token into Materializer so publish writes can verify
-        // ownership immediately before mutation.
-        let lease = match acquire_repo_write_lease_with_busy_wait(&state, &repo).await {
-            Ok(LeaseAcquire::Acquired(lease)) => lease,
-            Ok(LeaseAcquire::Busy) => {
-                let retry_after = state.domain.config.leases.busy_retry_after_seconds;
-                return Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header(header::RETRY_AFTER, retry_after.to_string())
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"error":"update in progress, retry later"}"#))
-                    .expect("lease busy response");
-            }
+        if parse_want_lines(&body).is_empty() {
+            return match materializer.handle_upload_pack(&repo, &body).await {
+                Ok(process) => stream_upload_pack_response(&state, process),
+                Err(error) => ApiError::from(error).into_response(),
+            };
+        }
+
+        let lease = match acquire_repo_write_lease_for_git_client(&state, &repo).await {
+            Ok(lease) => lease,
             Err(error) => return ApiError::from(error).into_response(),
         };
         let token = lease.token().to_string();
@@ -441,8 +462,11 @@ async fn git_repo(
 
         match (process_result, release_result) {
             (Ok(process), Ok(())) => stream_upload_pack_response(&state, process),
+            (Ok(process), Err(error)) => {
+                warn!(%repo, %error, "failed to release repo lease after upload-pack");
+                stream_upload_pack_response(&state, process)
+            }
             (Err(error), Ok(())) => ApiError::from(error).into_response(),
-            (Ok(_), Err(error)) => ApiError::from(error).into_response(),
             (Err(error), Err(release_error)) => {
                 warn!(%repo, %release_error, "failed to release repo lease after upload-pack error");
                 ApiError::from(error).into_response()

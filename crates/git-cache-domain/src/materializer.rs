@@ -16,14 +16,15 @@ use git_cache_objectstore::read_ref_manifest;
 #[cfg(test)]
 use git_cache_objectstore::write_repo_generation_head;
 use git_cache_objectstore::{
-    advance_generation_head, generation_manifest_key, pending_generation_publish_key,
-    put_json_if_version_matches, read_commit_manifest, read_generation_manifest, read_json,
-    read_json_with_version, read_lease_with_version, read_pending_generation_publish,
-    read_repo_generation_head, read_session_manifest, read_verified_generation_manifest,
-    verified_generation_manifest_key, write_commit_manifest,
-    write_commit_manifest_if_absent_or_matches, write_json, write_json_if_absent,
+    acquire_lease_with_token, advance_generation_head, generation_manifest_key,
+    pending_generation_publish_key, read_commit_manifest, read_generation_manifest, read_json,
+    read_lease_with_version, read_pending_generation_publish, read_repo_generation_head,
+    read_session_manifest, read_verified_generation_manifest, release_lease_if_token_matches,
+    steal_expired_lease_if_version_matches, verified_generation_manifest_key,
+    write_commit_manifest, write_commit_manifest_if_absent_or_matches, write_json,
     write_ref_manifest, write_session_manifest,
-    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, PublishManifests,
+    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, LeaseManifest,
+    PublishManifests,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -129,7 +130,11 @@ impl Materializer {
         match request.selector {
             Selector::Branch(branch) => self.materialize_local_branch(request.repo, &branch).await,
             Selector::DefaultBranch => self.materialize_local_default_branch(request.repo).await,
-            _ => self.materialize(request).await,
+            Selector::Commit(commit) => self.materialize_local_commit(request.repo, &commit).await,
+            Selector::ShortCommit(commit) => {
+                self.materialize_local_short_commit(request.repo, &commit)
+                    .await
+            }
         }
     }
 
@@ -143,13 +148,10 @@ impl Materializer {
         let commit = self
             .resolve_short_commit_from_upstream_refs(&repo_dir, &short_commit)
             .await?;
-        self.materialize_existing_local_commit(
-            repo,
-            &repo_dir,
-            commit,
-            MaterializeSource::GithubVerified,
-        )
-        .await
+        self.ensure_existing_local_commit(&repo, &repo_dir, &commit)
+            .await?;
+        self.create_session(repo, commit, MaterializeSource::GithubVerified)
+            .await
     }
 
     pub async fn materialize_commit(
@@ -157,80 +159,118 @@ impl Materializer {
         repo: RepoKey,
         commit: CommitSha,
     ) -> CoreResult<MaterializeResponse> {
-        if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
+        if let Some(response) = self
+            .try_materialize_complete_commit_from_cache(repo.clone(), &commit)
+            .await?
+        {
+            return Ok(response);
+        }
+
+        let source = self.ensure_commit(&repo, &commit).await?;
+        self.create_session(repo, commit, source).await
+    }
+
+    pub async fn try_materialize_complete_commit_from_cache(
+        &self,
+        repo: RepoKey,
+        commit: &CommitSha,
+    ) -> CoreResult<Option<MaterializeResponse>> {
+        self.validate_host(&repo)?;
+        let Some(manifest) = self.get_commit_manifest(&repo, commit).await? else {
+            return Ok(None);
+        };
+        if !manifest.complete {
+            return Ok(None);
+        }
+        self.hydrate_commit(&manifest).await?;
+        self.create_session(repo, commit.clone(), MaterializeSource::CacheVerified)
+            .await
+            .map(Some)
+    }
+
+    pub async fn ensure_commit(
+        &self,
+        repo: &RepoKey,
+        commit: &CommitSha,
+    ) -> CoreResult<MaterializeSource> {
+        self.validate_host(repo)?;
+        if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
             if manifest.complete {
                 self.hydrate_commit(&manifest).await?;
-                return self
-                    .create_session(repo, commit, MaterializeSource::CacheVerified)
-                    .await;
+                return Ok(MaterializeSource::CacheVerified);
             }
         }
         if self
-            .verify_pending_generation_for_commit(&repo, &commit)
+            .verify_pending_generation_for_commit(repo, commit)
             .await?
         {
-            if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
+            if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
                 if manifest.complete {
                     self.hydrate_commit(&manifest).await?;
-                    return self
-                        .create_session(repo, commit, MaterializeSource::CacheVerified)
-                        .await;
+                    return Ok(MaterializeSource::CacheVerified);
                 }
             }
         }
 
-        let repo_dir = self.ensure_repo_dir(&repo).await?;
-        if self.commit_exists(&repo_dir, &commit).await {
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        if self.commit_exists(&repo_dir, commit).await {
             if let Some(generation) = self
-                .index_local_commit_from_known_generation(&repo, &repo_dir, &commit)
+                .index_local_commit_from_known_generation(repo, &repo_dir, commit)
                 .await?
             {
                 debug!(%repo, %commit, %generation, "indexed exact commit from known generation");
-                return self
-                    .create_session(repo, commit, MaterializeSource::CacheVerified)
-                    .await;
+                return Ok(MaterializeSource::CacheVerified);
             }
         }
 
-        self.fetch_all_refs(&repo, &repo_dir).await?;
+        self.fetch_all_refs(repo, &repo_dir).await?;
 
-        if !self.commit_exists(&repo_dir, &commit).await {
+        if !self.commit_exists(&repo_dir, commit).await {
             return Err(GitCacheError::NotFound(format!(
                 "commit `{commit}` was not found after upstream verification"
             )));
         }
 
         if let Some(generation) = self
-            .index_local_commit_from_known_generation(&repo, &repo_dir, &commit)
+            .index_local_commit_from_known_generation(repo, &repo_dir, commit)
             .await?
         {
             debug!(%repo, %commit, %generation, "indexed exact commit from known generation after upstream fetch");
-            return self
-                .create_session(repo, commit, MaterializeSource::CacheVerified)
-                .await;
+            return Ok(MaterializeSource::CacheVerified);
         }
 
-        self.materialize_existing_local_commit(
-            repo,
-            &repo_dir,
-            commit,
-            MaterializeSource::GithubVerified,
-        )
-        .await
+        self.ensure_existing_local_commit(repo, &repo_dir, commit)
+            .await?;
+        Ok(MaterializeSource::GithubVerified)
     }
 
-    async fn materialize_existing_local_commit(
+    pub async fn ensure_short_commit(
         &self,
-        repo: RepoKey,
+        repo: &RepoKey,
+        short_commit: &ShortCommitSha,
+    ) -> CoreResult<CommitSha> {
+        self.validate_host(repo)?;
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        self.fetch_all_refs(repo, &repo_dir).await?;
+        let commit = self
+            .resolve_short_commit_from_upstream_refs(&repo_dir, short_commit)
+            .await?;
+        self.ensure_existing_local_commit(repo, &repo_dir, &commit)
+            .await?;
+        Ok(commit)
+    }
+
+    async fn ensure_existing_local_commit(
+        &self,
+        repo: &RepoKey,
         repo_dir: &FsPath,
-        commit: CommitSha,
-        source: MaterializeSource,
-    ) -> CoreResult<MaterializeResponse> {
+        commit: &CommitSha,
+    ) -> CoreResult<GenerationId> {
         let generation = self
-            .publish_generation(&repo, repo_dir, &commit, None, false)
+            .publish_generation(repo, repo_dir, commit, None, false)
             .await?;
         debug!(%repo, %commit, %generation, "published generation for exact commit");
-        self.create_session(repo, commit, source).await
+        Ok(generation)
     }
 
     async fn index_local_commit_from_known_generation(
@@ -613,6 +653,9 @@ impl Materializer {
     ) -> CoreResult<GenerationId> {
         if let Some(existing) = self.get_commit_manifest(repo, commit).await? {
             if existing.complete {
+                if branch.is_some() || default_branch {
+                    self.verify_lease_held(repo).await?;
+                }
                 if let Some(branch) = branch {
                     let ref_manifest = RefManifest {
                         repo: repo.clone(),
@@ -1000,38 +1043,47 @@ impl Materializer {
                 "verification for generation `{generation}` was not produced"
             ))
         })?;
-        GenerationPublish::with_manifests(pending.generation.clone(), pending.manifests.clone())
+        let mut publish_manifests = pending.manifests.clone();
+        let ref_manifests = std::mem::take(&mut publish_manifests.refs);
+        GenerationPublish::with_manifests(pending.generation.clone(), publish_manifests)
             .with_verification(verification)
             .publish_verified_metadata(&*self.state.store)
             .await?;
 
+        let current_head = read_repo_generation_head(&*self.state.store, &repo).await?;
+        let current_gen = current_head.as_ref().map(|h| h.generation);
+        let mut head_accepts_pending = current_gen == Some(pending.head.generation);
+        if !head_accepts_pending
+            && !advance_generation_head(&*self.state.store, current_gen, None, &pending.head)
+                .await?
+        {
+            let refreshed = read_repo_generation_head(&*self.state.store, &repo).await?;
+            if let Some(head) = refreshed {
+                head_accepts_pending = self
+                    .generation_chain_contains(&repo, head.generation, pending.head.generation)
+                    .await?;
+            }
+
+            if head_accepts_pending {
+                debug!(%repo, %generation, "head already includes verified generation");
+            } else {
+                warn!(%repo, %generation, "generation head CAS conflict; head is older than expected");
+                reservation.release().await?;
+                return Err(GitCacheError::Conflict(format!(
+                    "generation head CAS conflict while verifying `{generation}`"
+                )));
+            }
+        }
+
+        self.verify_lease_held(&repo).await?;
+        for manifest in &ref_manifests {
+            write_ref_manifest(&*self.state.store, manifest).await?;
+        }
         if let Some(default_ref) = pending.default_ref {
             write_ref_manifest(&*self.state.store, &default_ref).await?;
             self.write_default_ref_manifest(&default_ref).await?;
         }
 
-        let current_head = read_repo_generation_head(&*self.state.store, &repo).await?;
-        let current_gen = current_head.as_ref().map(|h| h.generation);
-        let current_is_newer = current_head
-            .as_ref()
-            .map(|h| h.updated_at > pending.head.updated_at)
-            .unwrap_or(false);
-        if current_gen != Some(pending.head.generation)
-            && !current_is_newer
-            && !advance_generation_head(&*self.state.store, current_gen, None, &pending.head)
-                .await?
-        {
-            let refreshed = read_repo_generation_head(&*self.state.store, &repo).await?;
-            if refreshed
-                .as_ref()
-                .map(|h| h.updated_at > pending.head.updated_at)
-                .unwrap_or(false)
-            {
-                debug!(%repo, %generation, "head already at or past verified generation");
-            } else {
-                warn!(%repo, %generation, "generation head CAS conflict; head is older than expected");
-            }
-        }
         if let Err(err) = self
             .state
             .store
@@ -1043,6 +1095,31 @@ impl Materializer {
         reservation.release().await?;
         info!(%repo, %generation, "generation verified");
         Ok(())
+    }
+
+    async fn generation_chain_contains(
+        &self,
+        repo: &RepoKey,
+        head: GenerationId,
+        needle: GenerationId,
+    ) -> CoreResult<bool> {
+        let mut seen = HashSet::new();
+        let mut next = Some(head);
+        while let Some(current) = next {
+            if current == needle {
+                return Ok(true);
+            }
+            if !seen.insert(current) {
+                return Err(GitCacheError::Conflict(format!(
+                    "generation chain for `{repo}` contains a cycle at `{current}`"
+                )));
+            }
+            let Some(manifest) = self.get_generation_manifest(repo, current).await? else {
+                return Ok(false);
+            };
+            next = manifest.parent_generation;
+        }
+        Ok(false)
     }
 
     async fn generation_chain_for_verification(
@@ -1169,10 +1246,20 @@ impl Materializer {
             tip_commits: head.tip_commits.clone(),
             updated_at: now,
         };
+        let Some((lease_token, release_when_done)) =
+            self.acquire_compaction_cleanup_lease(repo).await?
+        else {
+            debug!(%repo, "compaction skipped mutable publish because repo-write lease was busy");
+            reservation.release().await?;
+            return Ok(None);
+        };
+        let fenced_materializer =
+            Materializer::with_lease_token(Arc::clone(&self.state), lease_token.clone());
         GenerationPublish::new(generation_manifest.clone())
             .publish_pending_bundle_file(&*self.state.store, &bundle_path, new_head.clone(), None)
             .await?;
-        self.verify_generation_with_semaphore(repo.clone(), new_generation, false)
+        fenced_materializer
+            .verify_generation_with_semaphore(repo.clone(), new_generation, false)
             .await?;
 
         if !advance_generation_head(&*self.state.store, Some(head.generation), None, &new_head)
@@ -1181,11 +1268,22 @@ impl Materializer {
             // Another worker advanced the head after our snapshot; abort
             // cleanup to avoid deleting generations the new head still needs.
             warn!(%repo, "compaction head CAS lost; aborting cleanup");
+            if release_when_done {
+                release_lease_if_token_matches(
+                    &*self.state.store,
+                    repo,
+                    "repo-write",
+                    &lease_token,
+                    Utc::now(),
+                )
+                .await?;
+            }
             reservation.release().await?;
             return Ok(None);
         }
 
-        self.repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)
+        fenced_materializer
+            .repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)
             .await?;
         for commit in commits {
             write_commit_manifest(
@@ -1203,16 +1301,36 @@ impl Materializer {
         let retained_generations = self
             .old_generations_needed_by_pending_publishes(repo, &old_generation_set)
             .await?;
+        if !retained_generations.is_empty() {
+            debug!(
+                %repo,
+                retained = retained_generations.len(),
+                "compaction kept old generations referenced by pending publishes"
+            );
+        }
         let delete_generations = old_generations
             .iter()
             .copied()
             .filter(|generation| !retained_generations.contains(generation))
             .collect::<Vec<_>>();
-        let bytes_reclaimed = self
-            .bundle_bytes_for_generations(repo, &delete_generations)
+        let mut bytes_reclaimed = 0;
+        if !delete_generations.is_empty() {
+            bytes_reclaimed = self
+                .bundle_bytes_for_generations(repo, &delete_generations)
+                .await?;
+            self.delete_old_generations(repo, &delete_generations)
+                .await?;
+        }
+        if release_when_done {
+            release_lease_if_token_matches(
+                &*self.state.store,
+                repo,
+                "repo-write",
+                &lease_token,
+                Utc::now(),
+            )
             .await?;
-        self.delete_old_generations(repo, &delete_generations)
-            .await?;
+        }
 
         reservation.release().await?;
 
@@ -1373,6 +1491,78 @@ impl Materializer {
         Ok(())
     }
 
+    async fn acquire_compaction_cleanup_lease(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<Option<(String, bool)>> {
+        if let Some(token) = &self.lease_token {
+            self.verify_lease_held(repo).await?;
+            return Ok(Some((token.clone(), false)));
+        }
+
+        let token = GenerationId::new().to_string();
+        let now = Utc::now();
+        let ttl = ChronoDuration::seconds(self.state.config.leases.ttl_seconds as i64);
+        let holder = self
+            .state
+            .config
+            .leases
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| format!("compaction-{}", std::process::id()));
+
+        if acquire_lease_with_token(
+            &*self.state.store,
+            repo,
+            "repo-write",
+            holder.clone(),
+            token.clone(),
+            now,
+            ttl,
+        )
+        .await?
+        .is_some()
+        {
+            return Ok(Some((token, true)));
+        }
+
+        let Some((existing, version)) =
+            read_lease_with_version(&*self.state.store, repo, "repo-write").await?
+        else {
+            return Ok(None);
+        };
+        if existing.released_at.is_none() && existing.expires_at > now {
+            return Ok(None);
+        }
+
+        let lease = LeaseManifest {
+            schema_version: 1,
+            repo: repo.clone(),
+            name: "repo-write".into(),
+            holder,
+            token: token.clone(),
+            acquired_at: now,
+            renewed_at: Some(now),
+            expires_at: now + ttl,
+            released_at: None,
+            operation: Some("compaction-cleanup".into()),
+            expected_head: None,
+        };
+        if steal_expired_lease_if_version_matches(
+            &*self.state.store,
+            repo,
+            "repo-write",
+            &version,
+            lease,
+        )
+        .await?
+        {
+            Ok(Some((token, true)))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn delete_old_generations(
         &self,
         repo: &RepoKey,
@@ -1409,36 +1599,14 @@ impl Materializer {
             generation: commit_manifest.generation,
             verified_at: Utc::now(),
         };
+        self.verify_lease_held(repo).await?;
         write_ref_manifest(&*self.state.store, &manifest).await?;
         self.write_default_ref_manifest(&manifest).await
     }
 
     async fn write_default_ref_manifest(&self, manifest: &RefManifest) -> CoreResult<()> {
         let key = default_manifest_key(&manifest.repo);
-        loop {
-            match read_json_with_version::<_, RefManifest>(&*self.state.store, &key).await? {
-                Some((existing, version)) => {
-                    if existing == *manifest {
-                        return Ok(());
-                    }
-                    // Use monotonic generation ordering (UUID v7) instead of
-                    // wall-clock verified_at.
-                    if existing.generation >= manifest.generation {
-                        return Ok(());
-                    }
-                    if put_json_if_version_matches(&*self.state.store, &key, &version, manifest)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                }
-                None => {
-                    if write_json_if_absent(&*self.state.store, &key, manifest).await? {
-                        return Ok(());
-                    }
-                }
-            }
-        }
+        write_json(&*self.state.store, &key, manifest).await
     }
 
     pub async fn get_commit_manifest(
@@ -1464,6 +1632,44 @@ impl Materializer {
             .and_then(CommitSha::parse)?;
         self.create_session(repo, commit, MaterializeSource::GithubVerified)
             .await
+    }
+
+    async fn materialize_local_commit(
+        &self,
+        repo: RepoKey,
+        commit: &CommitSha,
+    ) -> CoreResult<MaterializeResponse> {
+        if let Some(manifest) = self.get_commit_manifest(&repo, commit).await? {
+            if manifest.complete {
+                self.hydrate_commit(&manifest).await?;
+                return self
+                    .create_session(repo, commit.clone(), MaterializeSource::CacheVerified)
+                    .await;
+            }
+        }
+
+        let repo_dir = self.ensure_repo_dir(&repo).await?;
+        if self.commit_ready_for_serving(&repo_dir, commit).await {
+            return self
+                .create_session(repo, commit.clone(), MaterializeSource::GithubVerified)
+                .await;
+        }
+
+        Err(GitCacheError::NotFound(format!(
+            "coordinated read-through did not make commit `{commit}` available"
+        )))
+    }
+
+    async fn materialize_local_short_commit(
+        &self,
+        repo: RepoKey,
+        short_commit: &ShortCommitSha,
+    ) -> CoreResult<MaterializeResponse> {
+        let repo_dir = self.ensure_repo_dir(&repo).await?;
+        let commit = self
+            .resolve_short_commit_from_upstream_refs(&repo_dir, short_commit)
+            .await?;
+        self.materialize_local_commit(repo, &commit).await
     }
 
     async fn materialize_local_default_branch(
@@ -2238,13 +2444,11 @@ impl UpdateExecutor for MaterializerExecutor {
                 materializer.ensure_default_branch(&request.repo).await?;
             }
             UpdateTarget::Commit(commit) => {
-                materializer
-                    .materialize_commit(request.repo, commit)
-                    .await?;
+                materializer.ensure_commit(&request.repo, &commit).await?;
             }
             UpdateTarget::ShortCommit(commit) => {
                 materializer
-                    .materialize_short_commit(request.repo, commit)
+                    .ensure_short_commit(&request.repo, &commit)
                     .await?;
             }
             UpdateTarget::Ref(ref ref_name) => {
