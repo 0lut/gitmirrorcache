@@ -14,7 +14,7 @@ impl Materializer {
         let mut changed: HashMap<String, String> = HashMap::new();
 
         for (branch, upstream_sha) in &ls.refs {
-            let local_ref = format!("refs/heads/{branch}");
+            let local_ref = format!("refs/cache/upstream/heads/{branch}");
             let local_sha = self.state.git.rev_parse(&repo_dir, &local_ref).await.ok();
             if local_sha.as_deref() != Some(upstream_sha.as_str()) {
                 changed.insert(branch.clone(), upstream_sha.clone());
@@ -183,9 +183,7 @@ impl Materializer {
         wants: &[String],
         comparison: &UpstreamRefComparison,
     ) -> CoreResult<()> {
-        self.fetch_changed_refs(repo, comparison).await?;
         let repo_dir = self.ensure_repo_dir(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
 
         let authorized_tips: HashSet<String> = comparison
             .all_upstream
@@ -213,45 +211,56 @@ impl Materializer {
                     )));
                 }
 
-                let existed_before_fetch = self.object_exists(&repo_dir, &object_id).await;
-                match upstream_git
-                    .fetch_object(&repo_dir, &upstream_url, &object_id)
-                    .await
                 {
-                    Ok(_) if !existed_before_fetch => {}
-                    Ok(_) => {
-                        upstream_git
-                            .fetch_all_heads(&repo_dir, &upstream_url)
-                            .await?;
-                        if !self
-                            .object_reachable_from_upstream_tips(
-                                &repo_dir,
-                                &object_id,
-                                &upstream_tips,
-                            )
-                            .await?
-                        {
-                            return self.unproven_want_error(&object_id, None);
+                    let _repo_lock = self.lock_repo(repo).await?;
+                    let existed_before_fetch = self.object_exists(&repo_dir, &object_id).await;
+                    match upstream_git
+                        .fetch_object(&repo_dir, &upstream_url, &object_id)
+                        .await
+                    {
+                        Ok(_) if !existed_before_fetch => {}
+                        Ok(_) => {
+                            upstream_git
+                                .fetch_all_heads(&repo_dir, &upstream_url)
+                                .await?;
+                            if !self
+                                .object_reachable_from_upstream_tips(
+                                    &repo_dir,
+                                    &object_id,
+                                    &upstream_tips,
+                                )
+                                .await?
+                            {
+                                return self.unproven_want_error(&object_id, None);
+                            }
                         }
-                    }
-                    Err(err) => {
-                        upstream_git
-                            .fetch_all_heads(&repo_dir, &upstream_url)
-                            .await?;
-                        if !self
-                            .object_reachable_from_upstream_tips(
-                                &repo_dir,
-                                &object_id,
-                                &upstream_tips,
-                            )
-                            .await?
-                        {
-                            return self.unproven_want_error(&object_id, Some(&err));
+                        Err(err) => {
+                            upstream_git
+                                .fetch_all_heads(&repo_dir, &upstream_url)
+                                .await?;
+                            if !self
+                                .object_reachable_from_upstream_tips(
+                                    &repo_dir,
+                                    &object_id,
+                                    &upstream_tips,
+                                )
+                                .await?
+                            {
+                                return self.unproven_want_error(&object_id, Some(&err));
+                            }
                         }
                     }
                 }
+            } else if self.get_commit_manifest(repo, &object_id).await?.is_none()
+                && (!self.object_exists(&repo_dir, &object_id).await
+                    || (self.commit_exists(&repo_dir, &object_id).await
+                        && !self.commit_ready_for_serving(&repo_dir, &object_id).await))
+            {
+                self.fetch_refs_for_advertised_want(repo, comparison, &object_id)
+                    .await?;
             }
 
+            let _repo_lock = self.lock_repo(repo).await?;
             if !self.object_exists(&repo_dir, &object_id).await
                 || (self.commit_exists(&repo_dir, &object_id).await
                     && !self.commit_ready_for_serving(&repo_dir, &object_id).await)
@@ -307,6 +316,30 @@ impl Materializer {
         }
 
         Ok(())
+    }
+
+    async fn fetch_refs_for_advertised_want(
+        &self,
+        repo: &RepoKey,
+        comparison: &UpstreamRefComparison,
+        object_id: &CommitSha,
+    ) -> CoreResult<()> {
+        let changed = comparison
+            .all_upstream
+            .iter()
+            .filter(|(_, sha)| sha.eq_ignore_ascii_case(object_id.as_str()))
+            .map(|(branch, sha)| (branch.clone(), sha.clone()))
+            .collect::<HashMap<_, _>>();
+        if changed.is_empty() {
+            return Ok(());
+        }
+
+        let wanted_comparison = UpstreamRefComparison {
+            changed,
+            default_branch: comparison.default_branch.clone(),
+            all_upstream: comparison.all_upstream.clone(),
+        };
+        self.fetch_changed_refs(repo, &wanted_comparison).await
     }
 
     pub(super) async fn object_reachable_from_upstream_tips(

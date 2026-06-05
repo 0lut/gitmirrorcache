@@ -592,3 +592,24 @@ raw prefix scans still exist for cleanup/compaction, but key deserialization is
 centralized in the wrapper. Materializer tests were split into behavior modules
 so future changes can add focused coverage without growing one monolithic test
 file again.
+
+### D9. Direct Git wants fetch only what the requested object needs
+
+AWS smoke logs for `llvm/llvm-project` showed generation verification conflicts
+for the current `main` commit while the host cache already had the commit and
+tree locally. The surprising part was direct clone POST behavior: after the
+synthesized upstream advertisement, `ensure_wants_available` fetched and
+published every branch that differed from local public `refs/heads/*` before it
+checked whether the requested want was already an advertised, complete cached
+tip. Large repos with many active branches could therefore stall on unrelated
+fetch/publish work and race with existing generation manifests.
+
+Direct Git ref comparison now uses internal upstream cache refs
+`refs/cache/upstream/heads/*`, which are the refs materialization maintains.
+For an advertised want, the path serves an already-complete cached object
+without fetching unrelated changed refs. If the advertised object is missing or
+incomplete and has no complete commit manifest, the path fetches only the
+advertised branch or branches that point at that exact object. A regression test
+first reproduced the old behavior by adding an unrequested changed side branch:
+the old code fetched `refs/heads/side` for a `main` want, while the fixed path
+does not publish or fetch that side branch.

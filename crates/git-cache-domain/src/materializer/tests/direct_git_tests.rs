@@ -126,6 +126,62 @@ async fn anonymous_direct_want_allows_cached_public_ancestor() {
 }
 
 #[tokio::test]
+async fn anonymous_direct_want_does_not_fetch_unrequested_changed_refs() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let cached = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let cached_manifest = wait_for_commit_manifest(&state, &fixture.repo, &cached.commit).await;
+    wait_for_verified_generation(&state, &fixture.repo, cached_manifest.generation).await;
+
+    stdfs::write(fixture.work_path().join("side.txt"), "side\n").unwrap();
+    run_git(&fixture.work_path(), ["add", "side.txt"]);
+    run_git(&fixture.work_path(), ["commit", "-m", "side branch"]);
+    let side_commit =
+        CommitSha::parse(git_stdout(&fixture.work_path(), ["rev-parse", "HEAD"])).unwrap();
+    fixture.push_head_to_branch("side");
+
+    let generation_keys_before = generation_object_keys(&state, &fixture.repo).await;
+
+    materializer
+        .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
+        .await
+        .expect("cached advertised tip should be served without fetching unrelated refs");
+
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    assert!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/heads/side")
+            .await
+            .is_err(),
+        "unrequested changed side branch should not be fetched"
+    );
+    assert!(
+        materializer
+            .get_commit_manifest(&fixture.repo, &side_commit)
+            .await
+            .unwrap()
+            .is_none(),
+        "unrequested side branch should not be published"
+    );
+    assert_eq!(
+        generation_keys_before,
+        generation_object_keys(&state, &fixture.repo).await,
+        "serving an already-cached want should not write new generation objects"
+    );
+}
+
+#[tokio::test]
 async fn anonymous_direct_want_allows_cached_public_blob() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
