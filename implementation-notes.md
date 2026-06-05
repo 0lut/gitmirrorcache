@@ -688,3 +688,25 @@ types, likely something like `GitHubOrigin`, `GitLabOrigin`,
 `BitbucketOrigin`, and `PrivateGitServerOrigin`. The existing `RepoKey` remains
 the three-segment `host/owner/name` shape in this branch, so GitLab nested
 groups still need that later origin/key model.
+
+### D11. Anonymous direct Git can restore public proof from matching manifests
+
+AWS LLVM smoke testing exposed a ref-cold/object-warm state: the local bare repo
+held large packs, but did not have `refs/heads/*` or
+`refs/cache/upstream/heads/*`. Current `main` served this quickly because it
+trusted object existence, but that is the SHA-guess leak the auth work is meant
+to close. The auth branch therefore needs a bridge that restores serving proof
+without treating raw object presence as authorization.
+
+Anonymous direct Git POST now checks persisted public ref manifests before it
+fetches an advertised tip from upstream. A ref manifest is only used when its
+`refs/heads/<branch> -> commit` mapping exactly matches the current upstream
+advertisement for this request. In that case the materializer hydrates the
+verified generation if needed, restores both `refs/cache/upstream/heads/<branch>`
+and public `refs/heads/<branch>`, updates `HEAD` for the advertised default
+branch, and then continues through the normal local public-reachability path.
+
+This deliberately is not a visibility cache. If GitHub/GitLab/Bitbucket now
+advertises a different tip, the manifest is stale for this request and the path
+falls back to upstream proof/fetch. The restored refs only recover the hot path
+for commits whose public ref mapping is still current.

@@ -445,7 +445,12 @@ impl Materializer {
                         }
                     }
                 }
-            } else if self.get_commit_manifest(repo, &object_id).await?.is_none()
+            } else if !self
+                .restore_public_refs_from_matching_manifests(
+                    repo, &repo_dir, comparison, &object_id,
+                )
+                .await?
+                && self.get_commit_manifest(repo, &object_id).await?.is_none()
                 && (!self.object_exists(&repo_dir, &object_id).await
                     || (self.commit_exists(&repo_dir, &object_id).await
                         && !self.commit_ready_for_serving(&repo_dir, &object_id).await))
@@ -513,6 +518,88 @@ impl Materializer {
         }
 
         Ok(())
+    }
+
+    async fn restore_public_refs_from_matching_manifests(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        comparison: &UpstreamRefComparison,
+        object_id: &CommitSha,
+    ) -> CoreResult<bool> {
+        if self.upstream_auth.is_authenticated() {
+            return Ok(false);
+        }
+
+        let mut restored = false;
+        for (branch, advertised_sha) in &comparison.all_upstream {
+            if !advertised_sha.eq_ignore_ascii_case(object_id.as_str()) {
+                continue;
+            }
+
+            let branch = BranchName::parse(branch.as_str())?;
+            let ref_name = branch.ref_name();
+            let Some(ref_manifest) = self.manifests().ref_manifest(repo, &ref_name).await? else {
+                continue;
+            };
+            if ref_manifest.commit != *object_id {
+                continue;
+            }
+
+            // A public ref manifest is durable proof that this ref->commit
+            // mapping was publicly verified. We only use it when it matches
+            // the current upstream advertisement, then restore local refs so
+            // future anonymous wants can prove reachability without trusting
+            // raw object presence.
+            let commit_manifest = self
+                .get_commit_manifest(repo, object_id)
+                .await?
+                .filter(|manifest| manifest.complete)
+                .unwrap_or_else(|| CommitManifest {
+                    repo: repo.clone(),
+                    commit: object_id.clone(),
+                    generation: ref_manifest.generation,
+                    complete: true,
+                    verified_at: ref_manifest.verified_at,
+                });
+
+            let _repo_lock = self.lock_repo(repo).await?;
+            self.hydrate_commit_in_repo(repo_dir, &commit_manifest)
+                .await?;
+            if !self.commit_ready_for_serving(repo_dir, object_id).await {
+                return Err(GitCacheError::NotFound(format!(
+                    "ref manifest `{ref_name}` restored generation `{}` but commit `{object_id}` is incomplete",
+                    ref_manifest.generation
+                )));
+            }
+
+            if self.get_commit_manifest(repo, object_id).await?.is_none() {
+                self.manifests().write_commit(&commit_manifest).await?;
+            }
+
+            self.state
+                .git
+                .update_ref(
+                    repo_dir,
+                    &format!("refs/cache/upstream/heads/{branch}"),
+                    object_id.as_str(),
+                )
+                .await?;
+            self.state
+                .git
+                .update_ref(repo_dir, &ref_name, object_id.as_str())
+                .await?;
+
+            if comparison.default_branch.as_deref() == Some(branch.as_str()) {
+                self.state
+                    .git
+                    .symbolic_ref(repo_dir, "HEAD", &ref_name)
+                    .await?;
+            }
+            restored = true;
+        }
+
+        Ok(restored)
     }
 
     async fn fetch_refs_for_advertised_want(
