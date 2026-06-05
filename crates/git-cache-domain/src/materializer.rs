@@ -1669,7 +1669,23 @@ impl Materializer {
         let commit = self
             .resolve_short_commit_from_upstream_refs(&repo_dir, short_commit)
             .await?;
-        self.materialize_local_commit(repo, &commit).await
+        if let Some(manifest) = self.get_commit_manifest(&repo, &commit).await? {
+            if manifest.complete {
+                self.hydrate_commit(&manifest).await?;
+                return self
+                    .create_session(repo, commit, MaterializeSource::GithubVerified)
+                    .await;
+            }
+        }
+        if self.commit_ready_for_serving(&repo_dir, &commit).await {
+            return self
+                .create_session(repo, commit, MaterializeSource::GithubVerified)
+                .await;
+        }
+
+        Err(GitCacheError::NotFound(format!(
+            "coordinated read-through did not make short commit `{short_commit}` available"
+        )))
     }
 
     async fn materialize_local_default_branch(
