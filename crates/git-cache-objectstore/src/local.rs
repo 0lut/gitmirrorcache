@@ -128,6 +128,7 @@ impl LocalObjectStore {
                 .await
             {
                 Ok(mut file) => {
+                    let lock = LocalObjectLock { path: lock_path };
                     let created_at_ms = now_unix_millis();
                     file.write_all(
                         format!(
@@ -138,7 +139,7 @@ impl LocalObjectStore {
                     )
                     .await?;
                     file.sync_all().await?;
-                    return Ok(LocalObjectLock { path: lock_path });
+                    return Ok(lock);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     self.recover_stale_lock(&lock_path).await?;

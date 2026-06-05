@@ -21,10 +21,10 @@ use git_cache_objectstore::{
     read_json_with_version, read_lease_with_version, read_pending_generation_publish,
     read_ref_manifest_with_version, read_repo_generation_head, read_session_manifest,
     read_verified_generation_manifest, verified_generation_manifest_key, write_commit_manifest,
-    write_commit_manifest_if_absent_or_matches, write_json, write_json_if_absent,
-    write_ref_manifest, write_ref_manifest_if_version_matches, write_session_manifest,
-    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish,
-    PendingGenerationPublish, PublishManifests,
+    write_commit_manifest_if_absent_or_matches, write_generation_manifest_if_absent_or_matches,
+    write_json, write_json_if_absent, write_ref_manifest, write_ref_manifest_if_version_matches,
+    write_session_manifest, write_verified_generation_manifest_if_absent_or_matches,
+    GenerationPublish, PendingGenerationPublish, PublishManifests,
 };
 use git_cache_worker::{LeaseAcquire, ObjectStoreRepoLeaseManager, RepoLeaseManager};
 use serde::Serialize;
@@ -46,6 +46,7 @@ const GENERATION_VERIFICATION_MAX_ATTEMPTS: usize = 3;
 const GENERATION_VERIFICATION_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
 const COMPACTION_MAX_ATTEMPTS: usize = 3;
 const COMPACTION_LEASE_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
+const GENERATION_MANIFEST_READBACK_ATTEMPTS: usize = 3;
 const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
 
 #[derive(Clone)]
@@ -837,6 +838,14 @@ impl Materializer {
                     .await;
                 match result {
                     Ok(()) => return,
+                    Err(
+                        GitCacheError::LeaseBusy(err)
+                        | GitCacheError::Conflict(err)
+                        | GitCacheError::CasConflict(err),
+                    ) if attempt < GENERATION_VERIFICATION_MAX_ATTEMPTS => {
+                        warn!(%repo, %generation, attempt, %err, "generation verification contention; retrying");
+                        tokio::time::sleep(COMPACTION_LEASE_RETRY_DELAY).await;
+                    }
                     Err(err) if attempt < GENERATION_VERIFICATION_MAX_ATTEMPTS => {
                         warn!(%repo, %generation, attempt, %err, "generation verification failed; retrying");
                         tokio::time::sleep(GENERATION_VERIFICATION_RETRY_DELAY).await;
@@ -1091,12 +1100,18 @@ impl Materializer {
         pending: PendingGenerationPublish,
         verification: VerifiedGenerationManifest,
     ) -> CoreResult<()> {
-        let Some((lease_token, verification_lease)) =
-            self.acquire_repo_write_lease_for_mutation(&repo).await?
-        else {
-            return Err(GitCacheError::LeaseBusy(format!(
-                "repo-write lease busy while verifying generation `{generation}`"
-            )));
+        let retry_for = StdDuration::from_secs(self.state.config.leases.busy_retry_after_seconds);
+        let deadline = tokio::time::Instant::now() + retry_for;
+        let (lease_token, verification_lease) = loop {
+            if let Some(lease) = self.acquire_repo_write_lease_for_mutation(&repo).await? {
+                break lease;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(GitCacheError::LeaseBusy(format!(
+                    "repo-write lease busy while verifying generation `{generation}`"
+                )));
+            }
+            tokio::time::sleep(COMPACTION_LEASE_RETRY_DELAY).await;
         };
         let fenced_materializer =
             Materializer::with_lease_token(Arc::clone(&self.state), lease_token);
@@ -1140,6 +1155,8 @@ impl Materializer {
         GenerationPublish::with_manifests(pending.generation.clone(), publish_manifests)
             .with_verification(verification)
             .publish_verified_metadata(&*self.state.store)
+            .await?;
+        self.ensure_generation_manifest_readable(&repo, generation, &pending.generation)
             .await?;
 
         let has_public_refs = !ref_manifests.is_empty() || pending.default_ref.is_some();
@@ -1226,6 +1243,40 @@ impl Materializer {
         self.delete_pending_generation_publish(&repo, generation)
             .await;
         Ok(())
+    }
+
+    async fn ensure_generation_manifest_readable(
+        &self,
+        repo: &RepoKey,
+        generation: GenerationId,
+        expected: &GenerationManifest,
+    ) -> CoreResult<()> {
+        for attempt in 1..=GENERATION_MANIFEST_READBACK_ATTEMPTS {
+            match read_generation_manifest(&*self.state.store, repo, generation).await? {
+                Some(manifest) if manifest == *expected => return Ok(()),
+                Some(_) => {
+                    return Err(GitCacheError::Conflict(format!(
+                        "generation manifest `{generation}` changed during publication"
+                    )));
+                }
+                None => {
+                    if !self.state.store.exists(&expected.bundle_key).await? {
+                        return Err(GitCacheError::NotFound(format!(
+                            "bundle `{}` missing while publishing generation `{generation}`",
+                            expected.bundle_key
+                        )));
+                    }
+                    write_generation_manifest_if_absent_or_matches(&*self.state.store, expected)
+                        .await?;
+                    if attempt < GENERATION_MANIFEST_READBACK_ATTEMPTS {
+                        tokio::time::sleep(COMPACTION_LEASE_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+        Err(GitCacheError::CasConflict(format!(
+            "generation manifest `{generation}` not readable after publication"
+        )))
     }
 
     async fn pending_ref_observation_still_current(
@@ -1662,6 +1713,9 @@ impl Materializer {
             fenced_materializer
                 .verify_generation_with_semaphore(repo.clone(), new_generation, false)
                 .await?;
+            fenced_materializer
+                .ensure_generation_manifest_readable(repo, new_generation, &generation_manifest)
+                .await?;
 
             if !advance_generation_head(&*self.state.store, Some(head.generation), None, &new_head)
                 .await?
@@ -1702,7 +1756,9 @@ impl Materializer {
             let delete_generations = old_generations
                 .iter()
                 .copied()
-                .filter(|generation| !retained_generations.contains(generation))
+                .filter(|generation| {
+                    *generation != new_generation && !retained_generations.contains(generation)
+                })
                 .collect::<Vec<_>>();
             let mut bytes_reclaimed = 0;
             if !delete_generations.is_empty() {
@@ -1712,6 +1768,9 @@ impl Materializer {
                 self.delete_old_generations(repo, &delete_generations)
                     .await?;
             }
+            fenced_materializer
+                .ensure_generation_manifest_readable(repo, new_generation, &generation_manifest)
+                .await?;
 
             reservation.release().await?;
 
@@ -3186,6 +3245,8 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
+    const TEST_ASYNC_PUBLISH_ATTEMPTS: usize = 2_000;
+
     #[cfg(test)]
     fn ref_manifest_key(repo: &RepoKey, branch: &str) -> String {
         git_cache_objectstore::ref_manifest_key(repo, &format!("refs/heads/{branch}"))
@@ -3216,7 +3277,7 @@ mod tests {
         repo: &RepoKey,
         generation: GenerationId,
     ) {
-        for _ in 0..100 {
+        for _ in 0..TEST_ASYNC_PUBLISH_ATTEMPTS {
             if read_verified_generation_manifest(&*state.store, repo, generation)
                 .await
                 .unwrap()
@@ -3234,7 +3295,7 @@ mod tests {
         repo: &RepoKey,
         commit: &CommitSha,
     ) -> CommitManifest {
-        for _ in 0..100 {
+        for _ in 0..TEST_ASYNC_PUBLISH_ATTEMPTS {
             if let Some(manifest) = read_commit_manifest(&*state.store, repo, commit)
                 .await
                 .unwrap()
@@ -3251,7 +3312,7 @@ mod tests {
         repo: &RepoKey,
         generation: GenerationId,
     ) -> RepoGenerationHead {
-        for _ in 0..100 {
+        for _ in 0..TEST_ASYNC_PUBLISH_ATTEMPTS {
             if let Some(head) = read_repo_generation_head(&*state.store, repo)
                 .await
                 .unwrap()
@@ -3346,6 +3407,7 @@ mod tests {
             .await
             .unwrap();
         let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
         let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
         let first_generation =
             generation_manifest_for(&state, &fixture.repo, first_manifest.generation).await;

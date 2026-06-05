@@ -618,3 +618,28 @@ either compacts under the acquired lease or returns `LeaseBusy`, keeping
 same distinction applies when the generation-head CAS loses to another verifier:
 explicit compaction retries against the refreshed head, then returns the
 remaining CAS conflict instead of reporting an ordinary no-op.
+
+Compaction also read-validates the compacted generation manifest before and
+after head publication/cleanup. If a concurrent verifier or object-store
+ordering gap makes `generation-head.json` point at metadata that is not yet
+readable, explicit compaction rewrites/validates the manifest before returning
+or reports a retryable CAS conflict instead of handing callers a report for an
+unreadable head. Token-less pending verification now waits briefly for the
+`repo-write` lease before surfacing `LeaseBusy`, which avoids 30s background
+retry gaps during ordinary same-repo verifier contention; background verifiers
+also retry lease/head contention immediately rather than sleeping for the long
+non-contention verification retry interval. The async test wait helpers use a
+longer window so they tolerate the configured lease-busy retry budget without
+weakening the asserted manifest/head invariants.
+
+The compaction-chain regression setup now waits for both first-generation commit
+metadata and the first generation head before publishing the second generation.
+That keeps the test aligned with the object-store invariant above: commit
+metadata can be durable before head publication, so commit metadata alone should
+not be used as a proxy for chain ancestry.
+
+Local object-store key locks now construct the RAII cleanup guard immediately
+after the lock file is created, before writing lock metadata. That closes a
+cancellation-safety gap where aborting a task in the metadata-write window could
+leave a same-PID lock file behind; same-PID locks are intentionally not stolen
+by stale-lock recovery.
