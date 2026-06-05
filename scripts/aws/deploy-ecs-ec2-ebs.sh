@@ -50,11 +50,23 @@ ECS_EBS_VOLUME_TYPE="${ECS_EBS_VOLUME_TYPE:-gp3}"
 ECS_EBS_IOPS="${ECS_EBS_IOPS:-8000}"
 ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-500}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
+ECS_EBS_DELETE_ON_TERMINATION="${ECS_EBS_DELETE_ON_TERMINATION:-false}"
 ECS_SKIP_DOCKER_BUILD="${ECS_SKIP_DOCKER_BUILD:-false}"
+ECR_PUSH_LATEST="${ECR_PUSH_LATEST:-true}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
 LATEST_URI="${ECR_REPOSITORY_URI}:latest"
+
+case "$ECS_EBS_DELETE_ON_TERMINATION" in
+  true | false) ;;
+  *) die "ECS_EBS_DELETE_ON_TERMINATION must be true or false" ;;
+esac
+
+case "$ECR_PUSH_LATEST" in
+  true | false) ;;
+  *) die "ECR_PUSH_LATEST must be true or false" ;;
+esac
 
 runtime_s3_prefix() {
   local prefix="$1"
@@ -95,6 +107,7 @@ export ECS_ALB_NAME ECS_TARGET_GROUP_NAME ECS_ALB_SG_NAME ECS_TASK_SG_NAME ECS_L
 export ECS_EXECUTION_ROLE_NAME ECS_TASK_ROLE_NAME ECS_INSTANCE_ROLE_NAME ECS_INSTANCE_PROFILE_NAME
 export ECS_INSTANCE_NAME ECS_CPU ECS_MEMORY ECS_DESIRED_COUNT ECS_EC2_INSTANCE_TYPE ECS_CPU_ARCHITECTURE
 export ECS_EBS_SIZE_GIB ECS_EBS_VOLUME_TYPE ECS_EBS_IOPS ECS_EBS_THROUGHPUT ECS_EBS_DEVICE_NAME
+export ECS_EBS_DELETE_ON_TERMINATION
 export IMAGE_URI S3_RUNTIME_PREFIX GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_QUOTA_BYTES
 
 ensure_role() {
@@ -408,9 +421,15 @@ build_and_push_image() {
   fi
 
   aws_cli ecr get-login-password | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-  docker build --platform "$DOCKER_PLATFORM" -t "$IMAGE_URI" -t "$LATEST_URI" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
+  local docker_tags=(-t "$IMAGE_URI")
+  if [[ "$ECR_PUSH_LATEST" == "true" ]]; then
+    docker_tags+=(-t "$LATEST_URI")
+  fi
+  docker build --platform "$DOCKER_PLATFORM" "${docker_tags[@]}" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
   docker push "$IMAGE_URI"
-  docker push "$LATEST_URI"
+  if [[ "$ECR_PUSH_LATEST" == "true" ]]; then
+    docker push "$LATEST_URI"
+  fi
 }
 
 ecs_optimized_ami_id() {
@@ -507,7 +526,7 @@ ensure_container_instance() {
       "Iops": $ECS_EBS_IOPS,
       "Throughput": $ECS_EBS_THROUGHPUT,
       "Encrypted": true,
-      "DeleteOnTermination": false
+      "DeleteOnTermination": $ECS_EBS_DELETE_ON_TERMINATION
     }
   }
 ]

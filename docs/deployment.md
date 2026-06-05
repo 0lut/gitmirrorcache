@@ -78,6 +78,77 @@ namespace at runtime. For example, `S3_PREFIX=repos` is served from `repos-v2`.
 The ECS deploy script grants task IAM access to that runtime prefix while still
 passing the base prefix to the container.
 
+## Preview Commit Stacks
+
+Use preview stacks to deploy any branch, tag, or commit without touching the
+production `main` stack. The preview wrapper resolves the version with Git:
+
+```sh
+scripts/aws/deploy-preview.sh my-branch
+```
+
+That command computes:
+
+- `VERSION_ID=$(git rev-parse --short=12 "my-branch^{commit}")`
+- `NAME_PREFIX=gmc-p-$VERSION_ID`
+- `ENVIRONMENT=preview-$VERSION_ID`
+- `S3_PREFIX=previews/$VERSION_ID/repos`
+- `IMAGE_TAG=$VERSION_ID`
+
+The application still appends the runtime schema suffix, so preview cache
+objects land below `previews/$VERSION_ID/repos-v2`. By default, the preview
+stack uses the shared production-style bucket and ECR repository derived from
+`PREVIEW_SHARED_NAME_PREFIX=gitmirrorcache-arm`. Override either explicitly when
+needed:
+
+```sh
+PREVIEW_S3_BUCKET=gitmirrorcache-arm-123456789012-us-west-2 \
+PREVIEW_ECR_REPOSITORY=gitmirrorcache-arm \
+scripts/aws/deploy-preview.sh my-branch
+```
+
+Preview deploys set `ECR_PUSH_LATEST=false`, `ECS_EBS_DELETE_ON_TERMINATION=true`,
+`ECS_COMPACTION_SCHEDULE_STATE=DISABLED`, and `ECS_LOG_RETENTION_DAYS=3` unless
+you override them. This keeps previews isolated, disposable, and less noisy
+while still exercising the ECS, EC2/EBS, ALB, IAM, ECR, S3, and smoke-test path.
+
+Destroy a preview with the same ref:
+
+```sh
+scripts/aws/destroy-preview.sh my-branch
+```
+
+If the branch is gone, pass the derived version or full commit SHA directly.
+The script normalizes it to the 12-character preview version:
+
+```sh
+VERSION_ID=d35c30fab123 scripts/aws/destroy-preview.sh
+```
+
+Destroy removes the preview ECS service, cluster, ALB, target group, EC2
+instance, available preview EBS volume, task definitions, EventBridge compaction
+rule, log group, preview IAM roles, and the preview image tag. It removes the
+deployment manifest by default. It preserves durable cache objects unless you
+opt in:
+
+```sh
+DELETE_DATA=true VERSION_ID=d35c30fab123 scripts/aws/destroy-preview.sh
+```
+
+The GitHub Actions workflow **Preview Stack** exposes the same lifecycle as a
+one-button operation. Use `ref` to deploy or destroy by branch, tag, or commit.
+Use `version_id` on destroy when the ref no longer exists. Configure these
+repository variables:
+
+- `AWS_ROLE_TO_ASSUME`: IAM role for GitHub OIDC deployments.
+- `AWS_REGION`: optional, defaults to `us-west-2`.
+- `PREVIEW_SHARED_NAME_PREFIX`: optional, defaults to `gitmirrorcache-arm`.
+- `GIT_CACHE_PREVIEW_S3_BUCKET`: optional explicit shared bucket.
+- `GIT_CACHE_PREVIEW_ECR_REPOSITORY`: optional explicit shared ECR repository.
+
+Configure `GIT_CACHE_GITHUB_TOKEN_SECRET_ARN` as a repository secret if preview
+tasks should receive the upstream GitHub token from Secrets Manager.
+
 ## Deployment Findings
 
 The large-repository investigation found two important cache behaviors:
