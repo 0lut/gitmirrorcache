@@ -451,28 +451,17 @@ impl Materializer {
         &self,
         repo: &RepoKey,
         body: &Bytes,
+        comparison: Option<&UpstreamRefComparison>,
     ) -> CoreResult<UploadPackProcess> {
         let wants = parse_want_lines(body);
         if !wants.is_empty() {
-            Box::pin(self.ensure_wants_available(repo, &wants)).await?;
-        }
-        let repo_dir = self.ensure_repo_dir(repo).await?;
-        self.configure_served_repo(&repo_dir).await?;
-        self.state
-            .git
-            .upload_pack_spawn(&repo_dir, body.clone())
-            .await
-    }
-
-    pub async fn handle_upload_pack_with_comparison(
-        &self,
-        repo: &RepoKey,
-        body: &Bytes,
-        comparison: &UpstreamRefComparison,
-    ) -> CoreResult<UploadPackProcess> {
-        let wants = parse_want_lines(body);
-        if !wants.is_empty() {
-            Box::pin(self.ensure_wants_available_from_comparison(repo, &wants, comparison)).await?;
+            match comparison {
+                Some(comparison) => {
+                    Box::pin(self.ensure_wants_available_from_comparison(repo, &wants, comparison))
+                        .await?;
+                }
+                None => Box::pin(self.ensure_wants_available(repo, &wants)).await?,
+            }
         }
         let repo_dir = self.ensure_repo_dir(repo).await?;
         self.configure_served_repo(&repo_dir).await?;

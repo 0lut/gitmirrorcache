@@ -706,3 +706,14 @@ an in-memory, short-TTL record of the exact upstream advertisement just sent to
 a Git client, keyed by repo and anonymous/auth credential fingerprint. It exists
 so the POST can validate wants against the same proof without making a second
 upstream call on the clone hot path.
+
+### D12. Direct upload-pack has one serving entrypoint again
+
+After restoring LLVM direct clone performance, I collapsed the proof-specific
+`handle_upload_pack_with_comparison` method back into `handle_upload_pack` with
+an optional upstream ref proof argument. The API layer still decides whether it
+has a fresh GET->POST proof handoff or needs the fallback repo-access gate, but
+domain serving now has one upload-pack path for parsing wants, validating proof,
+configuring the served repo, and spawning `git upload-pack`. This keeps the
+proof optimization explicit without creating another authenticated/unauthed
+method family.

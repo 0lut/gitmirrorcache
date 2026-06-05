@@ -982,12 +982,8 @@ async fn git_repo(
         };
         let materializer = materializer.using_upstream_auth(&auth);
 
-        let result = if let Some(comparison) = comparison {
-            Box::pin(materializer.handle_upload_pack_with_comparison(&repo, &body, &comparison))
-                .await
-        } else {
-            Box::pin(materializer.handle_upload_pack(&repo, &body)).await
-        };
+        let result =
+            Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await;
 
         match result {
             Ok(process) => stream_upload_pack_response(&state, process),
