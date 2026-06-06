@@ -20,6 +20,7 @@ ECS_TASK_FAMILY="${ECS_TASK_FAMILY:-$NAME_PREFIX-ec2-api}"
 ECS_CONTAINER_NAME="${ECS_CONTAINER_NAME:-git-cache-api}"
 ECS_COMPACTION_TASK_FAMILY="${ECS_COMPACTION_TASK_FAMILY:-$NAME_PREFIX-ec2-compaction}"
 ECS_COMPACTION_CONTAINER_NAME="${ECS_COMPACTION_CONTAINER_NAME:-git-cache-compaction}"
+ECS_COMPACTION_ENABLED="${ECS_COMPACTION_ENABLED:-true}"
 ECS_COMPACTION_EVENTS_ROLE_NAME="${ECS_COMPACTION_EVENTS_ROLE_NAME:-$NAME_PREFIX-ecs-compaction-events}"
 ECS_COMPACTION_RULE_NAME="${ECS_COMPACTION_RULE_NAME:-$NAME_PREFIX-compact-hourly}"
 ECS_COMPACTION_TARGET_ID="${ECS_COMPACTION_TARGET_ID:-compact-all}"
@@ -52,7 +53,9 @@ ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-500}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
 ECS_EBS_DELETE_ON_TERMINATION="${ECS_EBS_DELETE_ON_TERMINATION:-false}"
 ECS_SKIP_DOCKER_BUILD="${ECS_SKIP_DOCKER_BUILD:-false}"
+ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS="${ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS:-false}"
 ECR_PUSH_LATEST="${ECR_PUSH_LATEST:-true}"
+DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
@@ -61,6 +64,16 @@ LATEST_URI="${ECR_REPOSITORY_URI}:latest"
 case "$ECS_EBS_DELETE_ON_TERMINATION" in
   true | false) ;;
   *) die "ECS_EBS_DELETE_ON_TERMINATION must be true or false" ;;
+esac
+
+case "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" in
+  true | false) ;;
+  *) die "ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS must be true or false" ;;
+esac
+
+case "$ECS_COMPACTION_ENABLED" in
+  true | false) ;;
+  *) die "ECS_COMPACTION_ENABLED must be true or false" ;;
 esac
 
 case "$ECR_PUSH_LATEST" in
@@ -99,7 +112,7 @@ if ((GIT_CACHE_DISK_QUOTA_BYTES < 0)); then
 fi
 
 export ECS_CLUSTER_NAME ECS_SERVICE_NAME ECS_TASK_FAMILY ECS_CONTAINER_NAME ECS_CACHE_VOLUME_NAME
-export ECS_COMPACTION_TASK_FAMILY ECS_COMPACTION_CONTAINER_NAME ECS_COMPACTION_EVENTS_ROLE_NAME
+export ECS_COMPACTION_TASK_FAMILY ECS_COMPACTION_CONTAINER_NAME ECS_COMPACTION_ENABLED ECS_COMPACTION_EVENTS_ROLE_NAME
 export ECS_COMPACTION_RULE_NAME ECS_COMPACTION_TARGET_ID ECS_COMPACTION_SCHEDULE_EXPRESSION
 export ECS_COMPACTION_SCHEDULE_STATE ECS_COMPACTION_LOG_STREAM_PREFIX ECS_COMPACTION_LOCK_PATH
 export ECS_COMPACTION_MEMORY_RESERVATION
@@ -346,10 +359,10 @@ ensure_load_balancer() {
       --vpc-id "$vpc_id" \
       --health-check-protocol HTTP \
       --health-check-path /healthz \
-      --health-check-interval-seconds 30 \
-      --health-check-timeout-seconds 5 \
-      --healthy-threshold-count 2 \
-      --unhealthy-threshold-count 5 \
+      --health-check-interval-seconds "${ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS:-30}" \
+      --health-check-timeout-seconds "${ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS:-5}" \
+      --healthy-threshold-count "${ECS_ALB_HEALTHY_THRESHOLD_COUNT:-2}" \
+      --unhealthy-threshold-count "${ECS_ALB_UNHEALTHY_THRESHOLD_COUNT:-5}" \
       --matcher HttpCode=200 \
       --query 'TargetGroups[0].TargetGroupArn' \
       --output text)"
@@ -420,12 +433,20 @@ build_and_push_image() {
     return
   fi
 
+  if [[ "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" == "true" ]] \
+    && aws_cli ecr describe-images \
+      --repository-name "$ECR_REPOSITORY" \
+      --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+    printf 'skipping Docker build; image already exists: %s\n' "$IMAGE_URI"
+    return
+  fi
+
   aws_cli ecr get-login-password | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
   local docker_tags=(-t "$IMAGE_URI")
   if [[ "$ECR_PUSH_LATEST" == "true" ]]; then
     docker_tags+=(-t "$LATEST_URI")
   fi
-  docker build --platform "$DOCKER_PLATFORM" "${docker_tags[@]}" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
+  DOCKER_BUILDKIT="$DOCKER_BUILDKIT" docker build --platform "$DOCKER_PLATFORM" "${docker_tags[@]}" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
   docker push "$IMAGE_URI"
   if [[ "$ECR_PUSH_LATEST" == "true" ]]; then
     docker push "$LATEST_URI"
@@ -1021,12 +1042,21 @@ export ECS_EXECUTION_ROLE_ARN="$execution_role_arn"
 export ECS_TASK_ROLE_ARN="$task_role_arn"
 
 task_definition_arn="$(register_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
-compaction_task_definition_arn="$(register_compaction_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+compaction_task_definition_arn=""
+if [[ "$ECS_COMPACTION_ENABLED" == "true" ]]; then
+  compaction_task_definition_arn="$(register_compaction_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+fi
+
 write_service_inputs "$task_definition_arn" "$task_sg_id" "$all_subnets_csv" "$target_group_arn"
 ensure_ecs_service
-cluster_arn="$(cluster_arn_by_name)"
-compaction_events_role_arn="$(ensure_compaction_events_role "$compaction_task_definition_arn" "$execution_role_arn" "$task_role_arn")"
-ensure_compaction_schedule "$compaction_task_definition_arn" "$compaction_events_role_arn" "$cluster_arn"
+
+if [[ "$ECS_COMPACTION_ENABLED" == "true" ]]; then
+  cluster_arn="$(cluster_arn_by_name)"
+  compaction_events_role_arn="$(ensure_compaction_events_role "$compaction_task_definition_arn" "$execution_role_arn" "$task_role_arn")"
+  ensure_compaction_schedule "$compaction_task_definition_arn" "$compaction_events_role_arn" "$cluster_arn"
+else
+  printf 'skipping compaction task and schedule because ECS_COMPACTION_ENABLED=false\n'
+fi
 
 cat <<EOF
 ECS EC2/EBS deployment complete.
@@ -1034,6 +1064,7 @@ IMAGE_URI=$IMAGE_URI
 ECS_CLUSTER_NAME=$ECS_CLUSTER_NAME
 ECS_SERVICE_NAME=$ECS_SERVICE_NAME
 ECS_TASK_DEFINITION_ARN=$task_definition_arn
+ECS_COMPACTION_ENABLED=$ECS_COMPACTION_ENABLED
 ECS_COMPACTION_TASK_DEFINITION_ARN=$compaction_task_definition_arn
 ECS_COMPACTION_RULE_NAME=$ECS_COMPACTION_RULE_NAME
 ECS_COMPACTION_SCHEDULE_EXPRESSION=$ECS_COMPACTION_SCHEDULE_EXPRESSION

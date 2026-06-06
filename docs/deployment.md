@@ -107,10 +107,13 @@ PREVIEW_ECR_REPOSITORY=gitmirrorcache-arm \
 scripts/aws/deploy-preview.sh my-branch
 ```
 
-Preview deploys set `ECR_PUSH_LATEST=false`, `ECS_EBS_DELETE_ON_TERMINATION=true`,
-`ECS_COMPACTION_SCHEDULE_STATE=DISABLED`, and `ECS_LOG_RETENTION_DAYS=3` unless
-you override them. This keeps previews isolated, disposable, and less noisy
-while still exercising the ECS, EC2/EBS, ALB, IAM, ECR, S3, and smoke-test path.
+Preview deploys set `ECR_PUSH_LATEST=false`,
+`ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true`,
+`ECS_EBS_DELETE_ON_TERMINATION=true`, `ECS_COMPACTION_ENABLED=false`,
+`ECS_LOG_RETENTION_DAYS=3`, and shorter ALB target health-check intervals unless
+you override them. This keeps previews isolated, disposable, faster to redeploy,
+and less noisy while still exercising the ECS, EC2/EBS, ALB, IAM, ECR, S3, and
+smoke-test path.
 
 Destroy a preview with the same ref:
 
