@@ -45,6 +45,7 @@ ECS_CPU="${ECS_CPU:-8192}"
 ECS_MEMORY="${ECS_MEMORY:-24576}"
 ECS_DESIRED_COUNT="${ECS_DESIRED_COUNT:-1}"
 ECS_EC2_INSTANCE_TYPE="${ECS_EC2_INSTANCE_TYPE:-m8g.2xlarge}"
+ECS_PRECHECK_VCPU_QUOTA="${ECS_PRECHECK_VCPU_QUOTA:-false}"
 ECS_CPU_ARCHITECTURE="${ECS_CPU_ARCHITECTURE:-ARM64}"
 ECS_EBS_SIZE_GIB="${ECS_EBS_SIZE_GIB:-128}"
 ECS_EBS_VOLUME_TYPE="${ECS_EBS_VOLUME_TYPE:-gp3}"
@@ -69,6 +70,11 @@ esac
 case "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" in
   true | false) ;;
   *) die "ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS must be true or false" ;;
+esac
+
+case "$ECS_PRECHECK_VCPU_QUOTA" in
+  true | false) ;;
+  *) die "ECS_PRECHECK_VCPU_QUOTA must be true or false" ;;
 esac
 
 case "$ECS_COMPACTION_ENABLED" in
@@ -119,6 +125,7 @@ export ECS_COMPACTION_MEMORY_RESERVATION
 export ECS_ALB_NAME ECS_TARGET_GROUP_NAME ECS_ALB_SG_NAME ECS_TASK_SG_NAME ECS_LOG_GROUP
 export ECS_EXECUTION_ROLE_NAME ECS_TASK_ROLE_NAME ECS_INSTANCE_ROLE_NAME ECS_INSTANCE_PROFILE_NAME
 export ECS_INSTANCE_NAME ECS_CPU ECS_MEMORY ECS_DESIRED_COUNT ECS_EC2_INSTANCE_TYPE ECS_CPU_ARCHITECTURE
+export ECS_PRECHECK_VCPU_QUOTA
 export ECS_EBS_SIZE_GIB ECS_EBS_VOLUME_TYPE ECS_EBS_IOPS ECS_EBS_THROUGHPUT ECS_EBS_DEVICE_NAME
 export ECS_EBS_DELETE_ON_TERMINATION
 export IMAGE_URI S3_RUNTIME_PREFIX GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_QUOTA_BYTES
@@ -326,6 +333,72 @@ ensure_log_group() {
   aws_cli logs put-retention-policy \
     --log-group-name "$ECS_LOG_GROUP" \
     --retention-in-days "${ECS_LOG_RETENTION_DAYS:-14}" >/dev/null
+}
+
+preflight_ec2_vcpu_quota() {
+  [[ "$ECS_PRECHECK_VCPU_QUOTA" == "true" ]] || return 0
+
+  local existing_instance_id quota desired_vcpus running_types used_vcpus projected_vcpus
+  existing_instance_id="$(instance_id_by_name)"
+  if [[ "$existing_instance_id" != "None" && -n "$existing_instance_id" ]]; then
+    printf 'skipping EC2 vCPU quota preflight; reusing instance: %s\n' "$existing_instance_id"
+    return 0
+  fi
+
+  quota="$(aws_cli service-quotas get-service-quota \
+    --service-code ec2 \
+    --quota-code L-1216C47A \
+    --query 'Quota.Value' \
+    --output text 2>/dev/null || true)"
+  if [[ -z "$quota" || "$quota" == "None" ]]; then
+    printf 'warning: could not read EC2 vCPU quota; continuing without quota preflight\n' >&2
+    return 0
+  fi
+
+  desired_vcpus="$(aws_cli ec2 describe-instance-types \
+    --instance-types "$ECS_EC2_INSTANCE_TYPE" \
+    --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' \
+    --output text)"
+  [[ "$desired_vcpus" =~ ^[0-9]+$ ]] || die "could not resolve vCPU count for $ECS_EC2_INSTANCE_TYPE"
+
+  running_types="$(aws_cli ec2 describe-instances \
+    --filters Name=instance-state-name,Values=pending,running \
+    --query 'Reservations[].Instances[].InstanceType' \
+    --output text)"
+  used_vcpus=0
+  for instance_type in $running_types; do
+    local type_vcpus
+    type_vcpus="$(aws_cli ec2 describe-instance-types \
+      --instance-types "$instance_type" \
+      --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' \
+      --output text)"
+    [[ "$type_vcpus" =~ ^[0-9]+$ ]] || die "could not resolve vCPU count for $instance_type"
+    used_vcpus=$((used_vcpus + type_vcpus))
+  done
+
+  projected_vcpus=$((used_vcpus + desired_vcpus))
+  python3 - "$used_vcpus" "$desired_vcpus" "$projected_vcpus" "$quota" "$ECS_EC2_INSTANCE_TYPE" <<'PY'
+import sys
+
+used = int(sys.argv[1])
+desired = int(sys.argv[2])
+projected = int(sys.argv[3])
+quota = float(sys.argv[4])
+instance_type = sys.argv[5]
+
+if projected > quota:
+    raise SystemExit(
+        "EC2 vCPU quota preflight failed: "
+        f"running/pending={used}, requested {instance_type}={desired}, "
+        f"projected={projected}, quota={quota:g}"
+    )
+
+print(
+    "EC2 vCPU quota preflight passed: "
+    f"running/pending={used}, requested {instance_type}={desired}, "
+    f"projected={projected}, quota={quota:g}"
+)
+PY
 }
 
 load_balancer_arn_by_name() {
@@ -553,7 +626,7 @@ ensure_container_instance() {
 ]
 EOF
     printf 'launching ECS container instance: %s\n' "$ECS_INSTANCE_NAME" >&2
-    instance_id="$(aws_cli ec2 run-instances \
+    if ! instance_id="$(aws_cli ec2 run-instances \
       --image-id "$ami_id" \
       --instance-type "$ECS_EC2_INSTANCE_TYPE" \
       --iam-instance-profile "Name=$ECS_INSTANCE_PROFILE_NAME" \
@@ -563,7 +636,10 @@ EOF
       --user-data "file://$tmpdir/user-data.sh" \
       --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$ECS_INSTANCE_NAME},{Key=App,Value=$APP_NAME},{Key=Environment,Value=$ENVIRONMENT}]" "ResourceType=volume,Tags=[{Key=Name,Value=$ECS_INSTANCE_NAME-cache},{Key=App,Value=$APP_NAME},{Key=Environment,Value=$ENVIRONMENT}]" \
       --query 'Instances[0].InstanceId' \
-      --output text)"
+      --output text)"; then
+      die "failed to launch ECS container instance: $ECS_INSTANCE_NAME"
+    fi
+    [[ -n "$instance_id" && "$instance_id" != "None" ]] || die "EC2 launch did not return an instance id for $ECS_INSTANCE_NAME"
   else
     state="$(aws_cli ec2 describe-instances --instance-ids "$instance_id" --query 'Reservations[0].Instances[0].State.Name' --output text)"
     printf 'using existing ECS container instance: %s (%s)\n' "$instance_id" "$state" >&2
@@ -1011,6 +1087,7 @@ ensure_ecs_service() {
   aws_cli ecs wait services-stable --cluster "$ECS_CLUSTER_NAME" --services "$ECS_SERVICE_NAME"
 }
 
+preflight_ec2_vcpu_quota
 ensure_ecs_roles
 ensure_cluster
 ensure_log_group

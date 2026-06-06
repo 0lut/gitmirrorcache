@@ -109,11 +109,14 @@ scripts/aws/deploy-preview.sh my-branch
 
 Preview deploys set `ECR_PUSH_LATEST=false`,
 `ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true`,
+`ECS_EC2_INSTANCE_TYPE=m8g.2xlarge`, `ECS_PRECHECK_VCPU_QUOTA=true`,
 `ECS_EBS_DELETE_ON_TERMINATION=true`, `ECS_COMPACTION_ENABLED=false`,
 `ECS_LOG_RETENTION_DAYS=3`, and shorter ALB target health-check intervals unless
 you override them. This keeps previews isolated, disposable, faster to redeploy,
 and less noisy while still exercising the ECS, EC2/EBS, ALB, IAM, ECR, S3, and
-smoke-test path.
+smoke-test path. The quota preflight fails before creating preview infrastructure
+if launching the preview instance would exceed the account's EC2 on-demand vCPU
+quota.
 
 Destroy a preview with the same ref:
 
