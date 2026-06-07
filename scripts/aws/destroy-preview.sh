@@ -254,3 +254,12 @@ VERSION_ID=$VERSION_ID
 NAME_PREFIX=$NAME_PREFIX
 DELETE_DATA=$DELETE_DATA
 EOF
+
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  {
+    printf '## Preview destroy complete\n\n'
+    printf '- Version: `%s`\n' "$VERSION_ID"
+    printf '- Name prefix: `%s`\n' "$NAME_PREFIX"
+    printf '- Deleted durable preview data: `%s`\n' "$DELETE_DATA"
+  } >>"$GITHUB_STEP_SUMMARY"
+fi

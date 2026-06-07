@@ -81,7 +81,45 @@ passing the base prefix to the container.
 ## Preview Commit Stacks
 
 Use preview stacks to deploy any branch, tag, or commit without touching the
-production `main` stack. The preview wrapper resolves the version with Git:
+production `main` stack. Production keeps using `NAME_PREFIX=gitmirrorcache-arm`
+and `S3_PREFIX=repos`; every preview gets a derived stack name and an isolated
+S3 prefix.
+
+### GitHub Actions Button
+
+After `.github/workflows/preview-stack.yml` is merged to the default branch, use
+**Actions > Preview Stack > Run workflow** as the one-button path:
+
+1. Run the workflow from `main`.
+2. For deploy, set `action=deploy` and put the branch, tag, or commit SHA in
+   `ref`.
+3. For teardown, set `action=destroy` and use the same `ref`, or set
+   `version_id` to the 12-character preview version if the branch no longer
+   exists.
+4. Leave `delete_data=false` for normal teardown. Set it to `true` only when the
+   preview's durable S3 cache prefix should also be removed.
+
+The workflow checks out deployment tooling from the workflow branch and the
+target source separately. That lets the button deploy older branches or commits
+that do not contain the preview scripts themselves, as long as the commit is
+reachable to `actions/checkout`. The job summary includes the preview URL,
+health URL, manifest location, and the exact version to use for destroy.
+
+Configure these repository variables:
+
+- `AWS_ROLE_TO_ASSUME`: IAM role for GitHub OIDC deployments.
+- `AWS_REGION`: optional, defaults to `us-west-2`.
+- `PREVIEW_SHARED_NAME_PREFIX`: optional, defaults to `gitmirrorcache-arm`.
+- `GIT_CACHE_PREVIEW_S3_BUCKET`: optional explicit shared bucket.
+- `GIT_CACHE_PREVIEW_ECR_REPOSITORY`: optional explicit shared ECR repository.
+
+Configure `GIT_CACHE_GITHUB_TOKEN_SECRET_ARN` as a repository secret if preview
+tasks should receive the upstream GitHub token from Secrets Manager.
+
+### Local Scripts
+
+The local preview wrapper uses the same lifecycle and resolves the version with
+Git:
 
 ```sh
 scripts/aws/deploy-preview.sh my-branch
@@ -140,20 +178,6 @@ opt in:
 ```sh
 DELETE_DATA=true VERSION_ID=d35c30fab123 scripts/aws/destroy-preview.sh
 ```
-
-The GitHub Actions workflow **Preview Stack** exposes the same lifecycle as a
-one-button operation. Use `ref` to deploy or destroy by branch, tag, or commit.
-Use `version_id` on destroy when the ref no longer exists. Configure these
-repository variables:
-
-- `AWS_ROLE_TO_ASSUME`: IAM role for GitHub OIDC deployments.
-- `AWS_REGION`: optional, defaults to `us-west-2`.
-- `PREVIEW_SHARED_NAME_PREFIX`: optional, defaults to `gitmirrorcache-arm`.
-- `GIT_CACHE_PREVIEW_S3_BUCKET`: optional explicit shared bucket.
-- `GIT_CACHE_PREVIEW_ECR_REPOSITORY`: optional explicit shared ECR repository.
-
-Configure `GIT_CACHE_GITHUB_TOKEN_SECRET_ARN` as a repository secret if preview
-tasks should receive the upstream GitHub token from Secrets Manager.
 
 ## Deployment Findings
 

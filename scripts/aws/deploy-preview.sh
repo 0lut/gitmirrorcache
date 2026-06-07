@@ -91,3 +91,18 @@ HEALTH_URL=$public_base_url/healthz
 S3_MANIFEST=s3://$S3_BUCKET/$manifest_key
 DESTROY_COMMAND=VERSION_ID=$VERSION_ID scripts/aws/destroy-preview.sh
 EOF
+
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  {
+    printf '## Preview deployment complete\n\n'
+    printf '- Version: `%s`\n' "$VERSION_ID"
+    printf '- Ref: `%s`\n' "$PREVIEW_REF"
+    if [[ -n "${PREVIEW_COMMIT:-}" ]]; then
+      printf '- Commit: `%s`\n' "$PREVIEW_COMMIT"
+    fi
+    printf '- URL: %s\n' "$public_base_url"
+    printf '- Health: %s/healthz\n' "$public_base_url"
+    printf '- Manifest: `s3://%s/%s`\n\n' "$S3_BUCKET" "$manifest_key"
+    printf 'To tear this down, run **Preview Stack** with action `destroy` and version_id `%s`.\n' "$VERSION_ID"
+  } >>"$GITHUB_STEP_SUMMARY"
+fi

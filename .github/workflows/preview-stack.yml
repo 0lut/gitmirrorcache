@@ -47,9 +47,17 @@ jobs:
       PREVIEW_ECR_REPOSITORY: ${{ vars.GIT_CACHE_PREVIEW_ECR_REPOSITORY }}
       GITHUB_TOKEN_SECRET_ARN: ${{ secrets.GIT_CACHE_GITHUB_TOKEN_SECRET_ARN }}
     steps:
-      - name: Check out target ref
+      - name: Check out deployment tooling
         uses: actions/checkout@v4
         with:
+          path: tooling
+          fetch-depth: 0
+
+      - name: Check out target source
+        if: ${{ github.event.inputs.action == 'deploy' || github.event.inputs.version_id == '' }}
+        uses: actions/checkout@v4
+        with:
+          path: source
           ref: ${{ github.event.inputs.ref || github.ref }}
           fetch-depth: 0
 
@@ -66,14 +74,19 @@ jobs:
           else
             echo "REF=HEAD" >> "$GITHUB_ENV"
           fi
+          if [[ -d "$GITHUB_WORKSPACE/source/.git" ]]; then
+            echo "REPO_ROOT=$GITHUB_WORKSPACE/source" >> "$GITHUB_ENV"
+          else
+            echo "REPO_ROOT=$GITHUB_WORKSPACE/tooling" >> "$GITHUB_ENV"
+          fi
 
       - name: Deploy preview
         if: ${{ github.event.inputs.action == 'deploy' }}
-        run: scripts/aws/deploy-preview.sh
+        run: "$GITHUB_WORKSPACE/tooling/scripts/aws/deploy-preview.sh"
 
       - name: Destroy preview
         if: ${{ github.event.inputs.action == 'destroy' }}
         env:
           DELETE_DATA: ${{ github.event.inputs.delete_data }}
           VERSION_ID: ${{ github.event.inputs.version_id }}
-        run: scripts/aws/destroy-preview.sh
+        run: "$GITHUB_WORKSPACE/tooling/scripts/aws/destroy-preview.sh"
