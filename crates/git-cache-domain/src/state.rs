@@ -387,7 +387,6 @@ mod tests {
             git_timeout_seconds: 30,
             max_git_output_bytes: 1024 * 1024,
             object_store: ObjectStoreConfig::Local { root: object_root },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 120,
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -398,7 +397,6 @@ mod tests {
             git_remote: Default::default(),
             compaction: Default::default(),
             max_concurrent_git_processes: 1,
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
         }
     }

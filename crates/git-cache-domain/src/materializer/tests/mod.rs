@@ -1,5 +1,4 @@
 use super::generations::{bundle_key, pending_generation_from_key, push_unique_commit};
-use super::sessions::new_session_token;
 use super::*;
 #[cfg(feature = "s3-tests")]
 use aws_credential_types::Credentials;
@@ -20,9 +19,8 @@ use git_cache_objectstore::read_ref_manifest;
 #[cfg(feature = "s3-tests")]
 use git_cache_objectstore::{ObjectStore, S3ObjectStore};
 use std::fs as stdfs;
-use std::io::Write;
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use tempfile::TempDir;
 
 fn ref_manifest_key(repo: &RepoKey, branch: &str) -> String {
@@ -125,7 +123,6 @@ impl GitFixture {
             object_store: ObjectStoreConfig::Local {
                 root: self.tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -136,7 +133,6 @@ impl GitFixture {
             git_remote: Default::default(),
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
         }
     }
@@ -368,4 +364,3 @@ mod key_path_tests;
 mod minio_tests;
 mod performance_tests;
 mod selector_tests;
-mod session_tests;

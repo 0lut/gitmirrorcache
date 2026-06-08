@@ -25,7 +25,7 @@ What the tests do:
 - build and start `git-cache-api` on a random localhost port
 - materialize `github.com/astral-sh/uv` `main` in strict mode
 - compare the returned commit to `git ls-remote`
-- fetch the returned session ref with `git fetch`
+- fetch the branch through the direct `/git/...` remote
 - resolve an abbreviated `short_commit` selector to the canonical full commit
 - delete local hot-cache repos and verify exact commit materialization rehydrates from object storage with `cache_verified`
 - materialize the upstream default branch

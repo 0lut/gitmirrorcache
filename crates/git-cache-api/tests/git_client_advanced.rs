@@ -63,11 +63,9 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             allowed_upstream_hosts: vec!["github.com".into()],
             disk: git_cache_core::DiskConfig {

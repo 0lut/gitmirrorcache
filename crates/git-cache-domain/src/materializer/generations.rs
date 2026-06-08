@@ -1,5 +1,6 @@
 use super::util::hex_lower;
 use super::*;
+use sha2::{Digest, Sha256};
 
 const VERIFIED_GENERATION_SCHEMA_VERSION: u32 = 2;
 const VERIFIED_GENERATION_VERIFIER_VERSION: u32 = 1;
@@ -366,7 +367,6 @@ impl Materializer {
                 })
                 .collect(),
             refs: Vec::new(),
-            sessions: Vec::new(),
         };
 
         if let Some(branch) = branch {
@@ -1272,13 +1272,6 @@ impl Materializer {
         self.manifests().generation(repo, generation).await
     }
 
-    pub(super) async fn get_session_manifest(
-        &self,
-        repo: &RepoKey,
-        session_id: SessionId,
-    ) -> CoreResult<Option<SessionManifest>> {
-        self.manifests().session(repo, session_id).await
-    }
 }
 
 pub fn default_manifest_key(repo: &RepoKey) -> String {

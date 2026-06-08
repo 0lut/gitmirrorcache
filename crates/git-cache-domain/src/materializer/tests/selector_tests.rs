@@ -69,10 +69,6 @@ async fn authenticated_exact_commit_materialize_uses_repo_access_without_reachab
         response.source,
         MaterializeSource::UpstreamAuthorizedFetched
     );
-    assert!(
-        response.session_token.is_some(),
-        "authenticated exact commit materialize should create a protected session"
-    );
 }
 
 #[tokio::test]

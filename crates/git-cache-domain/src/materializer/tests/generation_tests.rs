@@ -116,7 +116,6 @@ async fn pending_generation_verifies_from_local_repo_without_parent_bundle() {
             verified_at: now,
         }],
         refs: Vec::new(),
-        sessions: Vec::new(),
     };
     GenerationPublish::with_manifests(child_manifest, child_manifests)
         .publish_pending_bundle_file(&*state.store, &bundle_path, child_head, None)
@@ -816,7 +815,6 @@ async fn compaction_preserves_parents_needed_by_pending_generation_verification(
             verified_at: now,
         }],
         refs: Vec::new(),
-        sessions: Vec::new(),
     };
     GenerationPublish::with_manifests(child_manifest, child_manifests)
         .publish_pending_bundle_file(&*state.store, &bundle_path, child_head, None)

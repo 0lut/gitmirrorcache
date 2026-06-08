@@ -288,7 +288,6 @@ Object storage is the source of truth for:
 - bundles
 - commit manifests
 - ref manifests
-- session manifests
 - lease objects
 
 ## Credentials
