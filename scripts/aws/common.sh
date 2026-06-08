@@ -21,6 +21,76 @@ aws_cli() {
   aws "${AWS_ARGS[@]}" "$@"
 }
 
+timing_now() {
+  date +%s
+}
+
+timing_record() {
+  local name="$1"
+  local seconds="$2"
+  local status="${3:-0}"
+
+  [[ -n "${DEPLOY_TIMING_FILE:-}" ]] || return 0
+  mkdir -p "$(dirname -- "$DEPLOY_TIMING_FILE")" 2>/dev/null || true
+  printf '%s\t%s\t%s\n' "$name" "$seconds" "$status" >>"$DEPLOY_TIMING_FILE"
+}
+
+timed() {
+  local name="$1"
+  shift
+
+  local started finished seconds status
+  started="$(timing_now)"
+  printf '==> %s\n' "$name" >&2
+  if "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  finished="$(timing_now)"
+  seconds=$((finished - started))
+  timing_record "$name" "$seconds" "$status"
+
+  if [[ "$status" -eq 0 ]]; then
+    printf '<== %s completed in %ss\n' "$name" "$seconds" >&2
+  else
+    printf '<== %s failed after %ss (exit %s)\n' "$name" "$seconds" "$status" >&2
+  fi
+  return "$status"
+}
+
+timing_print_summary() {
+  local file="${1:-${DEPLOY_TIMING_FILE:-}}"
+  [[ -n "$file" && -s "$file" ]] || return 0
+
+  printf 'Deployment timings:\n'
+  awk -F '\t' '{
+    status = ($3 == 0 ? "ok" : "exit " $3)
+    printf "  %6ss  %-7s  %s\n", $2, status, $1
+  }' "$file"
+}
+
+timing_write_github_summary() {
+  local title="${1:-Deployment timings}"
+  local file="${2:-${DEPLOY_TIMING_FILE:-}}"
+  [[ -n "${GITHUB_STEP_SUMMARY:-}" && -n "$file" && -s "$file" ]] || return 0
+
+  {
+    printf '## %s\n\n' "$title"
+    printf '| Phase | Seconds | Status |\n'
+    printf '| --- | ---: | --- |\n'
+    while IFS=$'\t' read -r name seconds status; do
+      if [[ "$status" == "0" ]]; then
+        status="ok"
+      else
+        status="exit $status"
+      fi
+      printf '| %s | %s | %s |\n' "$name" "$seconds" "$status"
+    done <"$file"
+    printf '\n'
+  } >>"$GITHUB_STEP_SUMMARY"
+}
+
 role_arn() {
   printf 'arn:%s:iam::%s:role/%s' "$AWS_PARTITION" "$AWS_ACCOUNT_ID" "$1"
 }

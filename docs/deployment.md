@@ -103,7 +103,8 @@ The workflow checks out deployment tooling from the workflow branch and the
 target source separately. That lets the button deploy older branches or commits
 that do not contain the preview scripts themselves, as long as the commit is
 reachable to `actions/checkout`. The job summary includes the preview URL,
-health URL, manifest location, and the exact version to use for destroy.
+health URL, manifest location, the exact version to use for destroy, and a
+phase-by-phase timing table for the deploy.
 
 Configure these repository variables:
 
@@ -149,12 +150,21 @@ Preview deploys set `ECR_PUSH_LATEST=false`,
 `ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true`,
 `ECS_EC2_INSTANCE_TYPE=m8g.2xlarge`, `ECS_PRECHECK_VCPU_QUOTA=true`,
 `ECS_EBS_DELETE_ON_TERMINATION=true`, `ECS_COMPACTION_ENABLED=false`,
-`ECS_LOG_RETENTION_DAYS=3`, and shorter ALB target health-check intervals unless
-you override them. This keeps previews isolated, disposable, faster to redeploy,
-and less noisy while still exercising the ECS, EC2/EBS, ALB, IAM, ECR, S3, and
-smoke-test path. The quota preflight fails before creating preview infrastructure
-if launching the preview instance would exceed the account's EC2 on-demand vCPU
-quota.
+`ECS_LOG_RETENTION_DAYS=3`, `BOOTSTRAP_FAST_EXISTING=true`, a 60-second ECS
+health-check grace period, faster ECS service polling, and shorter ALB target
+health-check intervals unless you override them. This keeps previews isolated,
+disposable, faster to redeploy, and less noisy while still exercising the ECS,
+EC2/EBS, ALB, IAM, ECR, S3, and smoke-test path. The quota preflight fails
+before creating preview infrastructure if launching the preview instance would
+exceed the account's EC2 on-demand vCPU quota.
+
+Every preview deploy writes ordered phase timings to stdout and, in GitHub
+Actions, to the job summary. The key phases include shared bootstrap, IAM,
+networking, ALB, EC2 launch/ECS registration, Docker build and push, task
+registration, ECS service stabilization, smoke test, manifest upload, and total
+preview deployment time. To capture the same timing table from lower-level
+scripts, set `DEPLOY_TIMING_FILE=/path/to/timings.tsv` before invoking
+`deploy-and-smoke.sh` or `deploy-ecs-ec2-ebs.sh`.
 
 Destroy a preview with the same ref:
 

@@ -14,6 +14,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+owns_timing_file=false
+if [[ -z "${DEPLOY_TIMING_FILE:-}" ]]; then
+  DEPLOY_TIMING_FILE="$tmpdir/ecs-ec2-ebs-timings.tsv"
+  owns_timing_file=true
+fi
+export DEPLOY_TIMING_FILE
+deploy_started_at="$(timing_now)"
+
 ECS_CLUSTER_NAME="${ECS_CLUSTER_NAME:-$NAME_PREFIX-ec2}"
 ECS_SERVICE_NAME="${ECS_SERVICE_NAME:-$NAME_PREFIX-ec2-api}"
 ECS_TASK_FAMILY="${ECS_TASK_FAMILY:-$NAME_PREFIX-ec2-api}"
@@ -58,6 +66,8 @@ ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS="${ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS:-
 ECR_PUSH_LATEST="${ECR_PUSH_LATEST:-true}"
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
+ECS_SERVICE_STABLE_TIMEOUT_SECONDS="${ECS_SERVICE_STABLE_TIMEOUT_SECONDS:-900}"
+ECS_SERVICE_STABLE_POLL_SECONDS="${ECS_SERVICE_STABLE_POLL_SECONDS:-10}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
 LATEST_URI="${ECR_REPOSITORY_URI}:latest"
@@ -129,6 +139,7 @@ export ECS_PRECHECK_VCPU_QUOTA
 export ECS_EBS_SIZE_GIB ECS_EBS_VOLUME_TYPE ECS_EBS_IOPS ECS_EBS_THROUGHPUT ECS_EBS_DEVICE_NAME
 export ECS_EBS_DELETE_ON_TERMINATION
 export IMAGE_URI S3_RUNTIME_PREFIX GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_QUOTA_BYTES
+export ECS_SERVICE_STABLE_TIMEOUT_SECONDS ECS_SERVICE_STABLE_POLL_SECONDS
 
 ensure_role() {
   local role_name="$1"
@@ -366,15 +377,20 @@ preflight_ec2_vcpu_quota() {
     --query 'Reservations[].Instances[].InstanceType' \
     --output text)"
   used_vcpus=0
-  for instance_type in $running_types; do
-    local type_vcpus
-    type_vcpus="$(aws_cli ec2 describe-instance-types \
-      --instance-types "$instance_type" \
-      --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' \
+  if [[ -n "$running_types" ]]; then
+    local unique_running_types type_vcpu_rows
+    unique_running_types="$(printf '%s\n' $running_types | sort -u | tr '\n' ' ')"
+    type_vcpu_rows="$(aws_cli ec2 describe-instance-types \
+      --instance-types $unique_running_types \
+      --query 'InstanceTypes[].[InstanceType,VCpuInfo.DefaultVCpus]' \
       --output text)"
-    [[ "$type_vcpus" =~ ^[0-9]+$ ]] || die "could not resolve vCPU count for $instance_type"
-    used_vcpus=$((used_vcpus + type_vcpus))
-  done
+    for instance_type in $running_types; do
+      local type_vcpus
+      type_vcpus="$(printf '%s\n' "$type_vcpu_rows" | awk -v type="$instance_type" '$1 == type { print $2; exit }')"
+      [[ "$type_vcpus" =~ ^[0-9]+$ ]] || die "could not resolve vCPU count for $instance_type"
+      used_vcpus=$((used_vcpus + type_vcpus))
+    done
+  fi
 
   projected_vcpus=$((used_vcpus + desired_vcpus))
   python3 - "$used_vcpus" "$desired_vcpus" "$projected_vcpus" "$quota" "$ECS_EC2_INSTANCE_TYPE" <<'PY'
@@ -442,6 +458,16 @@ ensure_load_balancer() {
   else
     printf 'using existing target group: %s\n' "$ECS_TARGET_GROUP_NAME" >&2
   fi
+
+  aws_cli elbv2 modify-target-group \
+    --target-group-arn "$tg_arn" \
+    --health-check-protocol HTTP \
+    --health-check-path /healthz \
+    --health-check-interval-seconds "${ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS:-30}" \
+    --health-check-timeout-seconds "${ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS:-5}" \
+    --healthy-threshold-count "${ECS_ALB_HEALTHY_THRESHOLD_COUNT:-2}" \
+    --unhealthy-threshold-count "${ECS_ALB_UNHEALTHY_THRESHOLD_COUNT:-5}" \
+    --matcher HttpCode=200 >/dev/null
 
   lb_arn="$(load_balancer_arn_by_name)"
   if [[ "$lb_arn" == "None" || -z "$lb_arn" ]]; then
@@ -648,8 +674,10 @@ EOF
     fi
   fi
 
-  aws_cli ec2 wait instance-running --instance-ids "$instance_id"
+  timed "wait EC2 instance running" aws_cli ec2 wait instance-running --instance-ids "$instance_id"
   printf 'waiting for ECS container instance registration: %s\n' "$instance_id" >&2
+  local registration_started
+  registration_started="$(timing_now)"
   for attempt in $(seq 1 80); do
     container_instance_arn="$(aws_cli ecs list-container-instances \
       --cluster "$ECS_CLUSTER_NAME" \
@@ -663,6 +691,7 @@ EOF
         --query 'containerInstances[0].status' \
         --output text)"
       if [[ "$status" == "ACTIVE" ]]; then
+        timing_record "wait ECS container instance registration" "$(( $(timing_now) - registration_started ))" 0
         printf '%s\n' "$instance_id"
         return 0
       fi
@@ -671,6 +700,7 @@ EOF
     sleep 10
   done
 
+  timing_record "wait ECS container instance registration" "$(( $(timing_now) - registration_started ))" 1
   die "timed out waiting for ECS container instance registration for $instance_id"
 }
 
@@ -1074,66 +1104,115 @@ service_exists() {
     --output text 2>/dev/null | grep -Eq '^(ACTIVE|DRAINING)$'
 }
 
+wait_for_ecs_service_stable() {
+  local started now elapsed status desired running pending deployment_count primary_rollout
+  started="$(timing_now)"
+
+  while true; do
+    read -r status desired running pending deployment_count primary_rollout < <(
+      aws_cli ecs describe-services \
+        --cluster "$ECS_CLUSTER_NAME" \
+        --services "$ECS_SERVICE_NAME" \
+        --query 'services[0]' \
+        --output json |
+      python3 -c 'import json, sys
+service = json.load(sys.stdin) or {}
+deployments = service.get("deployments") or []
+primary = next((d for d in deployments if d.get("status") == "PRIMARY"), {})
+print(
+    service.get("status", "None"),
+    service.get("desiredCount", 0),
+    service.get("runningCount", 0),
+    service.get("pendingCount", 0),
+    len(deployments),
+    primary.get("rolloutState", "UNKNOWN"),
+)'
+    )
+
+    now="$(timing_now)"
+    elapsed=$((now - started))
+    if [[ "$status" == "ACTIVE" &&
+      "$desired" == "$running" &&
+      "$pending" == "0" &&
+      "$deployment_count" == "1" &&
+      ( "$primary_rollout" == "COMPLETED" || "$primary_rollout" == "UNKNOWN" ) ]]; then
+      printf 'ECS service stable after %ss: desired=%s running=%s rollout=%s\n' \
+        "$elapsed" "$desired" "$running" "$primary_rollout" >&2
+      return 0
+    fi
+
+    if (( elapsed >= ECS_SERVICE_STABLE_TIMEOUT_SECONDS )); then
+      die "timed out waiting for ECS service stability after ${elapsed}s: status=$status desired=$desired running=$running pending=$pending deployments=$deployment_count rollout=$primary_rollout"
+    fi
+
+    printf 'waiting for ECS service stable (%ss/%ss): status=%s desired=%s running=%s pending=%s deployments=%s rollout=%s\n' \
+      "$elapsed" "$ECS_SERVICE_STABLE_TIMEOUT_SECONDS" "$status" "$desired" "$running" "$pending" "$deployment_count" "$primary_rollout" >&2
+    sleep "$ECS_SERVICE_STABLE_POLL_SECONDS"
+  done
+}
+
 ensure_ecs_service() {
   if service_exists; then
     printf 'updating ECS service: %s\n' "$ECS_SERVICE_NAME"
-    aws_cli ecs update-service \
+    timed "update ECS service" aws_cli ecs update-service \
       --cli-input-json "file://$tmpdir/update-service.json" >/dev/null
   else
     printf 'creating ECS service: %s\n' "$ECS_SERVICE_NAME"
-    aws_cli ecs create-service \
+    timed "create ECS service" aws_cli ecs create-service \
       --cli-input-json "file://$tmpdir/create-service.json" >/dev/null
   fi
-  aws_cli ecs wait services-stable --cluster "$ECS_CLUSTER_NAME" --services "$ECS_SERVICE_NAME"
+  timed "wait ECS service stable" wait_for_ecs_service_stable
 }
 
-preflight_ec2_vcpu_quota
-ensure_ecs_roles
-ensure_cluster
-ensure_log_group
+timed "preflight EC2 vCPU quota" preflight_ec2_vcpu_quota
+timed "ensure ECS IAM roles" ensure_ecs_roles
+timed "ensure ECS cluster" ensure_cluster
+timed "ensure CloudWatch log group" ensure_log_group
 
-vpc_id="${ECS_VPC_ID:-$(default_vpc_id)}"
+vpc_id="${ECS_VPC_ID:-$(timed "resolve default VPC" default_vpc_id)}"
 [[ "$vpc_id" != "None" && -n "$vpc_id" ]] || die "no default VPC found; set ECS_VPC_ID and ECS_SUBNET_IDS"
-all_subnets_csv="${ECS_SUBNET_IDS:-$(default_subnet_ids "$vpc_id" | tr '\t' ',')}"
+all_subnets_csv="${ECS_SUBNET_IDS:-$(timed "resolve default subnets" default_subnet_ids "$vpc_id" | tr '\t' ',')}"
 [[ -n "$all_subnets_csv" ]] || die "no default subnets found; set ECS_SUBNET_IDS"
 instance_subnet_id="${ECS_EC2_SUBNET_ID:-$(printf '%s' "$all_subnets_csv" | cut -d, -f1)}"
 
-alb_sg_id="$(ensure_security_group "$vpc_id" "$ECS_ALB_SG_NAME" "gitmirrorcache EC2 ECS ALB")"
-task_sg_id="$(ensure_security_group "$vpc_id" "$ECS_TASK_SG_NAME" "gitmirrorcache EC2 ECS tasks")"
+alb_sg_id="$(timed "ensure ALB security group" ensure_security_group "$vpc_id" "$ECS_ALB_SG_NAME" "gitmirrorcache EC2 ECS ALB")"
+task_sg_id="$(timed "ensure task security group" ensure_security_group "$vpc_id" "$ECS_TASK_SG_NAME" "gitmirrorcache EC2 ECS tasks")"
 instance_sg_id="$task_sg_id"
-ensure_sg_rule ingress "$alb_sg_id" --ip-permissions 'IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0,Description="HTTP"}]'
-ensure_sg_rule ingress "$task_sg_id" --ip-permissions "IpProtocol=tcp,FromPort=8080,ToPort=8080,UserIdGroupPairs=[{GroupId=$alb_sg_id,Description=\"ALB to API\"}]"
+timed "ensure ALB ingress rule" ensure_sg_rule ingress "$alb_sg_id" --ip-permissions 'IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0,Description="HTTP"}]'
+timed "ensure task ingress rule" ensure_sg_rule ingress "$task_sg_id" --ip-permissions "IpProtocol=tcp,FromPort=8080,ToPort=8080,UserIdGroupPairs=[{GroupId=$alb_sg_id,Description=\"ALB to API\"}]"
 
-lb_output="$(ensure_load_balancer "$vpc_id" "$all_subnets_csv" "$alb_sg_id")"
+lb_output="$(timed "ensure load balancer" ensure_load_balancer "$vpc_id" "$all_subnets_csv" "$alb_sg_id")"
 load_balancer_arn="$(printf '%s\n' "$lb_output" | sed -n '1p')"
 target_group_arn="$(printf '%s\n' "$lb_output" | sed -n '2p')"
 public_base_url="${PUBLIC_BASE_URL:-http://$(alb_dns_name)}"
 
-container_instance_id="$(ensure_container_instance "$instance_subnet_id" "$instance_sg_id")"
-cache_volume_id="$(ensure_cache_volume_performance "$container_instance_id")"
-build_and_push_image
+container_instance_id="$(timed "ensure EC2/ECS container instance" ensure_container_instance "$instance_subnet_id" "$instance_sg_id")"
+cache_volume_id="$(timed "ensure EBS cache volume performance" ensure_cache_volume_performance "$container_instance_id")"
+timed "build and push image" build_and_push_image
 
-execution_role_arn="$(role_arn_by_name "$ECS_EXECUTION_ROLE_NAME")"
-task_role_arn="$(role_arn_by_name "$ECS_TASK_ROLE_NAME")"
+execution_role_arn="$(timed "resolve execution role ARN" role_arn_by_name "$ECS_EXECUTION_ROLE_NAME")"
+task_role_arn="$(timed "resolve task role ARN" role_arn_by_name "$ECS_TASK_ROLE_NAME")"
 export ECS_EXECUTION_ROLE_ARN="$execution_role_arn"
 export ECS_TASK_ROLE_ARN="$task_role_arn"
 
-task_definition_arn="$(register_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+task_definition_arn="$(timed "register API task definition" register_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
 compaction_task_definition_arn=""
 if [[ "$ECS_COMPACTION_ENABLED" == "true" ]]; then
-  compaction_task_definition_arn="$(register_compaction_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+  compaction_task_definition_arn="$(timed "register compaction task definition" register_compaction_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
 fi
 
-write_service_inputs "$task_definition_arn" "$task_sg_id" "$all_subnets_csv" "$target_group_arn"
+timed "write ECS service inputs" write_service_inputs "$task_definition_arn" "$task_sg_id" "$all_subnets_csv" "$target_group_arn"
 ensure_ecs_service
 
 if [[ "$ECS_COMPACTION_ENABLED" == "true" ]]; then
-  cluster_arn="$(cluster_arn_by_name)"
-  compaction_events_role_arn="$(ensure_compaction_events_role "$compaction_task_definition_arn" "$execution_role_arn" "$task_role_arn")"
-  ensure_compaction_schedule "$compaction_task_definition_arn" "$compaction_events_role_arn" "$cluster_arn"
+  cluster_arn="$(timed "resolve ECS cluster ARN" cluster_arn_by_name)"
+  compaction_events_role_arn="$(timed "ensure compaction events role" ensure_compaction_events_role "$compaction_task_definition_arn" "$execution_role_arn" "$task_role_arn")"
+  timed "ensure compaction schedule" ensure_compaction_schedule "$compaction_task_definition_arn" "$compaction_events_role_arn" "$cluster_arn"
 else
   printf 'skipping compaction task and schedule because ECS_COMPACTION_ENABLED=false\n'
 fi
+
+timing_record "ecs/ec2 deployment total" "$(( $(timing_now) - deploy_started_at ))" 0
 
 cat <<EOF
 ECS EC2/EBS deployment complete.
@@ -1156,3 +1235,8 @@ ECS_EBS_THROUGHPUT=$ECS_EBS_THROUGHPUT
 GIT_CACHE_DISK_QUOTA_BYTES=$GIT_CACHE_DISK_QUOTA_BYTES
 S3_RUNTIME_PREFIX=$S3_RUNTIME_PREFIX
 EOF
+
+if [[ "$owns_timing_file" == "true" ]]; then
+  timing_print_summary
+  timing_write_github_summary "ECS EC2/EBS deployment timings"
+fi

@@ -5,6 +5,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 source "$SCRIPT_DIR/preview-common.sh"
 
+tmpdir="$(mktemp -d)"
+cleanup() {
+  rm -rf "$tmpdir"
+}
+trap cleanup EXIT
+
+DEPLOY_TIMING_FILE="${DEPLOY_TIMING_FILE:-$tmpdir/preview-timings.tsv}"
+export DEPLOY_TIMING_FILE
+preview_started_at="$(timing_now)"
+
 requested_ref="${1:-${REF:-HEAD}}"
 caller_s3_bucket="${S3_BUCKET:-}"
 caller_ecr_repository="${ECR_REPOSITORY:-}"
@@ -28,34 +38,34 @@ ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS="${ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS:-
 ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS="${ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS:-5}"
 ECS_ALB_HEALTHY_THRESHOLD_COUNT="${ECS_ALB_HEALTHY_THRESHOLD_COUNT:-2}"
 ECS_ALB_UNHEALTHY_THRESHOLD_COUNT="${ECS_ALB_UNHEALTHY_THRESHOLD_COUNT:-3}"
+ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS="${ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS:-60}"
+ECS_SERVICE_STABLE_POLL_SECONDS="${ECS_SERVICE_STABLE_POLL_SECONDS:-5}"
+BOOTSTRAP_FAST_EXISTING="${BOOTSTRAP_FAST_EXISTING:-true}"
 export ECR_PUSH_LATEST ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS ECS_EC2_INSTANCE_TYPE
 export ECS_PRECHECK_VCPU_QUOTA ECS_EBS_DELETE_ON_TERMINATION
 export ECS_COMPACTION_ENABLED ECS_LOG_RETENTION_DAYS
 export ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS
 export ECS_ALB_HEALTHY_THRESHOLD_COUNT ECS_ALB_UNHEALTHY_THRESHOLD_COUNT
+export ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS ECS_SERVICE_STABLE_POLL_SECONDS
+export BOOTSTRAP_FAST_EXISTING
 
 printf 'Deploying preview %s from %s\n' "$VERSION_ID" "$PREVIEW_REF"
 printf 'NAME_PREFIX=%s\nS3_BUCKET=%s\nS3_PREFIX=%s\nECR_REPOSITORY=%s\n' \
   "$NAME_PREFIX" "$S3_BUCKET" "$S3_PREFIX" "$ECR_REPOSITORY"
 
 if [[ "${SKIP_BOOTSTRAP:-false}" != "true" ]]; then
-  "$SCRIPT_DIR/bootstrap.sh"
+  timed "preview bootstrap" "$SCRIPT_DIR/bootstrap.sh"
 fi
 
-"$SCRIPT_DIR/deploy-and-smoke.sh"
+timed "preview deploy and smoke" "$SCRIPT_DIR/deploy-and-smoke.sh"
 
 public_base_url="${PUBLIC_BASE_URL:-$(alb_base_url_by_name "$ECS_ALB_NAME")}"
 manifest_key="${PREVIEW_MANIFEST_KEY:-$(preview_manifest_key)}"
 
-tmpdir="$(mktemp -d)"
-cleanup() {
-  rm -rf "$tmpdir"
-}
-trap cleanup EXIT
-
-PREVIEW_PUBLIC_BASE_URL="$public_base_url" \
-PREVIEW_MANIFEST_KEY="$manifest_key" \
-python3 - "$tmpdir/preview-manifest.json" <<'PY'
+write_preview_manifest() {
+  PREVIEW_PUBLIC_BASE_URL="$public_base_url" \
+  PREVIEW_MANIFEST_KEY="$manifest_key" \
+  python3 - "$tmpdir/preview-manifest.json" <<'PY'
 import json
 import os
 import sys
@@ -81,7 +91,11 @@ manifest = {
 json.dump(manifest, open(sys.argv[1], "w"), indent=2)
 PY
 
-aws_cli s3 cp "$tmpdir/preview-manifest.json" "s3://$S3_BUCKET/$manifest_key" >/dev/null
+  aws_cli s3 cp "$tmpdir/preview-manifest.json" "s3://$S3_BUCKET/$manifest_key" >/dev/null
+}
+
+timed "write preview manifest" write_preview_manifest
+timing_record "preview deployment total" "$(( $(timing_now) - preview_started_at ))" 0
 
 cat <<EOF
 Preview deployment complete.
@@ -91,6 +105,8 @@ HEALTH_URL=$public_base_url/healthz
 S3_MANIFEST=s3://$S3_BUCKET/$manifest_key
 DESTROY_COMMAND=VERSION_ID=$VERSION_ID scripts/aws/destroy-preview.sh
 EOF
+
+timing_print_summary
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {
@@ -103,6 +119,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     printf '- URL: %s\n' "$public_base_url"
     printf '- Health: %s/healthz\n' "$public_base_url"
     printf '- Manifest: `s3://%s/%s`\n\n' "$S3_BUCKET" "$manifest_key"
-    printf 'To tear this down, run **Preview Stack** with action `destroy` and version_id `%s`.\n' "$VERSION_ID"
+    printf 'To tear this down, run **Preview Stack** with action `destroy` and version_id `%s`.\n\n' "$VERSION_ID"
   } >>"$GITHUB_STEP_SUMMARY"
+  timing_write_github_summary "Preview deployment timings"
 fi
