@@ -325,58 +325,12 @@ impl Materializer {
             .and_then(BranchName::parse)
     }
 
-    pub(super) async fn prepare_session_repo(
-        &self,
-        manifest: &SessionManifest,
-        source_repo: &FsPath,
-    ) -> CoreResult<()> {
-        let session_repo = self.session_repo_path(manifest.id);
-        let objects_dir = session_repo.join("objects");
-        let refs_dir = session_repo.join("refs/cache/sessions");
-        fs::create_dir_all(objects_dir.join("info")).await?;
-        fs::create_dir_all(&refs_dir).await?;
-        fs::write(
-            session_repo.join("HEAD"),
-            format!("ref: {}\n", manifest.synthetic_ref),
-        )
-        .await?;
-        let upload_pack_config = match &manifest.protection {
-            SessionProtection::Public => {
-                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = true\n\tallowAnySHA1InWant = true\n\tallowReachableSHA1InWant = true\n"
-            }
-            SessionProtection::BearerToken { .. } => {
-                "[core]\n\trepositoryformatversion = 0\n\tbare = true\n[uploadpack]\n\tallowFilter = false\n\tallowAnySHA1InWant = false\n\tallowReachableSHA1InWant = false\n"
-            }
-        };
-        fs::write(session_repo.join("config"), upload_pack_config).await?;
-        fs::write(
-            objects_dir.join("info/alternates"),
-            format!("{}\n", source_repo.join("objects").display()),
-        )
-        .await?;
-
-        let ref_file = session_repo.join(&manifest.synthetic_ref);
-        if let Some(parent) = ref_file.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        fs::write(ref_file, format!("{}\n", manifest.commit)).await?;
-        Ok(())
-    }
-
     pub fn repo_dir(&self, repo: &RepoKey) -> PathBuf {
         self.state
             .config
             .cache_root
             .join("repos")
             .join(repo.local_bare_path())
-    }
-
-    pub fn session_repo_path(&self, session_id: SessionId) -> PathBuf {
-        self.state
-            .config
-            .cache_root
-            .join("sessions")
-            .join(format!("{session_id}.git"))
     }
 
     pub(super) fn repo_disk_path(&self, repo: &RepoKey) -> PathBuf {

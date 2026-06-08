@@ -1,7 +1,7 @@
 //! Correctness integration tests for git-cache-api endpoints.
 //!
-//! Tests edge cases for materialize, resolve, healthz, metrics, and session
-//! endpoints using the same TestServer pattern as other integration tests.
+//! Tests edge cases for materialize, resolve, healthz, and metrics endpoints
+//! using the same TestServer pattern as other integration tests.
 
 use git_cache_api::app;
 use git_cache_core::{AppConfig, GitRemoteConfig, ObjectStoreConfig};
@@ -63,11 +63,9 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             allowed_upstream_hosts: vec!["github.com".into()],
             disk: git_cache_core::DiskConfig {
@@ -176,7 +174,6 @@ async fn metrics_returns_expected_counter_names() {
     for counter in &[
         "git_cache_materialize_total",
         "git_cache_materialize_errors_total",
-        "git_cache_git_upload_pack_total",
         "git_cache_rate_limited_total",
         "git_cache_git_remote_refs_total",
         "git_cache_git_remote_upload_pack_total",
@@ -357,7 +354,7 @@ async fn resolve_with_valid_branch_returns_lightweight_response() {
     assert!(body["authorized_at"].is_string());
     assert!(
         body.get("git_url").is_none(),
-        "resolve should not create a materialize session"
+        "resolve should not return a Git remote URL"
     );
 }
 
@@ -455,48 +452,6 @@ async fn materialize_nonexistent_branch_returns_error() {
     );
 }
 
-// ── Session clone with wrong repo in URL ────────────────────────────────
-
-#[tokio::test(flavor = "multi_thread")]
-async fn session_clone_wrong_repo_returns_error() {
-    let server = TestServer::start().await;
-    let client = reqwest::Client::new();
-
-    // First materialize to get a session
-    let resp = client
-        .post(server.materialize_url())
-        .json(&serde_json::json!({
-            "repo": "github.com/org/repo",
-            "selector": {"branch": "main"}
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let git_url = body["git_url"].as_str().unwrap();
-
-    // Extract session ID from git_url (format: http://host/git/session/{id}/{repo}.git)
-    let session_id = git_url
-        .split("/git/session/")
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .unwrap();
-
-    // Try to access session with wrong repo
-    let wrong_url = format!(
-        "http://{}/git/session/{}/github.com/wrong/repo.git/info/refs?service=git-upload-pack",
-        server.addr, session_id
-    );
-    let resp = reqwest::get(&wrong_url).await.unwrap();
-    assert!(
-        resp.status().is_client_error() || resp.status().is_server_error(),
-        "expected error for wrong repo in session URL, got {}",
-        resp.status()
-    );
-}
-
 // ── Materialize with invalid JSON body ──────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -552,9 +507,9 @@ async fn materialize_response_has_expected_fields() {
     assert!(body["commit"].is_string());
     assert!(body["source"].is_string());
     assert!(body["verified_at"].is_string());
-    assert!(body["git_url"].is_string());
-    assert!(body["ref"].is_string());
-    assert!(body["expires_at"].is_string());
+    assert!(body.get("git_url").is_none());
+    assert!(body.get("ref").is_none());
+    assert!(body.get("expires_at").is_none());
 
     // commit should be 40-char hex
     let commit = body["commit"].as_str().unwrap();

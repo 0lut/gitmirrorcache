@@ -61,11 +61,9 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             allowed_upstream_hosts: vec!["github.com".into()],
             disk: git_cache_core::DiskConfig {
@@ -311,10 +309,10 @@ async fn test_clone_fetch_cycle() {
     );
 }
 
-// ── 4. Session creation throughput ───────────────────────────────────────
+// ── 4. Repeated materialize throughput ───────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_session_creation_throughput() {
+async fn test_repeated_materialize_throughput() {
     let server = TestServer::start().await;
     let client = reqwest::Client::new();
     let url = format!("http://{}/v1/materialize", server.addr);
@@ -324,11 +322,11 @@ async fn test_session_creation_throughput() {
         "selector": {"branch": "main"}
     });
 
-    let session_count = 20;
-    let mut latencies = Vec::with_capacity(session_count);
+    let call_count = 20;
+    let mut latencies = Vec::with_capacity(call_count);
 
     let start = Instant::now();
-    for _ in 0..session_count {
+    for _ in 0..call_count {
         let call_start = Instant::now();
         let resp = client.post(&url).json(&body).send().await.unwrap();
         let call_elapsed = call_start.elapsed();
@@ -341,11 +339,11 @@ async fn test_session_creation_throughput() {
     }
     let total = start.elapsed();
 
-    let avg = total / session_count as u32;
-    eprintln!("session creation: {session_count} sessions in {total:?}, avg={avg:?}");
+    let avg = total / call_count as u32;
+    eprintln!("repeated materialize: {call_count} calls in {total:?}, avg={avg:?}");
     assert!(
         total.as_secs() < 120,
-        "session creation too slow: {total:?}"
+        "repeated materialize too slow: {total:?}"
     );
 }
 

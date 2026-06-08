@@ -3,7 +3,7 @@
 //! These tests exercise the API against a local upstream, local object store,
 //! and local hot cache. They focus on cold-cache hydration and partially
 //! corrupted hot-cache repos, where durable generation manifests and bundles
-//! must repair local state before Git sessions are served.
+//! must repair local state before direct Git fetches are served.
 
 use git_cache_api::app;
 use git_cache_core::{AppConfig, GitRemoteConfig, ObjectStoreConfig};
@@ -68,7 +68,6 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -82,7 +81,6 @@ impl TestServer {
             },
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
         };
 
@@ -100,6 +98,10 @@ impl TestServer {
 
     fn materialize_url(&self) -> String {
         format!("http://{}/v1/materialize", self.addr)
+    }
+
+    fn git_url(&self) -> String {
+        format!("http://{}/git/{REPO}.git", self.addr)
     }
 
     fn cache_repo_dir(&self) -> PathBuf {
@@ -131,9 +133,6 @@ impl TestServer {
 struct MaterializeResponse {
     commit: String,
     source: String,
-    git_url: String,
-    #[serde(rename = "ref")]
-    ref_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -170,7 +169,7 @@ async fn exact_commit_hydrates_incremental_chain_after_hot_cache_deletion() {
     let mat = materialize_exact(&server, &client, &third).await;
     assert_eq!(mat.source, "cache_verified");
     assert_eq!(mat.commit, third);
-    assert_eq!(fetch_session_ref(&server, &mat).await, third);
+    assert_eq!(fetch_direct_remote_head(&server, &mat.commit).await, third);
 
     for commit in [&first, &second, &third] {
         run_git(
@@ -182,7 +181,7 @@ async fn exact_commit_hydrates_incremental_chain_after_hot_cache_deletion() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn exact_commit_repairs_partial_hot_cache_before_serving_session() {
+async fn exact_commit_repairs_partial_hot_cache_before_direct_fetch() {
     let server = TestServer::start().await;
     let client = reqwest::Client::new();
 
@@ -201,7 +200,7 @@ async fn exact_commit_repairs_partial_hot_cache_before_serving_session() {
 
     let mat = materialize_exact(&server, &client, &commit).await;
     assert_eq!(mat.source, "cache_verified");
-    assert_eq!(fetch_session_ref(&server, &mat).await, commit);
+    assert_eq!(fetch_direct_remote_head(&server, &mat.commit).await, commit);
     run_git(
         &server.cache_repo_dir(),
         &["cat-file", "-e", &format!("{commit}^{{tree}}")],
@@ -318,11 +317,11 @@ fn assert_generation_parent(server: &TestServer, generation: &str, expected_pare
     );
 }
 
-async fn fetch_session_ref(server: &TestServer, mat: &MaterializeResponse) -> String {
-    let fetch_dir = server.tmp.path().join(format!("fetch-{}", mat.commit));
+async fn fetch_direct_remote_head(server: &TestServer, commit: &str) -> String {
+    let fetch_dir = server.tmp.path().join(format!("fetch-{commit}"));
     fs::create_dir_all(&fetch_dir).unwrap();
     run_git_async(&fetch_dir, &["init"]).await;
-    run_git_async(&fetch_dir, &["fetch", &mat.git_url, &mat.ref_name]).await;
+    run_git_async(&fetch_dir, &["fetch", &server.git_url(), "refs/heads/main"]).await;
     git_stdout_async(&fetch_dir, &["rev-parse", "FETCH_HEAD"]).await
 }
 

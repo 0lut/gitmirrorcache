@@ -74,6 +74,8 @@ ECS_PUBLIC_PATH_PREFIX="${ECS_PUBLIC_PATH_PREFIX:-}"
 ECS_ALB_RULE_PATH_PATTERN="${ECS_ALB_RULE_PATH_PATTERN:-}"
 ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-}"
 ECS_ALB_RULE_REWRITE_REPLACE="${ECS_ALB_RULE_REWRITE_REPLACE:-\$1}"
+ECS_ALB_DEREGISTRATION_DELAY_SECONDS="${ECS_ALB_DEREGISTRATION_DELAY_SECONDS:-300}"
+ECS_CONTAINER_STOP_TIMEOUT_SECONDS="${ECS_CONTAINER_STOP_TIMEOUT_SECONDS:-30}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
 LATEST_URI="${ECR_REPOSITORY_URI}:latest"
@@ -171,6 +173,8 @@ export IMAGE_URI S3_RUNTIME_PREFIX GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_
 export ECS_SERVICE_STABLE_TIMEOUT_SECONDS ECS_SERVICE_STABLE_POLL_SECONDS
 export ECS_SHARED_ALB ECS_PUBLIC_PATH_PREFIX ECS_ALB_RULE_PATH_PATTERN
 export ECS_ALB_RULE_REWRITE_REGEX ECS_ALB_RULE_REWRITE_REPLACE
+export ECS_ALB_DEREGISTRATION_DELAY_SECONDS
+export ECS_CONTAINER_STOP_TIMEOUT_SECONDS
 
 ensure_role() {
   local role_name="$1"
@@ -646,6 +650,10 @@ ensure_load_balancer() {
     --unhealthy-threshold-count "${ECS_ALB_UNHEALTHY_THRESHOLD_COUNT:-5}" \
     --matcher HttpCode=200 >/dev/null
 
+  aws_cli elbv2 modify-target-group-attributes \
+    --target-group-arn "$tg_arn" \
+    --attributes Key=deregistration_delay.timeout_seconds,Value="$ECS_ALB_DEREGISTRATION_DELAY_SECONDS" >/dev/null
+
   lb_arn="$(load_balancer_arn_by_name)"
   if [[ "$lb_arn" == "None" || -z "$lb_arn" ]]; then
     printf 'creating ALB: %s\n' "$ECS_ALB_NAME" >&2
@@ -995,6 +1003,7 @@ container = {
     "image": os.environ["IMAGE_URI"],
     "essential": True,
     "user": os.environ.get("ECS_CONTAINER_USER", "0"),
+    "stopTimeout": int(os.environ["ECS_CONTAINER_STOP_TIMEOUT_SECONDS"]),
     "portMappings": [{
         "containerPort": 8080,
         "hostPort": 8080,
@@ -1297,6 +1306,8 @@ update = {
     "desiredCount": int(os.environ["ECS_DESIRED_COUNT"]),
     "forceNewDeployment": True,
     "loadBalancers": load_balancers,
+    "healthCheckGracePeriodSeconds": base["healthCheckGracePeriodSeconds"],
+    "deploymentConfiguration": base["deploymentConfiguration"],
 }
 json.dump(update, open(sys.argv[2], "w"))
 PY

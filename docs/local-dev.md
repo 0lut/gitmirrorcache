@@ -54,11 +54,9 @@ The response should report `cache_verified`.
 ## 5. Disk And Object Store State
 
 - Local hot repos: `cache/repos/`
-- Session repos: `cache/sessions/`
 - Reservations: `cache/reservations/`
 - Object-store manifests and bundles: `tmp/object-store/repos/`
 
 ```sh
 cargo run -p git-cache-cli -- disk-status
 ```
-

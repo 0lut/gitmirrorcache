@@ -294,7 +294,6 @@ async fn anonymous_direct_want_does_not_verify_pending_generation_on_post() {
             verified_at: now,
         }],
         refs: Vec::new(),
-        sessions: Vec::new(),
     };
     let head = RepoGenerationHead {
         repo: fixture.repo.clone(),

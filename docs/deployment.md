@@ -47,10 +47,21 @@ GITHUB_TOKEN_SECRET_ARN=arn:aws:secretsmanager:us-west-2:123456789012:secret:git
 ECS_COMPACTION_SCHEDULE_EXPRESSION='rate(1 hour)'
 ECS_COMPACTION_MEMORY_RESERVATION=4096
 GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD=10
+ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS=5
+ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS=2
+ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS=15
 ```
 
 If `PUBLIC_BASE_URL` is omitted, the deployment script uses the ALB DNS name and
 sets `GIT_CACHE_PUBLIC_BASE_URL` to `http://<alb-dns-name>`.
+
+For `dev-*` and preview environments, `deploy-and-smoke.sh` defaults to
+5-second ALB health checks, a 15-second ECS health-check grace period, and
+5-second service-stability polling. Those defaults improve startup detection
+without shortening the ALB request-drain window or ECS container stop timeout.
+If a disposable environment can tolerate interrupting in-flight requests during
+deploy, set `ECS_ALB_DEREGISTRATION_DELAY_SECONDS` or
+`ECS_CONTAINER_STOP_TIMEOUT_SECONDS` explicitly.
 
 ## Why EC2/EBS Instead Of App Runner
 
@@ -139,7 +150,7 @@ Preview deploys set `ECR_PUSH_LATEST=false`,
 `ECS_EC2_INSTANCE_TYPE=m8g.2xlarge`, `ECS_PRECHECK_VCPU_QUOTA=true`,
 `ECS_EBS_DELETE_ON_TERMINATION=true`, `ECS_COMPACTION_ENABLED=false`,
 `ECS_LOG_RETENTION_DAYS=3`, `BOOTSTRAP_FAST_EXISTING=true`,
-`PREVIEW_SHARED_ALB=true`, a 60-second ECS health-check grace period, faster ECS
+`PREVIEW_SHARED_ALB=true`, a 15-second ECS health-check grace period, faster ECS
 service polling, and shorter ALB target health-check intervals unless you
 override them. This keeps previews isolated, disposable, faster to redeploy, and
 less noisy while still exercising the ECS, EC2/EBS, ALB listener-rule, IAM, ECR,
@@ -288,7 +299,6 @@ Object storage is the source of truth for:
 - bundles
 - commit manifests
 - ref manifests
-- session manifests
 - lease objects
 
 ## Credentials

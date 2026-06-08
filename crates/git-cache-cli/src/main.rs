@@ -31,8 +31,6 @@ enum Command {
         #[arg(long, default_value = "strict")]
         mode: CliRequestMode,
     },
-    /// Remove expired sessions from disk and object store.
-    SessionCleanup,
     /// Repack a local cached repo with bitmap indexes for faster upload-pack.
     Optimize {
         /// Repository key, e.g. github.com/org/repo
@@ -130,13 +128,6 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
-        }
-        Command::SessionCleanup => {
-            let config = AppConfig::from_env()?;
-            let state = Arc::new(AppState::try_new_async(config).await?);
-            let materializer = Materializer::new(state);
-            let report = materializer.cleanup_expired_sessions().await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Optimize { repo } => {
             let repo = git_cache_core::RepoKey::parse(&repo)?;

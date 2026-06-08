@@ -33,18 +33,6 @@ impl<'a> ManifestStore<'a> {
         read_generation_manifest(&*self.state.store, repo, generation).await
     }
 
-    pub(super) async fn session(
-        &self,
-        repo: &RepoKey,
-        session_id: SessionId,
-    ) -> CoreResult<Option<SessionManifest>> {
-        read_session_manifest(&*self.state.store, repo, session_id).await
-    }
-
-    pub(super) async fn write_session(&self, manifest: &SessionManifest) -> CoreResult<()> {
-        write_session_manifest(&*self.state.store, manifest).await
-    }
-
     pub(super) async fn ref_by_key(&self, key: &str) -> CoreResult<Option<RefManifest>> {
         read_json::<_, RefManifest>(&*self.state.store, key).await
     }
