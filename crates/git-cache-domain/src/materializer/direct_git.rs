@@ -14,18 +14,18 @@ enum DirectFetchedWantKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UploadPackFilter {
+pub(super) enum UploadPackFilter {
     BlobNone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct UploadPackIntent {
-    pub wants: Vec<CommitSha>,
-    pub filter: Option<UploadPackFilter>,
-    pub depth: Option<u32>,
-    pub deepen_since: Option<u64>,
-    pub deepen_not: Vec<String>,
-    pub shallow: Vec<CommitSha>,
+pub(super) struct UploadPackIntent {
+    pub(super) wants: Vec<CommitSha>,
+    pub(super) filter: Option<UploadPackFilter>,
+    pub(super) depth: Option<u32>,
+    pub(super) deepen_since: Option<u64>,
+    pub(super) deepen_not: Vec<String>,
+    pub(super) shallow: Vec<CommitSha>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -95,7 +95,12 @@ impl Materializer {
     /// request-scoped upstream auth. The repo cache is scoped by `RepoKey`;
     /// deployments that need stricter history isolation should use separate
     /// upstream repositories for truly separate data.
-    pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
+    #[cfg(test)]
+    pub(super) async fn ensure_wants_available(
+        &self,
+        repo: &RepoKey,
+        wants: &[String],
+    ) -> CoreResult<()> {
         let object_ids = parse_want_strings(wants)?;
         Box::pin(self.ensure_wants_read_through(
             repo,
@@ -423,7 +428,7 @@ impl Materializer {
     /// - `uploadpack.allowFilter=true`
     /// - `uploadpack.hideRefs=refs/cache`
     /// - `transfer.hideRefs=refs/cache`
-    pub async fn configure_served_repo(&self, repo_dir: &FsPath) -> CoreResult<()> {
+    async fn configure_served_repo(&self, repo_dir: &FsPath) -> CoreResult<()> {
         let marker = repo_dir.join(SERVED_REPO_CONFIG_MARKER);
         if fs::try_exists(&marker).await? {
             return Ok(());
@@ -573,14 +578,6 @@ impl UpstreamRefComparison {
     }
 }
 
-pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u8>> {
-    Ok(state
-        .git
-        .upload_pack_advertise_refs(repo, state.config.max_git_output_bytes)
-        .await?
-        .stdout)
-}
-
 /// Build a pkt-line formatted ref advertisement from upstream ref data.
 ///
 /// This produces the same output as `git upload-pack --advertise-refs` but
@@ -655,19 +652,6 @@ fn pkt_line(out: &mut Vec<u8>, data: &str) {
     out.extend_from_slice(data.as_bytes());
 }
 
-pub async fn upload_pack(state: &AppState, repo: &FsPath, body: Bytes) -> CoreResult<Vec<u8>> {
-    Ok(state
-        .git
-        .upload_pack_stateless_rpc(
-            repo,
-            &body,
-            state.config.max_git_output_bytes,
-            state.config.max_git_output_bytes,
-        )
-        .await?
-        .stdout)
-}
-
 /// Frame a ref advertisement with the Git smart-HTTP service header.
 pub fn frame_ref_advertisement(refs_output: &[u8]) -> Vec<u8> {
     let mut framed = Vec::with_capacity(refs_output.len() + 34);
@@ -676,29 +660,14 @@ pub fn frame_ref_advertisement(refs_output: &[u8]) -> Vec<u8> {
     framed
 }
 
-/// Parse `want <oid>` lines from a Git pkt-line formatted upload-pack request.
-pub fn parse_want_lines(body: &[u8]) -> Vec<String> {
-    let mut wants = Vec::new();
-    visit_upload_pack_lines(body, |line| {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("want ") {
-            let oid = rest.split_whitespace().next().unwrap_or("");
-            if !oid.is_empty() {
-                wants.push(oid.to_string());
-            }
-        }
-    });
-    wants
-}
-
 #[cfg(test)]
-pub fn upload_pack_requests_blobless_filter(body: &[u8]) -> bool {
+pub(super) fn upload_pack_requests_blobless_filter(body: &[u8]) -> bool {
     parse_upload_pack_intent(body)
         .map(|intent| intent.filter == Some(UploadPackFilter::BlobNone))
         .unwrap_or(false)
 }
 
-pub fn parse_upload_pack_intent(body: &[u8]) -> CoreResult<UploadPackIntent> {
+pub(super) fn parse_upload_pack_intent(body: &[u8]) -> CoreResult<UploadPackIntent> {
     let mut intent = UploadPackIntent::default();
     let mut error = None;
     visit_upload_pack_lines(body, |line| {
@@ -754,6 +723,7 @@ pub fn parse_upload_pack_intent(body: &[u8]) -> CoreResult<UploadPackIntent> {
     Ok(intent)
 }
 
+#[cfg(test)]
 fn parse_want_strings(wants: &[String]) -> CoreResult<Vec<CommitSha>> {
     wants
         .iter()

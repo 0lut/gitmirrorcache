@@ -9,18 +9,13 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
-base64.workspace = true
-bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
 git-cache-core = { path = "../git-cache-core" }
 git-cache-domain = { path = "../git-cache-domain" }
 git-cache-git = { path = "../git-cache-git" }
-git-cache-worker = { path = "../git-cache-worker" }
 http.workspace = true
-reqwest.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -32,9 +27,6 @@ default = []
 s3 = ["git-cache-domain/s3"]
 
 [dev-dependencies]
-axum.workspace = true
-futures.workspace = true
-git-cache-core = { path = "../git-cache-core" }
+reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

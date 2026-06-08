@@ -487,69 +487,6 @@ async fn bundle_create_incremental_only_includes_new_commits() {
     let _ = delta_size;
 }
 
-// ── upload_pack_advertise_refs ──────────────────────────────────────────
-
-#[tokio::test]
-async fn upload_pack_advertise_refs_contains_cache_refs() {
-    let temp = TempTree::new("upload-adv");
-    let (source_repo, _) = create_source_repo(&temp.path);
-    let cache_repo = temp.path.join("cache.git");
-    let git = test_git();
-
-    git.init_bare(&cache_repo).await.expect("init cache repo");
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&source_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .expect("fetch main");
-
-    let output = git
-        .upload_pack_advertise_refs(&cache_repo, 128 * 1024)
-        .await
-        .expect("advertise refs");
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        text.contains("refs/cache/main"),
-        "should contain refs/cache/ prefix refs: {text}"
-    );
-}
-
-// ── upload_pack_stateless_rpc ───────────────────────────────────────────
-
-#[tokio::test]
-async fn upload_pack_stateless_rpc_returns_pack_data() {
-    let temp = TempTree::new("upload-rpc");
-    let (source_repo, source_sha) = create_source_repo(&temp.path);
-    let cache_repo = temp.path.join("cache.git");
-    let git = test_git();
-
-    git.init_bare(&cache_repo).await.expect("init cache repo");
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&source_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .expect("fetch main");
-
-    let request = format!("0032want {source_sha}\n00000009done\n");
-    let response = git
-        .upload_pack_stateless_rpc(&cache_repo, request.as_bytes(), 1024, 4 * 1024 * 1024)
-        .await
-        .expect("serve stateless upload-pack");
-
-    assert!(
-        response.stdout.windows(4).any(|chunk| chunk == b"PACK"),
-        "expected PACK in response, got {} bytes",
-        response.stdout.len()
-    );
-}
-
 // ── run ─────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -605,9 +542,9 @@ async fn timeout_kills_slow_command() {
         .expect("init repo");
     assert!(status.status.success());
 
-    // Try upload_pack_advertise_refs with 1ms timeout - it needs to spawn
-    // a git process which almost certainly takes > 1ms.
-    let result = git.upload_pack_advertise_refs(&repo_dir, 128 * 1024).await;
+    // Try a basic command with 1ms timeout. It should either timeout or
+    // complete very quickly.
+    let result = git.run(Some(&repo_dir), ["rev-parse", "--git-dir"]).await;
 
     // The command should either timeout or succeed very quickly.
     // We just verify that if it errors, the error is a timeout.
