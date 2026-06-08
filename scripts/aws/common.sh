@@ -137,3 +137,18 @@ alb_base_url_by_name() {
   [[ -n "$dns_name" && "$dns_name" != "None" ]] || return 1
   printf 'http://%s\n' "$dns_name"
 }
+
+public_base_url_by_alb_name() {
+  local alb_name="$1"
+  local base_url prefix
+  base_url="$(alb_base_url_by_name "$alb_name")" || return 1
+  prefix="${ECS_PUBLIC_PATH_PREFIX:-}"
+  if [[ -n "$prefix" ]]; then
+    [[ "$prefix" == /* ]] || prefix="/$prefix"
+    while [[ "$prefix" == */ ]]; do
+      prefix="${prefix%/}"
+    done
+    base_url="${base_url%/}$prefix"
+  fi
+  printf '%s\n' "$base_url"
+}

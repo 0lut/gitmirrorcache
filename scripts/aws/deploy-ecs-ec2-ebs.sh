@@ -68,6 +68,11 @@ DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
 ECS_SERVICE_STABLE_TIMEOUT_SECONDS="${ECS_SERVICE_STABLE_TIMEOUT_SECONDS:-900}"
 ECS_SERVICE_STABLE_POLL_SECONDS="${ECS_SERVICE_STABLE_POLL_SECONDS:-10}"
+ECS_SHARED_ALB="${ECS_SHARED_ALB:-false}"
+ECS_PUBLIC_PATH_PREFIX="${ECS_PUBLIC_PATH_PREFIX:-}"
+ECS_ALB_RULE_PATH_PATTERN="${ECS_ALB_RULE_PATH_PATTERN:-}"
+ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-}"
+ECS_ALB_RULE_REWRITE_REPLACE="${ECS_ALB_RULE_REWRITE_REPLACE:-\$1}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
 LATEST_URI="${ECR_REPOSITORY_URI}:latest"
@@ -96,6 +101,24 @@ case "$ECR_PUSH_LATEST" in
   true | false) ;;
   *) die "ECR_PUSH_LATEST must be true or false" ;;
 esac
+
+case "$ECS_SHARED_ALB" in
+  true | false) ;;
+  *) die "ECS_SHARED_ALB must be true or false" ;;
+esac
+
+if [[ -n "$ECS_PUBLIC_PATH_PREFIX" ]]; then
+  [[ "$ECS_PUBLIC_PATH_PREFIX" == /* ]] || ECS_PUBLIC_PATH_PREFIX="/$ECS_PUBLIC_PATH_PREFIX"
+  while [[ "$ECS_PUBLIC_PATH_PREFIX" == */ ]]; do
+    ECS_PUBLIC_PATH_PREFIX="${ECS_PUBLIC_PATH_PREFIX%/}"
+  done
+fi
+
+if [[ "$ECS_SHARED_ALB" == "true" ]]; then
+  [[ -n "$ECS_PUBLIC_PATH_PREFIX" ]] || die "ECS_PUBLIC_PATH_PREFIX is required when ECS_SHARED_ALB=true"
+  ECS_ALB_RULE_PATH_PATTERN="${ECS_ALB_RULE_PATH_PATTERN:-$ECS_PUBLIC_PATH_PREFIX/*}"
+  ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-^$ECS_PUBLIC_PATH_PREFIX(/.*)$}"
+fi
 
 runtime_s3_prefix() {
   local prefix="$1"
@@ -140,6 +163,8 @@ export ECS_EBS_SIZE_GIB ECS_EBS_VOLUME_TYPE ECS_EBS_IOPS ECS_EBS_THROUGHPUT ECS_
 export ECS_EBS_DELETE_ON_TERMINATION
 export IMAGE_URI S3_RUNTIME_PREFIX GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_QUOTA_BYTES
 export ECS_SERVICE_STABLE_TIMEOUT_SECONDS ECS_SERVICE_STABLE_POLL_SECONDS
+export ECS_SHARED_ALB ECS_PUBLIC_PATH_PREFIX ECS_ALB_RULE_PATH_PATTERN
+export ECS_ALB_RULE_REWRITE_REGEX ECS_ALB_RULE_REWRITE_REPLACE
 
 ensure_role() {
   local role_name="$1"
@@ -431,11 +456,157 @@ target_group_arn_by_name() {
     --output text 2>/dev/null || true
 }
 
+listener_rule_arn_by_path_pattern() {
+  local listener_arn="$1"
+  local path_pattern="$2"
+  local rules_json
+  rules_json="$(aws_cli elbv2 describe-rules \
+    --listener-arn "$listener_arn" \
+    --output json)"
+  RULES_JSON="$rules_json" python3 - "$path_pattern" <<'PY'
+import json
+import os
+import sys
+
+path_pattern = sys.argv[1]
+rules = json.loads(os.environ["RULES_JSON"]).get("Rules", [])
+for rule in rules:
+    for condition in rule.get("Conditions", []):
+        if condition.get("Field") != "path-pattern":
+            continue
+        values = condition.get("Values") or condition.get("PathPatternConfig", {}).get("Values", [])
+        if path_pattern in values:
+            print(rule["RuleArn"])
+            raise SystemExit(0)
+print("None")
+PY
+}
+
+next_listener_rule_priority() {
+  local listener_arn="$1"
+  local version_seed="${VERSION_ID:-${IMAGE_TAG:-1000}}"
+  local rules_json
+  rules_json="$(aws_cli elbv2 describe-rules \
+    --listener-arn "$listener_arn" \
+    --output json)"
+  RULES_JSON="$rules_json" python3 - "$version_seed" <<'PY'
+import json
+import os
+import sys
+
+seed = sys.argv[1]
+rules = json.loads(os.environ["RULES_JSON"]).get("Rules", [])
+used = set()
+for rule in rules:
+    priority = rule.get("Priority")
+    if priority and priority != "default":
+        used.add(int(priority))
+
+try:
+    base = int(seed[:8], 16)
+except ValueError:
+    base = 1000
+
+candidate = 100 + (base % 49900)
+for offset in range(49900):
+    priority = 100 + ((candidate - 100 + offset) % 49900)
+    if priority not in used:
+        print(priority)
+        raise SystemExit(0)
+
+raise SystemExit("no available ALB listener rule priorities")
+PY
+}
+
+write_shared_listener_rule_inputs() {
+  local target_group_arn="$1"
+
+  ECS_LISTENER_TARGET_GROUP_ARN="$target_group_arn" python3 \
+    - "$tmpdir/shared-listener-conditions.json" \
+      "$tmpdir/shared-listener-actions.json" \
+      "$tmpdir/shared-listener-transforms.json" <<'PY'
+import json
+import os
+import sys
+
+conditions_path, actions_path, transforms_path = sys.argv[1:]
+
+conditions = [{
+    "Field": "path-pattern",
+    "PathPatternConfig": {"Values": [os.environ["ECS_ALB_RULE_PATH_PATTERN"]]},
+}]
+actions = [{
+    "Type": "forward",
+    "TargetGroupArn": os.environ["ECS_LISTENER_TARGET_GROUP_ARN"],
+}]
+transforms = [{
+    "Type": "url-rewrite",
+    "UrlRewriteConfig": {
+        "Rewrites": [{
+            "Regex": os.environ["ECS_ALB_RULE_REWRITE_REGEX"],
+            "Replace": os.environ["ECS_ALB_RULE_REWRITE_REPLACE"],
+        }],
+    },
+}]
+
+json.dump(conditions, open(conditions_path, "w"))
+json.dump(actions, open(actions_path, "w"))
+json.dump(transforms, open(transforms_path, "w"))
+PY
+}
+
+write_shared_listener_default_action() {
+  python3 - "$tmpdir/shared-listener-default-action.json" <<'PY'
+import json
+import sys
+
+actions = [{
+    "Type": "fixed-response",
+    "FixedResponseConfig": {
+        "StatusCode": "404",
+        "ContentType": "text/plain",
+        "MessageBody": "preview version not found",
+    },
+}]
+json.dump(actions, open(sys.argv[1], "w"))
+PY
+}
+
+ensure_shared_listener_rule() {
+  local listener_arn="$1"
+  local target_group_arn="$2"
+  local rule_arn priority
+
+  write_shared_listener_rule_inputs "$target_group_arn"
+  rule_arn="$(listener_rule_arn_by_path_pattern "$listener_arn" "$ECS_ALB_RULE_PATH_PATTERN")"
+  if [[ "$rule_arn" != "None" && -n "$rule_arn" ]]; then
+    printf 'updating shared ALB listener rule for %s\n' "$ECS_ALB_RULE_PATH_PATTERN" >&2
+    aws_cli elbv2 modify-rule \
+      --rule-arn "$rule_arn" \
+      --conditions "file://$tmpdir/shared-listener-conditions.json" \
+      --actions "file://$tmpdir/shared-listener-actions.json" \
+      --transforms "file://$tmpdir/shared-listener-transforms.json" >/dev/null
+  else
+    priority="$(next_listener_rule_priority "$listener_arn")"
+    printf 'creating shared ALB listener rule: %s priority=%s\n' "$ECS_ALB_RULE_PATH_PATTERN" "$priority" >&2
+    rule_arn="$(aws_cli elbv2 create-rule \
+      --listener-arn "$listener_arn" \
+      --priority "$priority" \
+      --conditions "file://$tmpdir/shared-listener-conditions.json" \
+      --actions "file://$tmpdir/shared-listener-actions.json" \
+      --transforms "file://$tmpdir/shared-listener-transforms.json" \
+      --query 'Rules[0].RuleArn' \
+      --output text)"
+  fi
+
+  printf '%s\n' "$rule_arn"
+}
+
 ensure_load_balancer() {
   local vpc_id="$1"
   local subnets_csv="$2"
   local alb_sg_id="$3"
-  local tg_arn lb_arn
+  local tg_arn lb_arn listener_arn rule_arn
 
   tg_arn="$(target_group_arn_by_name)"
   if [[ "$tg_arn" == "None" || -z "$tg_arn" ]]; then
@@ -496,18 +667,43 @@ ensure_load_balancer() {
     --output text)"
   if [[ "$listener_arn" == "None" || -z "$listener_arn" ]]; then
     printf 'creating HTTP listener on ALB\n' >&2
-    aws_cli elbv2 create-listener \
-      --load-balancer-arn "$lb_arn" \
-      --protocol HTTP \
-      --port 80 \
-      --default-actions Type=forward,TargetGroupArn="$tg_arn" >/dev/null
+    if [[ "$ECS_SHARED_ALB" == "true" ]]; then
+      write_shared_listener_default_action
+      listener_arn="$(aws_cli elbv2 create-listener \
+        --load-balancer-arn "$lb_arn" \
+        --protocol HTTP \
+        --port 80 \
+        --default-actions "file://$tmpdir/shared-listener-default-action.json" \
+        --query 'Listeners[0].ListenerArn' \
+        --output text)"
+    else
+      listener_arn="$(aws_cli elbv2 create-listener \
+        --load-balancer-arn "$lb_arn" \
+        --protocol HTTP \
+        --port 80 \
+        --default-actions Type=forward,TargetGroupArn="$tg_arn" \
+        --query 'Listeners[0].ListenerArn' \
+        --output text)"
+    fi
   else
-    aws_cli elbv2 modify-listener \
-      --listener-arn "$listener_arn" \
-      --default-actions Type=forward,TargetGroupArn="$tg_arn" >/dev/null
+    if [[ "$ECS_SHARED_ALB" == "true" ]]; then
+      write_shared_listener_default_action
+      aws_cli elbv2 modify-listener \
+        --listener-arn "$listener_arn" \
+        --default-actions "file://$tmpdir/shared-listener-default-action.json" >/dev/null
+    else
+      aws_cli elbv2 modify-listener \
+        --listener-arn "$listener_arn" \
+        --default-actions Type=forward,TargetGroupArn="$tg_arn" >/dev/null
+    fi
   fi
 
-  printf '%s\n%s\n' "$lb_arn" "$tg_arn"
+  rule_arn=""
+  if [[ "$ECS_SHARED_ALB" == "true" ]]; then
+    rule_arn="$(ensure_shared_listener_rule "$listener_arn" "$tg_arn")"
+  fi
+
+  printf '%s\n%s\n%s\n' "$lb_arn" "$tg_arn" "$rule_arn"
 }
 
 alb_dns_name() {
@@ -1184,7 +1380,8 @@ timed "ensure task ingress rule" ensure_sg_rule ingress "$task_sg_id" --ip-permi
 lb_output="$(timed "ensure load balancer" ensure_load_balancer "$vpc_id" "$all_subnets_csv" "$alb_sg_id")"
 load_balancer_arn="$(printf '%s\n' "$lb_output" | sed -n '1p')"
 target_group_arn="$(printf '%s\n' "$lb_output" | sed -n '2p')"
-public_base_url="${PUBLIC_BASE_URL:-http://$(alb_dns_name)}"
+listener_rule_arn="$(printf '%s\n' "$lb_output" | sed -n '3p')"
+public_base_url="${PUBLIC_BASE_URL:-$(public_base_url_by_alb_name "$ECS_ALB_NAME")}"
 
 container_instance_id="$(timed "ensure EC2/ECS container instance" ensure_container_instance "$instance_subnet_id" "$instance_sg_id")"
 cache_volume_id="$(timed "ensure EBS cache volume performance" ensure_cache_volume_performance "$container_instance_id")"
@@ -1226,6 +1423,7 @@ ECS_COMPACTION_RULE_NAME=$ECS_COMPACTION_RULE_NAME
 ECS_COMPACTION_SCHEDULE_EXPRESSION=$ECS_COMPACTION_SCHEDULE_EXPRESSION
 ECS_CONTAINER_INSTANCE_ID=$container_instance_id
 ECS_LOAD_BALANCER_ARN=$load_balancer_arn
+ECS_LISTENER_RULE_ARN=$listener_rule_arn
 PUBLIC_BASE_URL=$public_base_url
 HEALTH_URL=$public_base_url/healthz
 ECS_CACHE_VOLUME_ID=$cache_volume_id

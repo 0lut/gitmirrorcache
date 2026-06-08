@@ -12,6 +12,7 @@ caller_ecr_repository="${ECR_REPOSITORY:-}"
 preview_resolve_version "$requested_ref"
 preview_configure_identity_defaults
 preview_export_resource_defaults
+preview_configure_ingress_defaults
 
 init_aws_context
 preview_configure_shared_infra "$caller_s3_bucket" "$caller_ecr_repository"
@@ -23,8 +24,9 @@ DELETE_DATA="${DELETE_DATA:-false}"
 export IMAGE_TAG DELETE_IMAGE DELETE_DATA
 
 printf 'Destroying preview %s\n' "$VERSION_ID"
-printf 'NAME_PREFIX=%s\nS3_BUCKET=%s\nS3_PREFIX=%s\nDELETE_DATA=%s\n' \
-  "$NAME_PREFIX" "$S3_BUCKET" "$S3_PREFIX" "$DELETE_DATA"
+printf 'NAME_PREFIX=%s\nS3_BUCKET=%s\nS3_PREFIX=%s\nDELETE_DATA=%s\nECS_SHARED_ALB=%s\nECS_ALB_NAME=%s\nECS_PUBLIC_PATH_PREFIX=%s\n' \
+  "$NAME_PREFIX" "$S3_BUCKET" "$S3_PREFIX" "$DELETE_DATA" \
+  "${ECS_SHARED_ALB:-false}" "$ECS_ALB_NAME" "${ECS_PUBLIC_PATH_PREFIX:-}"
 
 delete_event_rule() {
   local targets
@@ -83,21 +85,86 @@ deregister_task_family() {
   done
 }
 
-delete_load_balancer() {
-  local lb_arn tg_arn
-  lb_arn="$(aws_cli elbv2 describe-load-balancers \
-    --names "$ECS_ALB_NAME" \
+load_balancer_arn_by_destroy_name() {
+  local lb_name="$1"
+  aws_cli elbv2 describe-load-balancers \
+    --names "$lb_name" \
     --query 'LoadBalancers[0].LoadBalancerArn' \
-    --output text 2>/dev/null || true)"
+    --output text 2>/dev/null || true
+}
+
+target_group_arn_by_destroy_name() {
+  local tg_name="$1"
+  aws_cli elbv2 describe-target-groups \
+    --names "$tg_name" \
+    --query 'TargetGroups[0].TargetGroupArn' \
+    --output text 2>/dev/null || true
+}
+
+listener_arn_by_destroy_lb_arn() {
+  local lb_arn="$1"
+  aws_cli elbv2 describe-listeners \
+    --load-balancer-arn "$lb_arn" \
+    --query 'Listeners[?Port==`80`].ListenerArn | [0]' \
+    --output text 2>/dev/null || true
+}
+
+listener_rule_arn_by_destroy_path_pattern() {
+  local listener_arn="$1"
+  local path_pattern="$2"
+  local rules_json
+  rules_json="$(aws_cli elbv2 describe-rules \
+    --listener-arn "$listener_arn" \
+    --output json 2>/dev/null || true)"
+  RULES_JSON="$rules_json" python3 - "$path_pattern" <<'PY'
+import json
+import os
+import sys
+
+path_pattern = sys.argv[1]
+try:
+    rules = json.loads(os.environ.get("RULES_JSON") or "{}").get("Rules", [])
+except json.JSONDecodeError:
+    rules = []
+for rule in rules:
+    for condition in rule.get("Conditions", []):
+        if condition.get("Field") != "path-pattern":
+            continue
+        values = condition.get("Values") or condition.get("PathPatternConfig", {}).get("Values", [])
+        if path_pattern in values:
+            print(rule["RuleArn"])
+            raise SystemExit(0)
+print("None")
+PY
+}
+
+delete_shared_listener_rule() {
+  [[ "${ECS_SHARED_ALB:-false}" == "true" ]] || return 0
+  local lb_arn listener_arn rule_arn
+  lb_arn="$(load_balancer_arn_by_destroy_name "$ECS_ALB_NAME")"
+  [[ -n "$lb_arn" && "$lb_arn" != "None" ]] || return 0
+  listener_arn="$(listener_arn_by_destroy_lb_arn "$lb_arn")"
+  [[ -n "$listener_arn" && "$listener_arn" != "None" ]] || return 0
+  rule_arn="$(listener_rule_arn_by_destroy_path_pattern "$listener_arn" "$ECS_ALB_RULE_PATH_PATTERN")"
+  if [[ -n "$rule_arn" && "$rule_arn" != "None" ]]; then
+    aws_cli elbv2 delete-rule --rule-arn "$rule_arn" >/dev/null 2>&1 || true
+  fi
+}
+
+delete_load_balancer_by_name() {
+  local lb_name="$1"
+  local lb_arn
+  lb_arn="$(load_balancer_arn_by_destroy_name "$lb_name")"
   if [[ -n "$lb_arn" && "$lb_arn" != "None" ]]; then
     aws_cli elbv2 delete-load-balancer --load-balancer-arn "$lb_arn" >/dev/null 2>&1 || true
     aws_cli elbv2 wait load-balancers-deleted --load-balancer-arns "$lb_arn" >/dev/null 2>&1 || true
   fi
+}
 
-  tg_arn="$(aws_cli elbv2 describe-target-groups \
-    --names "$ECS_TARGET_GROUP_NAME" \
-    --query 'TargetGroups[0].TargetGroupArn' \
-    --output text 2>/dev/null || true)"
+delete_target_group_by_name() {
+  local tg_name="$1"
+  local tg_arn
+  tg_arn="$(target_group_arn_by_destroy_name "$tg_name")"
   if [[ -n "$tg_arn" && "$tg_arn" != "None" ]]; then
     for _ in $(seq 1 12); do
       if aws_cli elbv2 delete-target-group --target-group-arn "$tg_arn" >/dev/null 2>&1; then
@@ -106,6 +173,17 @@ delete_load_balancer() {
       sleep 10
     done
   fi
+}
+
+delete_load_balancer() {
+  if [[ "${ECS_SHARED_ALB:-false}" == "true" ]]; then
+    delete_shared_listener_rule
+    delete_load_balancer_by_name "$PREVIEW_DEDICATED_ALB_NAME"
+  else
+    delete_load_balancer_by_name "$ECS_ALB_NAME"
+  fi
+
+  delete_target_group_by_name "$ECS_TARGET_GROUP_NAME"
 }
 
 terminate_instances_and_volumes() {
@@ -173,7 +251,11 @@ delete_security_groups() {
   vpc_id="${ECS_VPC_ID:-$(default_vpc_id_for_destroy)}"
   [[ -n "$vpc_id" && "$vpc_id" != "None" ]] || return 0
   delete_security_group_by_name "$vpc_id" "$ECS_TASK_SG_NAME"
-  delete_security_group_by_name "$vpc_id" "$ECS_ALB_SG_NAME"
+  if [[ "${ECS_SHARED_ALB:-false}" == "true" ]]; then
+    delete_security_group_by_name "$vpc_id" "$PREVIEW_DEDICATED_ALB_SG_NAME"
+  else
+    delete_security_group_by_name "$vpc_id" "$ECS_ALB_SG_NAME"
+  fi
 }
 
 delete_role_by_name() {
@@ -260,6 +342,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     printf '## Preview destroy complete\n\n'
     printf '- Version: `%s`\n' "$VERSION_ID"
     printf '- Name prefix: `%s`\n' "$NAME_PREFIX"
+    printf '- Shared ALB: `%s`\n' "${ECS_SHARED_ALB:-false}"
     printf '- Deleted durable preview data: `%s`\n' "$DELETE_DATA"
   } >>"$GITHUB_STEP_SUMMARY"
 fi

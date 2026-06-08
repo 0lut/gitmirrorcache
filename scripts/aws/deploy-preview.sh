@@ -22,6 +22,7 @@ caller_ecr_repository="${ECR_REPOSITORY:-}"
 preview_resolve_version "$requested_ref"
 preview_configure_identity_defaults
 preview_export_resource_defaults
+preview_configure_ingress_defaults
 
 init_aws_context
 preview_configure_shared_infra "$caller_s3_bucket" "$caller_ecr_repository"
@@ -50,8 +51,9 @@ export ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS ECS_SERVICE_STABLE_POLL_SECONDS
 export BOOTSTRAP_FAST_EXISTING
 
 printf 'Deploying preview %s from %s\n' "$VERSION_ID" "$PREVIEW_REF"
-printf 'NAME_PREFIX=%s\nS3_BUCKET=%s\nS3_PREFIX=%s\nECR_REPOSITORY=%s\n' \
-  "$NAME_PREFIX" "$S3_BUCKET" "$S3_PREFIX" "$ECR_REPOSITORY"
+printf 'NAME_PREFIX=%s\nS3_BUCKET=%s\nS3_PREFIX=%s\nECR_REPOSITORY=%s\nECS_SHARED_ALB=%s\nECS_ALB_NAME=%s\nECS_PUBLIC_PATH_PREFIX=%s\n' \
+  "$NAME_PREFIX" "$S3_BUCKET" "$S3_PREFIX" "$ECR_REPOSITORY" \
+  "${ECS_SHARED_ALB:-false}" "$ECS_ALB_NAME" "${ECS_PUBLIC_PATH_PREFIX:-}"
 
 if [[ "${SKIP_BOOTSTRAP:-false}" != "true" ]]; then
   timed "preview bootstrap" "$SCRIPT_DIR/bootstrap.sh"
@@ -59,7 +61,7 @@ fi
 
 timed "preview deploy and smoke" "$SCRIPT_DIR/deploy-and-smoke.sh"
 
-public_base_url="${PUBLIC_BASE_URL:-$(alb_base_url_by_name "$ECS_ALB_NAME")}"
+public_base_url="${PUBLIC_BASE_URL:-$(public_base_url_by_alb_name "$ECS_ALB_NAME")}"
 manifest_key="${PREVIEW_MANIFEST_KEY:-$(preview_manifest_key)}"
 
 write_preview_manifest() {
@@ -81,6 +83,9 @@ manifest = {
     "environment": os.environ["ENVIRONMENT"],
     "public_base_url": os.environ["PREVIEW_PUBLIC_BASE_URL"],
     "health_url": os.environ["PREVIEW_PUBLIC_BASE_URL"].rstrip("/") + "/healthz",
+    "shared_alb": os.environ.get("ECS_SHARED_ALB") == "true",
+    "alb_name": os.environ["ECS_ALB_NAME"],
+    "public_path_prefix": os.environ.get("ECS_PUBLIC_PATH_PREFIX") or None,
     "s3_bucket": os.environ["S3_BUCKET"],
     "s3_prefix": os.environ["S3_PREFIX"],
     "ecr_repository": os.environ["ECR_REPOSITORY"],

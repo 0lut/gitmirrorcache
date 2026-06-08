@@ -87,10 +87,51 @@ preview_export_resource_defaults() {
   export ECS_INSTANCE_NAME ECS_LOG_GROUP
 }
 
+preview_configure_ingress_defaults() {
+  PREVIEW_SHARED_ALB="${PREVIEW_SHARED_ALB:-true}"
+  case "$PREVIEW_SHARED_ALB" in
+    true | false) ;;
+    *) die "PREVIEW_SHARED_ALB must be true or false" ;;
+  esac
+
+  PREVIEW_DEDICATED_ALB_NAME="${PREVIEW_DEDICATED_ALB_NAME:-$NAME_PREFIX-ec2-alb}"
+  PREVIEW_DEDICATED_ALB_SG_NAME="${PREVIEW_DEDICATED_ALB_SG_NAME:-$NAME_PREFIX-ec2-alb}"
+
+  if [[ "$PREVIEW_SHARED_ALB" == "true" ]]; then
+    local shared_name_prefix="${PREVIEW_SHARED_NAME_PREFIX:-gitmirrorcache-arm}"
+    local public_path_prefix
+
+    ECS_SHARED_ALB="true"
+    ECS_ALB_NAME="${PREVIEW_ALB_NAME:-$shared_name_prefix-preview-alb}"
+    ECS_ALB_SG_NAME="${PREVIEW_ALB_SG_NAME:-$ECS_ALB_NAME}"
+
+    public_path_prefix="${ECS_PUBLIC_PATH_PREFIX:-/v/$VERSION_ID}"
+    [[ "$public_path_prefix" == /* ]] || public_path_prefix="/$public_path_prefix"
+    while [[ "$public_path_prefix" == */ ]]; do
+      public_path_prefix="${public_path_prefix%/}"
+    done
+    ECS_PUBLIC_PATH_PREFIX="$public_path_prefix"
+    ECS_ALB_RULE_PATH_PATTERN="${ECS_ALB_RULE_PATH_PATTERN:-$ECS_PUBLIC_PATH_PREFIX/*}"
+    ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-^$ECS_PUBLIC_PATH_PREFIX(/.*)$}"
+    ECS_ALB_RULE_REWRITE_REPLACE="${ECS_ALB_RULE_REWRITE_REPLACE:-\$1}"
+  else
+    ECS_SHARED_ALB="${ECS_SHARED_ALB:-false}"
+  fi
+
+  export PREVIEW_SHARED_ALB PREVIEW_DEDICATED_ALB_NAME PREVIEW_DEDICATED_ALB_SG_NAME
+  export ECS_SHARED_ALB ECS_ALB_NAME ECS_ALB_SG_NAME ECS_PUBLIC_PATH_PREFIX
+  export ECS_ALB_RULE_PATH_PATTERN ECS_ALB_RULE_REWRITE_REGEX ECS_ALB_RULE_REWRITE_REPLACE
+}
+
 preview_assert_safe_defaults() {
   if [[ "${ALLOW_CUSTOM_PREVIEW_NAMES:-false}" != "true" ]]; then
     [[ "$ENVIRONMENT" == preview-* ]] || die "refusing preview operation outside preview-* environment: $ENVIRONMENT"
     [[ "$S3_PREFIX" == previews/* ]] || die "refusing preview operation outside previews/ S3 prefix: $S3_PREFIX"
+  fi
+
+  if [[ "${ECS_SHARED_ALB:-false}" == "true" ]]; then
+    [[ "${ECS_PUBLIC_PATH_PREFIX:-}" == /v/"$VERSION_ID" ]] || die "refusing shared preview ALB path outside /v/$VERSION_ID: ${ECS_PUBLIC_PATH_PREFIX:-}"
+    [[ "${ECS_ALB_RULE_PATH_PATTERN:-}" == /v/"$VERSION_ID"/* ]] || die "refusing shared preview ALB rule outside /v/$VERSION_ID/*: ${ECS_ALB_RULE_PATH_PATTERN:-}"
   fi
 
   if [[ -z "${ECS_TARGET_GROUP_NAME_OVERRIDE_OK:-}" && ${#NAME_PREFIX} -gt 19 ]]; then
