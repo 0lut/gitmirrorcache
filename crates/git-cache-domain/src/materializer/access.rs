@@ -9,23 +9,10 @@ pub(super) struct RepoAccessContext {
 
 #[derive(Debug, Clone)]
 pub(super) enum RepoAccessProof {
-    PublicRef {
-        ref_name: String,
-        commit: CommitSha,
-    },
-    PublicCommit {
-        commit: CommitSha,
-    },
-    AuthenticatedRef {
-        ref_name: String,
-        commit: CommitSha,
-    },
-    AuthenticatedCommit {
-        commit: CommitSha,
-        reachable_from: ReachabilitySelector,
-        ref_name: String,
-        tip: CommitSha,
-    },
+    PublicRef { ref_name: String, commit: CommitSha },
+    PublicCommit { commit: CommitSha },
+    AuthenticatedRef { ref_name: String, commit: CommitSha },
+    AuthenticatedCommit { commit: CommitSha },
 }
 
 impl RepoAccessContext {
@@ -62,19 +49,11 @@ impl RepoAccessContext {
         repo: RepoKey,
         upstream_auth: UpstreamAuth,
         commit: CommitSha,
-        reachable_from: ReachabilitySelector,
-        ref_name: String,
-        tip: CommitSha,
     ) -> Self {
         Self {
             repo,
             upstream_auth,
-            proof: RepoAccessProof::AuthenticatedCommit {
-                commit,
-                reachable_from,
-                ref_name,
-                tip,
-            },
+            proof: RepoAccessProof::AuthenticatedCommit { commit },
         }
     }
 
@@ -103,16 +82,10 @@ impl RepoAccessContext {
 
     pub fn session_authorized_refs(&self) -> Vec<String> {
         match &self.proof {
-            RepoAccessProof::AuthenticatedRef { ref_name, .. }
-            | RepoAccessProof::AuthenticatedCommit {
-                ref_name,
-                reachable_from: _,
-                tip: _,
-                ..
-            } => {
-                vec![ref_name.clone()]
-            }
-            RepoAccessProof::PublicRef { .. } | RepoAccessProof::PublicCommit { .. } => Vec::new(),
+            RepoAccessProof::AuthenticatedRef { ref_name, .. } => vec![ref_name.clone()],
+            RepoAccessProof::PublicRef { .. }
+            | RepoAccessProof::PublicCommit { .. }
+            | RepoAccessProof::AuthenticatedCommit { .. } => Vec::new(),
         }
     }
 
@@ -121,29 +94,17 @@ impl RepoAccessContext {
             RepoAccessProof::PublicRef { commit, .. }
             | RepoAccessProof::PublicCommit { commit }
             | RepoAccessProof::AuthenticatedRef { commit, .. }
-            | RepoAccessProof::AuthenticatedCommit { commit, .. } => commit,
+            | RepoAccessProof::AuthenticatedCommit { commit } => commit,
         }
     }
 
     pub fn proof_ref_name(&self) -> Option<&str> {
         match &self.proof {
             RepoAccessProof::PublicRef { ref_name, .. }
-            | RepoAccessProof::AuthenticatedRef { ref_name, .. }
-            | RepoAccessProof::AuthenticatedCommit { ref_name, .. } => Some(ref_name.as_str()),
-            RepoAccessProof::PublicCommit { .. } => None,
-        }
-    }
-
-    pub fn reachability_proof(&self) -> Option<(&ReachabilitySelector, &CommitSha)> {
-        match &self.proof {
-            RepoAccessProof::AuthenticatedCommit {
-                reachable_from,
-                tip,
-                ..
-            } => Some((reachable_from, tip)),
-            RepoAccessProof::PublicRef { .. }
-            | RepoAccessProof::PublicCommit { .. }
-            | RepoAccessProof::AuthenticatedRef { .. } => None,
+            | RepoAccessProof::AuthenticatedRef { ref_name, .. } => Some(ref_name.as_str()),
+            RepoAccessProof::PublicCommit { .. } | RepoAccessProof::AuthenticatedCommit { .. } => {
+                None
+            }
         }
     }
 }

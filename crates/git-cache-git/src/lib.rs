@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, info};
 
 pub const DEFAULT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
@@ -363,6 +363,14 @@ impl Git {
         self.run(
             Some(repo_dir),
             ["fetch", "--", path_to_str(bundle_path)?, "+refs/*:refs/*"],
+        )
+        .await
+    }
+
+    pub async fn bundle_verify(&self, repo_dir: &Path, bundle_path: &Path) -> Result<GitOutput> {
+        self.run(
+            Some(repo_dir),
+            ["bundle", "verify", "--", path_to_str(bundle_path)?],
         )
         .await
     }
@@ -855,16 +863,36 @@ impl Git {
             Ok::<_, GitCacheError>((status, stdout, stderr))
         };
 
+        let started = Instant::now();
         let (status, stdout, stderr) = timeout(self.timeout, run).await.map_err(|_| {
             GitCacheError::Timeout(format!("git command exceeded {:?}", self.timeout))
         })??;
 
         let status_code = status.code().unwrap_or(-1);
+        let elapsed = started.elapsed();
         if !status.success() {
+            if elapsed >= Duration::from_secs(1) {
+                info!(
+                    ?cwd,
+                    ?args,
+                    status_code,
+                    elapsed_ms = elapsed.as_millis(),
+                    "git command failed"
+                );
+            }
             let stderr = String::from_utf8_lossy(&stderr);
             return Err(GitCacheError::Validation(format!(
                 "git exited with status {status_code}: {stderr}"
             )));
+        }
+        if elapsed >= Duration::from_secs(1) {
+            info!(
+                ?cwd,
+                ?args,
+                status_code,
+                elapsed_ms = elapsed.as_millis(),
+                "git command finished"
+            );
         }
 
         Ok(GitOutput {

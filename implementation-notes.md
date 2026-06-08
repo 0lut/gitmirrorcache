@@ -342,15 +342,17 @@ runtime and avoids double-suffixing if a config already contains `-v2` or `v2`.
 
 ## Overview
 
-Implemented the first HTTPS auth slice from `AUTH-PLAN.md`: request-scoped
-Basic authorization can be forwarded to upstream git commands without putting
+Implemented the HTTPS auth slice from `AUTH-PLAN.md`: request-scoped Basic
+authorization can be forwarded to upstream git commands without putting
 credentials in argv, logs, local repo config, object-store keys, or manifests.
-Authenticated materialization now creates bearer-protected session URLs. Direct
-`/git/...` now has a repo-access gate before upload-pack serving: all HTTPS
-providers first use anonymous Smart HTTP protocol v2 to prove public
-reachability, GitHub private requests fall back to REST only when that public
-probe fails, and GitLab/Bitbucket/generic private requests fall back to
-request-scoped Git protocol proof.
+Credentialed materialization creates bearer-protected session URLs.
+
+The final simplification for this PR is repo-level access first, then
+main-like materialize/resolve/direct serving. The API parses upstream auth and
+checks only caller intent such as "auth required"; the domain proves repo/ref
+access by contacting upstream with the selected auth. There is no GitHub REST
+provider layer, no token-present-to-anonymous downshift, and no parallel
+authenticated materializer implementation.
 
 ## Decisions not in the spec
 
@@ -361,12 +363,11 @@ and redacted `Debug` implementation. It accepts only `Basic ...` for this plan,
 rejects empty/control/NUL-containing headers, and exposes the raw header only to
 the git wrapper execution boundary.
 
-### 2. Keep anonymous `/v1/resolve` compatibility
+### 2. `/v1/resolve` is lightweight for all callers
 
-Existing `/v1/resolve` behaved like materialize and returned a session URL. I
-kept that behavior for anonymous requests to avoid breaking current tests and
-callers. Authenticated `/v1/resolve` uses the new no-session `ResolveResponse`
-shape with `cache_available` and `authorized_at`.
+`/v1/resolve` now consistently returns `ResolveResponse` with the resolved
+commit, source label, `cache_available`, and `authorized_at`. It does not create
+sessions and does not fall through to materialize for anonymous callers.
 
 ### 3. Protected sessions reuse the existing session repo layout
 
@@ -384,31 +385,38 @@ Only its SHA-256 hash is stored in the session manifest. Public sessions keep
 
 ## Tradeoffs
 
-### T1. Direct authenticated `/git/...` is repo-gated, not fully ephemeral
+### T1. Direct `/git/...` is repo-gated, not fully ephemeral
 
 The plan asks for an ephemeral protected serving repo for authenticated direct
 Git. This implementation does not yet build that separate direct-remote repo.
-Instead, direct upload-pack proves repo-level access at the API boundary and
-then serves from the shared repo. Authenticated GitHub requests prove access via
-REST before entering the domain path; GitLab/Bitbucket/generic private requests
-prove access with authenticated `git ls-remote`; public requests use anonymous
-Smart HTTP proof. This closes the old "cached object proves access" hole for
-anonymous callers while avoiding duplicated authorized/unauthed domain methods.
-The full ephemeral-repo isolation still belongs in a later hardening pass.
+Instead, direct `info/refs` proves repo-level access with the request's selected
+upstream auth and direct `git-upload-pack` serves from the shared repo after
+local readiness checks. This follows the simplification rule that repo access is
+the authorization boundary. Deployments that need stricter isolation for
+rewritten or hidden history should keep that history in a separate upstream repo
+or revisit ephemeral direct serving repos later.
 
-### T2. Anonymous direct Git now also gets upstream proof for wants
+### T2. Direct upload-pack does local readiness only
 
-To prevent authenticated private cache entries from leaking to anonymous exact
-SHA fetches, anonymous `/git/.../git-upload-pack` also checks upstream before
-serving non-advertised wants. Public exact-SHA fetches still work when upstream
-can provide the object anonymously.
+Direct Git POST must not fetch packs, hydrate generations, publish generations,
+or run object-level upstream reachability proof. Its job is to parse wants,
+check that wanted objects are already locally present, require commit wants to
+have their tree object, expose served commits through hidden refs, and spawn
+`git upload-pack`. If an authorized object is not locally ready, the request
+fails fast with a cache-miss `503`.
 
-### T3. Authenticated exact commits require reachability context
+This intentionally accepts repo-level access as sufficient for all objects in
+the repo-scoped cache. It removes the LLVM hot-clone regression caused by
+per-POST upstream proof and hidden materialization work.
 
-Bare exact and short commit selectors are rejected in authenticated mode. The
-new selector shape `{"commit":"...","reachable_from":{"branch":"main"}}`
-authorizes the branch/default ref first, fetches that ref with the same auth,
-and proves ancestry locally before creating a protected session.
+### T3. Exact commits use repo-level access
+
+Bare exact and short commit selectors are allowed for credentialed and anonymous
+requests after the repo access check. The tradeoff is explicit: a caller who can
+read a repo may materialize cached history from that repo even if a commit is no
+longer reachable from an advertised upstream ref. A future hardening option can
+add a "current reachability required" policy, but it is not the default for this
+PR.
 
 ### T4. Process-wide `upstream_auth_token_env` remains trusted-deployment only
 
@@ -450,9 +458,8 @@ and preservation of existing public direct remote behavior.
 ### M1. Kept main's runtime-cache completeness checks
 
 While merging `origin/main`, I preserved its `commit_ready_for_serving` checks
-for direct upload-pack wants. Authenticated wants still require current upstream
-proof, but commit wants are not exposed unless both the commit and tree are
-available locally.
+for direct upload-pack wants. Commit wants are not exposed unless both the
+commit and tree are available locally.
 
 ### M2. Protected session repos do not hide their synthetic ref
 
@@ -528,57 +535,43 @@ cached Basic credentials. The direct Git shared-repo / request-scoped proof
 concerns remain known hardening tradeoffs pending ephemeral repo isolation, with
 the request-scoped proof fallback tightened in D5.
 
-### D5. Preserve auth-free public access while tightening direct want proof
+### D5. Preserve auth-free public access with one repo-access model
 
 The auth model remains two separate gates: service auth is deployment/app
-access control, while upstream repo auth is request-scoped proof that the caller
-can reach a repo/ref. This code currently has no in-app service-auth gate, so
-auth-free deployments still work. `/v1/*` keeps upstream repo credentials in
-`Git-Cache-Upstream-Authorization` so a service `Authorization` header can
-coexist. Direct Git still uses `Authorization: Basic ...` as repo credentials
-because that is what Git credential helpers naturally send, so any future
-in-app service-auth gate needs a separate convention or a gateway that does not
-forward its own service token as the direct Git upstream credential.
+access control, while upstream repo auth proves that the caller can reach a
+repository through upstream Git. This code currently has no in-app service-auth
+gate, so auth-free deployments still work. `/v1/*` keeps upstream repo
+credentials in `Git-Cache-Upstream-Authorization` so a service `Authorization`
+header can coexist. Direct Git still uses `Authorization: Basic ...` as repo
+credentials because that is what Git credential helpers naturally send.
 
-A static-review finding correctly reproduced one multitenant edge: if a
-non-advertised want already existed in the shared repo, `git fetch <sha>` or the
-fallback could return success without proving the current anonymous request was
-allowed to receive that object. The direct want path now records whether the
-object existed before the upstream fetch. Pre-existing cached wants must be
-reachable from refs fetched from upstream for the current request credential;
-newly fetched wants may still rely on upstream providing the object. Regression
-tests cover both sides: anonymous wants reject locally cached unadvertised
-commits, while cached commits reachable from current public upstream refs still
-work without auth.
+For this PR, repo access is the security boundary. After a request proves it can
+read the upstream repo with either anonymous auth or supplied credentials,
+materialize, resolve, and direct upload-pack stop asking whether the path was
+"authenticated" or "anonymous". This intentionally avoids separate authorized
+method families.
 
-### D6. Domain materialization now plans repo access before serving
+### D6. Domain materialization plans access and target together
 
 Raw `UpstreamAuth` stays out of `MaterializeRequest` because it is transport
-context with secret-bearing data, not JSON request data. The domain now turns a
-request plus upstream auth context into a `RepoAccess`/`MaterializePlan` first:
-`RepoAccess::Public` for empty auth and `RepoAccess::Upstream` for request
-credentials. Materialization then serves that plan without asking whether it is
-on an authenticated path again. This keeps the auth-free public option while
-making the principle explicit: once code reaches the serving/materialization
-stage, it is operating on an already checked repo intent and may only fail if
-upstream/cache state changes underneath it.
+context with secret-bearing data, not JSON request data. The API parses auth and
+passes it through `Materializer::using_upstream_auth`; the domain then builds a
+`MaterializePlan` containing a `RepoAccessContext` and a target commit/ref.
 
-The API layer also uses helper predicates on `MaterializeRequest` and
-`UpstreamAuthorizationMode` instead of repeating direct enum comparisons. The
-old authenticated materialization method family was collapsed into shared
-helpers that ensure a branch tip, ensure a reachable commit, and create either a
-public or protected session based on `RepoAccess`.
+Branch and default-branch selectors prove access by resolving the upstream tip
+with the selected auth. Exact commit selectors first run a lightweight
+`ls_remote_default_branch` repo-access check, then use the main-like exact
+commit flow. Short commits fetch upstream refs with the selected auth before
+resolving. The old authenticated materialization method family was removed.
 
-### D7. Direct Git blob wants use graph proof, not commit-only proof
+### D7. Direct Git wants are availability checks after repo proof
 
-Partial clones can later ask upload-pack for blob objects that are not advertised
-as ref tips. The tightened direct-want check originally proved only commit wants,
-which rejected cached public blobs during checkout. Non-advertised wants now get
-checked against the exact upstream tips from the current advertisement with a
-bounded `git rev-list --objects` pass. This keeps the private-object guard: a
-cached object is not served merely because it exists locally; it must be in the
-currently authorized upstream graph or be newly provided by upstream for that
-request.
+Partial clones can later ask upload-pack for blob/tree objects that are not ref
+tips. Under the simplified repo-boundary model, direct Git POST no longer runs
+per-object upstream graph proof. It requires that requested OIDs already exist
+locally, and commit wants additionally require `commit_ready_for_serving` so a
+commit without its tree is not exposed. Missing or incomplete wants return a
+fast cache miss instead of triggering upstream fetch/hydration work.
 
 ### D8. Materializer split keeps behavior intact while reducing local coupling
 
@@ -599,7 +592,7 @@ centralized in the wrapper. Materializer tests were split into behavior modules
 so future changes can add focused coverage without growing one monolithic test
 file again.
 
-### D9. Direct Git wants fetch only what the requested object needs
+### D9. Direct Git POST no longer materializes
 
 AWS smoke logs for `llvm/llvm-project` showed generation verification conflicts
 for the current `main` commit while the host cache already had the commit and
@@ -610,16 +603,6 @@ checked whether the requested want was already an advertised, complete cached
 tip. Large repos with many active branches could therefore stall on unrelated
 fetch/publish work and race with existing generation manifests.
 
-Direct Git ref comparison now uses internal upstream cache refs
-`refs/cache/upstream/heads/*`, which are the refs materialization maintains.
-For an advertised want, the path serves an already-complete cached object
-without fetching unrelated changed refs. If the advertised object is missing or
-incomplete and has no complete commit manifest, the path fetches only the
-advertised branch or branches that point at that exact object. A regression test
-first reproduced the old behavior by adding an unrequested changed side branch:
-the old code fetched `refs/heads/side` for a `main` want, while the fixed path
-does not publish or fetch that side branch.
-
 After an AWS control run against current `main`, public LLVM direct clones were
 ~1.5s while the first version of this fix was ~45s. Several follow-up
 optimizations tried to recover that latency by using locally published public
@@ -627,93 +610,146 @@ refs/manifests as direct Git POST proof. Those optimizations were subtle and
 easy to get wrong in the shared repo model, especially once credentialed and
 anonymous requests shared code paths.
 
-The current simplification intentionally removes that local-only direct POST
-proof shortcut. Direct Git GET still fetches a fresh upstream advertisement
-without materializing objects. Direct Git POST re-runs upstream ref proof using
-the request's effective auth before serving wants. Public manifests and hidden
-negotiation refs remain availability/fetch-size aids after proof, not
-authorization shortcuts.
+The current simplification makes direct Git POST a serving path only. It parses
+wants, checks local readiness, configures the served repo, and spawns
+`git upload-pack`. It does not fetch refs/objects, hydrate generation bundles,
+verify pending generations, publish generation metadata, or use stale ref
+manifests to rebuild serving state during a clone/fetch request.
 
-### D10. Repo authorization is now an API gate for direct Git POST
+### D10. Repo access proof uses Git transport, not provider REST
 
 The revised auth model separates the future service-auth gate from the current
 upstream repo-access gate. Service auth answers "can this caller use the cache
 service at all" and is still out of scope for this branch. Repo auth answers
-"can this request reach this upstream repo" and now happens before
-materialize/resolve/direct upload-pack serving.
+"can this request reach this upstream repo" and is proven by ordinary upstream
+Git operations using the selected `UpstreamAuth`.
 
-Requests first perform an anonymous Smart HTTP v2 public probe:
-`GET https://{host}/{owner}/{repo}.git/info/refs?service=git-upload-pack` with
-`Git-Protocol: version=2`. This does not send the request token. If the probe
-returns `200`, the request is treated as public even when Basic auth was
-present, so materialize/resolve/direct Git continue with
-`UpstreamAuth::Anonymous` and public session behavior.
+No token means anonymous Git access. Token present means credentialed Git
+access. The implementation does not classify public/private repositories with
+GitHub REST and does not downshift token-present requests to anonymous mode. A
+bad supplied token is therefore visible to the caller instead of silently
+falling back to public access.
 
-If the public probe fails and request auth is present for GitHub, the API uses
-GitHub REST as the private-repo fallback: it reads repository metadata and the
-default branch ref with the request token. Direct Git POST normally consumes
-the short-lived upstream advertisement proof created by the immediately
-preceding direct Git GET. If that proof handoff is absent, expired, or scoped to
-different credentials, POST falls back to the full repo-access gate.
+For GitHub, GitLab, Bitbucket, and other allowed HTTPS hosts, this pass keeps
+one provider-neutral mechanism: `ls-remote`/Smart HTTP through the existing git
+wrapper. A future provider layer can introduce `GitHubOrigin`, `GitLabOrigin`,
+`BitbucketOrigin`, or `PrivateGitServerOrigin` if measurements show a real need,
+but this PR avoids adding that complexity.
 
-GitLab, Bitbucket, and generic HTTPS origins use the same anonymous Smart HTTP
-public probe. When that fails and request auth is present, they fall back to
-authenticated `git ls-remote` because we do not yet have provider-specific REST
-adapters for them. This intentionally keeps provider support open while
-preserving the no-token public path.
+### D11. Direct proof cache is only a GET-to-POST hot-path handoff
 
-Anonymous requests deliberately do not use provider REST APIs. The public,
-auth-free mode remains available, and anonymous proof stays on the provider's
-Git transport so large public clones do not consume REST quota. For direct Git
-POSTs, both anonymous and credentialed requests validate wants against a
-request-scoped upstream ref proof before serving from the shared repo; object
-existence alone is never authorization.
+Direct Git GET fetches upstream refs to prove repo access, then synthesizes the
+advertisement from refs that are already locally ready and whose branch names
+still exist upstream. It stores that local-ready advertisement for a short TTL
+keyed by repo and the exact auth fingerprint. Direct Git POST may use the
+matching entry to avoid a second upstream ref call. If the handoff is absent,
+expired, or keyed to different credentials, POST re-runs the same lightweight
+upstream ref fetch before serving.
 
-This is intentionally a first provider layer rather than a full provider
-interface. The next shape should move these decisions behind explicit origin
-types, likely something like `GitHubOrigin`, `GitLabOrigin`,
-`BitbucketOrigin`, and `PrivateGitServerOrigin`. The existing `RepoKey` remains
-the three-segment `host/owner/name` shape in this branch, so GitLab nested
-groups still need that later origin/key model.
+This means direct Git may intentionally advertise a cached branch tip that lags
+the current upstream tip. That is preferable to advertising a fresh upstream tip
+that upload-pack cannot serve without doing hidden fetch/index-pack work.
+`/v1/materialize` or a warmer is responsible for moving the cache forward.
 
-### D11. Public ref manifests are availability hints after proof
+The proof cache deliberately does not downshift credentialed requests to
+anonymous proofs, does not persist across process restarts, and does not
+authorize across credentials. It is a hot-path optimization for the stateless Git
+GET/POST pair, not a repository visibility cache.
 
-AWS LLVM smoke testing exposed a ref-cold/object-warm state: the local bare repo
-held large packs, but did not have `refs/heads/*` or
-`refs/cache/upstream/heads/*`. Current `main` served this quickly because it
-trusted object existence, but that is the SHA-guess leak the auth work is meant
-to close. The auth branch therefore needs a bridge that restores serving proof
-without treating raw object presence as authorization.
+### D12. Direct upload-pack has one serving entrypoint
 
-After the simplification pass, direct Git POST first obtains request-scoped
-upstream ref proof either from the fresh GET->POST proof handoff or from the
-fallback upstream gate. Direct Git then treats persisted manifests only as
-fetch negotiation hints when the referenced commit is already complete locally.
-It does not hydrate verified generations, verify pending generations, or
-publish new generation metadata while satisfying upload-pack wants. If a proven
-advertised tip is missing or incomplete locally, direct Git fetches that
-advertised ref from upstream using the request's effective auth.
+Domain serving has one `handle_upload_pack` path for parsing wants, local
+readiness checks, serving repo configuration, and spawning `git upload-pack`.
+The optional upstream-ref comparison argument remains only as API context for
+the GET-to-POST handoff; the domain no longer has separate authenticated,
+proof-specific, or fallback-fetch upload-pack implementations.
 
-Stale public ref manifests are still useful to materialize, but direct Git uses
-them only when they are already hot locally. Before fetching a newer advertised
-branch tip, direct Git may restore `refs/cache/upstream/heads/<branch>` from a
-manifest only if that commit's tree is already present in the shared repo. It
-does not restore public `refs/heads/<branch>` for stale manifests, because
-stale refs must not become anonymous serving proof.
+### D13. Materialize keeps main-like branch behavior
 
-The GET->POST proof handoff deliberately is not a repo visibility cache. It is
-an in-memory, short-TTL record of the exact upstream advertisement just sent to
-a Git client, keyed by repo and anonymous/auth credential fingerprint. It exists
-so the POST can validate wants against the same proof without making a second
-upstream call on the clone hot path.
+The branch/default materialize path is intentionally close to current `main`:
+resolve the upstream tip with the selected auth, serve immediately if the commit
+and tree are already local, otherwise fetch the target branch, verify the fetched
+SHA matches the earlier upstream tip, publish the generation, and create a
+session. Request-scoped auth changes which upstream credentials are used and
+whether the session is protected; it does not fork the branch materializer.
 
-### D12. Direct upload-pack has one serving entrypoint again
+### D14. Exact commits use repo-level authorization
 
-After restoring LLVM direct clone performance, I collapsed the proof-specific
-`handle_upload_pack_with_comparison` method back into `handle_upload_pack` with
-an optional upstream ref proof argument. The API layer still decides whether it
-has a fresh GET->POST proof handoff or needs the fallback repo-access gate, but
-domain serving now has one upload-pack path for parsing wants, validating proof,
-configuring the served repo, and spawning `git upload-pack`. This keeps the
-proof optimization explicit without creating another authenticated/unauthed
-method family.
+For the materialize API, repo access is now treated as sufficient authorization
+for exact commit selectors. Exact commit materialization first proves repo access
+with `ls_remote_default_branch`, then uses cached manifests/local generation
+indexes where possible, or fetches upstream refs with the same auth when needed.
+The protected session still requires its bearer token and is pinned to the
+materialized commit.
+
+The tradeoff is that a caller with repo access can materialize a cached commit
+for that repo even when the commit is not currently reachable from an advertised
+upstream ref. That matches the simpler repository-boundary model we want here:
+Git history is effectively repo-scoped, and operators should keep truly
+sensitive histories in separate repositories rather than relying on hidden or
+rewritten commits inside the same repo. The code carries a TODO to make
+"current upstream reachability" an explicit optional policy if deployments need
+that stricter behavior later.
+
+### D15. Resolve uses the same selector policy
+
+`/v1/resolve` now always returns the lightweight `ResolveResponse` shape after
+the same repo-access gate used by materialize. It no longer falls through to
+materialize for anonymous requests, so callers should not expect a session URL
+from resolve. The response reports the resolved commit, whether that commit is
+locally cache-available, and the source label.
+
+The selector policy now matches materialize: repo access is sufficient for exact
+commit selectors, and `reachable_from` is not required by default. Direct Git
+upload-pack follows the same repo-boundary policy and differs only in outcome:
+it streams from local cache if ready, or fails fast when the local cache is not
+ready.
+
+### D16. Remaining simplification direction
+
+The remaining cleanup should be small and mechanical: keep `RepoAccessContext`
+as an access/session/source label, keep auth parsing at API boundaries, keep Git
+auth env composition in the git wrapper, and avoid adding provider-specific
+helper families until there is a measured need. Materialize and resolve should
+continue to look as much like current `main` as possible, with request-scoped
+auth carried as upstream Git credentials and session/publication policy.
+
+### D17. API materialize no longer pre-runs the worker coordinator
+
+AWS LLVM benchmarking exposed a bad interaction between the HTTP materialize
+path and `UpdateCoordinator::read_through`: a branch request whose commit/tree
+were already present locally could still join or start warmer-style generation
+work before the unified materializer saw the hot local state. For LLVM this
+looked like an idle client connection or an LLVM-sized pending generation
+verification instead of a fast session response.
+
+The API now calls `Materializer::materialize` directly after rate limiting and
+upstream-auth header checks. The worker coordinator remains available for cron,
+event hints, and explicit warming, but it is no longer in front of interactive
+HTTP materialize/resolve handling. A regression test covers the hot local branch
+case by warming the bare repo, calling `/v1/materialize`, and asserting that no
+generation bundle or pending generation verification is written.
+
+### D18. Pending generation verification has a local-repo fast path
+
+LLVM benchmarking also exposed a second, older cost: after publishing a new
+incremental generation, verification fetched the whole generation chain into a
+temporary repo. For a repo with a large verified parent generation, that meant
+downloading and `index-pack`ing gigabytes of already-verified history before
+later hot requests could get a fair share of CPU and disk.
+
+Verification now first tries the normal HTTP-publish case: if the local repo
+still has the new generation's tip objects and every parent generation is
+already verified, the publisher verifies the just-created bundle file with
+`git bundle verify`, records its size/SHA-256, and writes verified generation
+metadata immediately. That proves the bundle prerequisites without unpacking
+the full parent chain again or re-downloading the bundle from object storage.
+
+If a generation is already pending, the background verifier uses the same local
+proof and downloads only that pending bundle. If the local repo is missing,
+incomplete, or the parent chain is not already verified, automatic background
+verification leaves the generation pending instead of falling back to full-chain
+replay. Explicit verification paths used by compaction/recovery still keep the
+original full-chain fallback. Regression tests cover both the synchronous
+publish path and a child pending generation whose verified parent bundle has
+been deleted.

@@ -63,7 +63,7 @@ fn synthesize_ref_advertisement_contains_capability_line() {
 }
 
 #[tokio::test]
-async fn anonymous_direct_want_rejects_locally_cached_unadvertised_commit() {
+async fn direct_want_allows_locally_ready_commit_after_repo_access() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -88,22 +88,14 @@ async fn anonymous_direct_want_rejects_locally_cached_unadvertised_commit() {
 
     assert!(materializer.commit_exists(&repo_dir, &private_commit).await);
 
-    let error = materializer
+    materializer
         .ensure_wants_available(&fixture.repo, &[private_commit.to_string()])
         .await
-        .expect_err("anonymous wants must not trust locally cached private commits");
-
-    assert!(
-        matches!(
-            error,
-            GitCacheError::NotFound(_) | GitCacheError::Forbidden(_)
-        ),
-        "unexpected error: {error}"
-    );
+        .expect("repo-authorized direct Git wants use object presence as availability");
 }
 
 #[tokio::test]
-async fn anonymous_direct_want_allows_cached_public_ancestor() {
+async fn anonymous_direct_want_allows_cached_public_ancestor_when_current_tip_is_local() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -117,7 +109,24 @@ async fn anonymous_direct_want_allows_cached_public_ancestor() {
         })
         .await
         .unwrap();
-    fixture.commit_and_push("public descendant");
+    let descendant = fixture.commit_and_push("public descendant");
+    materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    assert!(
+        materializer
+            .commit_ready_for_serving(&repo_dir, &descendant)
+            .await,
+        "current advertised tip must be local before direct Git can prove ancestor wants"
+    );
 
     materializer
         .ensure_wants_available(&fixture.repo, &[first.commit.to_string()])
@@ -126,7 +135,35 @@ async fn anonymous_direct_want_allows_cached_public_ancestor() {
 }
 
 #[tokio::test]
-async fn anonymous_direct_want_requires_upstream_proof_even_when_public_ref_is_cached() {
+async fn anonymous_direct_want_for_cached_ancestor_without_local_current_tip_stays_local_only() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let first = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let descendant = fixture.commit_and_push("public descendant");
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+
+    materializer
+        .ensure_wants_available(&fixture.repo, &[first.commit.to_string()])
+        .await
+        .expect("repo-authorized direct Git wants should not need current-tip proof");
+    assert!(
+        !materializer.commit_exists(&repo_dir, &descendant).await,
+        "direct Git POST must not import the current upstream tip for reachability proof"
+    );
+}
+
+#[tokio::test]
+async fn anonymous_direct_want_uses_cached_local_objects_when_upstream_is_offline() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -155,14 +192,10 @@ async fn anonymous_direct_want_requires_upstream_proof_even_when_public_ref_is_c
     )
     .unwrap();
 
-    let result = materializer
+    materializer
         .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
-        .await;
-
-    assert!(
-        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
-        "direct Git POST wants must not use cached public refs as fresh upstream proof: {result:?}"
-    );
+        .await
+        .expect("direct Git POST should not require upstream proof after repo access");
 }
 
 #[tokio::test]
@@ -260,6 +293,83 @@ async fn anonymous_direct_want_does_not_verify_pending_generation_on_post() {
             .unwrap()
             .is_none(),
         "direct Git POST must not verify and publish pending generations"
+    );
+}
+
+#[tokio::test]
+async fn anonymous_direct_want_for_advertised_uncached_commit_fails_fast_without_fetching() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+    let commit = fixture.head_commit();
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+
+    assert!(
+        !materializer.object_exists(&repo_dir, &commit).await,
+        "fixture should start with an empty local cache"
+    );
+
+    let comparison = UpstreamRefComparison {
+        changed: HashMap::new(),
+        default_branch: Some("main".to_string()),
+        all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+    };
+
+    let result = materializer
+        .ensure_wants_available_from_comparison(&fixture.repo, &[commit.to_string()], &comparison)
+        .await;
+
+    assert!(
+        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
+        "direct Git POST should fail fast on an authorized local cache miss: {result:?}"
+    );
+    assert!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
+            .await
+            .is_err(),
+        "direct Git POST must not fetch proved refs to satisfy cache misses"
+    );
+    assert!(
+        !materializer.object_exists(&repo_dir, &commit).await,
+        "direct Git POST must not import missing objects from upstream"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_direct_want_for_advertised_uncached_commit_fails_fast_without_fetching() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+    let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+    let authed_materializer = materializer.using_upstream_auth(&auth);
+    let commit = fixture.head_commit();
+    let repo_dir = authed_materializer
+        .ensure_repo_dir(&fixture.repo)
+        .await
+        .unwrap();
+    let comparison = UpstreamRefComparison {
+        changed: HashMap::new(),
+        default_branch: Some("main".to_string()),
+        all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+    };
+
+    let result = authed_materializer
+        .ensure_wants_available_from_comparison(&fixture.repo, &[commit.to_string()], &comparison)
+        .await;
+
+    assert!(
+        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
+        "authenticated direct Git POST should also fail fast on local cache misses: {result:?}"
+    );
+    assert!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
+            .await
+            .is_err(),
+        "authenticated direct Git POST must not fetch proved refs to satisfy cache misses"
     );
 }
 
@@ -443,7 +553,7 @@ async fn public_ref_manifest_restore_seeds_hidden_base_without_public_ref() {
 }
 
 #[tokio::test]
-async fn authenticated_direct_want_requires_upstream_proof_after_repo_authorization() {
+async fn authenticated_direct_want_uses_local_readiness_after_repo_authorization() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -465,15 +575,11 @@ async fn authenticated_direct_want_requires_upstream_proof_after_repo_authorizat
     .unwrap();
 
     let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
-    let result = materializer
+    materializer
         .using_upstream_auth(&auth)
         .ensure_wants_available(&fixture.repo, &[cached.commit.to_string()])
-        .await;
-
-    assert!(
-        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
-        "repo authorization alone must not make cached objects valid direct-Git wants: {result:?}"
-    );
+        .await
+        .expect("repo authorization is sufficient; POST should check local readiness only");
 }
 
 #[tokio::test]

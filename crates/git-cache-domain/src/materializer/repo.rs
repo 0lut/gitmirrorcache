@@ -53,6 +53,7 @@ impl Materializer {
             && self.commit_tree_exists(repo_dir, commit).await
     }
 
+    #[cfg(test)]
     pub(super) async fn object_exists(&self, repo_dir: &FsPath, object_id: &CommitSha) -> bool {
         self.state
             .git
@@ -74,6 +75,7 @@ impl Materializer {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn restore_upstream_ref_base_from_manifest(
         &self,
         repo: &RepoKey,
@@ -102,8 +104,15 @@ impl Materializer {
         repo_dir: &FsPath,
         branch: &BranchName,
     ) -> CoreResult<Option<CommitSha>> {
+        let started = Instant::now();
         let ref_name = branch.ref_name();
         let Some(ref_manifest) = self.manifests().ref_manifest(repo, &ref_name).await? else {
+            info!(
+                %repo,
+                %branch,
+                elapsed_ms = elapsed_ms(started),
+                "direct git found no hot public ref manifest"
+            );
             return Ok(None);
         };
 
@@ -114,6 +123,14 @@ impl Materializer {
             .commit_ready_for_serving(repo_dir, &ref_manifest.commit)
             .await
         {
+            info!(
+                %repo,
+                %branch,
+                commit = %ref_manifest.commit,
+                generation = %ref_manifest.generation,
+                elapsed_ms = elapsed_ms(started),
+                "direct git skipped public ref manifest: commit not locally ready"
+            );
             return Ok(None);
         }
 
@@ -121,9 +138,18 @@ impl Materializer {
         let _repo_lock = self.lock_repo(repo).await?;
         self.apply_restored_ref_manifest_refs(repo_dir, branch, &ref_manifest, false, false)
             .await?;
+        info!(
+            %repo,
+            %branch,
+            %commit,
+            generation = %ref_manifest.generation,
+            elapsed_ms = elapsed_ms(started),
+            "direct git restored hot public ref manifest"
+        );
         Ok(Some(commit))
     }
 
+    #[cfg(test)]
     pub(super) async fn restore_ref_manifest_in_repo(
         &self,
         repo: &RepoKey,

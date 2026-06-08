@@ -51,6 +51,7 @@ ECS_EBS_IOPS="${ECS_EBS_IOPS:-8000}"
 ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-500}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
 ECS_SKIP_DOCKER_BUILD="${ECS_SKIP_DOCKER_BUILD:-false}"
+ECS_DOCKER_BUILD_NO_CACHE="${ECS_DOCKER_BUILD_NO_CACHE:-false}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
@@ -408,7 +409,11 @@ build_and_push_image() {
   fi
 
   aws_cli ecr get-login-password | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-  docker build --platform "$DOCKER_PLATFORM" -t "$IMAGE_URI" -t "$LATEST_URI" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
+  local build_args=(--platform "$DOCKER_PLATFORM")
+  if [[ "$ECS_DOCKER_BUILD_NO_CACHE" == "true" ]]; then
+    build_args+=(--no-cache)
+  fi
+  docker build "${build_args[@]}" -t "$IMAGE_URI" -t "$LATEST_URI" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
   docker push "$IMAGE_URI"
   docker push "$LATEST_URI"
 }

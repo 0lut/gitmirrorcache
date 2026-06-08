@@ -15,7 +15,7 @@ struct TestServer {
     addr: SocketAddr,
     tmp: TempDir,
     upstream_work: PathBuf,
-    _upstream_bare: PathBuf,
+    upstream_bare: PathBuf,
 }
 
 impl TestServer {
@@ -85,12 +85,14 @@ impl TestServer {
             axum::serve(listener, router).await.unwrap();
         });
 
-        Self {
+        let server = Self {
             addr,
             tmp,
             upstream_work,
-            _upstream_bare: upstream_bare,
-        }
+            upstream_bare,
+        };
+        server.warm_all_heads();
+        server
     }
 
     fn git_url(&self, repo: &str) -> String {
@@ -102,6 +104,12 @@ impl TestServer {
     }
 
     fn commit_and_push(&self, contents: &str) -> String {
+        let commit = self.commit_and_push_without_warming(contents);
+        self.warm_all_heads();
+        commit
+    }
+
+    fn commit_and_push_without_warming(&self, contents: &str) -> String {
         std::fs::write(
             self.upstream_work.join("README.md"),
             format!("{contents}\n"),
@@ -111,6 +119,28 @@ impl TestServer {
         run_git(&self.upstream_work, &["commit", "-m", contents]);
         run_git(&self.upstream_work, &["push", "--force", "origin", "main"]);
         self.head_commit()
+    }
+
+    fn warm_all_heads(&self) {
+        let repo_dir = self.tmp.path().join("cache/repos/github.com/org/repo.git");
+        if !repo_dir.join("config").exists() {
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            run_git(
+                self.tmp.path(),
+                &["init", "--bare", repo_dir.to_str().unwrap()],
+            );
+        }
+        run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                self.upstream_bare.to_str().unwrap(),
+                "+refs/heads/*:refs/cache/upstream/heads/*",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 }
 
@@ -185,6 +215,28 @@ async fn git_stdout_async(cwd: &Path, args: &[&str]) -> String {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_direct_ref_advertisement_fails_without_local_repo() {
+    let server = TestServer::start().await;
+    let repo_dir = server
+        .tmp
+        .path()
+        .join("cache/repos/github.com/org/repo.git");
+    std::fs::remove_dir_all(&repo_dir).unwrap();
+
+    let url = format!(
+        "http://{}/git/github.com/org/repo.git/info/refs?service=git-upload-pack",
+        server.addr
+    );
+    let response = reqwest::get(&url).await.unwrap();
+
+    assert_eq!(response.status(), 503);
+    assert!(
+        !repo_dir.join("config").exists(),
+        "cold direct GET must not initialize or fetch the local repo"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn clone_branch_via_direct_remote() {
@@ -289,6 +341,36 @@ async fn clone_picks_up_new_branch_head() {
 
     assert_ne!(first_head, second_head);
     assert_eq!(second_head, new_commit);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clone_advertises_cached_ref_when_upstream_advances_without_warming() {
+    let server = TestServer::start().await;
+    let url = server.git_url("github.com/org/repo");
+    let cached_head = server.head_commit();
+
+    let upstream_head = server.commit_and_push_without_warming("unwarmed commit");
+    assert_ne!(cached_head, upstream_head);
+
+    let clone = server.tmp.path().join("stale-but-local");
+    run_git_async(
+        server.tmp.path(),
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone.to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    let cloned_head = git_stdout_async(&clone, &["rev-parse", "HEAD"]).await;
+    assert_eq!(
+        cloned_head, cached_head,
+        "direct Git must not advertise an upstream tip that has not been fetched locally"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

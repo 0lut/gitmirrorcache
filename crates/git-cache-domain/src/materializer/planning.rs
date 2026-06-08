@@ -19,11 +19,6 @@ enum MaterializeTarget {
         commit: CommitSha,
         default_branch: bool,
     },
-    ReachableCommit {
-        commit: CommitSha,
-        branch: BranchName,
-        tip: CommitSha,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -35,8 +30,10 @@ struct ResolvePlan {
 
 #[derive(Debug, Clone)]
 enum ResolveTarget {
-    Commit { commit: CommitSha },
-    ReachableCommit { commit: CommitSha, tip: CommitSha },
+    Commit {
+        commit: CommitSha,
+        source_hint: Option<MaterializeSource>,
+    },
 }
 
 impl Materializer {
@@ -64,10 +61,7 @@ impl Materializer {
     async fn plan_materialize(&self, request: MaterializeRequest) -> CoreResult<MaterializePlan> {
         self.validate_host(&request.repo)?;
         self.ensure_request_auth_allowed(&request)?;
-        if self.upstream_auth.is_authenticated() {
-            return self.plan_upstream_materialize(request).await;
-        }
-        self.plan_public_materialize(request).await
+        self.plan_materialize_target(request).await
     }
 
     async fn plan_materialize_after_upstream_validation(
@@ -76,15 +70,11 @@ impl Materializer {
     ) -> CoreResult<MaterializePlan> {
         self.validate_host(&request.repo)?;
         self.ensure_request_auth_allowed(&request)?;
-        if self.upstream_auth.is_authenticated() {
-            return self.plan_upstream_materialize(request).await;
-        }
 
         match request.selector {
             Selector::Branch(branch) => {
                 let commit = self.local_branch_tip(&request.repo, &branch).await?;
-                let access =
-                    RepoAccessContext::public_ref(request.repo, branch.ref_name(), commit.clone());
+                let access = self.access_for_ref(request.repo, branch.ref_name(), commit.clone());
                 Ok(MaterializePlan {
                     access,
                     target: MaterializeTarget::Commit {
@@ -96,8 +86,7 @@ impl Materializer {
             Selector::DefaultBranch => {
                 let branch = self.resolve_default_branch(&request.repo).await?;
                 let commit = self.local_branch_tip(&request.repo, &branch).await?;
-                let access =
-                    RepoAccessContext::public_ref(request.repo, branch.ref_name(), commit.clone());
+                let access = self.access_for_ref(request.repo, branch.ref_name(), commit.clone());
                 Ok(MaterializePlan {
                     access,
                     target: MaterializeTarget::Commit {
@@ -106,18 +95,20 @@ impl Materializer {
                     },
                 })
             }
-            _ => self.plan_public_materialize(request).await,
+            _ => self.plan_materialize_target(request).await,
         }
     }
 
-    async fn plan_public_materialize(
+    async fn plan_materialize_target(
         &self,
         request: MaterializeRequest,
     ) -> CoreResult<MaterializePlan> {
         match request.selector {
             Selector::Commit(commit) | Selector::CommitReachableFrom { commit, .. } => {
-                let source = self.ensure_public_commit(&request.repo, &commit).await?;
-                let access = RepoAccessContext::public_commit(request.repo, commit.clone());
+                self.ensure_repo_access(&request.repo).await?;
+                let source = self.ensure_exact_commit(&request.repo, &commit).await?;
+                let access = self.access_for_commit(request.repo, commit.clone());
+                let source = Self::source_for_access(&access, source);
                 Ok(MaterializePlan {
                     access,
                     target: MaterializeTarget::Commit { commit, source },
@@ -125,9 +116,10 @@ impl Materializer {
             }
             Selector::ShortCommit(short_commit) => {
                 let (commit, source) = self
-                    .ensure_public_short_commit(&request.repo, short_commit)
+                    .ensure_short_commit(&request.repo, short_commit)
                     .await?;
-                let access = RepoAccessContext::public_commit(request.repo, commit.clone());
+                let access = self.access_for_commit(request.repo, commit.clone());
+                let source = Self::source_for_access(&access, source);
                 Ok(MaterializePlan {
                     access,
                     target: MaterializeTarget::Commit { commit, source },
@@ -135,8 +127,7 @@ impl Materializer {
             }
             Selector::Branch(branch) => {
                 let (branch, commit) = self.resolve_branch_tip(&request.repo, branch).await?;
-                let access =
-                    RepoAccessContext::public_ref(request.repo, branch.ref_name(), commit.clone());
+                let access = self.access_for_ref(request.repo, branch.ref_name(), commit.clone());
                 Ok(MaterializePlan {
                     access,
                     target: MaterializeTarget::BranchTip {
@@ -148,8 +139,7 @@ impl Materializer {
             }
             Selector::DefaultBranch => {
                 let (branch, commit) = self.resolve_default_branch_tip(&request.repo).await?;
-                let access =
-                    RepoAccessContext::public_ref(request.repo, branch.ref_name(), commit.clone());
+                let access = self.access_for_ref(request.repo, branch.ref_name(), commit.clone());
                 Ok(MaterializePlan {
                     access,
                     target: MaterializeTarget::BranchTip {
@@ -159,76 +149,6 @@ impl Materializer {
                     },
                 })
             }
-        }
-    }
-
-    async fn plan_upstream_materialize(
-        &self,
-        request: MaterializeRequest,
-    ) -> CoreResult<MaterializePlan> {
-        match request.selector {
-            Selector::Branch(branch) => {
-                let (branch, commit) = self.resolve_branch_tip(&request.repo, branch).await?;
-                let access = RepoAccessContext::authenticated_ref(
-                    request.repo,
-                    self.upstream_auth.clone(),
-                    branch.ref_name(),
-                    commit.clone(),
-                );
-                Ok(MaterializePlan {
-                    access,
-                    target: MaterializeTarget::BranchTip {
-                        branch,
-                        commit,
-                        default_branch: false,
-                    },
-                })
-            }
-            Selector::DefaultBranch => {
-                let (branch, commit) = self.resolve_default_branch_tip(&request.repo).await?;
-                let access = RepoAccessContext::authenticated_ref(
-                    request.repo,
-                    self.upstream_auth.clone(),
-                    branch.ref_name(),
-                    commit.clone(),
-                );
-                Ok(MaterializePlan {
-                    access,
-                    target: MaterializeTarget::BranchTip {
-                        branch,
-                        commit,
-                        default_branch: true,
-                    },
-                })
-            }
-            Selector::CommitReachableFrom {
-                commit,
-                reachable_from,
-            } => {
-                let reachable_from_for_proof = reachable_from.clone();
-                let (branch, tip) = self
-                    .resolve_reachability_tip(&request.repo, reachable_from)
-                    .await?;
-                let access = RepoAccessContext::authenticated_commit(
-                    request.repo,
-                    self.upstream_auth.clone(),
-                    commit.clone(),
-                    reachable_from_for_proof,
-                    branch.ref_name(),
-                    tip.clone(),
-                );
-                Ok(MaterializePlan {
-                    access,
-                    target: MaterializeTarget::ReachableCommit {
-                        commit,
-                        branch,
-                        tip,
-                    },
-                })
-            }
-            Selector::Commit(_) | Selector::ShortCommit(_) => Err(GitCacheError::Validation(
-                "authenticated commit selectors require reachable_from context".into(),
-            )),
         }
     }
 
@@ -241,70 +161,92 @@ impl Materializer {
         Ok(())
     }
 
+    fn access_for_commit(&self, repo: RepoKey, commit: CommitSha) -> RepoAccessContext {
+        if self.upstream_auth.is_authenticated() {
+            RepoAccessContext::authenticated_commit(repo, self.upstream_auth.clone(), commit)
+        } else {
+            RepoAccessContext::public_commit(repo, commit)
+        }
+    }
+
+    fn access_for_ref(
+        &self,
+        repo: RepoKey,
+        ref_name: String,
+        commit: CommitSha,
+    ) -> RepoAccessContext {
+        if self.upstream_auth.is_authenticated() {
+            RepoAccessContext::authenticated_ref(repo, self.upstream_auth.clone(), ref_name, commit)
+        } else {
+            RepoAccessContext::public_ref(repo, ref_name, commit)
+        }
+    }
+
     async fn plan_resolve(&self, request: MaterializeRequest) -> CoreResult<ResolvePlan> {
         self.validate_host(&request.repo)?;
         self.ensure_request_auth_allowed(&request)?;
-        if !self.upstream_auth.is_authenticated() {
-            return Err(GitCacheError::Unsupported(
-                "anonymous resolve still uses the materialize-compatible endpoint".into(),
-            ));
-        }
 
         let selector = request.selector.clone();
         match selector.clone() {
-            Selector::Branch(branch) => {
-                let (branch, commit) = self.resolve_branch_tip(&request.repo, branch).await?;
-                let access = RepoAccessContext::authenticated_ref(
-                    request.repo,
-                    self.upstream_auth.clone(),
-                    branch.ref_name(),
-                    commit.clone(),
-                );
+            Selector::Commit(commit) | Selector::CommitReachableFrom { commit, .. } => {
+                // Match materialize's policy: once repo access has been
+                // checked, exact commit selectors are repo-authorized. Resolve
+                // only reports the concrete commit and local cache state; it
+                // does not stream objects or create a session.
+                //
+                // TODO(auth-hardening): If materialize grows an optional
+                // current-ref reachability policy, wire resolve through the
+                // same policy knob instead of making it stricter by default.
+                self.ensure_repo_access(&request.repo).await?;
+                let access = self.access_for_commit(request.repo, commit.clone());
                 Ok(ResolvePlan {
                     selector,
-                    target: ResolveTarget::Commit { commit },
+                    target: ResolveTarget::Commit {
+                        commit,
+                        source_hint: None,
+                    },
+                    access,
+                })
+            }
+            Selector::ShortCommit(short_commit) => {
+                let (commit, source) = self
+                    .ensure_short_commit(&request.repo, short_commit)
+                    .await?;
+                let access = self.access_for_commit(request.repo, commit.clone());
+                let source = Self::source_for_access(&access, source);
+                Ok(ResolvePlan {
+                    selector,
+                    target: ResolveTarget::Commit {
+                        commit,
+                        source_hint: Some(source),
+                    },
+                    access,
+                })
+            }
+            Selector::Branch(branch) => {
+                let (branch, commit) = self.resolve_branch_tip(&request.repo, branch).await?;
+                let access = self.access_for_ref(request.repo, branch.ref_name(), commit.clone());
+                Ok(ResolvePlan {
+                    selector,
+                    target: ResolveTarget::Commit {
+                        commit,
+                        source_hint: None,
+                    },
                     access,
                 })
             }
             Selector::DefaultBranch => {
                 let (branch, commit) = self.resolve_default_branch_tip(&request.repo).await?;
-                let access = RepoAccessContext::authenticated_ref(
-                    request.repo,
-                    self.upstream_auth.clone(),
-                    branch.ref_name(),
-                    commit.clone(),
-                );
+                let access = self.access_for_ref(request.repo, branch.ref_name(), commit.clone());
                 Ok(ResolvePlan {
                     selector,
-                    target: ResolveTarget::Commit { commit },
+                    target: ResolveTarget::Commit {
+                        commit,
+                        source_hint: None,
+                    },
                     access,
                 })
             }
-            Selector::CommitReachableFrom {
-                commit,
-                reachable_from,
-            } => {
-                let reachable_from_for_proof = reachable_from.clone();
-                let (branch, tip) = self
-                    .resolve_reachability_tip(&request.repo, reachable_from)
-                    .await?;
-                let access = RepoAccessContext::authenticated_commit(
-                    request.repo,
-                    self.upstream_auth.clone(),
-                    commit.clone(),
-                    reachable_from_for_proof,
-                    branch.ref_name(),
-                    tip.clone(),
-                );
-                Ok(ResolvePlan {
-                    selector,
-                    target: ResolveTarget::ReachableCommit { commit, tip },
-                    access,
-                })
-            }
-            Selector::Commit(_) | Selector::ShortCommit(_) => Err(GitCacheError::Validation(
-                "authenticated commit selectors require reachable_from context".into(),
-            )),
         }
     }
 
@@ -325,50 +267,24 @@ impl Materializer {
                 self.create_session_for_access(plan.access, commit, source)
                     .await
             }
-            MaterializeTarget::ReachableCommit {
-                commit,
-                branch,
-                tip,
-            } => {
-                let source = self
-                    .ensure_reachable_commit(&plan.access, &commit, &branch, &tip)
-                    .await?;
-                self.create_session_for_access(plan.access, commit, source)
-                    .await
-            }
         }
     }
 
     async fn resolve_plan(&self, plan: ResolvePlan) -> CoreResult<ResolveResponse> {
         let now = Utc::now();
         match plan.target {
-            ResolveTarget::Commit { commit } => {
+            ResolveTarget::Commit {
+                commit,
+                source_hint,
+            } => {
                 let cache_available = self.cache_has_commit(&plan.access.repo, &commit).await?;
-                let source = if cache_available {
+                let source = if let Some(source) = source_hint {
+                    source
+                } else if cache_available {
                     plan.access.cache_hit_source()
                 } else {
                     plan.access.fetched_source()
                 };
-                Ok(ResolveResponse {
-                    repo: plan.access.repo,
-                    selector: plan.selector,
-                    commit,
-                    source,
-                    cache_available,
-                    authorized_at: now,
-                })
-            }
-            ResolveTarget::ReachableCommit { commit, tip } => {
-                let repo_dir = self.ensure_repo_dir(&plan.access.repo).await?;
-                let cache_available = self.commit_exists(&repo_dir, &commit).await
-                    && self.commit_exists(&repo_dir, &tip).await
-                    && self.state.git.is_ancestor(&repo_dir, &commit, &tip).await?;
-                if !cache_available {
-                    return Err(GitCacheError::NotFound(format!(
-                        "commit `{commit}` is not available with local reachability proof"
-                    )));
-                }
-                let source = plan.access.cache_hit_source();
                 Ok(ResolveResponse {
                     repo: plan.access.repo,
                     selector: plan.selector,
@@ -409,15 +325,12 @@ impl Materializer {
         Ok((BranchName::parse(branch)?, CommitSha::parse(sha)?))
     }
 
-    async fn resolve_reachability_tip(
-        &self,
-        repo: &RepoKey,
-        reachable_from: ReachabilitySelector,
-    ) -> CoreResult<(BranchName, CommitSha)> {
-        match reachable_from {
-            ReachabilitySelector::Branch(branch) => self.resolve_branch_tip(repo, branch).await,
-            ReachabilitySelector::DefaultBranch => self.resolve_default_branch_tip(repo).await,
-        }
+    async fn ensure_repo_access(&self, repo: &RepoKey) -> CoreResult<()> {
+        let remote = self.upstream_url(repo)?;
+        self.upstream_git(&remote)?
+            .ls_remote_default_branch(&remote)
+            .await?;
+        Ok(())
     }
 
     async fn local_branch_tip(&self, repo: &RepoKey, branch: &BranchName) -> CoreResult<CommitSha> {
@@ -438,68 +351,9 @@ impl Materializer {
         default_branch: bool,
     ) -> CoreResult<MaterializeSource> {
         let repo = &access.repo;
-        let repo_dir = self.ensure_repo_dir(repo).await?;
-
-        if access.is_authenticated() && self.cache_has_commit(repo, commit).await? {
-            if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
-                if manifest.complete {
-                    self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
-                }
-            }
-            if !self.commit_exists(&repo_dir, commit).await {
-                return Err(GitCacheError::NotFound(format!(
-                    "commit `{commit}` is marked cached but could not be hydrated"
-                )));
-            }
-            return Ok(access.cache_hit_source());
-        }
-
         self.ensure_branch_from_verified_tip(repo, branch, commit, default_branch)
             .await?;
         Ok(access.fetched_source())
-    }
-
-    async fn ensure_reachable_commit(
-        &self,
-        access: &RepoAccessContext,
-        commit: &CommitSha,
-        branch: &BranchName,
-        tip: &CommitSha,
-    ) -> CoreResult<MaterializeSource> {
-        let repo = &access.repo;
-        let branch_source = self.ensure_branch_tip(access, branch, tip, false).await?;
-        let repo_dir = self.ensure_repo_dir(repo).await?;
-
-        if !self.commit_exists(&repo_dir, commit).await {
-            if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
-                if manifest.complete {
-                    self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
-                }
-            }
-        }
-        if !self.commit_exists(&repo_dir, commit).await {
-            return Err(GitCacheError::NotFound(format!(
-                "commit `{commit}` was not found after fetching authorized ref `{branch}`"
-            )));
-        }
-        if !self.state.git.is_ancestor(&repo_dir, commit, tip).await? {
-            return Err(GitCacheError::Forbidden(format!(
-                "commit `{commit}` is not reachable from authorized ref `{branch}`"
-            )));
-        }
-
-        if self.get_commit_manifest(repo, commit).await?.is_none() {
-            self.publish_generation(repo, &repo_dir, commit, None, false)
-                .await?;
-        }
-
-        let source = if branch_source == access.cache_hit_source() {
-            access.cache_hit_source()
-        } else {
-            access.fetched_source()
-        };
-
-        Ok(source)
     }
 
     async fn create_session_for_access(
@@ -510,6 +364,17 @@ impl Materializer {
     ) -> CoreResult<MaterializeResponse> {
         self.create_session_from_access(access, commit, source)
             .await
+    }
+
+    fn source_for_access(
+        access: &RepoAccessContext,
+        source: MaterializeSource,
+    ) -> MaterializeSource {
+        match source {
+            MaterializeSource::CacheVerified => access.cache_hit_source(),
+            MaterializeSource::UpstreamVerified => access.fetched_source(),
+            other => other,
+        }
     }
 
     async fn cache_has_commit(&self, repo: &RepoKey, commit: &CommitSha) -> CoreResult<bool> {
@@ -529,7 +394,7 @@ impl Materializer {
         repo: RepoKey,
         short_commit: ShortCommitSha,
     ) -> CoreResult<MaterializeResponse> {
-        let (commit, source) = self.ensure_public_short_commit(&repo, short_commit).await?;
+        let (commit, source) = self.ensure_short_commit(&repo, short_commit).await?;
         self.create_session(repo, commit, source).await
     }
 
@@ -538,11 +403,11 @@ impl Materializer {
         repo: RepoKey,
         commit: CommitSha,
     ) -> CoreResult<MaterializeResponse> {
-        let source = self.ensure_public_commit(&repo, &commit).await?;
+        let source = self.ensure_exact_commit(&repo, &commit).await?;
         self.create_session(repo, commit, source).await
     }
 
-    async fn ensure_public_short_commit(
+    async fn ensure_short_commit(
         &self,
         repo: &RepoKey,
         short_commit: ShortCommitSha,
@@ -562,7 +427,7 @@ impl Materializer {
         Ok((commit, MaterializeSource::UpstreamVerified))
     }
 
-    async fn ensure_public_commit(
+    async fn ensure_exact_commit(
         &self,
         repo: &RepoKey,
         commit: &CommitSha,
@@ -735,10 +600,28 @@ impl Materializer {
         branch: &BranchName,
         default_branch: bool,
     ) -> CoreResult<CommitSha> {
+        let started = Instant::now();
         self.validate_host(repo)?;
+        let ls_started = Instant::now();
         let upstream_commit = self.ls_remote_branch(repo, branch).await?;
-        self.ensure_branch_from_verified_tip(repo, branch, &upstream_commit, default_branch)
-            .await
+        info!(
+            %repo,
+            %branch,
+            upstream_commit = %upstream_commit,
+            elapsed_ms = elapsed_ms(ls_started),
+            "resolved upstream branch tip"
+        );
+        let commit = self
+            .ensure_branch_from_verified_tip(repo, branch, &upstream_commit, default_branch)
+            .await?;
+        info!(
+            %repo,
+            %branch,
+            commit = %commit,
+            elapsed_ms = elapsed_ms(started),
+            "ensured branch"
+        );
+        Ok(commit)
     }
 
     async fn ensure_branch_from_verified_tip(
@@ -748,103 +631,55 @@ impl Materializer {
         upstream_commit: &CommitSha,
         default_branch: bool,
     ) -> CoreResult<CommitSha> {
+        let started = Instant::now();
+        info!(
+            %repo,
+            %branch,
+            upstream_commit = %upstream_commit,
+            default_branch,
+            auth = if self.upstream_auth.is_authenticated() { "authenticated" } else { "anonymous" },
+            "ensure branch from verified tip started"
+        );
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
+
         if self
-            .verify_pending_generation_for_commit(repo, upstream_commit)
-            .await?
+            .commit_ready_for_serving(&repo_dir, upstream_commit)
+            .await
         {
-            if let Some(manifest) = self.get_commit_manifest(repo, upstream_commit).await? {
-                if manifest.complete {
-                    self.hydrate_commit_in_repo(&repo_dir, &manifest).await?;
-                }
-            }
-            if self
-                .commit_ready_for_serving(&repo_dir, upstream_commit)
-                .await
-            {
-                let _repo_lock = self.lock_repo(repo).await?;
-                self.state
-                    .git
-                    .update_ref(&repo_dir, &local_ref, upstream_commit.as_str())
-                    .await?;
-                if default_branch {
-                    self.state
-                        .git
-                        .symbolic_ref(
-                            &repo_dir,
-                            "HEAD",
-                            &format!("refs/cache/upstream/heads/{branch}"),
-                        )
-                        .await?;
-                }
-                if !self.upstream_auth.is_authenticated() {
-                    self.state
-                        .git
-                        .update_ref(
-                            &repo_dir,
-                            &format!("refs/heads/{branch}"),
-                            upstream_commit.as_str(),
-                        )
-                        .await?;
-                    if default_branch {
-                        self.state
-                            .git
-                            .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{branch}"))
-                            .await?;
-                    }
-                }
-                return Ok(upstream_commit.clone());
-            }
-        }
-
-        if !self.upstream_auth.is_authenticated() {
-            if let Some(restored_commit) =
-                Box::pin(self.restore_upstream_ref_base_from_manifest(repo, &repo_dir, branch))
-                    .await?
-            {
-                debug!(
-                    %repo,
-                    %branch,
-                    %restored_commit,
-                    upstream_commit = %upstream_commit,
-                    "restored public ref manifest before branch fetch"
-                );
-
-                if restored_commit == *upstream_commit
-                    && self
-                        .commit_ready_for_serving(&repo_dir, upstream_commit)
-                        .await
-                {
-                    let _repo_lock = self.lock_repo(repo).await?;
-                    self.state
-                        .git
-                        .update_ref(&repo_dir, &local_ref, upstream_commit.as_str())
-                        .await?;
-                    self.state
-                        .git
-                        .update_ref(
-                            &repo_dir,
-                            &format!("refs/heads/{branch}"),
-                            upstream_commit.as_str(),
-                        )
-                        .await?;
-                    if default_branch {
-                        self.state
-                            .git
-                            .symbolic_ref(&repo_dir, "HEAD", &format!("refs/heads/{branch}"))
-                            .await?;
-                    }
-                    return Ok(upstream_commit.clone());
-                }
-            }
+            self.record_verified_branch_refs(
+                repo,
+                &repo_dir,
+                branch,
+                upstream_commit,
+                default_branch,
+            )
+            .await?;
+            self.record_verified_branch_manifests(repo, branch, upstream_commit, default_branch)
+                .await?;
+            info!(
+                %repo,
+                %branch,
+                upstream_commit = %upstream_commit,
+                elapsed_ms = elapsed_ms(started),
+                "ensured branch from local ready commit"
+            );
+            return Ok(upstream_commit.clone());
         }
 
         let _repo_lock = self.lock_repo(repo).await?;
         let upstream_url = self.upstream_url(repo)?;
+        let fetch_started = Instant::now();
         self.upstream_git(&upstream_url)?
             .fetch_branch(&repo_dir, &upstream_url, branch.as_str(), &local_ref)
             .await?;
+        info!(
+            %repo,
+            %branch,
+            upstream_commit = %upstream_commit,
+            elapsed_ms = elapsed_ms(fetch_started),
+            "fetched branch from upstream"
+        );
 
         let commit = self
             .state
@@ -883,6 +718,7 @@ impl Materializer {
             }
         }
 
+        let publish_started = Instant::now();
         self.publish_generation(
             repo,
             &repo_dir,
@@ -891,8 +727,92 @@ impl Materializer {
             default_branch,
         )
         .await?;
+        info!(
+            %repo,
+            %branch,
+            commit = %commit,
+            elapsed_ms = elapsed_ms(publish_started),
+            "published branch generation"
+        );
 
+        info!(
+            %repo,
+            %branch,
+            commit = %commit,
+            elapsed_ms = elapsed_ms(started),
+            "ensured branch from upstream fetch"
+        );
         Ok(commit)
+    }
+
+    async fn record_verified_branch_manifests(
+        &self,
+        repo: &RepoKey,
+        branch: &BranchName,
+        commit: &CommitSha,
+        default_branch: bool,
+    ) -> CoreResult<()> {
+        let Some(commit_manifest) = self.get_commit_manifest(repo, commit).await? else {
+            return Ok(());
+        };
+        if !commit_manifest.complete {
+            return Ok(());
+        }
+
+        let ref_manifest = RefManifest {
+            repo: repo.clone(),
+            ref_name: branch.ref_name(),
+            commit: commit.clone(),
+            generation: commit_manifest.generation,
+            verified_at: Utc::now(),
+        };
+        self.manifests().write_ref(&ref_manifest).await?;
+        if default_branch {
+            self.put_default_manifest(repo, commit).await?;
+        }
+        Ok(())
+    }
+
+    async fn record_verified_branch_refs(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        branch: &BranchName,
+        commit: &CommitSha,
+        default_branch: bool,
+    ) -> CoreResult<()> {
+        let _repo_lock = self.lock_repo(repo).await?;
+        self.state
+            .git
+            .update_ref(
+                repo_dir,
+                &format!("refs/cache/upstream/heads/{branch}"),
+                commit.as_str(),
+            )
+            .await?;
+        if default_branch {
+            self.state
+                .git
+                .symbolic_ref(
+                    repo_dir,
+                    "HEAD",
+                    &format!("refs/cache/upstream/heads/{branch}"),
+                )
+                .await?;
+        }
+        if !self.upstream_auth.is_authenticated() {
+            self.state
+                .git
+                .update_ref(repo_dir, &format!("refs/heads/{branch}"), commit.as_str())
+                .await?;
+            if default_branch {
+                self.state
+                    .git
+                    .symbolic_ref(repo_dir, "HEAD", &format!("refs/heads/{branch}"))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn materialize_default_branch(

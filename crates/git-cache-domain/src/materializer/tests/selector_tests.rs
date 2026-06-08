@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn cached_exact_commit_survives_upstream_offline() {
+async fn cached_exact_commit_requires_repo_access_when_upstream_is_offline() {
     let fixture = GitFixture::new();
     let state = fixture.state();
     let materializer = Materializer::new(Arc::new(state));
@@ -32,7 +32,7 @@ async fn cached_exact_commit_survives_upstream_offline() {
     )
     .unwrap();
 
-    let commit_response = materializer
+    let error = materializer
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(branch_response.commit.clone()),
@@ -40,10 +40,89 @@ async fn cached_exact_commit_survives_upstream_offline() {
             upstream_authorization: Default::default(),
         })
         .await
+        .expect_err("exact commit materialize still needs current repo access");
+
+    assert!(matches!(error, GitCacheError::UpstreamUnavailable(_)));
+}
+
+#[tokio::test]
+async fn authenticated_exact_commit_materialize_uses_repo_access_without_reachable_from() {
+    let fixture = GitFixture::new();
+    let state = fixture.state();
+    let materializer = Materializer::new(Arc::new(state));
+    let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+    let head = fixture.head_commit();
+
+    let response = materializer
+        .using_upstream_auth(&auth)
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Commit(head.clone()),
+            mode: RequestMode::Strict,
+            upstream_authorization: git_cache_core::UpstreamAuthorizationMode::Required,
+        })
+        .await
         .unwrap();
 
-    assert_eq!(commit_response.source, MaterializeSource::CacheVerified);
-    assert_eq!(commit_response.commit, branch_response.commit);
+    assert_eq!(response.commit, head);
+    assert_eq!(
+        response.source,
+        MaterializeSource::UpstreamAuthorizedFetched
+    );
+    assert!(
+        response.session_token.is_some(),
+        "authenticated exact commit materialize should create a protected session"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_exact_commit_resolve_uses_repo_access_without_reachable_from() {
+    let fixture = GitFixture::new();
+    let state = fixture.state();
+    let materializer = Materializer::new(Arc::new(state));
+    let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+    let head = fixture.head_commit();
+
+    let response = materializer
+        .using_upstream_auth(&auth)
+        .resolve(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Commit(head.clone()),
+            mode: RequestMode::Strict,
+            upstream_authorization: git_cache_core::UpstreamAuthorizationMode::Required,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(response.commit, head);
+    assert!(!response.cache_available);
+    assert_eq!(
+        response.source,
+        MaterializeSource::UpstreamAuthorizedFetched
+    );
+}
+
+#[tokio::test]
+async fn short_commit_resolve_returns_lightweight_response() {
+    let fixture = GitFixture::new();
+    let state = fixture.state();
+    let materializer = Materializer::new(Arc::new(state));
+    let head = fixture.head_commit();
+    let short = ShortCommitSha::parse(&head.as_str()[..8]).unwrap();
+
+    let response = materializer
+        .resolve(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::ShortCommit(short),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(response.commit, head);
+    assert!(response.cache_available);
+    assert_eq!(response.source, MaterializeSource::UpstreamVerified);
 }
 
 #[tokio::test]

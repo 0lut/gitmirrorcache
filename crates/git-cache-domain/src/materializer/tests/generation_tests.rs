@@ -44,6 +44,95 @@ async fn publish_generation_links_delta_to_previous_generation() {
 }
 
 #[tokio::test]
+async fn pending_generation_verifies_from_local_repo_without_parent_bundle() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let first = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+    let parent_head =
+        wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
+    state
+        .store
+        .delete(&bundle_key(&fixture.repo, first_manifest.generation))
+        .await
+        .unwrap();
+
+    let child_commit = fixture.commit_and_push("second");
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    run_git(
+        &repo_dir,
+        [
+            "fetch",
+            "--no-tags",
+            fixture.upstream_path().to_str().unwrap(),
+            "+refs/heads/main:refs/cache/upstream/heads/main",
+        ],
+    );
+
+    let child_generation = GenerationId::new();
+    let reservation = state.disk.reserve(1024 * 1024 * 64).await.unwrap();
+    let temp_path = reservation.temp_path().unwrap();
+    fs::create_dir_all(&temp_path).await.unwrap();
+    let bundle_path = temp_path.join("pending-child.bundle");
+    state
+        .git
+        .bundle_create_incremental(&repo_dir, &bundle_path, &parent_head.tip_commits)
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let child_manifest = GenerationManifest {
+        repo: fixture.repo.clone(),
+        generation: child_generation,
+        bundle_key: bundle_key(&fixture.repo, child_generation),
+        parent_generation: Some(parent_head.generation),
+        created_at: now,
+        commits: vec![child_commit.clone()],
+    };
+    let mut child_tip_commits = parent_head.tip_commits.clone();
+    push_unique_commit(&mut child_tip_commits, child_commit.clone());
+    let child_head = RepoGenerationHead {
+        repo: fixture.repo.clone(),
+        generation: child_generation,
+        tip_commits: child_tip_commits,
+        updated_at: now,
+    };
+    let child_manifests = PublishManifests {
+        commits: vec![CommitManifest {
+            repo: fixture.repo.clone(),
+            commit: child_commit.clone(),
+            generation: child_generation,
+            complete: true,
+            verified_at: now,
+        }],
+        refs: Vec::new(),
+        sessions: Vec::new(),
+    };
+    GenerationPublish::with_manifests(child_manifest, child_manifests)
+        .publish_pending_bundle_file(&*state.store, &bundle_path, child_head, None)
+        .await
+        .unwrap();
+    reservation.release().await.unwrap();
+
+    materializer
+        .verify_generation_with_semaphore(fixture.repo.clone(), child_generation, false)
+        .await
+        .unwrap();
+    let child_manifest = wait_for_commit_manifest(&state, &fixture.repo, &child_commit).await;
+    assert_eq!(child_manifest.generation, child_generation);
+}
+
+#[tokio::test]
 async fn hydrate_commit_restores_parent_generation_chain_from_cold_cache() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());

@@ -29,10 +29,18 @@ impl Materializer {
         repo_dir: &FsPath,
         manifest: &CommitManifest,
     ) -> CoreResult<()> {
+        let started = Instant::now();
         if self
             .commit_ready_for_serving(repo_dir, &manifest.commit)
             .await
         {
+            info!(
+                repo = %manifest.repo,
+                commit = %manifest.commit,
+                generation = %manifest.generation,
+                elapsed_ms = elapsed_ms(started),
+                "hydrate commit skipped: commit already ready"
+            );
             return Ok(());
         }
 
@@ -47,6 +55,13 @@ impl Materializer {
                 manifest.generation, manifest.commit
             )));
         }
+        info!(
+            repo = %manifest.repo,
+            commit = %manifest.commit,
+            generation = %manifest.generation,
+            elapsed_ms = elapsed_ms(started),
+            "hydrated commit from generation"
+        );
         Ok(())
     }
 
@@ -56,9 +71,18 @@ impl Materializer {
         repo_dir: &FsPath,
         generation: GenerationId,
     ) -> CoreResult<()> {
+        let started = Instant::now();
         let chain = self.generation_chain(repo, generation).await?;
+        info!(
+            %repo,
+            %generation,
+            chain_len = chain.len(),
+            "hydrate generation started"
+        );
 
         for generation_manifest in chain.iter().rev() {
+            let bundle_started = Instant::now();
+            let manifest_started = Instant::now();
             let verification = self
                 .manifests()
                 .verified_generation(repo, generation_manifest.generation)
@@ -69,6 +93,13 @@ impl Materializer {
                         generation_manifest.generation
                     ))
                 })?;
+            info!(
+                %repo,
+                generation = %generation_manifest.generation,
+                elapsed_ms = elapsed_ms(manifest_started),
+                "loaded verified generation manifest"
+            );
+            let head_started = Instant::now();
             let bundle_meta = self
                 .state
                 .store
@@ -80,13 +111,30 @@ impl Materializer {
                         generation_manifest.bundle_key
                     ))
                 })?;
+            info!(
+                %repo,
+                generation = %generation_manifest.generation,
+                bundle_key = %generation_manifest.bundle_key,
+                bundle_len = bundle_meta.len,
+                elapsed_ms = elapsed_ms(head_started),
+                "loaded generation bundle metadata"
+            );
 
             validate_verified_generation(generation_manifest, &verification, bundle_meta.len)?;
 
+            let reserve_started = Instant::now();
             let reservation = self.state.disk.reserve(verification.bundle_len).await?;
             let temp_path = reservation.temp_path()?;
             fs::create_dir_all(&temp_path).await?;
             let bundle_path = temp_path.join("hydrate.bundle");
+            info!(
+                %repo,
+                generation = %generation_manifest.generation,
+                bundle_len = verification.bundle_len,
+                elapsed_ms = elapsed_ms(reserve_started),
+                "reserved disk for generation hydrate"
+            );
+            let download_started = Instant::now();
             if !self
                 .state
                 .store
@@ -98,6 +146,15 @@ impl Materializer {
                     generation_manifest.bundle_key
                 )));
             }
+            info!(
+                %repo,
+                generation = %generation_manifest.generation,
+                bundle_key = %generation_manifest.bundle_key,
+                bundle_len = verification.bundle_len,
+                elapsed_ms = elapsed_ms(download_started),
+                "downloaded generation bundle"
+            );
+            let checksum_started = Instant::now();
             let (bundle_len, bundle_sha256) = file_len_and_sha256(&bundle_path).await?;
             if bundle_len != verification.bundle_len {
                 return Err(GitCacheError::Validation(format!(
@@ -111,9 +168,36 @@ impl Materializer {
                     generation_manifest.bundle_key
                 )));
             }
+            info!(
+                %repo,
+                generation = %generation_manifest.generation,
+                bundle_len,
+                elapsed_ms = elapsed_ms(checksum_started),
+                "verified generation bundle checksum"
+            );
+            let fetch_started = Instant::now();
             self.state.git.fetch_bundle(repo_dir, &bundle_path).await?;
+            info!(
+                %repo,
+                generation = %generation_manifest.generation,
+                elapsed_ms = elapsed_ms(fetch_started),
+                "fetched generation bundle into local repo"
+            );
             reservation.release().await?;
+            info!(
+                %repo,
+                generation = %generation_manifest.generation,
+                elapsed_ms = elapsed_ms(bundle_started),
+                "hydrated generation bundle"
+            );
         }
+        info!(
+            %repo,
+            %generation,
+            chain_len = chain.len(),
+            elapsed_ms = elapsed_ms(started),
+            "hydrate generation finished"
+        );
         Ok(())
     }
 
@@ -125,6 +209,17 @@ impl Materializer {
         branch: Option<BranchName>,
         default_branch: bool,
     ) -> CoreResult<GenerationId> {
+        let started = Instant::now();
+        info!(
+            %repo,
+            %commit,
+            branch = branch
+                .as_ref()
+                .map(|branch| branch.as_str())
+                .unwrap_or("<none>"),
+            default_branch,
+            "publish generation started"
+        );
         if let Some(existing) = self.get_commit_manifest(repo, commit).await? {
             if existing.complete {
                 if let Some(branch) = branch {
@@ -141,11 +236,26 @@ impl Materializer {
                     self.put_default_manifest(repo, commit).await?;
                 }
 
+                info!(
+                    %repo,
+                    %commit,
+                    generation = %existing.generation,
+                    elapsed_ms = elapsed_ms(started),
+                    "publish generation skipped: commit manifest already complete"
+                );
                 return Ok(existing.generation);
             }
         }
 
+        let head_started = Instant::now();
         let previous_head = self.manifests().repo_head(repo).await?;
+        info!(
+            %repo,
+            previous_generation = previous_head.as_ref().map(|head| head.generation.to_string()).unwrap_or_else(|| "<none>".into()),
+            previous_tip_count = previous_head.as_ref().map(|head| head.tip_commits.len()).unwrap_or(0),
+            elapsed_ms = elapsed_ms(head_started),
+            "loaded repo generation head"
+        );
         let previous_generation = previous_head.as_ref().map(|head| head.generation);
         let previous_tips = previous_head
             .as_ref()
@@ -165,29 +275,57 @@ impl Materializer {
             .map(|head| head.tip_commits.clone())
             .unwrap_or_default();
 
+        let bundle_started = Instant::now();
         if previous_tips.is_empty() {
             self.state
                 .git
                 .bundle_create_all(repo_dir, &bundle_path)
                 .await?;
+            info!(
+                %repo,
+                %generation,
+                elapsed_ms = elapsed_ms(bundle_started),
+                "created full generation bundle"
+            );
         } else if let Err(err) = self
             .state
             .git
             .bundle_create_incremental(repo_dir, &bundle_path, previous_tips)
             .await
         {
-            warn!(%repo, %err, "delta bundle failed, falling back to full bundle");
+            warn!(
+                %repo,
+                %err,
+                elapsed_ms = elapsed_ms(bundle_started),
+                "delta bundle failed, falling back to full bundle"
+            );
             let _ = fs::remove_file(&bundle_path).await;
+            let fallback_started = Instant::now();
             self.state
                 .git
                 .bundle_create_all(repo_dir, &bundle_path)
                 .await?;
+            info!(
+                %repo,
+                %generation,
+                elapsed_ms = elapsed_ms(fallback_started),
+                "created fallback full generation bundle"
+            );
             parent_generation = None;
             tip_commits.clear();
+        } else {
+            info!(
+                %repo,
+                %generation,
+                previous_tip_count = previous_tips.len(),
+                elapsed_ms = elapsed_ms(bundle_started),
+                "created incremental generation bundle"
+            );
         }
         push_unique_commit(&mut tip_commits, commit.clone());
 
         let mut manifest_commits = vec![commit.clone()];
+        let manifest_scan_started = Instant::now();
         for ref_prefix in ["refs/cache/upstream/heads", "refs/cache/commits"] {
             for candidate in self
                 .state
@@ -200,6 +338,13 @@ impl Materializer {
                 }
             }
         }
+        info!(
+            %repo,
+            %generation,
+            manifest_commit_count = manifest_commits.len(),
+            elapsed_ms = elapsed_ms(manifest_scan_started),
+            "collected generation manifest commits"
+        );
 
         let generation_manifest = GenerationManifest {
             repo: repo.clone(),
@@ -252,14 +397,58 @@ impl Materializer {
             updated_at: now,
         };
 
-        GenerationPublish::with_manifests(generation_manifest, manifests)
-            .publish_pending_bundle_file(&*self.state.store, &bundle_path, head, default_ref)
-            .await?;
+        let publish_started = Instant::now();
+        let verification = Box::pin(self.verify_local_generation_bundle(
+            repo,
+            repo_dir,
+            generation,
+            &generation_manifest,
+            &bundle_path,
+            &head.tip_commits,
+        ))
+        .await?;
+        let published_verified = verification.is_some();
+        let default_ref_for_verified = default_ref.clone();
+        if let Some(verification) = verification {
+            GenerationPublish::with_manifests(generation_manifest.clone(), manifests)
+                .with_verification(verification)
+                .publish_bundle_file(&*self.state.store, &bundle_path)
+                .await?;
+            self.finish_verified_generation_publish(repo, &head, default_ref_for_verified)
+                .await?;
+            info!(
+                %repo,
+                %generation,
+                elapsed_ms = elapsed_ms(publish_started),
+                "published verified generation bundle"
+            );
+        } else {
+            GenerationPublish::with_manifests(generation_manifest, manifests)
+                .publish_pending_bundle_file(&*self.state.store, &bundle_path, head, default_ref)
+                .await?;
+            info!(
+                %repo,
+                %generation,
+                elapsed_ms = elapsed_ms(publish_started),
+                "published pending generation bundle"
+            );
+        }
 
         reservation.release().await?;
 
-        self.enqueue_generation_verification(repo.clone(), generation);
+        if published_verified {
+            self.enqueue_inline_compaction(repo.clone(), generation);
+        } else {
+            self.enqueue_generation_verification(repo.clone(), generation);
+        }
 
+        info!(
+            %repo,
+            %commit,
+            %generation,
+            elapsed_ms = elapsed_ms(started),
+            "publish generation finished"
+        );
         Ok(generation)
     }
 
@@ -269,7 +458,7 @@ impl Materializer {
             for attempt in 1..=GENERATION_VERIFICATION_MAX_ATTEMPTS {
                 let materializer = Materializer::new(Arc::clone(&state));
                 let result = materializer
-                    .verify_generation_with_semaphore(repo.clone(), generation, true)
+                    .verify_generation_with_semaphore_mode(repo.clone(), generation, true, false)
                     .await;
                 match result {
                     Ok(()) => return,
@@ -282,6 +471,20 @@ impl Materializer {
                         return;
                     }
                 }
+            }
+        });
+    }
+
+    fn enqueue_inline_compaction(&self, repo: RepoKey, generation: GenerationId) {
+        if !self.state.config.compaction.inline {
+            return;
+        }
+
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let materializer = Materializer::new(state);
+            if let Err(err) = Box::pin(materializer.compact_generation_chain(&repo)).await {
+                warn!(%repo, %generation, %err, "inline generation compaction failed");
             }
         });
     }
@@ -330,69 +533,22 @@ impl Materializer {
         Ok(queued)
     }
 
-    pub(super) async fn verify_pending_generation_for_commit(
-        &self,
-        repo: &RepoKey,
-        commit: &CommitSha,
-    ) -> CoreResult<bool> {
-        let keys = self
-            .state
-            .store
-            .list_prefix(
-                &format!("{PENDING_GENERATION_PREFIX}{repo}/"),
-                Some(MAX_PENDING_GENERATION_SCAN_KEYS),
-            )
-            .await?;
-        for key in keys {
-            let Some((pending_repo, generation)) = pending_generation_from_key(&key)? else {
-                continue;
-            };
-            if pending_repo != *repo {
-                continue;
-            }
-            let Some(pending) = self
-                .manifests()
-                .pending_generation(repo, generation)
-                .await?
-            else {
-                continue;
-            };
-            if !pending
-                .manifests
-                .commits
-                .iter()
-                .any(|manifest| manifest.complete && manifest.commit == *commit)
-            {
-                continue;
-            }
-
-            match self
-                .verify_generation_with_semaphore(repo.clone(), generation, true)
-                .await
-            {
-                Ok(()) => {
-                    return Ok(self.get_commit_manifest(repo, commit).await?.is_some());
-                }
-                Err(err) => {
-                    warn!(
-                        %repo,
-                        %generation,
-                        %commit,
-                        %err,
-                        "pending generation verification failed while satisfying foreground request"
-                    );
-                }
-            }
-        }
-
-        Ok(false)
-    }
-
     pub(super) async fn verify_generation_with_semaphore(
         &self,
         repo: RepoKey,
         generation: GenerationId,
         inline_compaction: bool,
+    ) -> CoreResult<()> {
+        self.verify_generation_with_semaphore_mode(repo, generation, inline_compaction, true)
+            .await
+    }
+
+    async fn verify_generation_with_semaphore_mode(
+        &self,
+        repo: RepoKey,
+        generation: GenerationId,
+        inline_compaction: bool,
+        allow_full_chain: bool,
     ) -> CoreResult<()> {
         let permit = self
             .state
@@ -403,7 +559,7 @@ impl Materializer {
             .map_err(|_| {
                 GitCacheError::Internal("generation verification semaphore closed".into())
             })?;
-        Box::pin(self.verify_generation_inner(repo.clone(), generation)).await?;
+        Box::pin(self.verify_generation_inner(repo.clone(), generation, allow_full_chain)).await?;
         drop(permit);
 
         if inline_compaction && self.state.config.compaction.inline {
@@ -418,6 +574,7 @@ impl Materializer {
         &self,
         repo: RepoKey,
         generation: GenerationId,
+        allow_full_chain: bool,
     ) -> CoreResult<()> {
         let Some(pending) = self
             .manifests()
@@ -426,6 +583,28 @@ impl Materializer {
         else {
             return Ok(());
         };
+
+        if let Some(verification) =
+            Box::pin(self.verify_generation_from_local_repo(&repo, generation, &pending)).await?
+        {
+            Box::pin(self.publish_verified_pending_generation(
+                &repo,
+                generation,
+                pending,
+                verification,
+            ))
+            .await?;
+            return Ok(());
+        }
+
+        if !allow_full_chain {
+            info!(
+                %repo,
+                %generation,
+                "generation verification left pending: local fast path was unavailable"
+            );
+            return Ok(());
+        }
 
         let chain = self
             .generation_chain_for_verification(&repo, generation)
@@ -514,35 +693,216 @@ impl Materializer {
                 "verification for generation `{generation}` was not produced"
             ))
         })?;
+        Box::pin(self.publish_verified_pending_generation(
+            &repo,
+            generation,
+            pending,
+            verification,
+        ))
+        .await?;
+        reservation.release().await?;
+        info!(%repo, %generation, "generation verified");
+        Ok(())
+    }
+
+    async fn verify_generation_from_local_repo(
+        &self,
+        repo: &RepoKey,
+        generation: GenerationId,
+        pending: &PendingGenerationPublish,
+    ) -> CoreResult<Option<VerifiedGenerationManifest>> {
+        let repo_dir = self.repo_dir(repo);
+        if !repo_dir.join("config").exists() {
+            return Ok(None);
+        }
+
+        let bundle_meta = self
+            .state
+            .store
+            .head(&pending.generation.bundle_key)
+            .await?
+            .ok_or_else(|| {
+                GitCacheError::NotFound(format!(
+                    "bundle `{}` not found",
+                    pending.generation.bundle_key
+                ))
+            })?;
+        let reservation = self.state.disk.reserve(bundle_meta.len).await?;
+        let temp_path = reservation.temp_path()?;
+        fs::create_dir_all(&temp_path).await?;
+        let bundle_path = temp_path.join("verify-local.bundle");
+        if !self
+            .state
+            .store
+            .get_file(&pending.generation.bundle_key, &bundle_path)
+            .await?
+        {
+            reservation.release().await?;
+            return Err(GitCacheError::NotFound(format!(
+                "bundle `{}` not found",
+                pending.generation.bundle_key
+            )));
+        }
+
+        let verification = Box::pin(self.verify_local_generation_bundle(
+            repo,
+            &repo_dir,
+            generation,
+            &pending.generation,
+            &bundle_path,
+            &pending.head.tip_commits,
+        ))
+        .await?;
+        let Some(verification) = verification else {
+            reservation.release().await?;
+            return Ok(None);
+        };
+
+        if verification.bundle_len != bundle_meta.len {
+            reservation.release().await?;
+            return Err(GitCacheError::Validation(format!(
+                "bundle `{}` length changed during verification: expected {}, got {}",
+                pending.generation.bundle_key, bundle_meta.len, verification.bundle_len
+            )));
+        }
+        reservation.release().await?;
+        Ok(Some(verification))
+    }
+
+    async fn verify_local_generation_bundle(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        generation: GenerationId,
+        generation_manifest: &GenerationManifest,
+        bundle_path: &FsPath,
+        tip_commits: &[CommitSha],
+    ) -> CoreResult<Option<VerifiedGenerationManifest>> {
+        let started = Instant::now();
+        for tip in tip_commits {
+            if !self.commit_ready_for_serving(repo_dir, tip).await {
+                info!(
+                    %repo,
+                    %generation,
+                    tip = %tip,
+                    elapsed_ms = elapsed_ms(started),
+                    "local generation verification skipped: tip not locally ready"
+                );
+                return Ok(None);
+            }
+        }
+
+        // For HTTP-published incremental generations, the local repo already
+        // has the parent history and the new objects that produced the bundle.
+        // Re-fetching the whole verified parent chain into a temporary repo is
+        // catastrophically expensive for repos like llvm-project and can starve
+        // hot materialize/direct-git requests. When every ancestor is already
+        // verified, `git bundle verify` against the local repo is enough to
+        // prove the pending bundle's prerequisites without running index-pack
+        // over gigabytes of parent history again.
+        let mut next = generation_manifest.parent_generation;
+        while let Some(parent) = next {
+            if self
+                .manifests()
+                .verified_generation(repo, parent)
+                .await?
+                .is_none()
+            {
+                info!(
+                    %repo,
+                    %generation,
+                    parent_generation = %parent,
+                    elapsed_ms = elapsed_ms(started),
+                    "local generation verification skipped: parent is not verified"
+                );
+                return Ok(None);
+            }
+            let Some(parent_manifest) = self.get_generation_manifest(repo, parent).await? else {
+                info!(
+                    %repo,
+                    %generation,
+                    parent_generation = %parent,
+                    elapsed_ms = elapsed_ms(started),
+                    "local generation verification skipped: parent manifest missing"
+                );
+                return Ok(None);
+            };
+            next = parent_manifest.parent_generation;
+        }
+
+        if let Err(err) = self.state.git.bundle_verify(repo_dir, bundle_path).await {
+            info!(
+                %repo,
+                %generation,
+                %err,
+                elapsed_ms = elapsed_ms(started),
+                "local generation verification skipped: bundle verify failed"
+            );
+            return Ok(None);
+        }
+
+        let (bundle_len, bundle_sha256) = file_len_and_sha256(bundle_path).await?;
+        info!(
+            %repo,
+            %generation,
+            bundle_len,
+            elapsed_ms = elapsed_ms(started),
+            "verified generation from local repo"
+        );
+        Ok(Some(verified_generation_manifest(
+            generation_manifest,
+            bundle_len,
+            bundle_sha256,
+            Utc::now(),
+            tip_commits.to_vec(),
+        )))
+    }
+
+    async fn finish_verified_generation_publish(
+        &self,
+        repo: &RepoKey,
+        head: &RepoGenerationHead,
+        default_ref: Option<RefManifest>,
+    ) -> CoreResult<()> {
+        if let Some(default_ref) = default_ref {
+            self.manifests()
+                .write_default_ref(repo, &default_ref)
+                .await?;
+        }
+
+        let current_head = self.manifests().repo_head(repo).await?;
+        if current_head
+            .as_ref()
+            .map(|current| current.updated_at <= head.updated_at)
+            .unwrap_or(true)
+        {
+            self.manifests().write_repo_head(head).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_verified_pending_generation(
+        &self,
+        repo: &RepoKey,
+        generation: GenerationId,
+        pending: PendingGenerationPublish,
+        verification: VerifiedGenerationManifest,
+    ) -> CoreResult<()> {
         GenerationPublish::with_manifests(pending.generation.clone(), pending.manifests.clone())
             .with_verification(verification)
             .publish_verified_metadata(&*self.state.store)
             .await?;
 
-        if let Some(default_ref) = pending.default_ref {
-            self.manifests()
-                .write_default_ref(&repo, &default_ref)
-                .await?;
-        }
-
-        let current_head = self.manifests().repo_head(&repo).await?;
-        if current_head
-            .as_ref()
-            .map(|head| head.updated_at <= pending.head.updated_at)
-            .unwrap_or(true)
-        {
-            self.manifests().write_repo_head(&pending.head).await?;
-        }
+        self.finish_verified_generation_publish(repo, &pending.head, pending.default_ref)
+            .await?;
         if let Err(err) = self
             .state
             .store
-            .delete(&pending_generation_publish_key(&repo, generation))
+            .delete(&pending_generation_publish_key(repo, generation))
             .await
         {
             warn!(%repo, %generation, %err, "failed to delete pending generation publish");
         }
-        reservation.release().await?;
-        info!(%repo, %generation, "generation verified");
         Ok(())
     }
 

@@ -3,12 +3,19 @@ use super::*;
 const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
 
 impl Materializer {
+    pub fn direct_repo_available(&self, repo: &RepoKey) -> bool {
+        self.repo_dir(repo).join("config").exists()
+    }
+
     pub async fn compare_upstream_refs(&self, repo: &RepoKey) -> CoreResult<UpstreamRefComparison> {
+        let started = Instant::now();
         let upstream_url = self.upstream_url(repo)?;
+        let ls_started = Instant::now();
         let ls = self
             .upstream_git(&upstream_url)?
             .ls_remote_heads(&upstream_url)
             .await?;
+        let ls_elapsed_ms = elapsed_ms(ls_started);
         let repo_dir = self.ensure_repo_dir(repo).await?;
 
         let mut changed: HashMap<String, String> = HashMap::new();
@@ -21,6 +28,15 @@ impl Materializer {
             }
         }
 
+        info!(
+            %repo,
+            refs_count = ls.refs.len(),
+            changed_count = changed.len(),
+            default_branch = ls.default_branch.as_deref().unwrap_or("<none>"),
+            ls_remote_elapsed_ms = ls_elapsed_ms,
+            elapsed_ms = elapsed_ms(started),
+            "compared upstream refs"
+        );
         Ok(UpstreamRefComparison {
             changed,
             default_branch: ls.default_branch,
@@ -31,16 +47,18 @@ impl Materializer {
     /// Fetch only the branches that changed (from compare_upstream_refs) and
     /// update serving refs.
     ///
-    /// Direct Git is a stateless serving path, not a materialization path:
-    /// it may fetch objects needed for the request, but it must not hydrate
-    /// durable generation bundles or publish new generation metadata while
-    /// satisfying upload-pack wants.
+    /// This is retained for explicit warming/background maintenance work.
+    /// Direct Git upload-pack POSTs must not call it: clone/fetch requests
+    /// should prove access, check local availability, and fail fast on cache
+    /// misses instead of importing pack data during the client request.
     pub async fn fetch_changed_refs(
         &self,
         repo: &RepoKey,
         comparison: &UpstreamRefComparison,
     ) -> CoreResult<()> {
+        let started = Instant::now();
         if comparison.changed.is_empty() {
+            info!(%repo, "direct git changed-ref fetch skipped: no changed refs");
             return Ok(());
         }
 
@@ -56,12 +74,15 @@ impl Materializer {
         }
 
         if !self.upstream_auth.is_authenticated() {
+            let restore_started = Instant::now();
+            let mut restored_count = 0usize;
             for (branch, _) in &validated {
                 if let Some(commit) = Box::pin(
                     self.restore_hot_upstream_ref_base_from_manifest(repo, &repo_dir, branch),
                 )
                 .await?
                 {
+                    restored_count += 1;
                     debug!(
                         %repo,
                         %branch,
@@ -70,6 +91,13 @@ impl Materializer {
                     );
                 }
             }
+            info!(
+                %repo,
+                changed_count = validated.len(),
+                restored_count,
+                elapsed_ms = elapsed_ms(restore_started),
+                "checked public ref manifests for direct git fetch negotiation"
+            );
         }
 
         let refspecs: Vec<String> = validated
@@ -78,10 +106,18 @@ impl Materializer {
             .collect();
 
         let _repo_lock = self.lock_repo(repo).await?;
+        let fetch_started = Instant::now();
         self.upstream_git(&upstream_url)?
             .fetch_refs(&repo_dir, &upstream_url, &refspecs)
             .await?;
+        info!(
+            %repo,
+            changed_count = validated.len(),
+            elapsed_ms = elapsed_ms(fetch_started),
+            "fetched changed refs from upstream"
+        );
 
+        let publish_started = Instant::now();
         for (branch_name, expected_commit) in &validated {
             let cache_ref = format!("refs/cache/upstream/heads/{branch_name}");
             let fetched_sha = match self.state.git.rev_parse(&repo_dir, &cache_ref).await {
@@ -127,6 +163,8 @@ impl Materializer {
         info!(
             %repo,
             changed_count = validated.len(),
+            publish_elapsed_ms = elapsed_ms(publish_started),
+            elapsed_ms = elapsed_ms(started),
             "fetched and published changed refs"
         );
 
@@ -138,6 +176,7 @@ impl Materializer {
     /// synthesize the pkt-line response directly, avoiding the need to
     /// materialise objects just for ls-remote.
     pub async fn upstream_refs(&self, repo: &RepoKey) -> CoreResult<UpstreamRefComparison> {
+        let started = Instant::now();
         self.validate_host(repo)?;
         let upstream_url = self.upstream_url(repo)?;
         let ls = self
@@ -145,10 +184,84 @@ impl Materializer {
             .ls_remote_heads(&upstream_url)
             .await?;
 
+        info!(
+            %repo,
+            refs_count = ls.refs.len(),
+            default_branch = ls.default_branch.as_deref().unwrap_or("<none>"),
+            elapsed_ms = elapsed_ms(started),
+            "fetched upstream refs for direct git advertisement"
+        );
         Ok(UpstreamRefComparison {
             changed: HashMap::new(),
             default_branch: ls.default_branch,
             all_upstream: ls.refs,
+        })
+    }
+
+    /// Convert an upstream access proof into the ref advertisement this cache
+    /// can actually serve without fetching.
+    ///
+    /// Direct Git GETs use upstream refs to prove that the repository is
+    /// reachable for the request, but the advertised commits must be local
+    /// and ready. Otherwise a fresh upstream tip can be advertised and then
+    /// rejected by the following upload-pack POST.
+    pub async fn locally_available_refs(
+        &self,
+        repo: &RepoKey,
+        upstream: &UpstreamRefComparison,
+    ) -> CoreResult<UpstreamRefComparison> {
+        let started = Instant::now();
+        let repo_dir = self.repo_dir(repo);
+        if !repo_dir.join("config").exists() {
+            return Err(Self::direct_git_repo_cache_miss(repo));
+        }
+
+        let upstream_branches: HashSet<&str> =
+            upstream.all_upstream.keys().map(String::as_str).collect();
+        let mut refs = HashMap::new();
+
+        for ref_prefix in ["refs/heads", "refs/cache/upstream/heads"] {
+            for (ref_name, commit) in self.state.git.for_each_ref(&repo_dir, ref_prefix).await? {
+                let Some(branch) = ref_name
+                    .strip_prefix("refs/heads/")
+                    .or_else(|| ref_name.strip_prefix("refs/cache/upstream/heads/"))
+                else {
+                    continue;
+                };
+                if !upstream_branches.contains(branch) || refs.contains_key(branch) {
+                    continue;
+                }
+                if self.commit_ready_for_serving(&repo_dir, &commit).await {
+                    refs.insert(branch.to_string(), commit.to_string());
+                }
+            }
+        }
+
+        if refs.is_empty() {
+            return Err(GitCacheError::UpstreamUnavailable(format!(
+                "repo `{repo}` has no locally available refs"
+            )));
+        }
+
+        let default_branch = upstream
+            .default_branch
+            .as_ref()
+            .filter(|branch| refs.contains_key(branch.as_str()))
+            .cloned();
+
+        info!(
+            %repo,
+            upstream_refs_count = upstream.all_upstream.len(),
+            advertised_refs_count = refs.len(),
+            default_branch = default_branch.as_deref().unwrap_or("<none>"),
+            elapsed_ms = elapsed_ms(started),
+            "selected locally available refs for direct git advertisement"
+        );
+
+        Ok(UpstreamRefComparison {
+            changed: HashMap::new(),
+            default_branch,
+            all_upstream: refs,
         })
     }
 
@@ -181,135 +294,73 @@ impl Materializer {
         Ok(())
     }
 
-    /// Ensure all wanted OIDs are available locally.
+    /// Ensure all wanted OIDs are locally ready after repo access is proven.
     ///
-    /// Repo-level auth is not enough to authorize arbitrary wants in the
-    /// shared cache. Direct Git POSTs first get a fresh upstream ref proof
-    /// using the request's effective auth, then fetch only from that proof if
-    /// local objects are missing or incomplete. Generation hydrate/publish
-    /// stays on the materialize path so upload-pack does not unexpectedly
-    /// import or verify multi-GB bundles.
+    /// Authorization is repo-scoped and must happen before this method is
+    /// called. This keeps direct Git aligned with the materialize policy: once
+    /// a caller can read a repo, object presence is an availability check, not
+    /// a second upstream authorization phase. The repo cache is scoped by
+    /// `RepoKey`; deployments that need stricter history isolation should use
+    /// separate upstream repositories for truly separate data.
+    ///
+    /// Direct Git remains a serving path. It must not fetch packs, hydrate
+    /// generation bundles, or publish new generations during upload-pack POST.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
-        let comparison = Box::pin(self.compare_upstream_refs(repo)).await?;
-        Box::pin(self.ensure_wants_available_from_comparison(repo, wants, &comparison)).await
+        Box::pin(self.ensure_wants_locally_ready(repo, wants)).await
     }
 
     pub(super) async fn ensure_wants_available_from_comparison(
         &self,
         repo: &RepoKey,
         wants: &[String],
-        comparison: &UpstreamRefComparison,
+        _comparison: &UpstreamRefComparison,
     ) -> CoreResult<()> {
-        let repo_dir = self.ensure_repo_dir(repo).await?;
+        Box::pin(self.ensure_wants_locally_ready(repo, wants)).await
+    }
 
-        let authorized_tips: HashSet<String> = comparison
-            .all_upstream
-            .values()
-            .map(|sha| sha.to_ascii_lowercase())
-            .collect();
-        let upstream_tips: Vec<CommitSha> = comparison
-            .all_upstream
-            .values()
-            .map(|sha| CommitSha::parse(sha.as_str()))
-            .collect::<CoreResult<_>>()?;
-        let upstream_url = self.upstream_url(repo)?;
-        let upstream_git = self.upstream_git(&upstream_url)?;
+    async fn ensure_wants_locally_ready(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
+        let started = Instant::now();
+        let repo_dir = self.repo_dir(repo);
+        if !repo_dir.join("config").exists() {
+            info!(%repo, "direct git repo missing from local cache");
+            return Err(Self::direct_git_repo_cache_miss(repo));
+        }
+
         let object_ids: Vec<CommitSha> = wants
             .iter()
             .map(|want_sha| CommitSha::parse(want_sha.as_str()))
             .collect::<CoreResult<_>>()?;
+        let object_count = object_ids.len();
+        let mut non_commit_wants = 0usize;
+        let mut served_commits = 0usize;
+        let object_types = self
+            .state
+            .git
+            .cat_file_batch_types(&repo_dir, &object_ids)
+            .await?;
 
         for object_id in object_ids {
-            let proven_by_advertisement = authorized_tips.contains(object_id.as_str());
-            if !proven_by_advertisement {
-                if !self.state.config.git_remote.commit_read_through {
-                    return Err(GitCacheError::Forbidden(format!(
-                        "object `{object_id}` is not authorized by the current upstream advertisement"
-                    )));
-                }
-
-                {
-                    let _repo_lock = self.lock_repo(repo).await?;
-                    let existed_before_fetch = self.object_exists(&repo_dir, &object_id).await;
-                    match upstream_git
-                        .fetch_object(&repo_dir, &upstream_url, &object_id)
-                        .await
-                    {
-                        Ok(_) if !existed_before_fetch => {}
-                        Ok(_) => {
-                            upstream_git
-                                .fetch_all_heads(&repo_dir, &upstream_url)
-                                .await?;
-                            if !self
-                                .object_reachable_from_upstream_tips(
-                                    &repo_dir,
-                                    &object_id,
-                                    &upstream_tips,
-                                )
-                                .await?
-                            {
-                                return self.unproven_want_error(&object_id, None);
-                            }
-                        }
-                        Err(err) => {
-                            upstream_git
-                                .fetch_all_heads(&repo_dir, &upstream_url)
-                                .await?;
-                            if !self
-                                .object_reachable_from_upstream_tips(
-                                    &repo_dir,
-                                    &object_id,
-                                    &upstream_tips,
-                                )
-                                .await?
-                            {
-                                return self.unproven_want_error(&object_id, Some(&err));
-                            }
-                        }
-                    }
-                }
-            } else if !self.object_exists(&repo_dir, &object_id).await
-                || (self.commit_exists(&repo_dir, &object_id).await
-                    && !self.commit_ready_for_serving(&repo_dir, &object_id).await)
-            {
-                self.fetch_refs_for_advertised_want(repo, comparison, &object_id)
-                    .await?;
-            }
-
-            let _repo_lock = self.lock_repo(repo).await?;
-            if !self.object_exists(&repo_dir, &object_id).await
-                || (self.commit_exists(&repo_dir, &object_id).await
-                    && !self.commit_ready_for_serving(&repo_dir, &object_id).await)
-            {
-                return Err(GitCacheError::NotFound(format!(
-                    "object `{object_id}` is authorized but unavailable locally"
-                )));
-            }
-
-            if !self.object_exists(&repo_dir, &object_id).await {
-                return Err(GitCacheError::NotFound(format!(
-                    "object `{object_id}` is authorized but unavailable locally"
-                )));
-            }
-
-            let object_types = self
-                .state
-                .git
-                .cat_file_batch_types(&repo_dir, std::slice::from_ref(&object_id))
-                .await?;
             let Some(object_type) = object_types.get(&object_id) else {
-                return Err(GitCacheError::NotFound(format!(
-                    "object `{object_id}` is authorized but unavailable locally"
-                )));
+                info!(
+                    %repo,
+                    want = %object_id,
+                    "direct git want missing from local cache after repo access proof"
+                );
+                return Err(Self::direct_git_cache_miss(&object_id));
             };
             if object_type != "commit" {
+                non_commit_wants += 1;
                 continue;
             }
+            served_commits += 1;
 
             if !self.commit_ready_for_serving(&repo_dir, &object_id).await {
-                return Err(GitCacheError::NotFound(format!(
-                    "commit `{object_id}` is incomplete after upstream fetch"
-                )));
+                info!(
+                    %repo,
+                    want = %object_id,
+                    "direct git commit want authorized but incomplete in local cache"
+                );
+                return Err(Self::direct_git_cache_miss(&object_id));
             }
 
             self.expose_served_commit(&repo_dir, &object_id).await?;
@@ -324,64 +375,27 @@ impl Materializer {
                 .await?;
         }
 
+        info!(
+            %repo,
+            wants_count = object_count,
+            non_commit_wants,
+            served_commits,
+            elapsed_ms = elapsed_ms(started),
+            "ensured direct git wants locally ready"
+        );
         Ok(())
     }
 
-    async fn fetch_refs_for_advertised_want(
-        &self,
-        repo: &RepoKey,
-        comparison: &UpstreamRefComparison,
-        object_id: &CommitSha,
-    ) -> CoreResult<()> {
-        let changed = comparison
-            .all_upstream
-            .iter()
-            .filter(|(_, sha)| sha.eq_ignore_ascii_case(object_id.as_str()))
-            .map(|(branch, sha)| (branch.clone(), sha.clone()))
-            .collect::<HashMap<_, _>>();
-        if changed.is_empty() {
-            return Ok(());
-        }
-
-        let wanted_comparison = UpstreamRefComparison {
-            changed,
-            default_branch: comparison.default_branch.clone(),
-            all_upstream: comparison.all_upstream.clone(),
-        };
-        self.fetch_changed_refs(repo, &wanted_comparison).await
+    fn direct_git_cache_miss(object_id: &CommitSha) -> GitCacheError {
+        GitCacheError::UpstreamUnavailable(format!(
+            "authorized object `{object_id}` is not available in the local cache"
+        ))
     }
 
-    pub(super) async fn object_reachable_from_upstream_tips(
-        &self,
-        repo_dir: &FsPath,
-        object_id: &CommitSha,
-        upstream_tips: &[CommitSha],
-    ) -> CoreResult<bool> {
-        Ok(self.object_exists(repo_dir, object_id).await
-            && self
-                .state
-                .git
-                .object_reachable_from_commits(repo_dir, object_id, upstream_tips)
-                .await?)
-    }
-
-    pub(super) fn unproven_want_error(
-        &self,
-        object_id: &CommitSha,
-        upstream_error: Option<&GitCacheError>,
-    ) -> CoreResult<()> {
-        let suffix = upstream_error
-            .map(|err| format!(": {err}"))
-            .unwrap_or_default();
-        if self.upstream_auth.is_authenticated() {
-            Err(GitCacheError::Forbidden(format!(
-                "object `{object_id}` is not authorized by upstream{suffix}"
-            )))
-        } else {
-            Err(GitCacheError::NotFound(format!(
-                "object `{object_id}` was not available from upstream{suffix}"
-            )))
-        }
+    fn direct_git_repo_cache_miss(repo: &RepoKey) -> GitCacheError {
+        GitCacheError::UpstreamUnavailable(format!(
+            "repo `{repo}` is not available in the local cache"
+        ))
     }
 
     /// Configure a bare repo for serving via the direct Git remote:
@@ -453,8 +467,16 @@ impl Materializer {
         body: &Bytes,
         comparison: Option<&UpstreamRefComparison>,
     ) -> CoreResult<UploadPackProcess> {
+        let started = Instant::now();
         let wants = parse_want_lines(body);
+        info!(
+            %repo,
+            wants_count = wants.len(),
+            cached_ref_proof = comparison.is_some(),
+            "direct git upload-pack preparation started"
+        );
         if !wants.is_empty() {
+            let ensure_started = Instant::now();
             match comparison {
                 Some(comparison) => {
                     Box::pin(self.ensure_wants_available_from_comparison(repo, &wants, comparison))
@@ -462,13 +484,44 @@ impl Materializer {
                 }
                 None => Box::pin(self.ensure_wants_available(repo, &wants)).await?,
             }
+            info!(
+                %repo,
+                wants_count = wants.len(),
+                elapsed_ms = elapsed_ms(ensure_started),
+                "direct git upload-pack wants prepared"
+            );
         }
-        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let repo_started = Instant::now();
+        let repo_dir = self.repo_dir(repo);
+        if !repo_dir.join("config").exists() {
+            info!(%repo, "direct git upload-pack repo missing from local cache");
+            return Err(Self::direct_git_repo_cache_miss(repo));
+        }
+        info!(
+            %repo,
+            elapsed_ms = elapsed_ms(repo_started),
+            "direct git upload-pack repo directory ready"
+        );
+        let configure_started = Instant::now();
         self.configure_served_repo(&repo_dir).await?;
-        self.state
+        info!(
+            %repo,
+            elapsed_ms = elapsed_ms(configure_started),
+            "direct git upload-pack repo configured"
+        );
+        let spawn_started = Instant::now();
+        let process = self
+            .state
             .git
             .upload_pack_spawn(&repo_dir, body.clone())
-            .await
+            .await?;
+        info!(
+            %repo,
+            spawn_elapsed_ms = elapsed_ms(spawn_started),
+            elapsed_ms = elapsed_ms(started),
+            "direct git upload-pack process ready"
+        );
+        Ok(process)
     }
 }
 

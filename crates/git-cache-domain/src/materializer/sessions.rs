@@ -30,7 +30,6 @@ impl Materializer {
             %commit,
             authenticated = access.is_authenticated(),
             ref_name = ?access.proof_ref_name(),
-            reachable_from = ?access.reachability_proof().map(|(selector, _)| selector),
             "creating session from repo access proof"
         );
         self.create_session_with_access(access, commit, source)
