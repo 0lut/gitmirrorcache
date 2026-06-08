@@ -371,8 +371,15 @@ async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
             .is_none(),
         "direct Git read-through should not publish generations synchronously"
     );
-    let manifest = wait_for_commit_manifest(&state, &fixture.repo, &commit).await;
-    wait_for_verified_generation(&state, &fixture.repo, manifest.generation).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        materializer
+            .get_commit_manifest(&fixture.repo, &commit)
+            .await
+            .unwrap()
+            .is_none(),
+        "direct Git read-through should trigger fsck, not generation publication"
+    );
 }
 
 #[tokio::test]

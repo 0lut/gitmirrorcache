@@ -4,9 +4,9 @@ const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
 const BLOBLESS_FETCH_FILTER: &str = "blob:none";
 
 #[cfg(test)]
-const DIRECT_GENERATION_PUBLISH_DELAY: StdDuration = StdDuration::from_millis(20);
+const DIRECT_FSCK_DELAY: StdDuration = StdDuration::from_millis(20);
 #[cfg(not(test))]
-const DIRECT_GENERATION_PUBLISH_DELAY: StdDuration = StdDuration::from_secs(30);
+const DIRECT_FSCK_DELAY: StdDuration = StdDuration::from_secs(30);
 
 enum DirectFetchedWantKind {
     Commit,
@@ -197,55 +197,43 @@ impl Materializer {
         }
         self.expose_served_commit(repo_dir, object_id).await?;
 
-        // Keep a hidden ref so async generation publication has a stable tip
-        // to bundle. The ref is hidden from clients by configure_served_repo.
+        // Keep a hidden ref so the fetched commit remains reachable in the
+        // shared bare repo. The ref is hidden from clients by
+        // configure_served_repo.
         let cache_ref = format!("refs/cache/commits/{object_id}");
         self.state
             .git
             .update_ref(repo_dir, &cache_ref, object_id.as_str())
             .await?;
 
-        self.enqueue_direct_generation_publish(
-            repo.clone(),
-            repo_dir.to_path_buf(),
-            object_id.clone(),
-        );
+        self.enqueue_direct_fsck(repo.clone(), repo_dir.to_path_buf(), object_id.clone());
         Ok(DirectFetchedWantKind::Commit)
     }
 
-    fn enqueue_direct_generation_publish(
-        &self,
-        repo: RepoKey,
-        repo_dir: PathBuf,
-        commit: CommitSha,
-    ) {
+    fn enqueue_direct_fsck(&self, repo: RepoKey, repo_dir: PathBuf, commit: CommitSha) {
         let materializer = self.clone();
         info!(
             %repo,
             %commit,
-            delay_ms = DIRECT_GENERATION_PUBLISH_DELAY.as_millis(),
-            "queued direct git background generation publish"
+            delay_ms = DIRECT_FSCK_DELAY.as_millis(),
+            "queued direct git background fsck"
         );
         tokio::spawn(async move {
-            tokio::time::sleep(DIRECT_GENERATION_PUBLISH_DELAY).await;
+            tokio::time::sleep(DIRECT_FSCK_DELAY).await;
             let started = Instant::now();
-            match materializer
-                .publish_generation(&repo, &repo_dir, &commit, None, false)
-                .await
-            {
-                Ok(generation) => info!(
+            match materializer.state.git.fsck(&repo_dir).await {
+                Ok(_) => info!(
                     %repo,
                     %commit,
-                    %generation,
                     elapsed_ms = elapsed_ms(started),
-                    "direct git background generation publish finished"
+                    "direct git background fsck finished"
                 ),
                 Err(err) => warn!(
                     %repo,
                     %commit,
                     %err,
                     elapsed_ms = elapsed_ms(started),
-                    "direct git background generation publish failed"
+                    "direct git background fsck failed"
                 ),
             }
         });
