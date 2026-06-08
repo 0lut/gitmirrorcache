@@ -143,7 +143,6 @@ class GitRemotePublicRepoTest(unittest.TestCase):
         config_path.write_text(
             f"""\
 bind_addr = "127.0.0.1:{cls.port}"
-public_base_url = "{cls.base_url}"
 cache_root = "{cls.cache_root}"
 git_timeout_seconds = 1200
 max_git_output_bytes = 1073741824
@@ -157,7 +156,6 @@ min_free_bytes = 0
 
 [git_remote]
 enabled = true
-branch_ref_check = "always"
 commit_read_through = true
 """
         )

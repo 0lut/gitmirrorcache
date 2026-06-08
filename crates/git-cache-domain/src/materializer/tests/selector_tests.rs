@@ -10,7 +10,6 @@ async fn cached_exact_commit_requires_repo_access_when_upstream_is_offline() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -36,7 +35,6 @@ async fn cached_exact_commit_requires_repo_access_when_upstream_is_offline() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(branch_response.commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -58,7 +56,6 @@ async fn authenticated_exact_commit_materialize_uses_repo_access_without_reachab
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(head.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: git_cache_core::UpstreamAuthorizationMode::Required,
         })
         .await
@@ -84,7 +81,6 @@ async fn authenticated_exact_commit_resolve_uses_repo_access_without_reachable_f
         .resolve(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(head.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: git_cache_core::UpstreamAuthorizationMode::Required,
         })
         .await
@@ -110,7 +106,6 @@ async fn short_commit_resolve_returns_lightweight_response() {
         .resolve(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::ShortCommit(short),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -133,7 +128,6 @@ async fn short_commit_selector_resolves_to_full_commit_from_upstream() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::ShortCommit(short),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -154,7 +148,6 @@ async fn short_commit_selector_revalidates_even_when_commit_is_cached() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -165,7 +158,6 @@ async fn short_commit_selector_revalidates_even_when_commit_is_cached() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::ShortCommit(short),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -185,7 +177,6 @@ async fn short_commit_selector_requires_upstream_even_when_cached() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -202,7 +193,6 @@ async fn short_commit_selector_requires_upstream_even_when_cached() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::ShortCommit(short),
-            mode: RequestMode::Cached,
             upstream_authorization: Default::default(),
         })
         .await
@@ -221,7 +211,6 @@ async fn unknown_short_commit_returns_not_found_after_upstream_check() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::ShortCommit(ShortCommitSha::parse("deadbeef").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -231,7 +220,7 @@ async fn unknown_short_commit_returns_not_found_after_upstream_check() {
 }
 
 #[tokio::test]
-async fn branch_and_default_selectors_require_upstream_for_all_modes() {
+async fn branch_and_default_selectors_require_upstream() {
     let fixture = GitFixture::new();
     let state = fixture.state();
     let materializer = Materializer::new(Arc::new(state));
@@ -240,7 +229,6 @@ async fn branch_and_default_selectors_require_upstream_for_all_modes() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::DefaultBranch,
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -256,19 +244,6 @@ async fn branch_and_default_selectors_require_upstream_for_all_modes() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
-            upstream_authorization: Default::default(),
-        })
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, GitCacheError::UpstreamUnavailable(_)));
-
-    let error = materializer
-        .materialize(MaterializeRequest {
-            repo: fixture.repo.clone(),
-            selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Cached,
             upstream_authorization: Default::default(),
         })
         .await
@@ -280,7 +255,6 @@ async fn branch_and_default_selectors_require_upstream_for_all_modes() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::DefaultBranch,
-            mode: RequestMode::Cached,
             upstream_authorization: Default::default(),
         })
         .await
@@ -299,7 +273,6 @@ async fn force_push_updates_branch_manifest_without_removing_old_commit() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -310,7 +283,6 @@ async fn force_push_updates_branch_manifest_without_removing_old_commit() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -332,7 +304,6 @@ async fn short_commit_selector_rejects_unreachable_stale_local_commit() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -344,7 +315,6 @@ async fn short_commit_selector_rejects_unreachable_stale_local_commit() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::ShortCommit(stale_short),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await

@@ -3,8 +3,9 @@
 //! These tests spin up a real Axum server with a local upstream, run actual
 //! `git clone` / `git fetch` commands against it, and verify the results.
 
+mod support;
+
 use git_cache_api::app;
-use git_cache_core::{AppConfig, GitRemoteConfig, ObjectStoreConfig};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,32 +49,7 @@ impl TestServer {
         run_git(&upstream_work, &["push", "origin", "main"]);
         run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
-        let config = AppConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            public_base_url: "http://127.0.0.1:0".into(),
-            cache_root: tmp.path().join("cache"),
-            upstream_root: Some(tmp.path().join("upstreams")),
-            git_binary: PathBuf::from("git"),
-            git_timeout_seconds: 120,
-            max_git_output_bytes: 64 * 1024 * 1024,
-            object_store: ObjectStoreConfig::Local {
-                root: tmp.path().join("objects"),
-            },
-            upstream_auth_token_env: None,
-            rate_limit_per_minute: 0,
-            allowed_upstream_hosts: vec!["github.com".into()],
-            disk: git_cache_core::DiskConfig {
-                quota_bytes: 1024 * 1024 * 1024,
-                min_free_bytes: 0,
-            },
-            git_remote: GitRemoteConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            compaction: Default::default(),
-            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            max_concurrent_generation_verifications: 1,
-        };
+        let config = support::test_config("127.0.0.1:0".parse().unwrap(), tmp.path());
 
         let router = app(config);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

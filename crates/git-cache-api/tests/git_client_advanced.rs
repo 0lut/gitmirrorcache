@@ -4,8 +4,9 @@
 //! ls-remote behavior, unsupported operations, URL normalization,
 //! branch deletion, binary files, empty repos, and large commit messages.
 
+mod support;
+
 use git_cache_api::app;
-use git_cache_core::{AppConfig, GitRemoteConfig, ObjectStoreConfig};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,32 +53,7 @@ impl TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let config = AppConfig {
-            bind_addr: addr,
-            public_base_url: format!("http://{addr}"),
-            cache_root: tmp.path().join("cache"),
-            upstream_root: Some(tmp.path().join("upstreams")),
-            git_binary: PathBuf::from("git"),
-            git_timeout_seconds: 120,
-            max_git_output_bytes: 64 * 1024 * 1024,
-            object_store: ObjectStoreConfig::Local {
-                root: tmp.path().join("objects"),
-            },
-            upstream_auth_token_env: None,
-            rate_limit_per_minute: 0,
-            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            max_concurrent_generation_verifications: 1,
-            allowed_upstream_hosts: vec!["github.com".into()],
-            disk: git_cache_core::DiskConfig {
-                quota_bytes: 1024 * 1024 * 1024,
-                min_free_bytes: 0,
-            },
-            git_remote: GitRemoteConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            compaction: Default::default(),
-        };
+        let config = support::test_config(addr, tmp.path());
 
         let router = app(config);
 

@@ -10,7 +10,6 @@ async fn publish_generation_links_delta_to_previous_generation() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -25,7 +24,6 @@ async fn publish_generation_links_delta_to_previous_generation() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -53,7 +51,6 @@ async fn pending_generation_verifies_from_local_repo_without_parent_bundle() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -141,7 +138,6 @@ async fn hydrate_commit_restores_parent_generation_chain_from_cold_cache() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -151,7 +147,6 @@ async fn hydrate_commit_restores_parent_generation_chain_from_cold_cache() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -164,7 +159,6 @@ async fn hydrate_commit_restores_parent_generation_chain_from_cold_cache() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(second_commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -191,7 +185,6 @@ async fn exact_ancestor_in_known_generation_indexes_without_new_bundle() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -212,7 +205,6 @@ async fn exact_ancestor_in_known_generation_indexes_without_new_bundle() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(ancestor_commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -245,7 +237,6 @@ async fn exact_ancestor_hydrates_generation_before_broad_upstream_fetch() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -265,7 +256,6 @@ async fn exact_ancestor_hydrates_generation_before_broad_upstream_fetch() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(ancestor_commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -298,7 +288,6 @@ async fn exact_ancestor_missing_generation_bundle_falls_back_to_upstream_fetch()
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -317,7 +306,6 @@ async fn exact_ancestor_missing_generation_bundle_falls_back_to_upstream_fetch()
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(ancestor_commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -344,7 +332,6 @@ async fn exact_ancestor_uses_local_cache_refs_when_generation_head_is_stale() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -372,7 +359,6 @@ async fn exact_ancestor_uses_local_cache_refs_when_generation_head_is_stale() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(ancestor_commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -402,7 +388,6 @@ async fn exact_descendants_after_cold_ancestor_fetch_reuse_full_bundle() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(tip_2.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -417,7 +402,6 @@ async fn exact_descendants_after_cold_ancestor_fetch_reuse_full_bundle() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(tip_1.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -433,7 +417,6 @@ async fn exact_descendants_after_cold_ancestor_fetch_reuse_full_bundle() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(tip.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -456,7 +439,6 @@ async fn exact_commit_ahead_of_known_generation_publishes_incremental_bundle() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -468,7 +450,6 @@ async fn exact_commit_ahead_of_known_generation_publishes_incremental_bundle() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(second_commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -497,7 +478,6 @@ async fn delta_publish_falls_back_to_full_bundle_when_previous_tip_is_missing_lo
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -518,7 +498,6 @@ async fn delta_publish_falls_back_to_full_bundle_when_previous_tip_is_missing_lo
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(second_commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -596,7 +575,6 @@ async fn compact_generation_chain_replaces_long_chain_with_single_root() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -607,7 +585,6 @@ async fn compact_generation_chain_replaces_long_chain_with_single_root() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -620,7 +597,6 @@ async fn compact_generation_chain_replaces_long_chain_with_single_root() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -631,7 +607,6 @@ async fn compact_generation_chain_replaces_long_chain_with_single_root() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("default").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -707,7 +682,6 @@ async fn compact_generation_chain_replaces_long_chain_with_single_root() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(third_commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -739,7 +713,6 @@ async fn inline_compaction_runs_after_verified_head_update() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -752,7 +725,6 @@ async fn inline_compaction_runs_after_verified_head_update() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -765,7 +737,6 @@ async fn inline_compaction_runs_after_verified_head_update() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -833,7 +804,6 @@ async fn compaction_preserves_parents_needed_by_pending_generation_verification(
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -843,7 +813,6 @@ async fn compaction_preserves_parents_needed_by_pending_generation_verification(
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -856,7 +825,6 @@ async fn compaction_preserves_parents_needed_by_pending_generation_verification(
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await

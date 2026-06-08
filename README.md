@@ -30,7 +30,7 @@ The local config expects fake upstream bare repositories under `./tmp/upstreams/
 ```sh
 curl -s http://127.0.0.1:8080/v1/materialize \
   -H 'content-type: application/json' \
-  -d '{"repo":"github.com/org/repo","selector":{"branch":"main"},"mode":"strict"}'
+  -d '{"repo":"github.com/org/repo","selector":{"branch":"main"}}'
 ```
 
 The response contains the verified commit, source, and timestamp. When the

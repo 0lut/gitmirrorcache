@@ -32,7 +32,7 @@ GIT_CACHE_CONFIG=config/local.example.toml cargo run -p git-cache-api
 ```sh
 curl -s http://127.0.0.1:8080/v1/materialize \
   -H 'content-type: application/json' \
-  -d '{"repo":"github.com/acme/widgets","selector":{"branch":"main"},"mode":"strict"}'
+  -d '{"repo":"github.com/acme/widgets","selector":{"branch":"main"}}'
 ```
 
 Strict branch and default-branch materialization require the fake upstream to be reachable. Exact commit materialization uses cached manifests first.
@@ -46,7 +46,7 @@ Strict branch and default-branch materialization require the fake upstream to be
 ```sh
 curl -s http://127.0.0.1:8080/v1/materialize \
   -H 'content-type: application/json' \
-  -d '{"repo":"github.com/acme/widgets","selector":{"commit":"<sha>"},"mode":"strict"}'
+  -d '{"repo":"github.com/acme/widgets","selector":{"commit":"<sha>"}}'
 ```
 
 The response should report `cache_verified`.

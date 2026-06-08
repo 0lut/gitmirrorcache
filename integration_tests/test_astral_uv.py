@@ -121,7 +121,6 @@ class AstralUvIntegrationTest(unittest.TestCase):
             config_path.write_text(
                 f"""\
 bind_addr = "127.0.0.1:{cls.port}"
-public_base_url = "{cls.base_url}"
 cache_root = "{cls.cache_root}"
 git_timeout_seconds = 600
 max_git_output_bytes = {512 * 1024 * 1024}
@@ -135,7 +134,6 @@ min_free_bytes = 0
 
 [git_remote]
 enabled = true
-branch_ref_check = "always"
 commit_read_through = true
 """
             )
@@ -156,7 +154,6 @@ commit_read_through = true
         env.update(
             {
                 "GIT_CACHE_BIND_ADDR": f"127.0.0.1:{cls.port}",
-                "GIT_CACHE_PUBLIC_BASE_URL": cls.base_url,
                 "GIT_CACHE_ROOT": str(cls.cache_root),
                 "GIT_CACHE_OBJECT_STORE_ROOT": str(cls.object_root),
                 "GIT_CACHE_GIT_TIMEOUT_SECONDS": "600",
@@ -232,12 +229,11 @@ commit_read_through = true
             f"expected MinIO cached objects to include a bundle, got: {objects}",
         )
 
-    def materialize(self, selector: dict[str, object], mode: str = "strict") -> dict[str, object]:
+    def materialize(self, selector: dict[str, object]) -> dict[str, object]:
         body = json.dumps(
             {
                 "repo": self.repo,
                 "selector": selector,
-                "mode": mode,
             }
         ).encode()
         request = urllib.request.Request(

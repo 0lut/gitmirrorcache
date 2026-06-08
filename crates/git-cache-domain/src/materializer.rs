@@ -2,8 +2,6 @@ use crate::state::AppState;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-#[cfg(test)]
-use git_cache_core::RequestMode;
 use git_cache_core::{
     BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest, GitCacheError,
     MaterializeRequest, MaterializeResponse, MaterializeSource, RefManifest, RepoGenerationHead,
