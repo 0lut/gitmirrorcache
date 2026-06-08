@@ -183,6 +183,22 @@ async fn metrics_returns_expected_counter_names() {
     }
 }
 
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        panic!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn metrics_content_type_is_text_plain() {
     let server = TestServer::start().await;
@@ -353,6 +369,34 @@ async fn resolve_with_valid_branch_returns_lightweight_response() {
     assert!(body["commit"].is_string());
     assert!(body["cache_available"].is_boolean());
     assert!(body["authorized_at"].is_string());
+    assert!(
+        body.get("git_url").is_none(),
+        "resolve should not return a Git remote URL"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_short_commit_returns_lightweight_response() {
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+    let commit = git_stdout(&server.upstream_bare, &["rev-parse", "HEAD"]);
+    let short_commit = &commit[..12];
+
+    let resp = client
+        .post(server.resolve_url())
+        .json(&serde_json::json!({
+            "repo": "github.com/org/repo",
+            "selector": {"short_commit": short_commit}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["repo"], "github.com/org/repo");
+    assert_eq!(body["commit"], commit);
+    assert_eq!(body["cache_available"], true);
     assert!(
         body.get("git_url").is_none(),
         "resolve should not return a Git remote URL"

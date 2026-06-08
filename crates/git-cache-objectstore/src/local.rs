@@ -160,16 +160,17 @@ impl LocalObjectStore {
             Err(err) => return Err(err.into()),
         };
         match lock_owner_pid(&contents) {
-            Some(pid) if process_is_alive(pid) => return Ok(()),
-            Some(_) => {}
+            Some(pid) => match process_is_alive(pid) {
+                Some(true) => return Ok(()),
+                Some(false) => {}
+                None => {
+                    if !stale_lock_age_elapsed(&contents, lock_path)? {
+                        return Ok(());
+                    }
+                }
+            },
             None => {
-                let created_at_ms = lock_created_at_unix_millis(&contents)
-                    .or_else(|| lock_file_modified_unix_millis(lock_path).ok().flatten());
-                let Some(created_at_ms) = created_at_ms else {
-                    return Ok(());
-                };
-                let age_ms = now_unix_millis().saturating_sub(created_at_ms);
-                if age_ms < LOCAL_PIDLESS_LOCK_STALE_AFTER.as_millis() {
+                if !stale_lock_age_elapsed(&contents, lock_path)? {
                     return Ok(());
                 }
             }
@@ -181,6 +182,16 @@ impl LocalObjectStore {
         }
         Ok(())
     }
+}
+
+fn stale_lock_age_elapsed(contents: &str, lock_path: &Path) -> Result<bool> {
+    let created_at_ms = lock_created_at_unix_millis(contents)
+        .or_else(|| lock_file_modified_unix_millis(lock_path).ok().flatten());
+    let Some(created_at_ms) = created_at_ms else {
+        return Ok(false);
+    };
+    let age_ms = now_unix_millis().saturating_sub(created_at_ms);
+    Ok(age_ms >= LOCAL_PIDLESS_LOCK_STALE_AFTER.as_millis())
 }
 
 #[async_trait]
@@ -491,15 +502,15 @@ fn lock_file_modified_unix_millis(path: &Path) -> Result<Option<u128>> {
         .map(|duration| duration.as_millis()))
 }
 
-fn process_is_alive(pid: u32) -> bool {
+fn process_is_alive(pid: u32) -> Option<bool> {
     if pid == std::process::id() {
-        return true;
+        return Some(true);
     }
     let proc_root = std::path::Path::new("/proc");
     if !proc_root.exists() {
-        return true;
+        return None;
     }
-    proc_root.join(pid.to_string()).exists()
+    Some(proc_root.join(pid.to_string()).exists())
 }
 
 fn hex_key(key: &str) -> String {
@@ -592,5 +603,45 @@ mod tests {
         store.recover_stale_lock(&lock_path).await.unwrap();
 
         assert!(!fs::try_exists(&lock_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pid_lock_with_unknown_liveness_keeps_fresh_age() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        let lock_path = store.lock_path("repos/example/object").unwrap();
+        fs::create_dir_all(lock_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(
+            &lock_path,
+            format!("pid=123456\ncreated_at_unix_ms={}\n", now_unix_millis()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!stale_lock_age_elapsed(
+            &fs::read_to_string(&lock_path).await.unwrap(),
+            &lock_path
+        )
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn pid_lock_with_unknown_liveness_reclaims_stale_age() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        let lock_path = store.lock_path("repos/example/object").unwrap();
+        fs::create_dir_all(lock_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&lock_path, "pid=123456\ncreated_at_unix_ms=1\n")
+            .await
+            .unwrap();
+
+        assert!(
+            stale_lock_age_elapsed(&fs::read_to_string(&lock_path).await.unwrap(), &lock_path)
+                .unwrap()
+        );
     }
 }

@@ -291,8 +291,9 @@ impl Materializer {
         }
 
         let head_started = Instant::now();
-        let previous_head = if use_previous_head {
+        let (previous_head, expected_head_generation) = if use_previous_head {
             let previous_head = self.manifests().repo_head(repo).await?;
+            let expected_head_generation = previous_head.as_ref().map(|head| head.generation);
             info!(
                 %repo,
                 previous_generation = previous_head.as_ref().map(|head| head.generation.to_string()).unwrap_or_else(|| "<none>".into()),
@@ -300,14 +301,17 @@ impl Materializer {
                 elapsed_ms = elapsed_ms(head_started),
                 "loaded repo generation head"
             );
-            previous_head
+            (previous_head, expected_head_generation)
         } else {
+            let expected_head = self.manifests().repo_head(repo).await?;
+            let expected_head_generation = expected_head.as_ref().map(|head| head.generation);
             info!(
                 %repo,
+                expected_generation = expected_head_generation.map(|generation| generation.to_string()).unwrap_or_else(|| "<none>".into()),
                 elapsed_ms = elapsed_ms(head_started),
-                "skipped repo generation head for standalone generation publish"
+                "loaded repo generation head only for standalone publish CAS"
             );
-            None
+            (None, expected_head_generation)
         };
         let previous_generation = previous_head.as_ref().map(|head| head.generation);
         let previous_tips = previous_head
@@ -467,8 +471,13 @@ impl Materializer {
                 .with_verification(verification)
                 .publish_bundle_file(&*self.state.store, &bundle_path)
                 .await?;
-            self.finish_verified_generation_publish(repo, &head, default_ref_for_verified)
-                .await?;
+            self.finish_verified_generation_head_publish(
+                repo,
+                &head,
+                expected_head_generation,
+                default_ref_for_verified,
+            )
+            .await?;
             info!(
                 %repo,
                 %generation,
@@ -481,7 +490,7 @@ impl Materializer {
                     &*self.state.store,
                     &bundle_path,
                     head,
-                    previous_generation,
+                    expected_head_generation,
                     default_ref,
                 )
                 .await?;
@@ -646,10 +655,9 @@ impl Materializer {
         if let Some(verification) =
             Box::pin(self.verify_generation_from_local_repo(&repo, generation, &pending)).await?
         {
-            Box::pin(self.publish_verified_pending_generation(
+            Box::pin(self.publish_verified_pending_generation_with_lease(
                 &repo,
                 generation,
-                pending,
                 verification,
             ))
             .await?;
@@ -752,10 +760,9 @@ impl Materializer {
                 "verification for generation `{generation}` was not produced"
             ))
         })?;
-        Box::pin(self.publish_verified_pending_generation(
+        Box::pin(self.publish_verified_pending_generation_with_lease(
             &repo,
             generation,
-            pending,
             verification,
         ))
         .await?;
@@ -917,26 +924,57 @@ impl Materializer {
         )))
     }
 
-    async fn finish_verified_generation_publish(
+    async fn finish_verified_generation_head_publish(
         &self,
         repo: &RepoKey,
         head: &RepoGenerationHead,
+        expected_head: Option<GenerationId>,
         default_ref: Option<RefManifest>,
     ) -> CoreResult<()> {
         self.verify_lease_held(repo).await?;
+        let advanced =
+            advance_generation_head(&*self.state.store, expected_head, None, head).await?;
+        if !advanced {
+            return Err(GitCacheError::CasConflict(format!(
+                "generation head for `{repo}` changed before generation `{}` promotion",
+                head.generation
+            )));
+        }
         if let Some(default_ref) = default_ref {
             self.manifests()
                 .write_default_ref(repo, &default_ref)
                 .await?;
         }
+        Ok(())
+    }
 
-        let current_head = self.manifests().repo_head(repo).await?;
-        if current_head
-            .as_ref()
-            .map(|current| current.updated_at <= head.updated_at)
-            .unwrap_or(true)
-        {
-            self.manifests().write_repo_head(head).await?;
+    async fn finish_verified_generation_publish(
+        &self,
+        repo: &RepoKey,
+        pending: &PendingGenerationPublish,
+    ) -> CoreResult<()> {
+        self.verify_lease_held(repo).await?;
+        let advanced = advance_generation_head(
+            &*self.state.store,
+            pending.expected_head,
+            None,
+            &pending.head,
+        )
+        .await?;
+        if !advanced {
+            return Err(GitCacheError::CasConflict(format!(
+                "generation head for `{repo}` changed before pending generation `{}` promotion",
+                pending.generation.generation
+            )));
+        }
+        self.verify_lease_held(repo).await?;
+        for ref_manifest in &pending.manifests.refs {
+            self.manifests().write_ref(ref_manifest).await?;
+        }
+        if let Some(default_ref) = &pending.default_ref {
+            self.manifests()
+                .write_default_ref(repo, default_ref)
+                .await?;
         }
         Ok(())
     }
@@ -949,12 +987,9 @@ impl Materializer {
         verification: VerifiedGenerationManifest,
     ) -> CoreResult<()> {
         self.verify_lease_held(repo).await?;
-        GenerationPublish::with_manifests(pending.generation.clone(), pending.manifests.clone())
-            .with_verification(verification)
-            .publish_verified_metadata(&*self.state.store)
+        self.write_verified_pending_metadata_without_refs(&pending, &verification)
             .await?;
-
-        self.finish_verified_generation_publish(repo, &pending.head, pending.default_ref)
+        self.finish_verified_generation_publish(repo, &pending)
             .await?;
         if let Err(err) = self
             .state
@@ -963,6 +998,79 @@ impl Materializer {
             .await
         {
             warn!(%repo, %generation, %err, "failed to delete pending generation publish");
+        }
+        Ok(())
+    }
+
+    async fn publish_verified_pending_generation_with_lease(
+        &self,
+        repo: &RepoKey,
+        generation: GenerationId,
+        verification: VerifiedGenerationManifest,
+    ) -> CoreResult<()> {
+        if self.lease_token.is_some() {
+            let Some(pending) = self
+                .manifests()
+                .pending_generation(repo, generation)
+                .await?
+            else {
+                return Ok(());
+            };
+            return self
+                .publish_verified_pending_generation(repo, generation, pending, verification)
+                .await;
+        }
+
+        let lease = self.acquire_repo_write_lease(repo).await?;
+        let token = lease.token().to_string();
+        let materializer = self.with_repo_write_token(token);
+        let result = async {
+            let Some(pending) = materializer
+                .manifests()
+                .pending_generation(repo, generation)
+                .await?
+            else {
+                return Ok(());
+            };
+            materializer
+                .publish_verified_pending_generation(repo, generation, pending, verification)
+                .await
+        }
+        .await;
+        let release_result = lease.release().await;
+        match (result, release_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Err(err), Err(release_err)) => {
+                warn!(%repo, %generation, %release_err, "failed to release repo lease after pending generation verification error");
+                Err(err)
+            }
+        }
+    }
+
+    async fn write_verified_pending_metadata_without_refs(
+        &self,
+        pending: &PendingGenerationPublish,
+        verification: &VerifiedGenerationManifest,
+    ) -> CoreResult<()> {
+        if !self
+            .state
+            .store
+            .exists(&pending.generation.bundle_key)
+            .await?
+        {
+            return Err(GitCacheError::NotFound(format!(
+                "bundle `{}` not found",
+                pending.generation.bundle_key
+            )));
+        }
+        write_verified_generation_manifest_if_absent_or_matches(&*self.state.store, verification)
+            .await?;
+        write_generation_manifest_if_absent_or_matches(&*self.state.store, &pending.generation)
+            .await?;
+        for manifest in &pending.manifests.commits {
+            write_commit_manifest_if_absent_or_matches(&*self.state.store, manifest).await?;
         }
         Ok(())
     }
@@ -1013,7 +1121,10 @@ impl Materializer {
         repo: &RepoKey,
     ) -> CoreResult<Option<CompactionReport>> {
         let threshold = self.state.config.compaction.chain_depth_threshold as usize;
-        Box::pin(self.compact_generation_chain_inner(repo, threshold, false)).await
+        if self.lease_token.is_some() {
+            return Box::pin(self.compact_generation_chain_inner(repo, threshold, false)).await;
+        }
+        Box::pin(self.compact_generation_chain_with_lease(repo, threshold)).await
     }
 
     pub async fn compact_generation_chain_dry_run(
@@ -1100,6 +1211,17 @@ impl Materializer {
             .await?;
 
         self.verify_lease_held(repo).await?;
+        let Some(current_head) = self.manifests().repo_head(repo).await? else {
+            return Err(GitCacheError::CasConflict(format!(
+                "generation head for `{repo}` disappeared during compaction"
+            )));
+        };
+        if current_head.generation != new_generation {
+            return Err(GitCacheError::CasConflict(format!(
+                "generation head for `{repo}` moved from compacted generation `{new_generation}` to `{}`",
+                current_head.generation
+            )));
+        }
         self.repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)
             .await?;
         for commit in commits {
@@ -1112,7 +1234,14 @@ impl Materializer {
             };
             self.manifests().write_commit(&manifest).await?;
         }
-        self.manifests().write_repo_head(&new_head).await?;
+        let advanced =
+            advance_generation_head(&*self.state.store, Some(new_generation), None, &new_head)
+                .await?;
+        if !advanced {
+            return Err(GitCacheError::CasConflict(format!(
+                "generation head for `{repo}` changed during compaction cleanup"
+            )));
+        }
         let retained_generations = self
             .old_generations_needed_by_pending_publishes(repo, &old_generation_set)
             .await?;
@@ -1136,6 +1265,28 @@ impl Materializer {
             new_generation,
             bytes_reclaimed,
         }))
+    }
+
+    async fn compact_generation_chain_with_lease(
+        &self,
+        repo: &RepoKey,
+        threshold: usize,
+    ) -> CoreResult<Option<CompactionReport>> {
+        let lease = self.acquire_repo_write_lease(repo).await?;
+        let token = lease.token().to_string();
+        let materializer = self.with_repo_write_token(token);
+        let result =
+            Box::pin(materializer.compact_generation_chain_inner(repo, threshold, false)).await;
+        let release_result = lease.release().await;
+        match (result, release_result) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), Err(release_err)) => {
+                warn!(%repo, %release_err, "failed to release repo lease after compaction error");
+                Err(err)
+            }
+        }
     }
 
     pub(super) async fn generation_chain(

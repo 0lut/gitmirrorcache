@@ -823,7 +823,7 @@ async fn inline_compaction_runs_after_verified_head_update() {
 }
 
 #[tokio::test]
-async fn compaction_preserves_parents_needed_by_pending_generation_verification() {
+async fn stale_pending_generation_fails_head_cas_after_compaction() {
     let fixture = GitFixture::new();
     let config = AppConfig {
         compaction: git_cache_core::CompactionConfig {
@@ -940,10 +940,27 @@ async fn compaction_preserves_parents_needed_by_pending_generation_verification(
         .unwrap();
     assert!(report.old_generations.contains(&parent_head.generation));
 
-    materializer
+    let result = materializer
         .verify_generation_with_semaphore(fixture.repo.clone(), child_generation, false)
+        .await;
+    assert!(matches!(result, Err(GitCacheError::CasConflict(_))));
+    assert!(
+        read_pending_generation_publish(&*state.store, &fixture.repo, child_generation)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        read_verified_generation_manifest(&*state.store, &fixture.repo, child_generation)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let head = read_repo_generation_head(&*state.store, &fixture.repo)
         .await
-        .expect("pending generation should verify after parent chain compaction");
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.generation, report.new_generation);
 }
 
 // ── upstream_url tests ───────────────────────────────────────────

@@ -57,9 +57,41 @@ impl Materializer {
         Box::pin(self.resolve_plan(plan)).await
     }
 
-    async fn plan_materialize(&self, request: MaterializeRequest) -> CoreResult<MaterializePlan> {
+    pub fn validate_materialize_request(&self, request: &MaterializeRequest) -> CoreResult<()> {
         self.validate_host(&request.repo)?;
-        self.ensure_request_auth_allowed(&request)?;
+        self.ensure_request_auth_allowed(request)
+    }
+
+    pub async fn materialize_complete_cache_hit(
+        &self,
+        request: &MaterializeRequest,
+    ) -> CoreResult<Option<MaterializeResponse>> {
+        self.validate_materialize_request(request)?;
+        let commit = match &request.selector {
+            Selector::Commit(commit) | Selector::CommitReachableFrom { commit, .. } => commit,
+            Selector::ShortCommit(_) | Selector::Branch(_) | Selector::DefaultBranch => {
+                return Ok(None);
+            }
+        };
+
+        let Some(manifest) = self.get_commit_manifest(&request.repo, commit).await? else {
+            return Ok(None);
+        };
+        if !manifest.complete {
+            return Ok(None);
+        }
+
+        self.hydrate_commit(&manifest).await?;
+        let access = self.access_for_commit(request.repo.clone(), commit.clone());
+        Ok(Some(self.materialize_response(
+            request.repo.clone(),
+            commit.clone(),
+            Self::source_for_access(&access, MaterializeSource::CacheVerified),
+        )))
+    }
+
+    async fn plan_materialize(&self, request: MaterializeRequest) -> CoreResult<MaterializePlan> {
+        self.validate_materialize_request(&request)?;
         self.plan_materialize_target(request).await
     }
 
@@ -147,8 +179,7 @@ impl Materializer {
     }
 
     async fn plan_resolve(&self, request: MaterializeRequest) -> CoreResult<ResolvePlan> {
-        self.validate_host(&request.repo)?;
-        self.ensure_request_auth_allowed(&request)?;
+        self.validate_materialize_request(&request)?;
 
         let selector = request.selector.clone();
         match selector.clone() {

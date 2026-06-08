@@ -13,14 +13,18 @@ use git_cache_core::{
 use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateResult, UpdateTarget};
 use git_cache_disk::RepoLock;
 pub use git_cache_git::UploadPackProcess;
+#[cfg(test)]
+use git_cache_objectstore::write_repo_generation_head;
 use git_cache_objectstore::{
-    generation_manifest_key, pending_generation_publish_key, read_commit_manifest,
-    read_generation_manifest, read_json, read_lease_with_version, read_pending_generation_publish,
-    read_repo_generation_head, read_verified_generation_manifest, verified_generation_manifest_key,
-    write_commit_manifest, write_json, write_ref_manifest, write_repo_generation_head,
-    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish,
-    PendingGenerationPublish, PublishManifests,
+    advance_generation_head, generation_manifest_key, pending_generation_publish_key,
+    read_commit_manifest, read_generation_manifest, read_json, read_lease_with_version,
+    read_pending_generation_publish, read_repo_generation_head, read_verified_generation_manifest,
+    verified_generation_manifest_key, write_commit_manifest,
+    write_commit_manifest_if_absent_or_matches, write_generation_manifest_if_absent_or_matches,
+    write_json, write_ref_manifest, write_verified_generation_manifest_if_absent_or_matches,
+    GenerationPublish, PendingGenerationPublish, PublishManifests,
 };
+use git_cache_worker::{LeaseAcquire, ObjectStoreRepoLeaseManager, RepoLease, RepoLeaseManager};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
@@ -119,6 +123,27 @@ impl Materializer {
             None => Err(GitCacheError::LeaseLost(format!(
                 "repo-write lease for {repo} was released"
             ))),
+        }
+    }
+
+    async fn acquire_repo_write_lease(&self, repo: &RepoKey) -> CoreResult<Box<dyn RepoLease>> {
+        let leases = ObjectStoreRepoLeaseManager::new(
+            Arc::clone(&self.state.store),
+            &self.state.config.leases,
+        );
+        match leases.acquire(repo).await? {
+            LeaseAcquire::Acquired(lease) => Ok(lease),
+            LeaseAcquire::Busy => Err(GitCacheError::LeaseBusy(format!(
+                "repo-write lease for `{repo}` is held by another worker"
+            ))),
+        }
+    }
+
+    fn with_repo_write_token(&self, token: String) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            upstream_auth: self.upstream_auth.clone(),
+            lease_token: Some(token),
         }
     }
 }

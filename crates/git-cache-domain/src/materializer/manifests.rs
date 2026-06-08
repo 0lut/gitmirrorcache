@@ -63,10 +63,6 @@ impl<'a> ManifestStore<'a> {
         read_repo_generation_head(&*self.state.store, repo).await
     }
 
-    pub(super) async fn write_repo_head(&self, head: &RepoGenerationHead) -> CoreResult<()> {
-        write_repo_generation_head(&*self.state.store, head).await
-    }
-
     pub(super) async fn pending_generation(
         &self,
         repo: &RepoKey,

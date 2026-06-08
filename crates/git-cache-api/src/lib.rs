@@ -5,7 +5,8 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult, UpstreamAuth,
+    AppConfig, GitCacheError, MaterializeRequest, MaterializeResponse, RepoKey,
+    Result as CoreResult, Selector, UpstreamAuth,
 };
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
@@ -26,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{watch, Mutex as AsyncMutex, OwnedSemaphorePermit};
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 use tracing::{info, info_span, warn, Instrument};
@@ -73,6 +74,8 @@ fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> 
 struct ApiState {
     domain: Arc<AppState>,
     direct_git_proofs: Arc<DirectGitProofCache>,
+    materialize_inflight:
+        Arc<AsyncMutex<HashMap<MaterializeInflightKey, Arc<MaterializeInflight>>>>,
     leases: Arc<dyn RepoLeaseManager>,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
@@ -100,6 +103,7 @@ impl ApiState {
         Ok(Self {
             domain,
             direct_git_proofs: Arc::new(DirectGitProofCache::new(DIRECT_GIT_PROOF_TTL)),
+            materialize_inflight: Arc::new(AsyncMutex::new(HashMap::new())),
             leases,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
@@ -108,6 +112,90 @@ impl ApiState {
 
     fn next_request_id(&self) -> u64 {
         self.metrics.request_ids.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    async fn materialize_inflight_for(
+        &self,
+        key: MaterializeInflightKey,
+    ) -> (Arc<MaterializeInflight>, bool) {
+        let mut inflight = self.materialize_inflight.lock().await;
+        if let Some(existing) = inflight.get(&key) {
+            return (Arc::clone(existing), false);
+        }
+
+        let entry = Arc::new(MaterializeInflight::new());
+        inflight.insert(key, Arc::clone(&entry));
+        (entry, true)
+    }
+
+    async fn remove_materialize_inflight(
+        &self,
+        key: &MaterializeInflightKey,
+        entry: &Arc<MaterializeInflight>,
+    ) {
+        let mut inflight = self.materialize_inflight.lock().await;
+        if inflight
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            inflight.remove(key);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MaterializeInflightKey {
+    repo: RepoKey,
+    selector: String,
+    mode: String,
+    upstream_authorization: String,
+    auth: DirectGitProofAuth,
+}
+
+impl MaterializeInflightKey {
+    fn new(request: &MaterializeRequest, auth: &UpstreamAuth) -> Self {
+        let selector = serde_json::to_string(&request.selector)
+            .unwrap_or_else(|_| format!("{:?}", request.selector));
+        Self {
+            repo: request.repo.clone(),
+            selector,
+            mode: format!("{:?}", request.mode),
+            upstream_authorization: format!("{:?}", request.upstream_authorization),
+            auth: DirectGitProofAuth::from_auth(auth),
+        }
+    }
+}
+
+struct MaterializeInflight {
+    sender: watch::Sender<Option<MaterializeSharedResult>>,
+    receiver: watch::Receiver<Option<MaterializeSharedResult>>,
+}
+
+type MaterializeSharedResult = std::result::Result<MaterializeResponse, ApiError>;
+
+impl MaterializeInflight {
+    fn new() -> Self {
+        let (sender, receiver) = watch::channel(None);
+        Self { sender, receiver }
+    }
+
+    async fn wait(&self) -> MaterializeSharedResult {
+        let mut receiver = self.receiver.clone();
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result;
+            }
+            if receiver.changed().await.is_err() {
+                return Err(ApiError::from_error(
+                    GitCacheError::Internal("materialize owner dropped before completion".into()),
+                    None,
+                ));
+            }
+        }
+    }
+
+    fn complete(&self, result: MaterializeSharedResult) {
+        let _ = self.sender.send(Some(result));
     }
 }
 
@@ -156,7 +244,7 @@ enum DirectGitProofAuth {
     Authenticated(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DirectGitProof {
     inserted_at: Instant,
     comparison: UpstreamRefComparison,
@@ -413,6 +501,42 @@ async fn run_materialize_request(
     auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
     let domain_started = Instant::now();
+    let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
+    materializer.validate_materialize_request(&request)?;
+    if let Some(response) = materializer
+        .materialize_complete_cache_hit(&request)
+        .await
+        .map_err(ApiError::from)?
+    {
+        info!(
+            repo = %response.repo,
+            commit = %response.commit,
+            source = ?response.source,
+            elapsed_ms = elapsed_ms(domain_started),
+            "domain materialize cache hit finished"
+        );
+        return Ok(Json(response).into_response());
+    }
+
+    let key = MaterializeInflightKey::new(&request, &auth);
+    let (inflight, owner) = state.materialize_inflight_for(key.clone()).await;
+    if !owner {
+        let result = inflight.wait().await;
+        return result.map(|response| Json(response).into_response());
+    }
+
+    let result = run_materialize_request_owner(state, request, auth, domain_started).await;
+    inflight.complete(result.clone());
+    state.remove_materialize_inflight(&key, &inflight).await;
+    result.map(|response| Json(response).into_response())
+}
+
+async fn run_materialize_request_owner(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+    domain_started: Instant,
+) -> Result<MaterializeResponse, ApiError> {
     let repo = request.repo.clone();
     let retry_after = state.domain.config.leases.busy_retry_after_seconds;
     let lease =
@@ -450,7 +574,7 @@ async fn run_materialize_request(
     }
 
     match (result, release_result) {
-        (Ok(response), Ok(())) => Ok(Json(response).into_response()),
+        (Ok(response), Ok(())) => Ok(response),
         (Err(error), Ok(())) => {
             state
                 .metrics
@@ -555,8 +679,28 @@ async fn handle_resolve_request_inner(
         };
 
     let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
+    if let Err(error) = materializer.validate_materialize_request(&request) {
+        state
+            .metrics
+            .materialize_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        let error = ApiError::from(error);
+        info!(
+            request_id,
+            repo = %repo,
+            elapsed_ms = elapsed_ms(started),
+            status = %error.status,
+            "resolve request finished"
+        );
+        return Err(error);
+    }
     let domain_started = Instant::now();
-    match materializer.resolve(request).await {
+    let result = if matches!(request.selector, Selector::ShortCommit(_)) {
+        resolve_short_commit_with_lease(state, request, auth).await
+    } else {
+        materializer.resolve(request).await.map_err(ApiError::from)
+    };
+    match result {
         Ok(response) => {
             info!(
                 request_id,
@@ -576,7 +720,6 @@ async fn handle_resolve_request_inner(
                 .metrics
                 .materialize_errors_total
                 .fetch_add(1, Ordering::Relaxed);
-            let error = ApiError::from(error);
             info!(
                 request_id,
                 repo = %repo,
@@ -585,6 +728,32 @@ async fn handle_resolve_request_inner(
                 "resolve request finished"
             );
             Err(error)
+        }
+    }
+}
+
+async fn resolve_short_commit_with_lease(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<git_cache_core::ResolveResponse, ApiError> {
+    let repo = request.repo.clone();
+    let retry_after = state.domain.config.leases.busy_retry_after_seconds;
+    let lease =
+        acquire_repo_write_lease_with_wait(state, &repo, Duration::from_secs(retry_after)).await;
+    let lease = lease.map_err(|error| ApiError::from_error(error, Some(retry_after)))?;
+    let token = lease.token().to_string();
+    let materializer =
+        Materializer::with_lease_token(Arc::clone(&state.domain), token).using_upstream_auth(&auth);
+    let result = materializer.resolve(request).await;
+    let release_result = lease.release().await;
+    match (result, release_result) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Err(error), Ok(())) => Err(error.into()),
+        (Ok(_), Err(error)) => Err(ApiError::from_error(error, Some(retry_after))),
+        (Err(error), Err(release_error)) => {
+            warn!(%repo, %release_error, "failed to release repo lease after resolve error");
+            Err(error.into())
         }
     }
 }
@@ -1024,7 +1193,7 @@ impl RateLimiter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -1155,6 +1324,7 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use futures::StreamExt;
     use git_cache_core::{
         MaterializeRequest, ObjectStoreConfig, RepoKey, Selector, UpstreamAuthorizationMode,
@@ -1172,6 +1342,42 @@ mod tests {
         assert!(limiter.check());
         assert!(limiter.check());
         assert!(!limiter.check());
+    }
+
+    #[test]
+    fn materialize_inflight_key_separates_authenticated_requests() {
+        let request = MaterializeRequest {
+            repo: RepoKey::parse("github.com/org/repo").unwrap(),
+            selector: Selector::DefaultBranch,
+            mode: Default::default(),
+            upstream_authorization: UpstreamAuthorizationMode::Anonymous,
+        };
+        let anonymous = MaterializeInflightKey::new(&request, &UpstreamAuth::Anonymous);
+        let authenticated = MaterializeInflightKey::new(
+            &request,
+            &UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap(),
+        );
+
+        assert_ne!(anonymous, authenticated);
+    }
+
+    #[tokio::test]
+    async fn materialize_inflight_joiners_receive_owner_response() {
+        let inflight = Arc::new(MaterializeInflight::new());
+        let joiner = {
+            let inflight = Arc::clone(&inflight);
+            tokio::spawn(async move { inflight.wait().await })
+        };
+        let response = MaterializeResponse {
+            repo: RepoKey::parse("github.com/org/repo").unwrap(),
+            commit: git_cache_core::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            source: git_cache_core::MaterializeSource::CacheVerified,
+            verified_at: Utc::now(),
+        };
+
+        inflight.complete(Ok(response.clone()));
+
+        assert_eq!(joiner.await.unwrap().unwrap(), response);
     }
 
     #[test]

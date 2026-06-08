@@ -761,3 +761,41 @@ replay. Explicit verification paths used by compaction/recovery still keep the
 original full-chain fallback. Regression tests cover both the synchronous
 publish path and a child pending generation whose verified parent bundle has
 been deleted.
+
+### D19. HTTP materialize uses API-local singleflight around leased work
+
+After the current-`main` refactor, direct `/v1/materialize` lease acquisition
+regressed same-worker singleflight: every waiter could acquire `repo-write` in
+turn and repeat the same update. The API now keeps an in-process in-flight map
+keyed by repo, selector, request mode, upstream authorization policy, and auth
+scope. Host/auth validation and exact complete-commit cache hits run before that
+map and before durable lease acquisition; only cache misses join the leased
+materialize owner.
+
+The worker `UpdateCoordinator` remains the background/event coordinator. The
+HTTP path uses an equivalent API-local singleflight instead of reusing the
+worker request type because HTTP materialize must carry request-scoped upstream
+auth and return the full `MaterializeResponse` to all waiters.
+
+### D20. Tokenless background paths reacquire durable leases
+
+Background pending-generation verification and inline/CLI compaction can be
+started from `Materializer::new(...)`, where `verify_lease_held()` intentionally
+has no token to check. Those paths now acquire `repo-write` themselves before
+publishing verified pending metadata, promoting generation heads/refs, or
+running compaction cleanup. Pending promotion uses the recorded
+`expected_head` with a generation-head CAS and only writes public/default refs
+after that promotion succeeds.
+
+Compaction now enters through a leased materializer unless it is already running
+inside a held lease. Its cleanup validates that the compacted head promotion is
+still current before repointing manifests/deleting old generations, and final
+head publication uses the same CAS helper instead of an unconditional write.
+
+### D21. Portable local lock stale recovery
+
+Local CAS locks still prefer PID liveness when `/proc` is available, but
+non-Linux hosts can no longer treat every PID-bearing lock as permanently live.
+When liveness is unknown, PID-bearing locks fall back to the same age-based
+stale threshold used for legacy PID-less locks, so crash leftovers eventually
+recover without manual cleanup.
