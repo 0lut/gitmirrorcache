@@ -1228,14 +1228,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64",
- "bytes",
  "chrono",
  "futures",
  "git-cache-core",
  "git-cache-domain",
  "git-cache-git",
- "git-cache-worker",
  "http 1.4.0",
  "reqwest",
  "serde",
@@ -1351,7 +1348,6 @@ dependencies = [
  "async-trait",
  "futures",
  "git-cache-core",
- "serde",
  "tokio",
  "tracing",
 ]

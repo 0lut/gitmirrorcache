@@ -112,6 +112,24 @@ fn upload_pack_intent_parser_ignores_unsupported_filters() {
     assert_eq!(intent.filter, None);
 }
 
+#[test]
+fn upload_pack_intent_parser_stops_on_invalid_packet_length() {
+    let intent = super::super::direct_git::parse_upload_pack_intent(b"zzzzbogus data here")
+        .expect("malformed pkt-line prefixes should stop parsing");
+
+    assert!(intent.wants.is_empty());
+    assert_eq!(intent.filter, None);
+}
+
+#[test]
+fn upload_pack_intent_parser_stops_on_truncated_packet() {
+    let intent = super::super::direct_git::parse_upload_pack_intent(b"0032want short\n")
+        .expect("truncated pkt-lines should stop parsing");
+
+    assert!(intent.wants.is_empty());
+    assert_eq!(intent.filter, None);
+}
+
 #[tokio::test]
 async fn direct_want_allows_locally_ready_commit_after_repo_access() {
     let fixture = GitFixture::new();

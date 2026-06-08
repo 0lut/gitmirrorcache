@@ -114,43 +114,6 @@ async fn repack_for_serving_writes_bitmap_index() {
 }
 
 #[tokio::test]
-async fn upload_pack_advertises_refs_and_serves_stateless_rpc() {
-    let temp = TempTree::new("upload-pack");
-    let (source_repo, source_sha) = create_source_repo(&temp.path);
-    let cache_repo = temp.path.join("cache.git");
-    let git = test_git();
-
-    git.init_bare(&cache_repo).await.expect("init cache repo");
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&source_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .expect("fetch main into cache repo");
-
-    let advertised = git
-        .upload_pack_advertise_refs(&cache_repo, 128 * 1024)
-        .await
-        .expect("advertise upload-pack refs");
-    let advertised = String::from_utf8_lossy(&advertised.stdout);
-    assert!(advertised.contains("refs/cache/main"), "{advertised}");
-
-    let request = format!("0032want {source_sha}\n00000009done\n");
-    let response = git
-        .upload_pack_stateless_rpc(&cache_repo, request.as_bytes(), 1024, 4 * 1024 * 1024)
-        .await
-        .expect("serve stateless upload-pack request");
-
-    assert!(
-        response.stdout.windows(4).any(|chunk| chunk == b"PACK"),
-        "expected pack response, got {} bytes",
-        response.stdout.len()
-    );
-}
-
-#[tokio::test]
 async fn run_rejects_stdout_larger_than_limit() {
     let git = test_git().with_output_limit(1);
     let err = git
@@ -160,21 +123,6 @@ async fn run_rejects_stdout_larger_than_limit() {
 
     assert!(
         err.to_string().contains("stdout exceeded limit"),
-        "unexpected error: {err}"
-    );
-}
-
-#[tokio::test]
-async fn upload_pack_rejects_requests_larger_than_limit() {
-    let git = test_git();
-    let err = git
-        .upload_pack_stateless_rpc(Path::new("/unused"), b"too large", 3, 1024)
-        .await
-        .expect_err("oversized upload-pack request should fail before spawn");
-
-    assert!(
-        err.to_string()
-            .contains("upload-pack request exceeded limit"),
         "unexpected error: {err}"
     );
 }

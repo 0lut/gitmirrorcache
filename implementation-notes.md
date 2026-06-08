@@ -18,19 +18,17 @@ already manages. Public `refs/heads/*` and `HEAD` are written into the same
 repo. Internal `refs/cache/*` are hidden via `git config` on the repo.
 
 ### 2. Streaming upload-pack via Axum's `StreamBody`
-The spec requires streaming pack output. The existing `upload_pack_stateless_rpc`
-buffers stdout into a `Vec<u8>`. For the direct remote, we add a new
-`upload_pack_stream` method on the `Git` wrapper that returns an async reader
-(the child process stdout) instead of buffering. The API layer wraps this in
-an Axum `Body::from_stream()`.  We keep the old buffered method for the session
-endpoint for backward compatibility.
+The spec requires streaming pack output. The direct remote uses
+`Git::upload_pack_spawn`, which returns the child process stdout and child
+handle instead of buffering stdout into a `Vec<u8>`. The API layer wraps stdout
+in an Axum `Body::from_stream()` and keeps the child alive with
+`ChildGuardStream`.
 
-### 3. Buffered ref advertisement
-`git upload-pack --advertise-refs` output is typically small (a few KB). We
-reuse the existing buffered `advertise_refs()` helper and prepend the
-`# service=git-upload-pack` header in-memory (a fixed 34-byte prefix).
-We initially tried streaming but the child process lifetime issue (see T2)
-made buffering the simpler and more correct approach for this small payload.
+### 3. Synthesized ref advertisement
+`GET /info/refs?service=git-upload-pack` fetches upstream refs with `ls-remote`
+and synthesizes the pkt-line advertisement directly. This avoids hydrating local
+objects just to advertise refs. The API prepends the `# service=git-upload-pack`
+header in-memory (a fixed 34-byte prefix).
 
 ### 4. Config structure for `git_remote`
 The spec suggests a `[git_remote]` TOML section. We add a `GitRemoteConfig`
@@ -55,10 +53,10 @@ default branch. This is done inside the lease to prevent races.
 ### 7. Concurrency: direct domain-layer synchronization
 The spec says concurrent requests should wait for the same upstream work. For the
 direct Git remote, we bypass the `UpdateCoordinator` and call the domain's
-`ensure_repo_advertisable()` directly. This method does upstream ref comparison
-and targeted fetch internally, which is simpler than routing through the
-coordinator for the branch-comparison-then-fetch flow. The coordinator remains
-in use for the existing `/v1/materialize` endpoint.
+`upstream_refs()` and `handle_upload_pack()` paths directly. The former proves
+repo access and advertises refs; the latter performs targeted read-through work
+for wanted objects. This is simpler than routing the direct Git flow through the
+coordinator. The coordinator remains in use for background update requests.
 
 ### 8. Want-line parsing
 For `POST /git-upload-pack`, we parse `want <oid>` lines from the pkt-line
@@ -95,16 +93,16 @@ Using the same bare repo for internal cache refs and public refs is simpler but
 means we need `hideRefs` config to prevent leaking `refs/cache/*`. If future
 features need stronger isolation, we'll need to refactor to use alternates.
 
-### T2. Buffered advertise-refs, streaming upload-pack
+### T2. Synthesized advertise-refs, streaming upload-pack
 Initially we tried streaming both `advertise-refs` and `upload-pack` output.
 However, child process lifetime management caused issues: the `UploadPackProcess`
 struct holds the child with `kill_on_drop(true)`, and when it drops at the end of
 the handler scope, the child is killed before the response stream is consumed by
-the client. For `advertise-refs` (output is small — just ref lines) we switched
-to the existing buffered `advertise_refs()` helper. For `upload-pack` (output can
-be arbitrarily large pack data), we use a `ChildGuardStream` wrapper that holds
-the child process handle alongside the `ReaderStream`, keeping the process alive
-for the duration of the HTTP response body.
+the client. For ref advertisement, we now synthesize pkt-lines from `ls-remote`
+results. For `upload-pack` (output can be arbitrarily large pack data), we use a
+`ChildGuardStream` wrapper that holds the child process handle alongside the
+`ReaderStream`, keeping the process alive for the duration of the HTTP response
+body.
 
 ### T2b. Multi-threaded tokio runtime needed for git integration tests
 `#[tokio::test]` uses a single-threaded runtime by default. Because the tests
@@ -127,9 +125,8 @@ round-trips and lets us update all stale branches in one fetch pass.
 
 ## Things I changed from existing code
 
-### C1. New `Git::upload_pack_stream` method
-Added alongside the existing buffered `upload_pack_stateless_rpc`. Returns a
-streaming reader + child process handle for the API to manage.
+### C1. New `Git::upload_pack_spawn` method
+Returns a streaming reader + child process handle for the API to manage.
 
 ### C2. New `Git::ls_remote_heads` method
 Returns parsed branch→SHA map from `git ls-remote --heads --symref`.

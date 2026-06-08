@@ -2,11 +2,13 @@ use crate::state::AppState;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+#[cfg(test)]
+use git_cache_core::RequestMode;
 use git_cache_core::{
     BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest, GitCacheError,
     MaterializeRequest, MaterializeResponse, MaterializeSource, RefManifest, RepoGenerationHead,
-    RepoKey, RequestMode, ResolveResponse, Result as CoreResult, Selector, ShortCommitSha,
-    UpstreamAuth, VerifiedGenerationManifest,
+    RepoKey, ResolveResponse, Result as CoreResult, Selector, ShortCommitSha, UpstreamAuth,
+    VerifiedGenerationManifest,
 };
 use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use git_cache_disk::RepoLock;
@@ -38,8 +40,7 @@ mod repo;
 mod util;
 
 pub use direct_git::{
-    advertise_refs, frame_ref_advertisement, parse_want_lines, synthesize_ref_advertisement,
-    upload_pack, UpstreamRefComparison,
+    frame_ref_advertisement, synthesize_ref_advertisement, UpstreamRefComparison,
 };
 pub use executor::MaterializerExecutor;
 pub use generations::{bundle_key, default_manifest_key, CompactionReport};
