@@ -1,6 +1,6 @@
 use crate::error::{GitCacheError, Result};
 use crate::repo::{CommitSha, ShortCommitSha};
-use serde::de::Error as _;
+use serde::de::{Error as _, IgnoredAny};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
@@ -60,10 +60,6 @@ impl<'de> Deserialize<'de> for BranchName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
     Commit(CommitSha),
-    CommitReachableFrom {
-        commit: CommitSha,
-        reachable_from: ReachabilitySelector,
-    },
     ShortCommit(ShortCommitSha),
     Branch(BranchName),
     DefaultBranch,
@@ -74,19 +70,9 @@ impl Serialize for Selector {
     where
         S: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(match self {
-            Self::CommitReachableFrom { .. } => 2,
-            _ => 1,
-        }))?;
+        let mut map = serializer.serialize_map(Some(1))?;
         match self {
             Self::Commit(commit) => map.serialize_entry("commit", commit)?,
-            Self::CommitReachableFrom {
-                commit,
-                reachable_from,
-            } => {
-                map.serialize_entry("commit", commit)?;
-                map.serialize_entry("reachable_from", reachable_from)?;
-            }
             Self::ShortCommit(commit) => map.serialize_entry("short_commit", commit)?,
             Self::Branch(branch) => map.serialize_entry("branch", branch)?,
             Self::DefaultBranch => map.serialize_entry("default_branch", &true)?,
@@ -103,7 +89,7 @@ impl<'de> Deserialize<'de> for Selector {
         #[derive(Deserialize)]
         struct WireSelector {
             commit: Option<CommitSha>,
-            reachable_from: Option<ReachabilitySelector>,
+            reachable_from: Option<IgnoredAny>,
             short_commit: Option<ShortCommitSha>,
             branch: Option<BranchName>,
             #[serde(default)]
@@ -111,9 +97,9 @@ impl<'de> Deserialize<'de> for Selector {
         }
 
         let wire = WireSelector::deserialize(deserializer)?;
-        if wire.reachable_from.is_some() && wire.commit.is_none() {
+        if wire.reachable_from.is_some() {
             return Err(D::Error::custom(
-                "reachable_from requires a commit selector",
+                "reachable_from selectors are not supported",
             ));
         }
 
@@ -129,64 +115,10 @@ impl<'de> Deserialize<'de> for Selector {
         }
 
         if let Some(commit) = wire.commit {
-            if let Some(reachable_from) = wire.reachable_from {
-                return Ok(Self::CommitReachableFrom {
-                    commit,
-                    reachable_from,
-                });
-            }
             Ok(Self::Commit(commit))
         } else if let Some(commit) = wire.short_commit {
             Ok(Self::ShortCommit(commit))
         } else if let Some(branch) = wire.branch {
-            Ok(Self::Branch(branch))
-        } else {
-            Ok(Self::DefaultBranch)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReachabilitySelector {
-    Branch(BranchName),
-    DefaultBranch,
-}
-
-impl Serialize for ReachabilitySelector {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut map = serializer.serialize_map(Some(1))?;
-        match self {
-            Self::Branch(branch) => map.serialize_entry("branch", branch)?,
-            Self::DefaultBranch => map.serialize_entry("default_branch", &true)?,
-        }
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for ReachabilitySelector {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct WireReachabilitySelector {
-            branch: Option<BranchName>,
-            #[serde(default)]
-            default_branch: bool,
-        }
-
-        let wire = WireReachabilitySelector::deserialize(deserializer)?;
-        let selected = wire.branch.is_some() as u8 + wire.default_branch as u8;
-        if selected != 1 {
-            return Err(D::Error::custom(
-                "reachable_from must include exactly one of branch or default_branch",
-            ));
-        }
-
-        if let Some(branch) = wire.branch {
             Ok(Self::Branch(branch))
         } else {
             Ok(Self::DefaultBranch)

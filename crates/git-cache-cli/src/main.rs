@@ -1,6 +1,6 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use git_cache_core::{
-    AppConfig, BranchName, CommitSha, MaterializeRequest, RequestMode, Selector, ShortCommitSha,
+    AppConfig, BranchName, CommitSha, MaterializeRequest, Selector, ShortCommitSha,
 };
 use git_cache_disk::DiskManager;
 use git_cache_domain::{AppState, Materializer};
@@ -27,9 +27,6 @@ enum Command {
         repo: String,
         /// Selector: a branch name, commit SHA, short commit, or "HEAD" for default branch
         selector: String,
-        /// Request mode
-        #[arg(long, default_value = "strict")]
-        mode: CliRequestMode,
     },
     /// Repack a local cached repo with bitmap indexes for faster upload-pack.
     Optimize {
@@ -48,21 +45,6 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-enum CliRequestMode {
-    Strict,
-    Cached,
-}
-
-impl From<CliRequestMode> for RequestMode {
-    fn from(mode: CliRequestMode) -> Self {
-        match mode {
-            CliRequestMode::Strict => RequestMode::Strict,
-            CliRequestMode::Cached => RequestMode::Cached,
-        }
-    }
 }
 
 fn parse_selector(value: &str) -> Result<Selector, git_cache_core::GitCacheError> {
@@ -101,11 +83,7 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("{}", serde_json::to_string_pretty(&manager.status()?)?);
         }
-        Command::Warm {
-            repo,
-            selector,
-            mode,
-        } => {
+        Command::Warm { repo, selector } => {
             let repo = git_cache_core::RepoKey::parse(&repo)?;
             let selector = parse_selector(&selector)?;
             let config = AppConfig::from_env()?;
@@ -115,7 +93,6 @@ async fn main() -> anyhow::Result<()> {
                 .materialize(MaterializeRequest {
                     repo,
                     selector,
-                    mode: mode.into(),
                     upstream_authorization: Default::default(),
                 })
                 .await;

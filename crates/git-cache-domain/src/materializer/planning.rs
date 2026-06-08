@@ -68,7 +68,7 @@ impl Materializer {
         request: MaterializeRequest,
     ) -> CoreResult<MaterializePlan> {
         match request.selector {
-            Selector::Commit(commit) | Selector::CommitReachableFrom { commit, .. } => {
+            Selector::Commit(commit) => {
                 self.ensure_repo_access(&request.repo).await?;
                 let source = self.ensure_exact_commit(&request.repo, &commit).await?;
                 let access = self.access_for_commit(request.repo, commit.clone());
@@ -152,7 +152,7 @@ impl Materializer {
 
         let selector = request.selector.clone();
         match selector.clone() {
-            Selector::Commit(commit) | Selector::CommitReachableFrom { commit, .. } => {
+            Selector::Commit(commit) => {
                 // Match materialize's policy: once repo access has been
                 // checked, exact commit selectors are repo-authorized. Resolve
                 // only reports the concrete commit and local cache state.

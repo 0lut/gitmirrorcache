@@ -15,7 +15,6 @@ async fn minio_materializer_rehydrates_commit_from_minio_after_hot_cache_deletio
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -34,7 +33,6 @@ async fn minio_materializer_rehydrates_commit_from_minio_after_hot_cache_deletio
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(first.commit.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -81,7 +79,6 @@ async fn minio_materializer_compacts_generations_and_rehydrates_commits() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -93,7 +90,6 @@ async fn minio_materializer_compacts_generations_and_rehydrates_commits() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -105,7 +101,6 @@ async fn minio_materializer_compacts_generations_and_rehydrates_commits() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -142,7 +137,6 @@ async fn minio_materializer_compacts_generations_and_rehydrates_commits() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Commit(third.clone()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await

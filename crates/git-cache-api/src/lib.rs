@@ -267,8 +267,40 @@ async fn resolve(
     handle_resolve_request(&state, request, auth).await
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MaterializeEndpoint {
+    Materialize,
+    Resolve,
+}
+
+impl MaterializeEndpoint {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Materialize => "materialize",
+            Self::Resolve => "resolve",
+        }
+    }
+}
+
 async fn handle_materialize_request(
     state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<Response, ApiError> {
+    handle_checked_materialize_request(state, MaterializeEndpoint::Materialize, request, auth).await
+}
+
+async fn handle_resolve_request(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<Response, ApiError> {
+    handle_checked_materialize_request(state, MaterializeEndpoint::Resolve, request, auth).await
+}
+
+async fn handle_checked_materialize_request(
+    state: &Arc<ApiState>,
+    endpoint: MaterializeEndpoint,
     request: MaterializeRequest,
     auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
@@ -278,18 +310,22 @@ async fn handle_materialize_request(
     let span = info_span!(
         "api_request",
         request_id,
-        endpoint = "materialize",
+        endpoint = endpoint.name(),
         repo = %repo
     );
     async move {
-        handle_materialize_request_inner(state, request, auth, request_id, selector).await
+        handle_checked_materialize_request_inner(
+            state, endpoint, request, auth, request_id, selector,
+        )
+        .await
     }
     .instrument(span)
     .await
 }
 
-async fn handle_materialize_request_inner(
+async fn handle_checked_materialize_request_inner(
     state: &Arc<ApiState>,
+    endpoint: MaterializeEndpoint,
     request: MaterializeRequest,
     auth: UpstreamAuth,
     request_id: u64,
@@ -299,10 +335,11 @@ async fn handle_materialize_request_inner(
     let repo = request.repo.clone();
     info!(
         request_id,
+        endpoint = endpoint.name(),
         repo = %repo,
         selector,
         auth = auth_label(&auth),
-        "materialize request started"
+        "api request started"
     );
     if !state.rate_limiter.check() {
         state
@@ -311,10 +348,11 @@ async fn handle_materialize_request_inner(
             .fetch_add(1, Ordering::Relaxed);
         info!(
             request_id,
+            endpoint = endpoint.name(),
             repo = %repo,
             elapsed_ms = elapsed_ms(started),
             status = %StatusCode::TOO_MANY_REQUESTS,
-            "materialize request finished"
+            "api request finished"
         );
         return Err(ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -337,28 +375,34 @@ async fn handle_materialize_request_inner(
                     .fetch_add(1, Ordering::Relaxed);
                 info!(
                     request_id,
+                    endpoint = endpoint.name(),
                     repo = %repo,
                     elapsed_ms = elapsed_ms(started),
                     status = %error.status,
-                    "materialize request finished"
+                    "api request finished"
                 );
                 return Err(error);
             }
         };
 
-    let result = run_materialize_request(state, request, auth).await;
+    let result = match endpoint {
+        MaterializeEndpoint::Materialize => run_materialize_request(state, request, auth).await,
+        MaterializeEndpoint::Resolve => run_resolve_request(state, request, auth).await,
+    };
     match &result {
         Ok(_) => info!(
             request_id,
+            endpoint = endpoint.name(),
             elapsed_ms = elapsed_ms(started),
             status = %StatusCode::OK,
-            "materialize request finished"
+            "api request finished"
         ),
         Err(error) => info!(
             request_id,
+            endpoint = endpoint.name(),
             elapsed_ms = elapsed_ms(started),
             status = %error.status,
-            "materialize request finished"
+            "api request finished"
         ),
     }
     result
@@ -399,114 +443,38 @@ async fn run_materialize_request(
     }
 }
 
-async fn handle_resolve_request(
+async fn run_resolve_request(
     state: &Arc<ApiState>,
     request: MaterializeRequest,
     auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
-    let request_id = state.next_request_id();
-    let repo = request.repo.clone();
-    let selector = format!("{:?}", request.selector);
-    let span = info_span!(
-        "api_request",
-        request_id,
-        endpoint = "resolve",
-        repo = %repo
-    );
-    async move { handle_resolve_request_inner(state, request, auth, request_id, selector).await }
-        .instrument(span)
-        .await
-}
-
-async fn handle_resolve_request_inner(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-    request_id: u64,
-    selector: String,
-) -> Result<Response, ApiError> {
-    let started = Instant::now();
-    let repo = request.repo.clone();
-    info!(
-        request_id,
-        repo = %repo,
-        selector,
-        auth = auth_label(&auth),
-        "resolve request started"
-    );
-    if !state.rate_limiter.check() {
-        state
-            .metrics
-            .rate_limited_total
-            .fetch_add(1, Ordering::Relaxed);
-        info!(
-            request_id,
-            repo = %repo,
-            elapsed_ms = elapsed_ms(started),
-            status = %StatusCode::TOO_MANY_REQUESTS,
-            "resolve request finished"
-        );
-        return Err(ApiError {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            message: "rate limit exceeded".into(),
-        });
-    }
-
-    state
-        .metrics
-        .materialize_total
-        .fetch_add(1, Ordering::Relaxed);
-
-    let CheckedMaterializeRequest { request, auth } =
-        match check_materialize_upstream_auth(request, auth).await {
-            Ok(checked) => checked,
-            Err(error) => {
-                state
-                    .metrics
-                    .materialize_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
-                info!(
-                    request_id,
-                    repo = %repo,
-                    elapsed_ms = elapsed_ms(started),
-                    status = %error.status,
-                    "resolve request finished"
-                );
-                return Err(error);
-            }
-        };
-
     let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
     let domain_started = Instant::now();
-    match materializer.resolve(request).await {
-        Ok(response) => {
-            info!(
-                request_id,
-                repo = %response.repo,
-                commit = %response.commit,
-                source = ?response.source,
-                cache_available = response.cache_available,
-                domain_elapsed_ms = elapsed_ms(domain_started),
-                elapsed_ms = elapsed_ms(started),
-                status = %StatusCode::OK,
-                "resolve request finished"
-            );
-            Ok(Json(response).into_response())
-        }
+    let result = materializer.resolve(request).await;
+    match &result {
+        Ok(response) => info!(
+            repo = %response.repo,
+            commit = %response.commit,
+            source = ?response.source,
+            cache_available = response.cache_available,
+            elapsed_ms = elapsed_ms(domain_started),
+            "domain resolve finished"
+        ),
+        Err(error) => info!(
+            error = %error,
+            elapsed_ms = elapsed_ms(domain_started),
+            "domain resolve failed"
+        ),
+    }
+
+    match result {
+        Ok(response) => Ok(Json(response).into_response()),
         Err(error) => {
             state
                 .metrics
                 .materialize_errors_total
                 .fetch_add(1, Ordering::Relaxed);
-            let error = ApiError::from(error);
-            info!(
-                request_id,
-                repo = %repo,
-                elapsed_ms = elapsed_ms(started),
-                status = %error.status,
-                "resolve request finished"
-            );
-            Err(error)
+            Err(error.into())
         }
     }
 }
@@ -1094,7 +1062,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = AppConfig {
             bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            public_base_url: "http://127.0.0.1:0".into(),
             cache_root: tmp.path().join("cache"),
             upstream_root: Some(tmp.path().join("upstreams")),
             git_binary: PathBuf::from("git"),
@@ -1121,7 +1088,6 @@ mod tests {
         let request = MaterializeRequest {
             repo: RepoKey::parse("evil.com/org/repo").unwrap(),
             selector: Selector::DefaultBranch,
-            mode: Default::default(),
             upstream_authorization: UpstreamAuthorizationMode::Required,
         };
         let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();

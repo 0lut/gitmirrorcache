@@ -1,5 +1,4 @@
 bind_addr = "0.0.0.0:8080"
-public_base_url = "https://git-cache.internal"
 cache_root = "/cache"
 git_binary = "git"
 git_timeout_seconds = 120

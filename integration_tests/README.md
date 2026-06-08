@@ -23,7 +23,7 @@ python3 -m unittest -v integration_tests.test_astral_uv
 What the tests do:
 
 - build and start `git-cache-api` on a random localhost port
-- materialize `github.com/astral-sh/uv` `main` in strict mode
+- materialize `github.com/astral-sh/uv` `main` with a branch selector
 - compare the returned commit to `git ls-remote`
 - fetch the branch through the direct `/git/...` remote
 - resolve an abbreviated `short_commit` selector to the canonical full commit
