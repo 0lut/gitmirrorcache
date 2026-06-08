@@ -35,7 +35,7 @@ curl -s http://127.0.0.1:8080/v1/materialize \
   -d '{"repo":"github.com/acme/widgets","selector":{"branch":"main"}}'
 ```
 
-Strict branch and default-branch materialization require the fake upstream to be reachable. Exact commit materialization uses cached manifests first.
+Branch and default-branch materialization require the fake upstream to be reachable. Exact commit materialization uses cached manifests first. Do not include the removed `mode` field in request bodies.
 
 ## 4. Exercise Offline Cached Commit Behavior
 

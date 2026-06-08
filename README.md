@@ -4,9 +4,9 @@ Read-only Git fetch cache for GitHub-style upstreams. The service keeps object s
 
 ## What Works
 
-- `POST /v1/materialize` for exact commits, strict branches, and strict default branch requests.
+- `POST /v1/materialize` for exact commits, branch selectors, and default branch selectors.
 - Known-complete exact commits are served from cache without contacting upstream.
-- Strict branch/default requests verify upstream with `git ls-remote` before serving.
+- Branch and default-branch requests verify upstream with `git ls-remote` before serving.
 - Optional read-through Git remote at `/git/{host}/{owner}/{repo}.git`.
 - `git-receive-pack` is rejected and never advertised.
 - Local object-store adapter and feature-gated S3-compatible adapter.
@@ -43,6 +43,10 @@ git fetch http://127.0.0.1:8080/git/github.com/org/repo.git refs/heads/main
 Full commit IDs belong in the `commit` selector. Abbreviated hashes are accepted
 through `short_commit`; they are resolved with Git first and all manifests still
 store only the canonical full object ID.
+
+Request bodies are strict: send only supported fields such as `repo`,
+`selector`, and `upstream_authorization`. The legacy `mode` field is no longer
+accepted.
 
 ## CLI
 
