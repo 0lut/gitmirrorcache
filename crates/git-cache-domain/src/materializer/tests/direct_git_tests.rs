@@ -81,6 +81,37 @@ fn upload_pack_blobless_filter_parser_ignores_other_filters() {
     assert!(!super::super::direct_git::upload_pack_requests_blobless_filter(&body));
 }
 
+#[test]
+fn upload_pack_intent_parser_preserves_depth_and_blobless_filter() {
+    let sha = "a".repeat(40);
+    let mut body = make_upload_pack_pkt_line(&format!("want {sha} multi_ack thin-pack\n"));
+    body.extend_from_slice(b"0000");
+    body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+    body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+    body.extend(make_upload_pack_pkt_line("done\n"));
+
+    let intent = super::super::direct_git::parse_upload_pack_intent(&body).unwrap();
+
+    assert_eq!(intent.wants, vec![CommitSha::parse(&sha).unwrap()]);
+    assert_eq!(
+        intent.filter,
+        Some(super::super::direct_git::UploadPackFilter::BlobNone)
+    );
+    assert_eq!(intent.depth, Some(1));
+}
+
+#[test]
+fn upload_pack_intent_parser_ignores_unsupported_filters() {
+    let sha = "b".repeat(40);
+    let mut body = make_upload_pack_pkt_line(&format!("want {sha}\n"));
+    body.extend(make_upload_pack_pkt_line("filter tree:0\n"));
+
+    let intent = super::super::direct_git::parse_upload_pack_intent(&body).unwrap();
+
+    assert_eq!(intent.wants, vec![CommitSha::parse(&sha).unwrap()]);
+    assert_eq!(intent.filter, None);
+}
+
 #[tokio::test]
 async fn direct_want_allows_locally_ready_commit_after_repo_access() {
     let fixture = GitFixture::new();
@@ -415,6 +446,98 @@ async fn authenticated_direct_want_for_advertised_uncached_commit_reads_through(
         authed_materializer
             .commit_ready_for_serving(&repo_dir, &commit)
             .await
+    );
+}
+
+#[tokio::test]
+async fn direct_want_for_advertised_branch_preserves_depth_and_fetches_ref() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+    let parent = fixture.head_commit();
+    let commit = fixture.commit_and_push("second");
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+
+    let comparison = UpstreamRefComparison {
+        default_branch: Some("main".to_string()),
+        all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+    };
+    let mut body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack thin-pack\n"));
+    body.extend_from_slice(b"0000");
+    body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+    body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+    body.extend(make_upload_pack_pkt_line("done\n"));
+    let intent = super::super::direct_git::parse_upload_pack_intent(&body).unwrap();
+
+    materializer
+        .ensure_upload_pack_intent_available_from_comparison(&fixture.repo, &intent, &comparison)
+        .await
+        .expect("advertised branch wants should read through with client depth/filter");
+
+    assert!(
+        materializer
+            .commit_ready_for_serving(&repo_dir, &commit)
+            .await
+    );
+    assert_eq!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
+            .await
+            .unwrap(),
+        commit.to_string(),
+        "advertised branch wants should fetch the ref instead of only the raw SHA"
+    );
+    assert!(
+        !materializer.commit_exists(&repo_dir, &parent).await,
+        "deepen 1 should avoid importing the parent commit on a cold read-through"
+    );
+}
+
+#[tokio::test]
+async fn direct_want_falls_back_to_exact_sha_when_advertised_branch_moves_before_post() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+    let advertised_commit = fixture.commit_and_push("advertised");
+    let moved_commit = fixture.commit_and_push("moved");
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+
+    let stale_comparison = UpstreamRefComparison {
+        default_branch: Some("main".to_string()),
+        all_upstream: HashMap::from([("main".to_string(), advertised_commit.to_string())]),
+    };
+    let mut body =
+        make_upload_pack_pkt_line(&format!("want {advertised_commit} multi_ack thin-pack\n"));
+    body.extend_from_slice(b"0000");
+    body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+    body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+    body.extend(make_upload_pack_pkt_line("done\n"));
+    let intent = super::super::direct_git::parse_upload_pack_intent(&body).unwrap();
+
+    materializer
+        .ensure_upload_pack_intent_available_from_comparison(
+            &fixture.repo,
+            &intent,
+            &stale_comparison,
+        )
+        .await
+        .expect("stale advertised-ref fetch should fall back to exact SHA fetch");
+
+    assert!(
+        materializer
+            .commit_ready_for_serving(&repo_dir, &advertised_commit)
+            .await,
+        "the originally advertised wanted commit should be fetched exactly"
+    );
+    assert_eq!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
+            .await
+            .unwrap(),
+        moved_commit.to_string(),
+        "the ref fetch may still record the newer branch tip"
     );
 }
 
