@@ -72,13 +72,10 @@ let Ok(mut state) = self.state.lock() else {
    on the `Git` struct. Every `spawn()` must acquire a permit first.
    For streaming responses (`UploadPackProcess`), the permit is held until
    the process exits.
-2. **Session directories must be cleaned up.** Sessions have a TTL but are
-   only removed when cleanup runs. `SessionCleanupLoop` runs periodically
-   to prevent unbounded inode/disk accumulation.
-3. **Disk reservations clean up on drop** via `Reservation::Drop` /
+2. **Disk reservations clean up on drop** via `Reservation::Drop` /
    `AsyncReservation::release()`. Always prefer explicit `release()` over
    relying on drop, and never call `temp_path()` after `release()`.
-4. **`kill_on_drop(true)`** is mandatory on all `tokio::process::Command`
+3. **`kill_on_drop(true)`** is mandatory on all `tokio::process::Command`
    child processes to prevent zombie accumulation.
 
 ## Deployment operations

@@ -93,8 +93,6 @@ fn create_source_repo(root: &Path) -> (PathBuf, String) {
         Some(&source_repo),
         ["config", "user.name", "Git Cache Test"],
     );
-    run_git(Some(&source_repo), ["config", "gc.auto", "0"]);
-    run_git(Some(&source_repo), ["config", "maintenance.auto", "false"]);
 
     std::fs::write(source_repo.join("README.md"), "hello from git-cache\n").expect("write README");
     run_git(Some(&source_repo), ["add", "README.md"]);
@@ -116,8 +114,6 @@ fn create_source_repo_with_commits(root: &Path, commit_count: usize) -> (PathBuf
         Some(&source_repo),
         ["config", "user.name", "Git Cache Test"],
     );
-    run_git(Some(&source_repo), ["config", "gc.auto", "0"]);
-    run_git(Some(&source_repo), ["config", "maintenance.auto", "false"]);
 
     for i in 0..commit_count {
         std::fs::write(source_repo.join("README.md"), format!("commit {i}\n"))
@@ -128,35 +124,6 @@ fn create_source_repo_with_commits(root: &Path, commit_count: usize) -> (PathBuf
 
     let sha = run_git(Some(&source_repo), ["rev-parse", "HEAD"]);
     (source_repo, sha)
-}
-
-fn create_source_repo_with_branches(root: &Path, branch_count: usize) -> PathBuf {
-    let source_repo = root.join("source");
-    run_git(None, ["init", "--", path_arg(&source_repo)]);
-    run_git(Some(&source_repo), ["checkout", "-B", "main"]);
-    run_git(
-        Some(&source_repo),
-        ["config", "user.email", "test@example.invalid"],
-    );
-    run_git(
-        Some(&source_repo),
-        ["config", "user.name", "Git Cache Test"],
-    );
-    run_git(Some(&source_repo), ["config", "gc.auto", "0"]);
-    run_git(Some(&source_repo), ["config", "maintenance.auto", "false"]);
-
-    std::fs::write(source_repo.join("README.md"), "base\n").expect("write README");
-    run_git(Some(&source_repo), ["add", "README.md"]);
-    run_git(Some(&source_repo), ["commit", "-m", "initial"]);
-
-    for i in 0..branch_count {
-        run_git(
-            Some(&source_repo),
-            ["branch", &format!("feature-{i}"), "main"],
-        );
-    }
-
-    source_repo
 }
 
 // ── 1. fetch_branch throughput ───────────────────────────────────────────
@@ -379,63 +346,4 @@ async fn test_concurrent_init_bare() {
         elapsed.as_secs() < 120,
         "concurrent init_bare too slow: {elapsed:?}"
     );
-}
-
-// ── 6. upload_pack_advertise_refs scaling ────────────────────────────────
-
-#[tokio::test]
-async fn test_upload_pack_advertise_refs_scaling() {
-    let branch_counts = [1, 10, 50];
-    let mut timings = Vec::new();
-
-    for &branch_count in &branch_counts {
-        let temp = TempTree::new(&format!("advertise-scale-{branch_count}"));
-        let git = test_git();
-        let source_repo = create_source_repo_with_branches(&temp.path, branch_count);
-
-        let cache_repo = temp.path.join("cache.git");
-        git.init_bare(&cache_repo).await.unwrap();
-
-        // Fetch main and all feature branches.
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .unwrap();
-        for i in 0..branch_count {
-            git.fetch_branch(
-                &cache_repo,
-                path_arg(&source_repo),
-                &format!("feature-{i}"),
-                &format!("refs/cache/feature-{i}"),
-            )
-            .await
-            .unwrap();
-        }
-
-        let start = Instant::now();
-        let advertised = git
-            .upload_pack_advertise_refs(&cache_repo, 128 * 1024)
-            .await
-            .unwrap();
-        let elapsed = start.elapsed();
-
-        let ref_count = branch_count + 1; // +1 for main
-        timings.push((ref_count, elapsed, advertised.stdout.len()));
-    }
-
-    eprintln!("upload_pack_advertise_refs scaling:");
-    for (ref_count, elapsed, size) in &timings {
-        eprintln!("  {ref_count} refs: {elapsed:?}, {size} bytes output");
-    }
-
-    for (ref_count, elapsed, _) in &timings {
-        assert!(
-            elapsed.as_secs() < 30,
-            "advertise_refs with {ref_count} refs too slow: {elapsed:?}"
-        );
-    }
 }

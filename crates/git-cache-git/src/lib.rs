@@ -383,44 +383,6 @@ impl Git {
         .await
     }
 
-    pub async fn upload_pack_advertise_refs(
-        &self,
-        repo_dir: &Path,
-        max_output_bytes: usize,
-    ) -> Result<GitOutput> {
-        self.run_with_stdin_and_limits(
-            Some(repo_dir),
-            ["upload-pack", "--stateless-rpc", "--advertise-refs", "."],
-            None,
-            max_output_bytes,
-            self.output_limit,
-        )
-        .await
-    }
-
-    pub async fn upload_pack_stateless_rpc(
-        &self,
-        repo_dir: &Path,
-        request: &[u8],
-        max_request_bytes: usize,
-        max_output_bytes: usize,
-    ) -> Result<GitOutput> {
-        if request.len() > max_request_bytes {
-            return Err(GitCacheError::Validation(format!(
-                "git upload-pack request exceeded limit of {max_request_bytes} bytes"
-            )));
-        }
-
-        self.run_with_stdin_and_limits(
-            Some(repo_dir),
-            ["upload-pack", "--stateless-rpc", "."],
-            Some(request),
-            max_output_bytes,
-            self.output_limit,
-        )
-        .await
-    }
-
     /// Run `git ls-remote --symref <remote> HEAD refs/heads/*` and return a map of
     /// `refs/heads/<branch>` → commit SHA, plus the optional default branch name.
     /// The explicit patterns include the HEAD symref without downloading tags.
@@ -595,62 +557,6 @@ impl Git {
             }
         });
 
-        let stderr = child.stderr.take();
-        let stdout = child.stdout.take().ok_or_else(|| {
-            GitCacheError::Validation("failed to capture upload-pack stdout".into())
-        })?;
-
-        Ok(UploadPackProcess {
-            child,
-            stdout: Box::pin(stdout),
-            stderr,
-            timeout: self.timeout,
-            stderr_limit: self.output_limit,
-            _permit: Some(permit),
-        })
-    }
-
-    /// Spawn `git upload-pack --stateless-rpc --advertise-refs .` and return
-    /// stdout for streaming.
-    pub async fn upload_pack_advertise_refs_spawn(
-        &self,
-        repo_dir: &Path,
-    ) -> Result<UploadPackProcess> {
-        let permit = self
-            .process_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
-
-        let mut command = Command::new(&self.binary);
-        command
-            .args(["upload-pack", "--stateless-rpc", "--advertise-refs", "."])
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_ASKPASS", "/bin/false")
-            .env("SSH_ASKPASS", "/bin/false")
-            .env("HOME", "/nonexistent")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .current_dir(repo_dir)
-            .kill_on_drop(true);
-
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
-        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            command.env("TMPDIR", tmpdir);
-        }
-
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
-        }
-
-        let mut child = command.spawn()?;
         let stderr = child.stderr.take();
         let stdout = child.stdout.take().ok_or_else(|| {
             GitCacheError::Validation("failed to capture upload-pack stdout".into())

@@ -10,7 +10,7 @@ use git_cache_core::{
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, parse_want_lines, synthesize_ref_advertisement, AppState,
+    frame_ref_advertisement, synthesize_ref_advertisement, upload_pack_has_wants, AppState,
     Materializer, UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
@@ -799,7 +799,7 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
                 (auth, Some(comparison))
             }
         };
-        if parse_want_lines(&body).is_empty() {
+        if matches!(upload_pack_has_wants(&body), Ok(false)) {
             let materializer = materializer.using_upstream_auth(&auth);
             return match Box::pin(materializer.handle_upload_pack(
                 &repo,
@@ -1159,7 +1159,6 @@ mod tests {
     use git_cache_core::{
         MaterializeRequest, ObjectStoreConfig, RepoKey, Selector, UpstreamAuthorizationMode,
     };
-    use git_cache_domain::parse_want_lines;
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::process::Stdio;
@@ -1331,82 +1330,5 @@ mod tests {
                 .contains("git upload-pack response exceeded timeout"),
             "unexpected timeout error: {error}"
         );
-    }
-
-    // ── parse_want_lines contract tests ─────────────────────────────────
-
-    fn make_pkt_line(data: &str) -> Vec<u8> {
-        let len = 4 + data.len();
-        format!("{len:04x}{data}").into_bytes()
-    }
-
-    #[test]
-    fn parse_want_standard_line() {
-        let sha = "a".repeat(40);
-        let line = format!("want {sha}\n");
-        let body = make_pkt_line(&line);
-        let wants = parse_want_lines(&body);
-        assert_eq!(wants, vec![sha]);
-    }
-
-    #[test]
-    fn parse_want_with_capabilities() {
-        let sha = "b".repeat(40);
-        let line = format!("want {sha} multi_ack thin-pack\n");
-        let body = make_pkt_line(&line);
-        let wants = parse_want_lines(&body);
-        assert_eq!(wants, vec![sha]);
-    }
-
-    #[test]
-    fn parse_want_multiple_wants() {
-        let sha1 = "a".repeat(40);
-        let sha2 = "b".repeat(40);
-        let mut body = make_pkt_line(&format!("want {sha1}\n"));
-        body.extend(make_pkt_line(&format!("want {sha2}\n")));
-        body.extend(b"0000");
-        body.extend(b"0009done\n");
-        let wants = parse_want_lines(&body);
-        assert_eq!(wants, vec![sha1, sha2]);
-    }
-
-    #[test]
-    fn parse_want_flush_in_middle_is_skipped() {
-        let sha1 = "a".repeat(40);
-        let sha2 = "c".repeat(40);
-        let mut body = make_pkt_line(&format!("want {sha1}\n"));
-        body.extend(b"0000");
-        body.extend(make_pkt_line(&format!("want {sha2}\n")));
-        let wants = parse_want_lines(&body);
-        assert_eq!(wants, vec![sha1, sha2]);
-    }
-
-    #[test]
-    fn parse_want_invalid_pkt_length_stops_gracefully() {
-        let body = b"zzzzbogus data here";
-        let wants = parse_want_lines(body);
-        assert!(wants.is_empty());
-    }
-
-    #[test]
-    fn parse_want_empty_body() {
-        let wants = parse_want_lines(b"");
-        assert!(wants.is_empty());
-    }
-
-    #[test]
-    fn parse_want_non_want_lines_ignored() {
-        let mut body = make_pkt_line("have aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
-        body.extend(make_pkt_line("done\n"));
-        let wants = parse_want_lines(&body);
-        assert!(wants.is_empty());
-    }
-
-    #[test]
-    fn parse_want_truncated_packet_stops_gracefully() {
-        // Length says 50 bytes but body is shorter.
-        let body = b"0032want short\n";
-        let wants = parse_want_lines(body);
-        assert!(wants.is_empty());
     }
 }

@@ -400,12 +400,12 @@ impl Materializer {
 pub fn repo_from_git_path(repo_path: &str) -> CoreResult<RepoKey> {
     let Some((repo, suffix)) = repo_path.split_once(".git") else {
         return Err(GitCacheError::Validation(format!(
-            "session repo path `{repo_path}` must end in .git"
+            "git repo path `{repo_path}` must end in .git"
         )));
     };
     if !suffix.is_empty() && !suffix.starts_with('/') {
         return Err(GitCacheError::Validation(format!(
-            "session repo path `{repo_path}` has an invalid .git suffix"
+            "git repo path `{repo_path}` has an invalid .git suffix"
         )));
     }
     RepoKey::parse(repo)

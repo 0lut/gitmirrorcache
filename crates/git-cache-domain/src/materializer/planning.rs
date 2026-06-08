@@ -52,14 +52,6 @@ impl Materializer {
         Box::pin(self.materialize_plan(plan)).await
     }
 
-    pub async fn materialize_after_upstream_validation(
-        &self,
-        request: MaterializeRequest,
-    ) -> CoreResult<MaterializeResponse> {
-        let plan = Box::pin(self.plan_materialize_after_upstream_validation(request)).await?;
-        Box::pin(self.materialize_plan(plan)).await
-    }
-
     pub async fn resolve(&self, request: MaterializeRequest) -> CoreResult<ResolveResponse> {
         let plan = Box::pin(self.plan_resolve(request)).await?;
         Box::pin(self.resolve_plan(plan)).await
@@ -69,41 +61,6 @@ impl Materializer {
         self.validate_host(&request.repo)?;
         self.ensure_request_auth_allowed(&request)?;
         self.plan_materialize_target(request).await
-    }
-
-    async fn plan_materialize_after_upstream_validation(
-        &self,
-        request: MaterializeRequest,
-    ) -> CoreResult<MaterializePlan> {
-        self.validate_host(&request.repo)?;
-        self.ensure_request_auth_allowed(&request)?;
-
-        match request.selector {
-            Selector::Branch(branch) => {
-                let commit = self.local_branch_tip(&request.repo, &branch).await?;
-                let access = self.access_for_ref(request.repo, branch.ref_name(), commit.clone());
-                Ok(MaterializePlan {
-                    access,
-                    target: MaterializeTarget::Commit {
-                        commit,
-                        source: MaterializeSource::UpstreamVerified,
-                    },
-                })
-            }
-            Selector::DefaultBranch => {
-                let branch = self.resolve_default_branch(&request.repo).await?;
-                let commit = self.local_branch_tip(&request.repo, &branch).await?;
-                let access = self.access_for_ref(request.repo, branch.ref_name(), commit.clone());
-                Ok(MaterializePlan {
-                    access,
-                    target: MaterializeTarget::Commit {
-                        commit,
-                        source: MaterializeSource::UpstreamVerified,
-                    },
-                })
-            }
-            _ => self.plan_materialize_target(request).await,
-        }
     }
 
     async fn plan_materialize_target(
@@ -198,8 +155,7 @@ impl Materializer {
             Selector::Commit(commit) | Selector::CommitReachableFrom { commit, .. } => {
                 // Match materialize's policy: once repo access has been
                 // checked, exact commit selectors are repo-authorized. Resolve
-                // only reports the concrete commit and local cache state; it
-                // does not stream objects or create a session.
+                // only reports the concrete commit and local cache state.
                 //
                 // TODO(auth-hardening): If materialize grows an optional
                 // current-ref reachability policy, wire resolve through the
@@ -336,16 +292,6 @@ impl Materializer {
             .ls_remote_default_branch(&remote)
             .await?;
         Ok(())
-    }
-
-    async fn local_branch_tip(&self, repo: &RepoKey, branch: &BranchName) -> CoreResult<CommitSha> {
-        let repo_dir = self.ensure_repo_dir(repo).await?;
-        let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
-        self.state
-            .git
-            .rev_parse(&repo_dir, &local_ref)
-            .await
-            .and_then(CommitSha::parse)
     }
 
     async fn ensure_branch_tip(
@@ -721,18 +667,7 @@ impl Materializer {
         Ok(())
     }
 
-    pub async fn materialize_branch(
-        &self,
-        repo: RepoKey,
-        branch: BranchName,
-        _mode: RequestMode,
-        default_branch: bool,
-    ) -> CoreResult<MaterializeResponse> {
-        let commit = self.ensure_branch(&repo, &branch, default_branch).await?;
-        Ok(self.materialize_response(repo, commit, MaterializeSource::UpstreamVerified))
-    }
-
-    /// Fetch and publish a branch from upstream without creating a session.
+    /// Fetch and publish a branch from upstream.
     /// Returns the verified commit SHA.
     pub async fn ensure_branch(
         &self,
@@ -956,16 +891,7 @@ impl Materializer {
         Ok(())
     }
 
-    pub async fn materialize_default_branch(
-        &self,
-        repo: RepoKey,
-        _mode: RequestMode,
-    ) -> CoreResult<MaterializeResponse> {
-        let commit = self.ensure_default_branch(&repo).await?;
-        Ok(self.materialize_response(repo, commit, MaterializeSource::UpstreamVerified))
-    }
-
-    /// Resolve, fetch and publish the default branch without creating a session.
+    /// Resolve, fetch and publish the default branch.
     /// Returns the verified commit SHA.
     pub async fn ensure_default_branch(&self, repo: &RepoKey) -> CoreResult<CommitSha> {
         self.validate_host(repo)?;

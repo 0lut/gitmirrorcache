@@ -126,33 +126,6 @@ fn create_source_repo_with_commits(root: &Path, commit_count: usize) -> (PathBuf
     (source_repo, sha)
 }
 
-fn create_source_repo_with_branches(root: &Path, branch_count: usize) -> PathBuf {
-    let source_repo = root.join("source");
-    run_git(None, ["init", "--", path_arg(&source_repo)]);
-    run_git(Some(&source_repo), ["checkout", "-B", "main"]);
-    run_git(
-        Some(&source_repo),
-        ["config", "user.email", "test@example.invalid"],
-    );
-    run_git(
-        Some(&source_repo),
-        ["config", "user.name", "Git Cache Test"],
-    );
-
-    std::fs::write(source_repo.join("README.md"), "base\n").expect("write README");
-    run_git(Some(&source_repo), ["add", "README.md"]);
-    run_git(Some(&source_repo), ["commit", "-m", "initial"]);
-
-    for i in 0..branch_count {
-        run_git(
-            Some(&source_repo),
-            ["branch", &format!("feature-{i}"), "main"],
-        );
-    }
-
-    source_repo
-}
-
 // ── 1. init_bare throughput ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -224,61 +197,7 @@ async fn test_bundle_create_restore_cycle() {
     assert!(total.as_secs() < 30, "bundle cycle too slow: {total:?}");
 }
 
-// ── 3. upload_pack_advertise_refs latency ────────────────────────────────
-
-#[tokio::test]
-async fn test_upload_pack_advertise_refs_latency() {
-    let temp = TempTree::new("advertise-refs");
-    let git = test_git();
-    let branch_count = 20;
-    let source_repo = create_source_repo_with_branches(&temp.path, branch_count);
-
-    let cache_repo = temp.path.join("cache.git");
-    git.init_bare(&cache_repo).await.unwrap();
-    git.fetch_branch(
-        &cache_repo,
-        path_arg(&source_repo),
-        "main",
-        "refs/cache/main",
-    )
-    .await
-    .unwrap();
-    for i in 0..branch_count {
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            &format!("feature-{i}"),
-            &format!("refs/cache/feature-{i}"),
-        )
-        .await
-        .unwrap();
-    }
-
-    let start = Instant::now();
-    let advertised = git
-        .upload_pack_advertise_refs(&cache_repo, 128 * 1024)
-        .await
-        .unwrap();
-    let elapsed = start.elapsed();
-
-    let text = String::from_utf8_lossy(&advertised.stdout);
-    assert!(
-        text.contains("refs/cache/main"),
-        "advertised refs should include main"
-    );
-
-    eprintln!(
-        "advertise_refs ({} branches): {elapsed:?}, {} bytes",
-        branch_count + 1,
-        advertised.stdout.len()
-    );
-    assert!(
-        elapsed.as_secs() < 10,
-        "advertise_refs too slow: {elapsed:?}"
-    );
-}
-
-// ── 4. rev_parse latency ─────────────────────────────────────────────────
+// ── 3. rev_parse latency ─────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_rev_parse_latency() {

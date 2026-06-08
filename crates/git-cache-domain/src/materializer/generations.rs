@@ -1255,11 +1255,7 @@ impl Materializer {
                     }
                 }
             } else if key.contains("/manifests/refs/") && key.ends_with(".json") {
-                if key.contains("/manifests/ref-updates/")
-                    || key.contains("/manifests/commits/")
-                    || key.contains("/manifests/sessions/")
-                    || key == default_manifest_key(repo)
-                {
+                if key == default_manifest_key(repo) {
                     continue;
                 }
                 if let Some(mut manifest) = self.manifests().ref_by_key(&key).await? {
