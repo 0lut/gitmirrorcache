@@ -636,6 +636,15 @@ async fn git_repo(
     let request_id = state.next_request_id();
     let path = uri.path().to_string();
     let method_for_span = method.clone();
+    let request = GitRepoRequest {
+        repo_path,
+        query,
+        headers,
+        method,
+        uri,
+        body,
+        request_id,
+    };
     let span = info_span!(
         "api_request",
         request_id,
@@ -643,18 +652,12 @@ async fn git_repo(
         method = %method_for_span,
         path = %path
     );
-    async move {
-        git_repo_inner(
-            state, repo_path, query, headers, method, uri, body, request_id,
-        )
+    async move { git_repo_inner(state, request).await }
+        .instrument(span)
         .await
-    }
-    .instrument(span)
-    .await
 }
 
-async fn git_repo_inner(
-    state: Arc<ApiState>,
+struct GitRepoRequest {
     repo_path: String,
     query: HashMap<String, String>,
     headers: HeaderMap,
@@ -662,7 +665,18 @@ async fn git_repo_inner(
     uri: Uri,
     body: Bytes,
     request_id: u64,
-) -> Response {
+}
+
+async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
+    let GitRepoRequest {
+        repo_path,
+        query,
+        headers,
+        method,
+        uri,
+        body,
+        request_id,
+    } = request;
     let path = uri.path();
 
     // Reject git-receive-pack (push) requests.
