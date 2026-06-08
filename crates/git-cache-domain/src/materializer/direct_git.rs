@@ -13,6 +13,51 @@ enum DirectFetchedWantKind {
     NonCommit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadPackFilter {
+    BlobNone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UploadPackIntent {
+    pub wants: Vec<CommitSha>,
+    pub filter: Option<UploadPackFilter>,
+    pub depth: Option<u32>,
+    pub deepen_since: Option<u64>,
+    pub deepen_not: Vec<String>,
+    pub shallow: Vec<CommitSha>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DirectFetchOptions {
+    filter: Option<&'static str>,
+    depth: Option<u32>,
+}
+
+impl DirectFetchOptions {
+    fn from_intent(intent: &UploadPackIntent) -> Self {
+        Self {
+            filter: match intent.filter {
+                Some(UploadPackFilter::BlobNone) => Some(BLOBLESS_FETCH_FILTER),
+                None => None,
+            },
+            depth: intent.depth,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_blobless(blobless_fetch: bool) -> Self {
+        Self {
+            filter: blobless_fetch.then_some(BLOBLESS_FETCH_FILTER),
+            depth: None,
+        }
+    }
+
+    fn blobless_fetch(self) -> bool {
+        self.filter == Some(BLOBLESS_FETCH_FILTER)
+    }
+}
+
 impl Materializer {
     /// Fetch the upstream ref advertisement for a repo without downloading
     /// any objects.  Returns the structured ref data so the API layer can
@@ -51,63 +96,103 @@ impl Materializer {
     /// deployments that need stricter history isolation should use separate
     /// upstream repositories for truly separate data.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
-        Box::pin(self.ensure_wants_read_through(repo, wants, false)).await
+        let object_ids = parse_want_strings(wants)?;
+        Box::pin(self.ensure_wants_read_through(
+            repo,
+            &object_ids,
+            None,
+            DirectFetchOptions::default(),
+        ))
+        .await
     }
 
+    #[cfg(test)]
     pub(super) async fn ensure_wants_available_from_comparison(
         &self,
         repo: &RepoKey,
         wants: &[String],
-        _comparison: &UpstreamRefComparison,
+        comparison: &UpstreamRefComparison,
         blobless_fetch: bool,
     ) -> CoreResult<()> {
-        Box::pin(self.ensure_wants_read_through(repo, wants, blobless_fetch)).await
+        let object_ids = parse_want_strings(wants)?;
+        Box::pin(self.ensure_wants_read_through(
+            repo,
+            &object_ids,
+            Some(comparison),
+            DirectFetchOptions::from_blobless(blobless_fetch),
+        ))
+        .await
+    }
+
+    pub(super) async fn ensure_upload_pack_intent_available_from_comparison(
+        &self,
+        repo: &RepoKey,
+        intent: &UploadPackIntent,
+        comparison: &UpstreamRefComparison,
+    ) -> CoreResult<()> {
+        Box::pin(self.ensure_wants_read_through(
+            repo,
+            &intent.wants,
+            Some(comparison),
+            DirectFetchOptions::from_intent(intent),
+        ))
+        .await
+    }
+
+    pub(super) async fn ensure_upload_pack_intent_available(
+        &self,
+        repo: &RepoKey,
+        intent: &UploadPackIntent,
+    ) -> CoreResult<()> {
+        Box::pin(self.ensure_wants_read_through(
+            repo,
+            &intent.wants,
+            None,
+            DirectFetchOptions::from_intent(intent),
+        ))
+        .await
     }
 
     async fn ensure_wants_read_through(
         &self,
         repo: &RepoKey,
-        wants: &[String],
-        blobless_fetch: bool,
+        object_ids: &[CommitSha],
+        comparison: Option<&UpstreamRefComparison>,
+        fetch_options: DirectFetchOptions,
     ) -> CoreResult<()> {
         let started = Instant::now();
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
-        let object_ids: Vec<CommitSha> = wants
-            .iter()
-            .map(|want_sha| CommitSha::parse(want_sha.as_str()))
-            .collect::<CoreResult<_>>()?;
         let object_count = object_ids.len();
         let object_types = self
             .state
             .git
-            .cat_file_batch_types(&repo_dir, &object_ids)
+            .cat_file_batch_types(&repo_dir, object_ids)
             .await?;
         let mut non_commit_wants = 0usize;
         let mut served_commits = 0usize;
         let mut hydrated_commits = 0usize;
         let mut fetched_commits = 0usize;
         let mut fetched_non_commit_wants = 0usize;
-        let fetch_filter = blobless_fetch.then_some(BLOBLESS_FETCH_FILTER);
 
         for object_id in object_ids {
-            if let Some(object_type) = object_types.get(&object_id) {
+            if let Some(object_type) = object_types.get(object_id) {
                 if object_type != "commit" {
                     non_commit_wants += 1;
                     continue;
                 }
 
-                if self.commit_tree_exists(&repo_dir, &object_id).await {
-                    self.expose_served_commit(&repo_dir, &object_id).await?;
+                if self.commit_tree_exists(&repo_dir, object_id).await {
+                    self.expose_served_commit(&repo_dir, object_id).await?;
                     served_commits += 1;
                     continue;
                 }
             }
 
-            if let Some(manifest) = self.get_commit_manifest(repo, &object_id).await? {
+            if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
                 if manifest.complete {
                     Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await?;
-                    self.expose_served_commit(&repo_dir, &object_id).await?;
+                    self.expose_served_commit(&repo_dir, object_id).await?;
                     hydrated_commits += 1;
                     continue;
                 }
@@ -119,19 +204,80 @@ impl Materializer {
                 )));
             }
 
-            info!(%repo, commit = %object_id, "direct git read-through fetch for wanted commit");
+            let advertised_branch = comparison
+                .and_then(|comparison| comparison.branch_for_commit(object_id).map(str::to_string));
+            let advertised_ref = advertised_branch
+                .as_ref()
+                .map(|branch| format!("refs/heads/{branch}"))
+                .unwrap_or_else(|| "<none>".to_string());
+            info!(
+                %repo,
+                commit = %object_id,
+                advertised_ref = %advertised_ref,
+                depth = fetch_options.depth,
+                blobless_fetch = fetch_options.blobless_fetch(),
+                "direct git read-through fetch for wanted commit"
+            );
             let upstream_url = self.upstream_url(repo)?;
             let upstream_git = self.upstream_git(&upstream_url)?;
-            let fetch_result = upstream_git
-                .fetch_object_with_filter(&repo_dir, &upstream_url, &object_id, fetch_filter)
-                .await;
+            let fetch_result = if let Some(branch) = advertised_branch {
+                let upstream_ref = format!("refs/heads/{branch}");
+                let local_ref = format!("refs/cache/upstream/heads/{branch}");
+                let ref_fetch_result = upstream_git
+                    .fetch_ref_with_options(
+                        &repo_dir,
+                        &upstream_url,
+                        &upstream_ref,
+                        &local_ref,
+                        fetch_options.filter,
+                        fetch_options.depth,
+                    )
+                    .await;
+                match ref_fetch_result {
+                    Ok(output) => Ok(output),
+                    Err(err) => {
+                        warn!(
+                            %repo,
+                            commit = %object_id,
+                            upstream_ref,
+                            local_ref,
+                            %err,
+                            "direct git advertised-ref fetch failed; falling back to raw object fetch"
+                        );
+                        upstream_git
+                            .fetch_object_with_options(
+                                &repo_dir,
+                                &upstream_url,
+                                object_id,
+                                fetch_options.filter,
+                                fetch_options.depth,
+                            )
+                            .await
+                    }
+                }
+            } else {
+                upstream_git
+                    .fetch_object_with_options(
+                        &repo_dir,
+                        &upstream_url,
+                        object_id,
+                        fetch_options.filter,
+                        fetch_options.depth,
+                    )
+                    .await
+            };
 
             if let Err(fetch_err) = fetch_result {
                 upstream_git
-                    .fetch_all_heads_with_filter(&repo_dir, &upstream_url, fetch_filter)
+                    .fetch_all_heads_with_options(
+                        &repo_dir,
+                        &upstream_url,
+                        fetch_options.filter,
+                        fetch_options.depth,
+                    )
                     .await?;
                 match self
-                    .prepare_fetched_direct_want(repo, &repo_dir, &object_id)
+                    .prepare_fetched_direct_want(repo, &repo_dir, object_id)
                     .await
                 {
                     Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
@@ -146,7 +292,7 @@ impl Materializer {
             }
 
             match self
-                .prepare_fetched_direct_want(repo, &repo_dir, &object_id)
+                .prepare_fetched_direct_want(repo, &repo_dir, object_id)
                 .await?
             {
                 DirectFetchedWantKind::Commit => fetched_commits += 1,
@@ -162,7 +308,8 @@ impl Materializer {
             hydrated_commits,
             fetched_commits,
             fetched_non_commit_wants,
-            blobless_fetch,
+            blobless_fetch = fetch_options.blobless_fetch(),
+            depth = fetch_options.depth,
             elapsed_ms = elapsed_ms(started),
             "ensured direct git wants via read-through"
         );
@@ -315,34 +462,29 @@ impl Materializer {
         comparison: Option<&UpstreamRefComparison>,
     ) -> CoreResult<UploadPackProcess> {
         let started = Instant::now();
-        let wants = parse_want_lines(body);
-        let blobless_fetch = upload_pack_requests_blobless_filter(body);
+        let intent = parse_upload_pack_intent(body)?;
         info!(
             %repo,
-            wants_count = wants.len(),
+            wants_count = intent.wants.len(),
             cached_ref_proof = comparison.is_some(),
-            blobless_fetch,
+            blobless_fetch = intent.filter == Some(UploadPackFilter::BlobNone),
+            depth = intent.depth,
             "direct git upload-pack preparation started"
         );
-        if !wants.is_empty() {
+        if !intent.wants.is_empty() {
             let ensure_started = Instant::now();
             match comparison {
                 Some(comparison) => {
-                    Box::pin(self.ensure_wants_available_from_comparison(
-                        repo,
-                        &wants,
-                        comparison,
-                        blobless_fetch,
+                    Box::pin(self.ensure_upload_pack_intent_available_from_comparison(
+                        repo, &intent, comparison,
                     ))
                     .await?;
                 }
-                None => {
-                    Box::pin(self.ensure_wants_read_through(repo, &wants, blobless_fetch)).await?
-                }
+                None => Box::pin(self.ensure_upload_pack_intent_available(repo, &intent)).await?,
             }
             info!(
                 %repo,
-                wants_count = wants.len(),
+                wants_count = intent.wants.len(),
                 elapsed_ms = elapsed_ms(ensure_started),
                 "direct git upload-pack wants prepared"
             );
@@ -385,6 +527,25 @@ impl Materializer {
 pub struct UpstreamRefComparison {
     pub default_branch: Option<String>,
     pub all_upstream: HashMap<String, String>,
+}
+
+impl UpstreamRefComparison {
+    fn branch_for_commit(&self, commit: &CommitSha) -> Option<&str> {
+        if let Some(default_branch) = self.default_branch.as_deref() {
+            if self
+                .all_upstream
+                .get(default_branch)
+                .is_some_and(|sha| sha == commit.as_str())
+            {
+                return Some(default_branch);
+            }
+        }
+
+        self.all_upstream
+            .iter()
+            .filter_map(|(branch, sha)| (sha == commit.as_str()).then_some(branch.as_str()))
+            .min()
+    }
 }
 
 pub async fn advertise_refs(state: &AppState, repo: &FsPath) -> CoreResult<Vec<u8>> {
@@ -493,42 +654,89 @@ pub fn frame_ref_advertisement(refs_output: &[u8]) -> Vec<u8> {
 /// Parse `want <oid>` lines from a Git pkt-line formatted upload-pack request.
 pub fn parse_want_lines(body: &[u8]) -> Vec<String> {
     let mut wants = Vec::new();
-    let mut offset = 0;
-    while offset + 4 <= body.len() {
-        let hex = match std::str::from_utf8(&body[offset..offset + 4]) {
-            Ok(h) => h,
-            Err(_) => break,
-        };
-        let pkt_len = match usize::from_str_radix(hex, 16) {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-
-        if pkt_len == 0 {
-            offset += 4;
-            continue;
-        }
-        if pkt_len < 4 || offset + pkt_len > body.len() {
-            break;
-        }
-
-        let line = &body[offset + 4..offset + pkt_len];
-        if let Ok(line_str) = std::str::from_utf8(line) {
-            let line_str = line_str.trim();
-            if let Some(rest) = line_str.strip_prefix("want ") {
-                let oid = rest.split_whitespace().next().unwrap_or("");
-                if !oid.is_empty() {
-                    wants.push(oid.to_string());
-                }
+    visit_upload_pack_lines(body, |line| {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("want ") {
+            let oid = rest.split_whitespace().next().unwrap_or("");
+            if !oid.is_empty() {
+                wants.push(oid.to_string());
             }
         }
-
-        offset += pkt_len;
-    }
+    });
     wants
 }
 
+#[cfg(test)]
 pub fn upload_pack_requests_blobless_filter(body: &[u8]) -> bool {
+    parse_upload_pack_intent(body)
+        .map(|intent| intent.filter == Some(UploadPackFilter::BlobNone))
+        .unwrap_or(false)
+}
+
+pub fn parse_upload_pack_intent(body: &[u8]) -> CoreResult<UploadPackIntent> {
+    let mut intent = UploadPackIntent::default();
+    let mut error = None;
+    visit_upload_pack_lines(body, |line| {
+        if error.is_some() {
+            return;
+        }
+
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("want ") {
+            let oid = rest.split_whitespace().next().unwrap_or("");
+            match CommitSha::parse(oid) {
+                Ok(commit) => intent.wants.push(commit),
+                Err(err) => error = Some(err),
+            }
+        } else if let Some(rest) = line.strip_prefix("filter ") {
+            if rest.trim() == BLOBLESS_FETCH_FILTER {
+                intent.filter = Some(UploadPackFilter::BlobNone);
+            }
+        } else if let Some(rest) = line.strip_prefix("deepen ") {
+            match rest.trim().parse::<u32>() {
+                Ok(depth) if depth > 0 => intent.depth = Some(depth),
+                _ => {
+                    error = Some(GitCacheError::Validation(format!(
+                        "invalid upload-pack depth: {rest:?}"
+                    )));
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("deepen-since ") {
+            match rest.trim().parse::<u64>() {
+                Ok(value) => intent.deepen_since = Some(value),
+                Err(_) => {
+                    error = Some(GitCacheError::Validation(format!(
+                        "invalid upload-pack deepen-since: {rest:?}"
+                    )));
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("deepen-not ") {
+            let value = rest.trim();
+            if !value.is_empty() {
+                intent.deepen_not.push(value.to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("shallow ") {
+            match CommitSha::parse(rest.split_whitespace().next().unwrap_or("")) {
+                Ok(commit) => intent.shallow.push(commit),
+                Err(err) => error = Some(err),
+            }
+        }
+    });
+
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(intent)
+}
+
+fn parse_want_strings(wants: &[String]) -> CoreResult<Vec<CommitSha>> {
+    wants
+        .iter()
+        .map(|want_sha| CommitSha::parse(want_sha.as_str()))
+        .collect()
+}
+
+fn visit_upload_pack_lines(body: &[u8], mut visit: impl FnMut(&str)) {
     let mut offset = 0;
     while offset + 4 <= body.len() {
         let hex = match std::str::from_utf8(&body[offset..offset + 4]) {
@@ -550,12 +758,9 @@ pub fn upload_pack_requests_blobless_filter(body: &[u8]) -> bool {
 
         let line = &body[offset + 4..offset + pkt_len];
         if let Ok(line_str) = std::str::from_utf8(line) {
-            if line_str.trim() == "filter blob:none" {
-                return true;
-            }
+            visit(line_str);
         }
 
         offset += pkt_len;
     }
-    false
 }

@@ -693,7 +693,7 @@ impl Git {
         remote_url: &str,
         object_id: &CommitSha,
     ) -> Result<GitOutput> {
-        self.fetch_object_with_filter(repo_dir, remote_url, object_id, None)
+        self.fetch_object_with_options(repo_dir, remote_url, object_id, None, None)
             .await
     }
 
@@ -704,14 +704,26 @@ impl Git {
         object_id: &CommitSha,
         filter: Option<&str>,
     ) -> Result<GitOutput> {
+        self.fetch_object_with_options(repo_dir, remote_url, object_id, filter, None)
+            .await
+    }
+
+    pub async fn fetch_object_with_options(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        object_id: &CommitSha,
+        filter: Option<&str>,
+        depth: Option<u32>,
+    ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
         reject_revision_arg(object_id.as_str())?;
-        let mut args = vec!["fetch", "--no-tags"];
-        if let Some(filter) = filter {
-            reject_fetch_filter(filter)?;
-            args.push("--filter=blob:none");
-        }
-        args.extend(["--", remote_url, object_id.as_str()]);
+        let mut args = fetch_args_with_options(filter, depth)?;
+        args.extend([
+            OsString::from("--"),
+            OsString::from(remote_url),
+            OsString::from(object_id.as_str()),
+        ]);
         self.run_upstream(Some(repo_dir), args).await
     }
 
@@ -726,16 +738,50 @@ impl Git {
         remote_url: &str,
         filter: Option<&str>,
     ) -> Result<GitOutput> {
+        self.fetch_all_heads_with_options(repo_dir, remote_url, filter, None)
+            .await
+    }
+
+    pub async fn fetch_all_heads_with_options(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        filter: Option<&str>,
+        depth: Option<u32>,
+    ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        let mut args = vec!["fetch", "--no-tags", "--prune"];
-        if let Some(filter) = filter {
-            reject_fetch_filter(filter)?;
-            args.push("--filter=blob:none");
-        }
+        let mut args = fetch_args_with_options(filter, depth)?;
+        args.push(OsString::from("--prune"));
         args.extend([
-            "--",
-            remote_url,
-            "+refs/heads/*:refs/cache/upstream/heads/*",
+            OsString::from("--"),
+            OsString::from(remote_url),
+            OsString::from("+refs/heads/*:refs/cache/upstream/heads/*"),
+        ]);
+        self.run_upstream(Some(repo_dir), args).await
+    }
+
+    pub async fn fetch_ref_with_options(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        upstream_ref: &str,
+        local_ref: &str,
+        filter: Option<&str>,
+        depth: Option<u32>,
+    ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        reject_ref_arg(upstream_ref, "upstream ref")?;
+        reject_ref_arg(local_ref, "local ref")?;
+        self.check_ref_name(upstream_ref).await?;
+        self.check_ref_name(local_ref).await?;
+
+        let refspec = format!("+{upstream_ref}:{local_ref}");
+        reject_refspec(&refspec)?;
+        let mut args = fetch_args_with_options(filter, depth)?;
+        args.extend([
+            OsString::from("--"),
+            OsString::from(remote_url),
+            OsString::from(refspec),
         ]);
         self.run_upstream(Some(repo_dir), args).await
     }
@@ -1012,6 +1058,28 @@ fn reject_fetch_filter(filter: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn reject_fetch_depth(depth: u32) -> Result<()> {
+    if depth == 0 {
+        return Err(GitCacheError::Validation(
+            "fetch depth must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn fetch_args_with_options(filter: Option<&str>, depth: Option<u32>) -> Result<Vec<OsString>> {
+    let mut args = vec![OsString::from("fetch"), OsString::from("--no-tags")];
+    if let Some(depth) = depth {
+        reject_fetch_depth(depth)?;
+        args.push(OsString::from(format!("--depth={depth}")));
+    }
+    if let Some(filter) = filter {
+        reject_fetch_filter(filter)?;
+        args.push(OsString::from("--filter=blob:none"));
+    }
+    Ok(args)
 }
 
 fn reject_nul(value: &str, kind: &str) -> Result<()> {
@@ -1475,6 +1543,12 @@ mod tests {
         assert!(reject_fetch_filter("blob:none\0bad").is_err());
     }
 
+    #[test]
+    fn reject_fetch_depth_rejects_zero() {
+        assert!(reject_fetch_depth(0).is_err());
+        assert!(reject_fetch_depth(1).is_ok());
+    }
+
     // ── reject_nul tests ────────────────────────────────────────────
 
     #[test]
@@ -1485,6 +1559,61 @@ mod tests {
     #[test]
     fn reject_nul_accepts_clean_string() {
         assert!(reject_nul("hello world", "value").is_ok());
+    }
+
+    #[tokio::test]
+    async fn fetch_ref_with_options_passes_depth_and_filter_before_remote() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "git-cache-fetch-ref-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-git");
+        let args_out = root.join("args.txt");
+        let repo_dir = root.join("repo.git");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  printf '[%s]' "$arg" >> "$FAKE_ARGS_OUT"
+done
+printf '\n' >> "$FAKE_ARGS_OUT"
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let git = Git::new(&script, Duration::from_secs(5))
+            .with_env("FAKE_ARGS_OUT", args_out.as_os_str().to_os_string());
+        git.fetch_ref_with_options(
+            &repo_dir,
+            "https://github.com/org/repo.git",
+            "refs/heads/main",
+            "refs/cache/upstream/heads/main",
+            Some("blob:none"),
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+        let args = std::fs::read_to_string(&args_out).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            args.lines().any(|line| line
+                == "[fetch][--no-tags][--depth=1][--filter=blob:none][--][https://github.com/org/repo.git][+refs/heads/main:refs/cache/upstream/heads/main]"),
+            "{args}"
+        );
     }
 
     // ── Public method rejection of dash-prefixed arguments ──────────
@@ -1616,6 +1745,70 @@ mod tests {
                 Path::new("/unused"),
                 "https://example.com/repo.git",
                 &["bad\0spec".to_string()]
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_ref_with_options_rejects_dash_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_ref_with_options(
+                Path::new("/unused"),
+                "-evil",
+                "refs/heads/main",
+                "refs/cache/upstream/heads/main",
+                None,
+                None,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_ref_with_options_rejects_dash_upstream_ref() {
+        let git = test_git();
+        assert!(git
+            .fetch_ref_with_options(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                "-evil",
+                "refs/cache/upstream/heads/main",
+                None,
+                None,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_ref_with_options_rejects_dash_local_ref() {
+        let git = test_git();
+        assert!(git
+            .fetch_ref_with_options(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                "refs/heads/main",
+                "-evil",
+                None,
+                None,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_object_with_options_rejects_zero_depth() {
+        let git = test_git();
+        let commit = CommitSha::parse("a".repeat(40)).unwrap();
+        assert!(git
+            .fetch_object_with_options(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &commit,
+                None,
+                Some(0),
             )
             .await
             .is_err());
