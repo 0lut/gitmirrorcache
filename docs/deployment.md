@@ -64,10 +64,10 @@ If a disposable environment can tolerate interrupting in-flight requests during
 deploy, set `ECS_ALB_DEREGISTRATION_DELAY_SECONDS` or
 `ECS_CONTAINER_STOP_TIMEOUT_SECONDS` explicitly.
 
-## Amazon Linux 2023 Host Migration
+## Amazon Linux 2023 Host AMI
 
 The maintained ECS host default is pinned to the latest Amazon Linux 2023
-ECS-optimized ARM64 AMI verified in `us-west-2` on June 5, 2026:
+ECS-optimized ARM64 AMI verified in `us-west-2` on June 8, 2026:
 
 ```sh
 ECS_EC2_AMI_ID=ami-0ac01d3c8b7a34f9d
@@ -91,55 +91,9 @@ aws ssm get-parameter \
   --output text
 ```
 
-Changing the AMI ID only affects newly launched EC2 instances. The deploy
-script reuses the existing ECS host when it finds one with
-`ECS_INSTANCE_NAME=$NAME_PREFIX-ecs-cache`, so an existing Amazon Linux 2 host
-must be replaced during a maintenance window.
-
-For the current single-host deployment, use the checked-in downtime migration
-script. It scales the ECS service to zero, optionally snapshots the old hot-cache
-EBS volume, terminates the existing host, and runs the normal deploy/smoke path
-with the pinned AL2023 AMI ID exported:
-
-```sh
-AWS_REGION=us-west-2 \
-ENVIRONMENT=dev-arm \
-NAME_PREFIX=gitmirrorcache-arm \
-CONFIRM_DOWNTIME=true \
-scripts/aws/migrate-ecs-host-al2023.sh
-```
-
-Set `CREATE_CACHE_SNAPSHOT=true` to snapshot the old `/cache` EBS volume before
-termination. The old cache volume is otherwise left unattached for manual
-cleanup or rollback inspection. S3 remains the durable cache source of truth, so
-the replacement host may start with a cold local `/cache`.
-
-Rollback is to repeat the same downtime flow with the prior AL2 AMI parameter,
-then restore the AL2023 default after the incident:
-
-```sh
-AWS_REGION=us-west-2 \
-ENVIRONMENT=dev-arm \
-NAME_PREFIX=gitmirrorcache-arm \
-CONFIRM_DOWNTIME=true \
-CONFIRM_AL2_ROLLBACK=true \
-ECS_EC2_AMI_PARAMETER=/aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id \
-scripts/aws/migrate-ecs-host-al2023.sh
-```
-
-After the deploy smoke test passes, verify the deployed Git remote path:
-
-```sh
-base="${PUBLIC_BASE_URL:-http://$(aws elbv2 describe-load-balancers \
-  --names gitmirrorcache-arm-ec2-alb \
-  --query 'LoadBalancers[0].DNSName' \
-  --output text)}"
-git ls-remote "$base/git/github.com/astral-sh/uv.git" refs/heads/main
-tmp="$(mktemp -d)"
-git clone --depth 1 --branch main --no-tags \
-  "$base/git/github.com/astral-sh/uv.git" "$tmp/uv"
-rm -rf "$tmp"
-```
+Changing the AMI ID only affects newly launched EC2 instances. The completed
+AL2-to-AL2023 migration and validation history is recorded in
+[PR #48](https://github.com/0lut/gitmirrorcache/pull/48).
 
 ## Why EC2/EBS Instead Of App Runner
 
