@@ -209,6 +209,45 @@ impl Materializer {
         branch: Option<BranchName>,
         default_branch: bool,
     ) -> CoreResult<GenerationId> {
+        self.publish_generation_with_parent_mode(
+            repo,
+            repo_dir,
+            commit,
+            branch,
+            default_branch,
+            true,
+        )
+        .await
+    }
+
+    pub(super) async fn publish_generation_without_parent(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+        branch: Option<BranchName>,
+        default_branch: bool,
+    ) -> CoreResult<GenerationId> {
+        self.publish_generation_with_parent_mode(
+            repo,
+            repo_dir,
+            commit,
+            branch,
+            default_branch,
+            false,
+        )
+        .await
+    }
+
+    async fn publish_generation_with_parent_mode(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+        branch: Option<BranchName>,
+        default_branch: bool,
+        use_previous_head: bool,
+    ) -> CoreResult<GenerationId> {
         let started = Instant::now();
         info!(
             %repo,
@@ -248,14 +287,24 @@ impl Materializer {
         }
 
         let head_started = Instant::now();
-        let previous_head = self.manifests().repo_head(repo).await?;
-        info!(
-            %repo,
-            previous_generation = previous_head.as_ref().map(|head| head.generation.to_string()).unwrap_or_else(|| "<none>".into()),
-            previous_tip_count = previous_head.as_ref().map(|head| head.tip_commits.len()).unwrap_or(0),
-            elapsed_ms = elapsed_ms(head_started),
-            "loaded repo generation head"
-        );
+        let previous_head = if use_previous_head {
+            let previous_head = self.manifests().repo_head(repo).await?;
+            info!(
+                %repo,
+                previous_generation = previous_head.as_ref().map(|head| head.generation.to_string()).unwrap_or_else(|| "<none>".into()),
+                previous_tip_count = previous_head.as_ref().map(|head| head.tip_commits.len()).unwrap_or(0),
+                elapsed_ms = elapsed_ms(head_started),
+                "loaded repo generation head"
+            );
+            previous_head
+        } else {
+            info!(
+                %repo,
+                elapsed_ms = elapsed_ms(head_started),
+                "skipped repo generation head for standalone generation publish"
+            );
+            None
+        };
         let previous_generation = previous_head.as_ref().map(|head| head.generation);
         let previous_tips = previous_head
             .as_ref()

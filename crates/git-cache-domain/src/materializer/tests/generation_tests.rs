@@ -288,6 +288,52 @@ async fn exact_ancestor_hydrates_generation_before_broad_upstream_fetch() {
 }
 
 #[tokio::test]
+async fn exact_ancestor_missing_generation_bundle_falls_back_to_upstream_fetch() {
+    let fixture = GitFixture::new();
+    let ancestor_commit = fixture.head_commit();
+    let tip_commit = fixture.commit_and_push("second");
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let tip_manifest = wait_for_commit_manifest(&state, &fixture.repo, &tip_commit).await;
+    wait_for_verified_generation(&state, &fixture.repo, tip_manifest.generation).await;
+
+    state
+        .store
+        .delete(&bundle_key(&fixture.repo, tip_manifest.generation))
+        .await
+        .unwrap();
+    stdfs::remove_dir_all(materializer.repo_dir(&fixture.repo)).unwrap();
+
+    let response = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Commit(ancestor_commit.clone()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.commit, ancestor_commit);
+    assert_eq!(response.source, MaterializeSource::UpstreamVerified);
+
+    let ancestor_manifest = read_commit_manifest(&*state.store, &fixture.repo, &ancestor_commit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(ancestor_manifest.generation, tip_manifest.generation);
+}
+
+#[tokio::test]
 async fn exact_ancestor_uses_local_cache_refs_when_generation_head_is_stale() {
     let fixture = GitFixture::new();
     let ancestor_commit = fixture.commit_and_push("second");
