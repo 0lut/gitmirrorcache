@@ -402,8 +402,8 @@ Direct Git POST must not run object-level upstream reachability proof. Its job
 is to parse wants after repo access is proven, serve already-ready commits,
 hydrate complete commit manifests when available, fetch missing wanted commits
 from upstream using the same request auth when read-through is enabled, require
-commit wants to have their tree object before exposure, publish newly imported
-generations, and spawn `git upload-pack`.
+commit wants to have their tree object before exposure, queue generation
+publication/verification for newly imported commits, and spawn `git upload-pack`.
 
 This intentionally accepts repo-level access as sufficient for all objects in
 the repo-scoped cache. It preserves current `main` behavior where `git clone`
@@ -618,9 +618,16 @@ availability to the main-like direct Git read-through path. Direct Git GET
 proves that the selected auth can read the upstream repo and advertises the
 current upstream refs without fetching objects. Direct Git POST then parses the
 wants, hydrates complete commit manifests when available, otherwise fetches the
-wanted commit from upstream using the same request-scoped auth, publishes a
-generation for newly imported commits, configures the serving repo, and spawns
-`git upload-pack`.
+wanted commit from upstream using the same request-scoped auth, configures the
+serving repo, and spawns `git upload-pack`.
+
+A preview run of cold `llvm/llvm-project` direct clone proved correctness but
+also showed that foreground `publish_generation` blocked the client on
+`git bundle create --all`. Direct Git now queues that generation
+publication/verification as background work after exposing the fetched commit.
+For blobless clients, the upstream read-through fetch also carries
+`--filter=blob:none`, matching the client request and avoiding unnecessary blob
+transfer into the cache.
 
 ### D10. Repo access proof uses Git transport, not provider REST
 
@@ -659,10 +666,11 @@ GET/POST pair, not a repository visibility cache.
 ### D12. Direct upload-pack has one read-through entrypoint
 
 Domain serving has one `handle_upload_pack` path for parsing wants, hydrating or
-fetching missing wanted commits, serving repo configuration, and spawning
-`git upload-pack`. The optional upstream-ref comparison argument remains only as
-API context for the GET-to-POST handoff; the domain no longer has separate
-authenticated, proof-specific, or fallback-fetch upload-pack implementations.
+fetching missing wanted commits, queueing generation publication for newly
+imported commits, serving repo configuration, and spawning `git upload-pack`.
+The optional upstream-ref comparison argument remains only as API context for
+the GET-to-POST handoff; the domain no longer has separate authenticated,
+proof-specific, or fallback-fetch upload-pack implementations.
 
 ### D13. Materialize keeps main-like branch behavior
 

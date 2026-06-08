@@ -132,7 +132,8 @@ Domain upload-pack:
 - fetches missing wanted commits from upstream using the same request auth;
 - requires `commit_ready_for_serving` before exposing a fetched or hydrated
   commit;
-- publishes a generation for newly imported commits;
+- queues background generation publication/verification for newly imported
+  commits;
 - exposes served commits through hidden refs;
 - configures the served repo;
 - spawns `git upload-pack`.
@@ -168,7 +169,10 @@ origin types such as `GitHubOrigin`, `GitLabOrigin`, `BitbucketOrigin`, and
 - Hot direct clone after a matching GET should avoid the second upstream ref
   proof and stay near current `main`.
 - Cold direct clone should work without pre-materialization by read-through
-  fetching the wanted commit, then publishing the generation.
+  fetching the wanted commit, then queueing generation publication/verification
+  in the background.
+- Blobless direct clone should forward `--filter=blob:none` to upstream
+  read-through fetches.
 - Expensive rebuilds must be no worse than current `main` for the same cache
   state; auth should add only the repo-access proof.
 - New generation publication should verify the just-created bundle from the

@@ -53,6 +53,7 @@ impl Materializer {
             && self.commit_tree_exists(repo_dir, commit).await
     }
 
+    #[cfg(test)]
     pub(super) async fn object_exists(&self, repo_dir: &FsPath, object_id: &CommitSha) -> bool {
         self.state
             .git

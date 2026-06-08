@@ -59,6 +59,28 @@ fn synthesize_ref_advertisement_contains_capability_line() {
     assert!(text.contains("agent=git-cache/1.0"));
 }
 
+fn make_upload_pack_pkt_line(data: &str) -> Vec<u8> {
+    format!("{:04x}{data}", data.len() + 4).into_bytes()
+}
+
+#[test]
+fn upload_pack_blobless_filter_parser_detects_exact_filter_line() {
+    let mut body = make_upload_pack_pkt_line("want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    body.extend_from_slice(b"0000");
+    body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+    body.extend(make_upload_pack_pkt_line("done\n"));
+
+    assert!(super::super::direct_git::upload_pack_requests_blobless_filter(&body));
+}
+
+#[test]
+fn upload_pack_blobless_filter_parser_ignores_other_filters() {
+    let mut body = make_upload_pack_pkt_line("filter tree:0\n");
+    body.extend(make_upload_pack_pkt_line("filter blob:limit=10\n"));
+
+    assert!(!super::super::direct_git::upload_pack_requests_blobless_filter(&body));
+}
+
 #[tokio::test]
 async fn direct_want_allows_locally_ready_commit_after_repo_access() {
     let fixture = GitFixture::new();
@@ -267,7 +289,12 @@ async fn anonymous_direct_want_does_not_verify_pending_generation_on_post() {
         all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
     };
     let result = materializer
-        .ensure_wants_available_from_comparison(&fixture.repo, &[commit.to_string()], &comparison)
+        .ensure_wants_available_from_comparison(
+            &fixture.repo,
+            &[commit.to_string()],
+            &comparison,
+            false,
+        )
         .await;
 
     assert!(
@@ -311,7 +338,12 @@ async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
     };
 
     let result = materializer
-        .ensure_wants_available_from_comparison(&fixture.repo, &[commit.to_string()], &comparison)
+        .ensure_wants_available_from_comparison(
+            &fixture.repo,
+            &[commit.to_string()],
+            &comparison,
+            false,
+        )
         .await;
 
     assert!(
@@ -331,6 +363,16 @@ async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
             .unwrap(),
         commit.to_string()
     );
+    assert!(
+        materializer
+            .get_commit_manifest(&fixture.repo, &commit)
+            .await
+            .unwrap()
+            .is_none(),
+        "direct Git read-through should not publish generations synchronously"
+    );
+    let manifest = wait_for_commit_manifest(&state, &fixture.repo, &commit).await;
+    wait_for_verified_generation(&state, &fixture.repo, manifest.generation).await;
 }
 
 #[tokio::test]
@@ -351,7 +393,12 @@ async fn authenticated_direct_want_for_advertised_uncached_commit_reads_through(
     };
 
     let result = authed_materializer
-        .ensure_wants_available_from_comparison(&fixture.repo, &[commit.to_string()], &comparison)
+        .ensure_wants_available_from_comparison(
+            &fixture.repo,
+            &[commit.to_string()],
+            &comparison,
+            false,
+        )
         .await;
 
     assert!(
@@ -401,6 +448,7 @@ async fn anonymous_direct_want_hydrates_public_ref_manifest_on_post() {
             &fixture.repo,
             &[cached.commit.to_string()],
             &comparison,
+            false,
         )
         .await;
 
@@ -481,6 +529,7 @@ async fn anonymous_direct_want_skips_manifest_restore_when_ref_is_already_hot() 
             &fixture.repo,
             &[cached.commit.to_string()],
             &comparison,
+            false,
         )
         .await
         .expect("hot public refs should not rehydrate the already-present manifest commit");

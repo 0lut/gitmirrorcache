@@ -693,29 +693,51 @@ impl Git {
         remote_url: &str,
         object_id: &CommitSha,
     ) -> Result<GitOutput> {
+        self.fetch_object_with_filter(repo_dir, remote_url, object_id, None)
+            .await
+    }
+
+    pub async fn fetch_object_with_filter(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        object_id: &CommitSha,
+        filter: Option<&str>,
+    ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
         reject_revision_arg(object_id.as_str())?;
-        self.run_upstream(
-            Some(repo_dir),
-            ["fetch", "--no-tags", "--", remote_url, object_id.as_str()],
-        )
-        .await
+        let mut args = vec!["fetch", "--no-tags"];
+        if let Some(filter) = filter {
+            reject_fetch_filter(filter)?;
+            args.push("--filter=blob:none");
+        }
+        args.extend(["--", remote_url, object_id.as_str()]);
+        self.run_upstream(Some(repo_dir), args).await
     }
 
     pub async fn fetch_all_heads(&self, repo_dir: &Path, remote_url: &str) -> Result<GitOutput> {
+        self.fetch_all_heads_with_filter(repo_dir, remote_url, None)
+            .await
+    }
+
+    pub async fn fetch_all_heads_with_filter(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        filter: Option<&str>,
+    ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        self.run_upstream(
-            Some(repo_dir),
-            [
-                "fetch",
-                "--no-tags",
-                "--prune",
-                "--",
-                remote_url,
-                "+refs/heads/*:refs/cache/upstream/heads/*",
-            ],
-        )
-        .await
+        let mut args = vec!["fetch", "--no-tags", "--prune"];
+        if let Some(filter) = filter {
+            reject_fetch_filter(filter)?;
+            args.push("--filter=blob:none");
+        }
+        args.extend([
+            "--",
+            remote_url,
+            "+refs/heads/*:refs/cache/upstream/heads/*",
+        ]);
+        self.run_upstream(Some(repo_dir), args).await
     }
 
     async fn check_branch_name(&self, branch: &str) -> Result<()> {
@@ -978,6 +1000,15 @@ fn reject_refspec(refspec: &str) -> Result<()> {
     if refspec.is_empty() || refspec.contains('\0') {
         return Err(GitCacheError::Validation(format!(
             "invalid refspec argument: {refspec:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_fetch_filter(filter: &str) -> Result<()> {
+    if filter != "blob:none" {
+        return Err(GitCacheError::Validation(format!(
+            "unsupported fetch filter argument: {filter:?}"
         )));
     }
     Ok(())
@@ -1427,6 +1458,21 @@ mod tests {
     #[test]
     fn reject_refspec_allows_colon() {
         assert!(reject_refspec("refs/heads/main:refs/remotes/origin/main").is_ok());
+    }
+
+    // ── reject_fetch_filter tests ───────────────────────────────────
+
+    #[test]
+    fn reject_fetch_filter_allows_blob_none() {
+        assert!(reject_fetch_filter("blob:none").is_ok());
+    }
+
+    #[test]
+    fn reject_fetch_filter_rejects_other_values() {
+        assert!(reject_fetch_filter("").is_err());
+        assert!(reject_fetch_filter("--upload-pack=evil").is_err());
+        assert!(reject_fetch_filter("blob:limit=10").is_err());
+        assert!(reject_fetch_filter("blob:none\0bad").is_err());
     }
 
     // ── reject_nul tests ────────────────────────────────────────────

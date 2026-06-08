@@ -1,6 +1,17 @@
 use super::*;
 
 const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
+const BLOBLESS_FETCH_FILTER: &str = "blob:none";
+
+#[cfg(test)]
+const DIRECT_GENERATION_PUBLISH_DELAY: StdDuration = StdDuration::from_millis(20);
+#[cfg(not(test))]
+const DIRECT_GENERATION_PUBLISH_DELAY: StdDuration = StdDuration::from_secs(30);
+
+enum DirectFetchedWantKind {
+    Commit,
+    NonCommit,
+}
 
 impl Materializer {
     /// Fetch the upstream ref advertisement for a repo without downloading
@@ -40,7 +51,7 @@ impl Materializer {
     /// deployments that need stricter history isolation should use separate
     /// upstream repositories for truly separate data.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
-        Box::pin(self.ensure_wants_read_through(repo, wants)).await
+        Box::pin(self.ensure_wants_read_through(repo, wants, false)).await
     }
 
     pub(super) async fn ensure_wants_available_from_comparison(
@@ -48,11 +59,17 @@ impl Materializer {
         repo: &RepoKey,
         wants: &[String],
         _comparison: &UpstreamRefComparison,
+        blobless_fetch: bool,
     ) -> CoreResult<()> {
-        Box::pin(self.ensure_wants_read_through(repo, wants)).await
+        Box::pin(self.ensure_wants_read_through(repo, wants, blobless_fetch)).await
     }
 
-    async fn ensure_wants_read_through(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
+    async fn ensure_wants_read_through(
+        &self,
+        repo: &RepoKey,
+        wants: &[String],
+        blobless_fetch: bool,
+    ) -> CoreResult<()> {
         let started = Instant::now();
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
@@ -70,6 +87,8 @@ impl Materializer {
         let mut served_commits = 0usize;
         let mut hydrated_commits = 0usize;
         let mut fetched_commits = 0usize;
+        let mut fetched_non_commit_wants = 0usize;
+        let fetch_filter = blobless_fetch.then_some(BLOBLESS_FETCH_FILTER);
 
         for object_id in object_ids {
             if let Some(object_type) = object_types.get(&object_id) {
@@ -104,48 +123,35 @@ impl Materializer {
             let upstream_url = self.upstream_url(repo)?;
             let upstream_git = self.upstream_git(&upstream_url)?;
             let fetch_result = upstream_git
-                .fetch_object(&repo_dir, &upstream_url, &object_id)
+                .fetch_object_with_filter(&repo_dir, &upstream_url, &object_id, fetch_filter)
                 .await;
 
             if let Err(fetch_err) = fetch_result {
                 upstream_git
-                    .fetch_all_heads(&repo_dir, &upstream_url)
+                    .fetch_all_heads_with_filter(&repo_dir, &upstream_url, fetch_filter)
                     .await?;
-                if self.object_exists(&repo_dir, &object_id).await {
-                    if self.commit_ready_for_serving(&repo_dir, &object_id).await {
-                        self.expose_served_commit(&repo_dir, &object_id).await?;
-                        fetched_commits += 1;
-                    } else if self.commit_exists(&repo_dir, &object_id).await {
+                match self
+                    .prepare_fetched_direct_want(repo, &repo_dir, &object_id)
+                    .await
+                {
+                    Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
+                    Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
+                    Err(_) => {
                         return Err(GitCacheError::NotFound(format!(
-                            "commit `{object_id}` is incomplete after upstream fetch"
+                            "object `{object_id}` could not be fetched from upstream: {fetch_err}"
                         )));
                     }
-                    continue;
                 }
-                return Err(GitCacheError::NotFound(format!(
-                    "object `{object_id}` could not be fetched from upstream: {fetch_err}"
-                )));
+                continue;
             }
 
-            if !self.commit_ready_for_serving(&repo_dir, &object_id).await {
-                return Err(GitCacheError::NotFound(format!(
-                    "commit `{object_id}` not found or incomplete after upstream fetch"
-                )));
+            match self
+                .prepare_fetched_direct_want(repo, &repo_dir, &object_id)
+                .await?
+            {
+                DirectFetchedWantKind::Commit => fetched_commits += 1,
+                DirectFetchedWantKind::NonCommit => fetched_non_commit_wants += 1,
             }
-            self.expose_served_commit(&repo_dir, &object_id).await?;
-            fetched_commits += 1;
-
-            // Create a ref so that `bundle create --all` has something
-            // to include.  We use refs/cache/ which is hidden from
-            // clients by configure_served_repo.
-            let cache_ref = format!("refs/cache/commits/{object_id}");
-            self.state
-                .git
-                .update_ref(&repo_dir, &cache_ref, object_id.as_str())
-                .await?;
-
-            self.publish_generation(repo, &repo_dir, &object_id, None, false)
-                .await?;
         }
 
         info!(
@@ -155,10 +161,94 @@ impl Materializer {
             served_commits,
             hydrated_commits,
             fetched_commits,
+            fetched_non_commit_wants,
+            blobless_fetch,
             elapsed_ms = elapsed_ms(started),
             "ensured direct git wants via read-through"
         );
         Ok(())
+    }
+
+    async fn prepare_fetched_direct_want(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        object_id: &CommitSha,
+    ) -> CoreResult<DirectFetchedWantKind> {
+        let object_types = self
+            .state
+            .git
+            .cat_file_batch_types(repo_dir, std::slice::from_ref(object_id))
+            .await?;
+        let Some(object_type) = object_types.get(object_id).map(String::as_str) else {
+            return Err(GitCacheError::NotFound(format!(
+                "object `{object_id}` not found after upstream fetch"
+            )));
+        };
+
+        if object_type != "commit" {
+            return Ok(DirectFetchedWantKind::NonCommit);
+        }
+
+        if !self.commit_ready_for_serving(repo_dir, object_id).await {
+            return Err(GitCacheError::NotFound(format!(
+                "commit `{object_id}` not found or incomplete after upstream fetch"
+            )));
+        }
+        self.expose_served_commit(repo_dir, object_id).await?;
+
+        // Keep a hidden ref so async generation publication has a stable tip
+        // to bundle. The ref is hidden from clients by configure_served_repo.
+        let cache_ref = format!("refs/cache/commits/{object_id}");
+        self.state
+            .git
+            .update_ref(repo_dir, &cache_ref, object_id.as_str())
+            .await?;
+
+        self.enqueue_direct_generation_publish(
+            repo.clone(),
+            repo_dir.to_path_buf(),
+            object_id.clone(),
+        );
+        Ok(DirectFetchedWantKind::Commit)
+    }
+
+    fn enqueue_direct_generation_publish(
+        &self,
+        repo: RepoKey,
+        repo_dir: PathBuf,
+        commit: CommitSha,
+    ) {
+        let materializer = self.clone();
+        info!(
+            %repo,
+            %commit,
+            delay_ms = DIRECT_GENERATION_PUBLISH_DELAY.as_millis(),
+            "queued direct git background generation publish"
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(DIRECT_GENERATION_PUBLISH_DELAY).await;
+            let started = Instant::now();
+            match materializer
+                .publish_generation(&repo, &repo_dir, &commit, None, false)
+                .await
+            {
+                Ok(generation) => info!(
+                    %repo,
+                    %commit,
+                    %generation,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git background generation publish finished"
+                ),
+                Err(err) => warn!(
+                    %repo,
+                    %commit,
+                    %err,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git background generation publish failed"
+                ),
+            }
+        });
     }
 
     fn direct_git_repo_cache_miss(repo: &RepoKey) -> GitCacheError {
@@ -238,20 +328,29 @@ impl Materializer {
     ) -> CoreResult<UploadPackProcess> {
         let started = Instant::now();
         let wants = parse_want_lines(body);
+        let blobless_fetch = upload_pack_requests_blobless_filter(body);
         info!(
             %repo,
             wants_count = wants.len(),
             cached_ref_proof = comparison.is_some(),
+            blobless_fetch,
             "direct git upload-pack preparation started"
         );
         if !wants.is_empty() {
             let ensure_started = Instant::now();
             match comparison {
                 Some(comparison) => {
-                    Box::pin(self.ensure_wants_available_from_comparison(repo, &wants, comparison))
-                        .await?;
+                    Box::pin(self.ensure_wants_available_from_comparison(
+                        repo,
+                        &wants,
+                        comparison,
+                        blobless_fetch,
+                    ))
+                    .await?;
                 }
-                None => Box::pin(self.ensure_wants_available(repo, &wants)).await?,
+                None => {
+                    Box::pin(self.ensure_wants_read_through(repo, &wants, blobless_fetch)).await?
+                }
             }
             info!(
                 %repo,
@@ -439,4 +538,36 @@ pub fn parse_want_lines(body: &[u8]) -> Vec<String> {
         offset += pkt_len;
     }
     wants
+}
+
+pub fn upload_pack_requests_blobless_filter(body: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset + 4 <= body.len() {
+        let hex = match std::str::from_utf8(&body[offset..offset + 4]) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        let pkt_len = match usize::from_str_radix(hex, 16) {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        if pkt_len == 0 {
+            offset += 4;
+            continue;
+        }
+        if pkt_len < 4 || offset + pkt_len > body.len() {
+            break;
+        }
+
+        let line = &body[offset + 4..offset + pkt_len];
+        if let Ok(line_str) = std::str::from_utf8(line) {
+            if line_str.trim() == "filter blob:none" {
+                return true;
+            }
+        }
+
+        offset += pkt_len;
+    }
+    false
 }

@@ -41,11 +41,15 @@ upstream.
 - fetches missing wanted commits from upstream using the same request auth;
 - requires fetched or hydrated commits to be ready for serving before exposing
   them;
-- publishes a generation for newly imported commits;
+- queues background generation publication/verification for newly imported
+  commits;
 - spawns `git upload-pack`.
 
 This keeps one path for anonymous and credentialed requests. Object checks are
 availability checks after repo access, not separate authorization checks.
+For blobless clients, direct Git forwards `--filter=blob:none` to the upstream
+read-through fetch so a blobless clone does not accidentally hydrate blobs into
+the cache.
 
 ## Auth Rule
 
@@ -65,6 +69,7 @@ Expected profile:
 - hot LLVM direct clone after materialize should stay near current `main`;
 - cold LLVM direct clone should work without pre-materialization;
 - direct Git should add at most the repo-access ref proof over current `main`;
+- direct Git should not block the client on `git bundle create --all`;
 - generation verification should avoid re-indexing the full LLVM history when a
   local-repo fast path can verify the newly created bundle.
 
