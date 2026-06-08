@@ -36,6 +36,13 @@ enum ResolveTarget {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactHydratedGenerationIndex {
+    Indexed(GenerationId),
+    Miss,
+    Unavailable,
+}
+
 impl Materializer {
     pub async fn materialize(
         &self,
@@ -452,6 +459,23 @@ impl Materializer {
             }
         }
 
+        let mut hydrate_unavailable = false;
+        if !self.commit_exists(&repo_dir, commit).await {
+            match self
+                .index_exact_commit_from_hydrated_generation(repo, &repo_dir, commit)
+                .await?
+            {
+                ExactHydratedGenerationIndex::Indexed(generation) => {
+                    debug!(%repo, %commit, %generation, "indexed exact commit from hydrated generation");
+                    return Ok(MaterializeSource::CacheVerified);
+                }
+                ExactHydratedGenerationIndex::Miss => {}
+                ExactHydratedGenerationIndex::Unavailable => {
+                    hydrate_unavailable = true;
+                }
+            }
+        }
+
         self.fetch_all_refs(repo, &repo_dir).await?;
 
         if !self.commit_exists(&repo_dir, commit).await {
@@ -460,21 +484,41 @@ impl Materializer {
             )));
         }
 
-        if let Some(generation) = self
-            .index_local_commit_from_known_generation(repo, &repo_dir, commit)
-            .await?
-        {
-            debug!(%repo, %commit, %generation, "indexed exact commit from known generation after upstream fetch");
-            return Ok(MaterializeSource::CacheVerified);
+        if !hydrate_unavailable {
+            if let Some(generation) = self
+                .index_local_commit_from_known_generation(repo, &repo_dir, commit)
+                .await?
+            {
+                debug!(%repo, %commit, %generation, "indexed exact commit from known generation after upstream fetch");
+                return Ok(MaterializeSource::CacheVerified);
+            }
+        } else {
+            // The repo head pointed at object-store data we could not hydrate.
+            // Avoid writing a fresh commit manifest back to that same generation.
+            info!(
+                %repo,
+                %commit,
+                "skipping known generation index after unavailable exact commit hydrate"
+            );
         }
 
-        self.publish_existing_local_commit(
-            repo,
-            &repo_dir,
-            commit,
-            MaterializeSource::UpstreamVerified,
-        )
-        .await
+        if hydrate_unavailable {
+            self.publish_existing_local_commit_from_fresh_generation(
+                repo,
+                &repo_dir,
+                commit,
+                MaterializeSource::UpstreamVerified,
+            )
+            .await
+        } else {
+            self.publish_existing_local_commit(
+                repo,
+                &repo_dir,
+                commit,
+                MaterializeSource::UpstreamVerified,
+            )
+            .await
+        }
     }
 
     async fn publish_existing_local_commit(
@@ -489,6 +533,100 @@ impl Materializer {
             .await?;
         debug!(%repo, %commit, %generation, "published generation for exact commit");
         Ok(source)
+    }
+
+    async fn publish_existing_local_commit_from_fresh_generation(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+        source: MaterializeSource,
+    ) -> CoreResult<MaterializeSource> {
+        let generation = self
+            .publish_generation_without_parent(repo, repo_dir, commit, None, false)
+            .await?;
+        debug!(%repo, %commit, %generation, "published fresh generation for exact commit");
+        Ok(source)
+    }
+
+    async fn index_exact_commit_from_hydrated_generation(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> CoreResult<ExactHydratedGenerationIndex> {
+        let head_started = Instant::now();
+        let Some(head) = self.manifests().repo_head(repo).await? else {
+            debug!(
+                %repo,
+                %commit,
+                elapsed_ms = elapsed_ms(head_started),
+                "exact commit hydrate skipped: no generation head"
+            );
+            return Ok(ExactHydratedGenerationIndex::Miss);
+        };
+        info!(
+            %repo,
+            %commit,
+            generation = %head.generation,
+            tip_count = head.tip_commits.len(),
+            elapsed_ms = elapsed_ms(head_started),
+            "exact commit generation head loaded"
+        );
+
+        let hydrate_started = Instant::now();
+        if let Err(err) = self
+            .hydrate_generation(repo, repo_dir, head.generation)
+            .await
+        {
+            if exact_hydrate_error_allows_upstream_fallback(&err) {
+                warn!(
+                    %repo,
+                    %commit,
+                    generation = %head.generation,
+                    %err,
+                    elapsed_ms = elapsed_ms(hydrate_started),
+                    "exact commit generation hydrate unavailable; falling back to upstream fetch"
+                );
+                return Ok(ExactHydratedGenerationIndex::Unavailable);
+            }
+            return Err(err);
+        }
+        info!(
+            %repo,
+            %commit,
+            generation = %head.generation,
+            elapsed_ms = elapsed_ms(hydrate_started),
+            "exact commit generation head hydrated"
+        );
+
+        if !self.commit_exists(repo_dir, commit).await {
+            info!(
+                %repo,
+                %commit,
+                generation = %head.generation,
+                elapsed_ms = elapsed_ms(hydrate_started),
+                "exact commit not present after generation head hydrate"
+            );
+            return Ok(ExactHydratedGenerationIndex::Miss);
+        }
+
+        let index_started = Instant::now();
+        let indexed = self
+            .index_local_commit_from_known_generation(repo, repo_dir, commit)
+            .await?;
+        info!(
+            %repo,
+            %commit,
+            generation = indexed
+                .map(|generation| generation.to_string())
+                .unwrap_or_else(|| "<none>".into()),
+            elapsed_ms = elapsed_ms(index_started),
+            "exact commit hydrated generation indexing finished"
+        );
+        Ok(indexed
+            .map(ExactHydratedGenerationIndex::Indexed)
+            .unwrap_or(ExactHydratedGenerationIndex::Miss))
     }
 
     async fn index_local_commit_from_known_generation(
@@ -832,4 +970,14 @@ impl Materializer {
         let branch = self.resolve_default_branch(repo).await?;
         self.ensure_branch(repo, &branch, true).await
     }
+}
+
+fn exact_hydrate_error_allows_upstream_fallback(err: &GitCacheError) -> bool {
+    matches!(
+        err,
+        GitCacheError::NotFound(_)
+            | GitCacheError::UpstreamUnavailable(_)
+            | GitCacheError::Timeout(_)
+            | GitCacheError::Io(_)
+    )
 }
