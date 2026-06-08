@@ -1,17 +1,18 @@
 use bytes::Bytes;
-use git_cache_core::{CommitSha, GitCacheError, Result};
+use git_cache_core::{CommitSha, GitCacheError, Result, UpstreamAuth};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, info};
 
 pub const DEFAULT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
@@ -21,6 +22,7 @@ pub struct Git {
     timeout: Duration,
     output_limit: usize,
     extra_env: Vec<(OsString, OsString)>,
+    upstream_auth_env: Option<GitAuthEnv>,
     process_semaphore: Arc<Semaphore>,
 }
 
@@ -51,6 +53,7 @@ impl Git {
             timeout,
             output_limit: DEFAULT_OUTPUT_LIMIT,
             extra_env: Vec::new(),
+            upstream_auth_env: None,
             process_semaphore: Arc::new(Semaphore::new(effective)),
         }
     }
@@ -69,6 +72,13 @@ impl Git {
         self
     }
 
+    pub fn with_upstream_auth(&self, remote_url: &str, auth: &UpstreamAuth) -> Result<Self> {
+        reject_remote_url(remote_url)?;
+        let mut git = self.clone();
+        git.upstream_auth_env = GitAuthEnv::from_upstream_auth(remote_url, auth)?;
+        Ok(git)
+    }
+
     pub async fn init_bare(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(None, ["init", "--bare", "--", path_to_str(repo_dir)?])
             .await
@@ -83,11 +93,12 @@ impl Git {
     ) -> Result<GitOutput> {
         reject_ref_arg(branch, "branch")?;
         reject_ref_arg(local_ref, "local ref")?;
+        reject_remote_url(remote_url)?;
         self.check_branch_name(branch).await?;
         self.check_ref_name(local_ref).await?;
 
         let refspec = format!("refs/heads/{branch}:{local_ref}");
-        self.run(
+        self.run_upstream(
             Some(repo_dir),
             ["fetch", "--no-tags", "--", remote_url, &refspec],
         )
@@ -154,6 +165,42 @@ impl Git {
             .collect()
     }
 
+    pub async fn for_each_ref(
+        &self,
+        repo_dir: &Path,
+        ref_prefix: &str,
+    ) -> Result<Vec<(String, CommitSha)>> {
+        reject_ref_arg(ref_prefix, "ref prefix")?;
+        let output = self
+            .run(
+                Some(repo_dir),
+                [
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "--",
+                    ref_prefix,
+                ],
+            )
+            .await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
+        })?;
+        let mut refs = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((ref_name, commit)) = line.split_once(' ') else {
+                return Err(GitCacheError::Validation(format!(
+                    "malformed git for-each-ref output line: {line:?}"
+                )));
+            };
+            refs.push((ref_name.to_string(), CommitSha::parse(commit)?));
+        }
+        Ok(refs)
+    }
+
     pub async fn for_each_ref_containing_commit(
         &self,
         repo_dir: &Path,
@@ -184,6 +231,39 @@ impl Git {
             .filter(|line| !line.trim().is_empty())
             .map(|line| CommitSha::parse(line.trim()))
             .collect()
+    }
+
+    pub async fn object_reachable_from_commits(
+        &self,
+        repo_dir: &Path,
+        object_id: &CommitSha,
+        commits: &[CommitSha],
+    ) -> Result<bool> {
+        reject_revision_arg(object_id.as_str())?;
+        if commits.is_empty() {
+            return Ok(false);
+        }
+
+        let mut stdin = Vec::with_capacity(commits.len() * 41);
+        for commit in commits {
+            reject_revision_arg(commit.as_str())?;
+            stdin.extend_from_slice(commit.as_str().as_bytes());
+            stdin.push(b'\n');
+        }
+
+        let output = self
+            .run_with_stdin_and_limits(
+                Some(repo_dir),
+                ["rev-list", "--objects", "--no-object-names", "--stdin"],
+                Some(&stdin),
+                self.output_limit,
+                self.output_limit,
+            )
+            .await?;
+        let text = String::from_utf8(output.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git rev-list returned non-utf8: {err}"))
+        })?;
+        Ok(text.lines().any(|line| line.trim() == object_id.as_str()))
     }
 
     pub async fn cat_file_batch_types(
@@ -287,6 +367,14 @@ impl Git {
         .await
     }
 
+    pub async fn bundle_verify(&self, repo_dir: &Path, bundle_path: &Path) -> Result<GitOutput> {
+        self.run(
+            Some(repo_dir),
+            ["bundle", "verify", "--", path_to_str(bundle_path)?],
+        )
+        .await
+    }
+
     pub async fn repack_for_serving(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(
             Some(repo_dir),
@@ -333,16 +421,24 @@ impl Git {
         .await
     }
 
-    /// Run `git ls-remote --symref <remote>` and return a map of
+    /// Run `git ls-remote --symref <remote> HEAD refs/heads/*` and return a map of
     /// `refs/heads/<branch>` → commit SHA, plus the optional default branch name.
-    /// We intentionally omit `--heads` so that the HEAD symref annotation is
-    /// included in the output, and filter to `refs/heads/*` in memory.
+    /// The explicit patterns include the HEAD symref without downloading tags.
     pub async fn ls_remote_heads(&self, remote: &str) -> Result<LsRemoteResult> {
         reject_remote_url(remote)?;
         let output = self
-            .run(None, ["ls-remote", "--symref", "--", remote])
-            .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+            .run_upstream(
+                None,
+                [
+                    "ls-remote",
+                    "--symref",
+                    "--",
+                    remote,
+                    "HEAD",
+                    "refs/heads/*",
+                ],
+            )
+            .await?;
 
         let text = String::from_utf8(output.stdout).map_err(|err| {
             GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
@@ -381,9 +477,8 @@ impl Git {
     pub async fn ls_remote_default_branch(&self, remote: &str) -> Result<String> {
         reject_remote_url(remote)?;
         let output = self
-            .run(None, ["ls-remote", "--symref", "--", remote, "HEAD"])
-            .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))?;
+            .run_upstream(None, ["ls-remote", "--symref", "--", remote, "HEAD"])
+            .await?;
 
         let text = String::from_utf8(output.stdout).map_err(|err| {
             GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
@@ -413,6 +508,12 @@ impl Git {
         reject_ref_arg(ref_name, "ref")?;
         reject_revision_arg(sha)?;
         self.run(Some(repo_dir), ["update-ref", "--", ref_name, sha])
+            .await
+    }
+
+    pub async fn delete_ref(&self, repo_dir: &Path, ref_name: &str) -> Result<GitOutput> {
+        reject_ref_arg(ref_name, "ref")?;
+        self.run(Some(repo_dir), ["update-ref", "-d", "--", ref_name])
             .await
     }
 
@@ -583,9 +684,60 @@ impl Git {
         ];
         args.extend(refspecs.iter().cloned());
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        self.run(Some(repo_dir), args_ref)
+        self.run_upstream(Some(repo_dir), args_ref).await
+    }
+
+    pub async fn fetch_object(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        object_id: &CommitSha,
+    ) -> Result<GitOutput> {
+        self.fetch_object_with_filter(repo_dir, remote_url, object_id, None)
             .await
-            .map_err(|err| GitCacheError::UpstreamUnavailable(err.to_string()))
+    }
+
+    pub async fn fetch_object_with_filter(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        object_id: &CommitSha,
+        filter: Option<&str>,
+    ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        reject_revision_arg(object_id.as_str())?;
+        let mut args = vec!["fetch", "--no-tags"];
+        if let Some(filter) = filter {
+            reject_fetch_filter(filter)?;
+            args.push("--filter=blob:none");
+        }
+        args.extend(["--", remote_url, object_id.as_str()]);
+        self.run_upstream(Some(repo_dir), args).await
+    }
+
+    pub async fn fetch_all_heads(&self, repo_dir: &Path, remote_url: &str) -> Result<GitOutput> {
+        self.fetch_all_heads_with_filter(repo_dir, remote_url, None)
+            .await
+    }
+
+    pub async fn fetch_all_heads_with_filter(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        filter: Option<&str>,
+    ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        let mut args = vec!["fetch", "--no-tags", "--prune"];
+        if let Some(filter) = filter {
+            reject_fetch_filter(filter)?;
+            args.push("--filter=blob:none");
+        }
+        args.extend([
+            "--",
+            remote_url,
+            "+refs/heads/*:refs/cache/upstream/heads/*",
+        ]);
+        self.run_upstream(Some(repo_dir), args).await
     }
 
     async fn check_branch_name(&self, branch: &str) -> Result<()> {
@@ -606,6 +758,33 @@ impl Git {
         stdin: Option<&[u8]>,
         max_stdout_bytes: usize,
         max_stderr_bytes: usize,
+    ) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_stdin_limits(cwd, args, stdin, max_stdout_bytes, max_stderr_bytes, false)
+            .await
+    }
+
+    async fn run_upstream<I, S>(&self, cwd: Option<&Path>, args: I) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_stdin_limits(cwd, args, None, self.output_limit, self.output_limit, true)
+            .await
+            .map_err(|err| self.map_upstream_git_error(err))
+    }
+
+    async fn run_with_stdin_limits<I, S>(
+        &self,
+        cwd: Option<&Path>,
+        args: I,
+        stdin: Option<&[u8]>,
+        max_stdout_bytes: usize,
+        max_stderr_bytes: usize,
+        apply_upstream_auth: bool,
     ) -> Result<GitOutput>
     where
         I: IntoIterator<Item = S>,
@@ -650,9 +829,22 @@ impl Git {
             command.env("TMPDIR", tmpdir);
         }
 
-        for (key, value) in &self.extra_env {
-            command.env(key, value);
+        let mut git_config_entries = git_config_entries_from_extra_env(&self.extra_env);
+        if apply_upstream_auth {
+            if let Some(auth_env) = &self.upstream_auth_env {
+                git_config_entries.retain(|(key, _)| key != &auth_env.config_key);
+                git_config_entries.push((
+                    auth_env.config_key.clone(),
+                    OsString::from(auth_env.config_value.clone()),
+                ));
+            }
         }
+        for (key, value) in &self.extra_env {
+            if !is_git_config_env_key(key) {
+                command.env(key, value);
+            }
+        }
+        apply_git_config_entries(&mut command, &git_config_entries);
 
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -693,16 +885,36 @@ impl Git {
             Ok::<_, GitCacheError>((status, stdout, stderr))
         };
 
+        let started = Instant::now();
         let (status, stdout, stderr) = timeout(self.timeout, run).await.map_err(|_| {
             GitCacheError::Timeout(format!("git command exceeded {:?}", self.timeout))
         })??;
 
         let status_code = status.code().unwrap_or(-1);
+        let elapsed = started.elapsed();
         if !status.success() {
+            if elapsed >= Duration::from_secs(1) {
+                info!(
+                    ?cwd,
+                    ?args,
+                    status_code,
+                    elapsed_ms = elapsed.as_millis(),
+                    "git command failed"
+                );
+            }
             let stderr = String::from_utf8_lossy(&stderr);
             return Err(GitCacheError::Validation(format!(
                 "git exited with status {status_code}: {stderr}"
             )));
+        }
+        if elapsed >= Duration::from_secs(1) {
+            info!(
+                ?cwd,
+                ?args,
+                status_code,
+                elapsed_ms = elapsed.as_millis(),
+                "git command finished"
+            );
         }
 
         Ok(GitOutput {
@@ -719,6 +931,25 @@ impl Git {
     {
         self.run_with_stdin_and_limits(cwd, args, None, self.output_limit, self.output_limit)
             .await
+    }
+
+    fn map_upstream_git_error(&self, error: GitCacheError) -> GitCacheError {
+        let error_text = error.to_string();
+        if self
+            .upstream_auth_env
+            .as_ref()
+            .is_some_and(|auth| auth.authenticated)
+            && looks_like_auth_rejection(&error_text)
+        {
+            return GitCacheError::Unauthorized("upstream rejected authorization".into());
+        }
+
+        match error {
+            GitCacheError::Validation(message) => GitCacheError::UpstreamUnavailable(format!(
+                "upstream git command failed: {message}"
+            )),
+            other => other,
+        }
     }
 }
 
@@ -774,6 +1005,15 @@ fn reject_refspec(refspec: &str) -> Result<()> {
     Ok(())
 }
 
+fn reject_fetch_filter(filter: &str) -> Result<()> {
+    if filter != "blob:none" {
+        return Err(GitCacheError::Validation(format!(
+            "unsupported fetch filter argument: {filter:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn reject_nul(value: &str, kind: &str) -> Result<()> {
     if value.contains('\0') {
         return Err(GitCacheError::Validation(format!(
@@ -781,6 +1021,116 @@ fn reject_nul(value: &str, kind: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn git_config_count_from_extra_env(extra_env: &[(OsString, OsString)]) -> usize {
+    extra_env
+        .iter()
+        .rev()
+        .find_map(|(key, value)| {
+            if key == OsStr::new("GIT_CONFIG_COUNT") {
+                value.to_str()?.parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn git_config_entries_from_extra_env(
+    extra_env: &[(OsString, OsString)],
+) -> Vec<(String, OsString)> {
+    let count = git_config_count_from_extra_env(extra_env);
+    let mut keys: HashMap<usize, String> = HashMap::new();
+    let mut values: HashMap<usize, OsString> = HashMap::new();
+
+    for (name, value) in extra_env {
+        if let Some(slot) = git_config_env_slot(name, "GIT_CONFIG_KEY_") {
+            if let Some(key) = value.to_str() {
+                keys.insert(slot, key.to_string());
+            }
+        } else if let Some(slot) = git_config_env_slot(name, "GIT_CONFIG_VALUE_") {
+            values.insert(slot, value.clone());
+        }
+    }
+
+    (0..count)
+        .filter_map(|slot| Some((keys.remove(&slot)?, values.remove(&slot)?)))
+        .collect()
+}
+
+fn git_config_env_slot(name: &OsStr, prefix: &str) -> Option<usize> {
+    name.to_str()?.strip_prefix(prefix)?.parse().ok()
+}
+
+fn is_git_config_env_key(name: &OsStr) -> bool {
+    name == OsStr::new("GIT_CONFIG_COUNT")
+        || git_config_env_slot(name, "GIT_CONFIG_KEY_").is_some()
+        || git_config_env_slot(name, "GIT_CONFIG_VALUE_").is_some()
+}
+
+fn apply_git_config_entries(command: &mut Command, entries: &[(String, OsString)]) {
+    if entries.is_empty() {
+        return;
+    }
+    command.env("GIT_CONFIG_COUNT", entries.len().to_string());
+    for (slot, (key, value)) in entries.iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{slot}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{slot}"), value);
+    }
+}
+
+#[derive(Clone)]
+struct GitAuthEnv {
+    config_key: String,
+    config_value: String,
+    authenticated: bool,
+}
+
+impl GitAuthEnv {
+    fn from_upstream_auth(remote_url: &str, auth: &UpstreamAuth) -> Result<Option<Self>> {
+        let Some(raw_header) = auth.raw_header() else {
+            return Ok(None);
+        };
+        let config_key = upstream_extra_header_key(remote_url);
+        reject_config_key(&config_key)?;
+        reject_nul(raw_header, "upstream authorization header")?;
+        Ok(Some(Self {
+            config_key,
+            config_value: format!("Authorization: {raw_header}"),
+            authenticated: auth.is_authenticated(),
+        }))
+    }
+}
+
+impl fmt::Debug for GitAuthEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitAuthEnv")
+            .field("config_key", &self.config_key)
+            .field("config_value", &"<redacted>")
+            .field("authenticated", &self.authenticated)
+            .finish()
+    }
+}
+
+fn upstream_extra_header_key(remote_url: &str) -> String {
+    if let Some(rest) = remote_url.strip_prefix("https://") {
+        if let Some(host) = rest.split('/').next().filter(|host| !host.is_empty()) {
+            return format!("http.https://{host}/.extraHeader");
+        }
+    }
+    "http.https://github.com/.extraHeader".to_string()
+}
+
+fn looks_like_auth_rejection(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("authentication failed")
+        || lower.contains("could not read username")
+        || lower.contains("terminal prompts disabled")
+        || lower.contains("authentication required")
+        || lower.contains("authorization failed")
+        || lower.contains("permission denied")
 }
 
 #[derive(Debug)]
@@ -867,6 +1217,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     // ── reject_ref_arg tests ────────────────────────────────────────
 
@@ -947,6 +1298,123 @@ mod tests {
         assert!(reject_config_key("key=value").is_ok());
     }
 
+    #[test]
+    fn upstream_error_mapping_preserves_timeout() {
+        let git = Git::default_with_timeout(Duration::from_secs(1));
+
+        let error = git.map_upstream_git_error(GitCacheError::Timeout("slow git".into()));
+
+        assert!(
+            matches!(&error, GitCacheError::Timeout(message) if message == "slow git"),
+            "timeout should not be remapped to upstream unavailable: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_auth_env_appends_to_existing_git_config_entries() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "git-cache-auth-env-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-git");
+        let env_out = root.join("env.txt");
+        std::fs::write(&script, "#!/bin/sh\nenv > \"$FAKE_ENV_OUT\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+        let git = Git::new(&script, Duration::from_secs(5))
+            .with_env("FAKE_ENV_OUT", env_out.as_os_str().to_os_string())
+            .with_env("GIT_CONFIG_COUNT", "1")
+            .with_env("GIT_CONFIG_KEY_0", "http.https://example.com/.extraHeader")
+            .with_env("GIT_CONFIG_VALUE_0", "Authorization: Bearer process")
+            .with_upstream_auth("https://github.com/org/repo.git", &auth)
+            .unwrap();
+
+        git.ls_remote_heads("https://github.com/org/repo.git")
+            .await
+            .unwrap();
+
+        let env = std::fs::read_to_string(&env_out).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(env.contains("GIT_CONFIG_COUNT=2"), "{env}");
+        assert!(
+            env.contains("GIT_CONFIG_KEY_0=http.https://example.com/.extraHeader"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_VALUE_0=Authorization: Bearer process"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_KEY_1=http.https://github.com/.extraHeader"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_VALUE_1=Authorization: Basic dXNlcjpwYXNz"),
+            "{env}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_auth_env_replaces_existing_entry_for_same_host() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "git-cache-auth-env-same-host-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-git");
+        let env_out = root.join("env.txt");
+        std::fs::write(&script, "#!/bin/sh\nenv > \"$FAKE_ENV_OUT\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+        let git = Git::new(&script, Duration::from_secs(5))
+            .with_env("FAKE_ENV_OUT", env_out.as_os_str().to_os_string())
+            .with_env("GIT_CONFIG_COUNT", "1")
+            .with_env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraHeader")
+            .with_env("GIT_CONFIG_VALUE_0", "Authorization: Bearer process")
+            .with_upstream_auth("https://github.com/org/repo.git", &auth)
+            .unwrap();
+
+        git.ls_remote_heads("https://github.com/org/repo.git")
+            .await
+            .unwrap();
+
+        let env = std::fs::read_to_string(&env_out).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(env.contains("GIT_CONFIG_COUNT=1"), "{env}");
+        assert!(
+            env.contains("GIT_CONFIG_KEY_0=http.https://github.com/.extraHeader"),
+            "{env}"
+        );
+        assert!(
+            env.contains("GIT_CONFIG_VALUE_0=Authorization: Basic dXNlcjpwYXNz"),
+            "{env}"
+        );
+        assert!(!env.contains("Authorization: Bearer process"), "{env}");
+    }
+
     // ── reject_remote_url tests ─────────────────────────────────────
 
     #[test]
@@ -990,6 +1458,21 @@ mod tests {
     #[test]
     fn reject_refspec_allows_colon() {
         assert!(reject_refspec("refs/heads/main:refs/remotes/origin/main").is_ok());
+    }
+
+    // ── reject_fetch_filter tests ───────────────────────────────────
+
+    #[test]
+    fn reject_fetch_filter_allows_blob_none() {
+        assert!(reject_fetch_filter("blob:none").is_ok());
+    }
+
+    #[test]
+    fn reject_fetch_filter_rejects_other_values() {
+        assert!(reject_fetch_filter("").is_err());
+        assert!(reject_fetch_filter("--upload-pack=evil").is_err());
+        assert!(reject_fetch_filter("blob:limit=10").is_err());
+        assert!(reject_fetch_filter("blob:none\0bad").is_err());
     }
 
     // ── reject_nul tests ────────────────────────────────────────────
@@ -1053,6 +1536,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn for_each_ref_rejects_dash_ref_prefix() {
+        let git = test_git();
+        assert!(git
+            .for_each_ref(Path::new("/unused"), "-evil")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn for_each_ref_containing_commit_rejects_dash_ref_prefix() {
         let git = test_git();
         let commit = CommitSha::parse("a".repeat(40)).unwrap();
@@ -1069,6 +1561,12 @@ mod tests {
             .update_ref(Path::new("/unused"), "-evil", "abc123")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_ref_rejects_dash_ref_name() {
+        let git = test_git();
+        assert!(git.delete_ref(Path::new("/unused"), "-evil").await.is_err());
     }
 
     #[tokio::test]

@@ -5,18 +5,18 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, Result as CoreResult, Selector,
+    AppConfig, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult, UpstreamAuth,
 };
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
     frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
-    MaterializerExecutor,
+    UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
-use git_cache_worker::{InMemoryRepoLeaseManager, UpdateCoordinator, UpdateDisposition};
-use http::{header, Method, StatusCode, Uri};
+use http::{header, HeaderMap, Method, StatusCode, Uri};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -28,8 +28,10 @@ use tokio::io::AsyncRead;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
+use tracing::{info, info_span, Instrument};
 
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const DIRECT_GIT_PROOF_TTL: Duration = Duration::from_secs(30);
 
 pub fn app(config: AppConfig) -> Router {
     app_result(config).expect("failed to initialize git-cache-api")
@@ -72,7 +74,7 @@ fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> 
 #[derive(Clone)]
 struct ApiState {
     domain: Arc<AppState>,
-    coordinator: UpdateCoordinator,
+    direct_git_proofs: Arc<DirectGitProofCache>,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -91,17 +93,130 @@ impl ApiState {
     }
 
     fn with_domain(rate_limiter: RateLimiter, domain: Arc<AppState>) -> CoreResult<Self> {
-        let executor = Arc::new(MaterializerExecutor::new(Arc::clone(&domain)));
-        let leases = Arc::new(InMemoryRepoLeaseManager::new());
-        let coordinator = UpdateCoordinator::new(executor, leases);
-        Materializer::new(Arc::clone(&domain)).enqueue_pending_generation_scan();
         Ok(Self {
             domain,
-            coordinator,
+            direct_git_proofs: Arc::new(DirectGitProofCache::new(DIRECT_GIT_PROOF_TTL)),
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
         })
     }
+
+    fn next_request_id(&self) -> u64 {
+        self.metrics.request_ids.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectGitProofKey {
+    repo: RepoKey,
+    auth: DirectGitProofAuth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DirectGitProofAuth {
+    Anonymous,
+    Authenticated(String),
+}
+
+#[derive(Debug, Clone)]
+struct DirectGitProof {
+    inserted_at: Instant,
+    comparison: UpstreamRefComparison,
+}
+
+#[derive(Debug)]
+struct DirectGitProofCache {
+    ttl: Duration,
+    entries: Mutex<HashMap<DirectGitProofKey, DirectGitProof>>,
+}
+
+impl DirectGitProofCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, repo: &RepoKey, auth: &UpstreamAuth, comparison: UpstreamRefComparison) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        self.prune_locked(&mut entries, now);
+        entries.insert(
+            DirectGitProofKey::new(repo, auth),
+            DirectGitProof {
+                inserted_at: now,
+                comparison,
+            },
+        );
+    }
+
+    fn get(
+        &self,
+        repo: &RepoKey,
+        auth: &UpstreamAuth,
+    ) -> Option<(UpstreamAuth, UpstreamRefComparison)> {
+        let Ok(mut entries) = self.entries.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        self.prune_locked(&mut entries, now);
+
+        if auth.is_authenticated() {
+            if let Some(proof) = entries.get(&DirectGitProofKey::new(repo, auth)) {
+                return Some((auth.clone(), proof.comparison.clone()));
+            }
+            return None;
+        }
+
+        if let Some(proof) = entries.get(&DirectGitProofKey::anonymous(repo)) {
+            return Some((UpstreamAuth::Anonymous, proof.comparison.clone()));
+        }
+
+        None
+    }
+
+    fn prune_locked(&self, entries: &mut HashMap<DirectGitProofKey, DirectGitProof>, now: Instant) {
+        entries.retain(|_, proof| now.duration_since(proof.inserted_at) <= self.ttl);
+    }
+}
+
+impl DirectGitProofKey {
+    fn anonymous(repo: &RepoKey) -> Self {
+        Self {
+            repo: repo.clone(),
+            auth: DirectGitProofAuth::Anonymous,
+        }
+    }
+
+    fn new(repo: &RepoKey, auth: &UpstreamAuth) -> Self {
+        Self {
+            repo: repo.clone(),
+            auth: DirectGitProofAuth::from_auth(auth),
+        }
+    }
+}
+
+impl DirectGitProofAuth {
+    fn from_auth(auth: &UpstreamAuth) -> Self {
+        let Some(raw) = auth.raw_header() else {
+            return Self::Anonymous;
+        };
+        let digest = Sha256::digest(raw.as_bytes());
+        Self::Authenticated(hex_lower(&digest))
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 async fn healthz() -> Json<HealthResponse> {
@@ -142,27 +257,71 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
 
 async fn materialize(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
-    handle_materialize_request(&state, request).await
+    let auth = upstream_api_auth(&headers)?;
+    handle_materialize_request(&state, request, auth).await
 }
 
 async fn resolve(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
-    handle_materialize_request(&state, request).await
+    let auth = upstream_api_auth(&headers)?;
+    handle_resolve_request(&state, request, auth).await
 }
 
 async fn handle_materialize_request(
     state: &Arc<ApiState>,
     request: MaterializeRequest,
+    auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
+    let request_id = state.next_request_id();
+    let repo = request.repo.clone();
+    let selector = format!("{:?}", request.selector);
+    let span = info_span!(
+        "api_request",
+        request_id,
+        endpoint = "materialize",
+        repo = %repo
+    );
+    async move {
+        handle_materialize_request_inner(state, request, auth, request_id, selector).await
+    }
+    .instrument(span)
+    .await
+}
+
+async fn handle_materialize_request_inner(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+    request_id: u64,
+    selector: String,
+) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let repo = request.repo.clone();
+    info!(
+        request_id,
+        repo = %repo,
+        selector,
+        auth = auth_label(&auth),
+        "materialize request started"
+    );
     if !state.rate_limiter.check() {
         state
             .metrics
             .rate_limited_total
             .fetch_add(1, Ordering::Relaxed);
+        info!(
+            request_id,
+            repo = %repo,
+            elapsed_ms = elapsed_ms(started),
+            status = %StatusCode::TOO_MANY_REQUESTS,
+            "materialize request finished"
+        );
         return Err(ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: "rate limit exceeded".into(),
@@ -174,45 +333,66 @@ async fn handle_materialize_request(
         .materialize_total
         .fetch_add(1, Ordering::Relaxed);
 
-    let use_coordinator = matches!(
-        request.selector,
-        Selector::Branch(_) | Selector::DefaultBranch
-    );
-
-    let verified_by_coordinator = if use_coordinator {
-        let outcome = state
-            .coordinator
-            .read_through(request.repo.clone(), request.selector.clone())
-            .await;
-        match outcome {
-            Ok(o) if o.disposition == UpdateDisposition::LeaseBusy => {
-                return Err(ApiError {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    message: "update in progress, retry later".into(),
-                });
-            }
+    let CheckedMaterializeRequest { request, auth } =
+        match check_materialize_upstream_auth(request, auth).await {
+            Ok(checked) => checked,
             Err(error) => {
                 state
                     .metrics
                     .materialize_errors_total
                     .fetch_add(1, Ordering::Relaxed);
-                return Err(error.into());
+                info!(
+                    request_id,
+                    repo = %repo,
+                    elapsed_ms = elapsed_ms(started),
+                    status = %error.status,
+                    "materialize request finished"
+                );
+                return Err(error);
             }
-            Ok(_) => {}
-        }
-        true
-    } else {
-        false
-    };
+        };
 
-    let materializer = Materializer::new(Arc::clone(&state.domain));
-    let result = if verified_by_coordinator {
-        materializer
-            .materialize_after_upstream_validation(request)
-            .await
-    } else {
-        materializer.materialize(request).await
-    };
+    let result = run_materialize_request(state, request, auth).await;
+    match &result {
+        Ok(_) => info!(
+            request_id,
+            elapsed_ms = elapsed_ms(started),
+            status = %StatusCode::OK,
+            "materialize request finished"
+        ),
+        Err(error) => info!(
+            request_id,
+            elapsed_ms = elapsed_ms(started),
+            status = %error.status,
+            "materialize request finished"
+        ),
+    }
+    result
+}
+
+async fn run_materialize_request(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<Response, ApiError> {
+    let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
+    let domain_started = Instant::now();
+    let result = materializer.materialize(request).await;
+    match &result {
+        Ok(response) => info!(
+            repo = %response.repo,
+            commit = %response.commit,
+            source = ?response.source,
+            session_protected = response.session_token.is_some(),
+            elapsed_ms = elapsed_ms(domain_started),
+            "domain materialize finished"
+        ),
+        Err(error) => info!(
+            error = %error,
+            elapsed_ms = elapsed_ms(domain_started),
+            "domain materialize failed"
+        ),
+    }
 
     match result {
         Ok(response) => Ok(Json(response).into_response()),
@@ -226,10 +406,140 @@ async fn handle_materialize_request(
     }
 }
 
+async fn handle_resolve_request(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<Response, ApiError> {
+    let request_id = state.next_request_id();
+    let repo = request.repo.clone();
+    let selector = format!("{:?}", request.selector);
+    let span = info_span!(
+        "api_request",
+        request_id,
+        endpoint = "resolve",
+        repo = %repo
+    );
+    async move { handle_resolve_request_inner(state, request, auth, request_id, selector).await }
+        .instrument(span)
+        .await
+}
+
+async fn handle_resolve_request_inner(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+    request_id: u64,
+    selector: String,
+) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let repo = request.repo.clone();
+    info!(
+        request_id,
+        repo = %repo,
+        selector,
+        auth = auth_label(&auth),
+        "resolve request started"
+    );
+    if !state.rate_limiter.check() {
+        state
+            .metrics
+            .rate_limited_total
+            .fetch_add(1, Ordering::Relaxed);
+        info!(
+            request_id,
+            repo = %repo,
+            elapsed_ms = elapsed_ms(started),
+            status = %StatusCode::TOO_MANY_REQUESTS,
+            "resolve request finished"
+        );
+        return Err(ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "rate limit exceeded".into(),
+        });
+    }
+
+    state
+        .metrics
+        .materialize_total
+        .fetch_add(1, Ordering::Relaxed);
+
+    let CheckedMaterializeRequest { request, auth } =
+        match check_materialize_upstream_auth(request, auth).await {
+            Ok(checked) => checked,
+            Err(error) => {
+                state
+                    .metrics
+                    .materialize_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                info!(
+                    request_id,
+                    repo = %repo,
+                    elapsed_ms = elapsed_ms(started),
+                    status = %error.status,
+                    "resolve request finished"
+                );
+                return Err(error);
+            }
+        };
+
+    let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
+    let domain_started = Instant::now();
+    match materializer.resolve(request).await {
+        Ok(response) => {
+            info!(
+                request_id,
+                repo = %response.repo,
+                commit = %response.commit,
+                source = ?response.source,
+                cache_available = response.cache_available,
+                domain_elapsed_ms = elapsed_ms(domain_started),
+                elapsed_ms = elapsed_ms(started),
+                status = %StatusCode::OK,
+                "resolve request finished"
+            );
+            Ok(Json(response).into_response())
+        }
+        Err(error) => {
+            state
+                .metrics
+                .materialize_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+            let error = ApiError::from(error);
+            info!(
+                request_id,
+                repo = %repo,
+                elapsed_ms = elapsed_ms(started),
+                status = %error.status,
+                "resolve request finished"
+            );
+            Err(error)
+        }
+    }
+}
+
+struct CheckedMaterializeRequest {
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+}
+
+async fn check_materialize_upstream_auth(
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<CheckedMaterializeRequest, ApiError> {
+    if request.requires_upstream_auth() && !auth.is_authenticated() {
+        return Err(
+            GitCacheError::Unauthorized("upstream authorization is required".into()).into(),
+        );
+    }
+    Ok(CheckedMaterializeRequest { request, auth })
+}
+
 async fn git_session(
     State(state): State<Arc<ApiState>>,
     Path((session_id, repo_path)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     method: Method,
     uri: Uri,
     body: Bytes,
@@ -257,8 +567,12 @@ async fn git_session(
     };
 
     let materializer = Materializer::new(Arc::clone(&state.domain));
+    let session_token = match session_bearer_token(&headers) {
+        Ok(token) => token,
+        Err(error) => return error.into_response(),
+    };
     let session_repo = match materializer
-        .session_repo_from_manifest(&repo, session_id)
+        .session_repo_from_manifest(&repo, session_id, session_token.as_deref())
         .await
     {
         Ok(repo) => repo,
@@ -314,10 +628,55 @@ async fn git_repo(
     State(state): State<Arc<ApiState>>,
     Path(repo_path): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     method: Method,
     uri: Uri,
     body: Bytes,
 ) -> Response {
+    let request_id = state.next_request_id();
+    let path = uri.path().to_string();
+    let method_for_span = method.clone();
+    let request = GitRepoRequest {
+        repo_path,
+        query,
+        headers,
+        method,
+        uri,
+        body,
+        request_id,
+    };
+    let span = info_span!(
+        "api_request",
+        request_id,
+        endpoint = "direct_git",
+        method = %method_for_span,
+        path = %path
+    );
+    async move { git_repo_inner(state, request).await }
+        .instrument(span)
+        .await
+}
+
+struct GitRepoRequest {
+    repo_path: String,
+    query: HashMap<String, String>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+    request_id: u64,
+}
+
+async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
+    let GitRepoRequest {
+        repo_path,
+        query,
+        headers,
+        method,
+        uri,
+        body,
+        request_id,
+    } = request;
     let path = uri.path();
 
     // Reject git-receive-pack (push) requests.
@@ -347,34 +706,142 @@ async fn git_repo(
         && path.ends_with("/info/refs")
         && query.get("service").is_some_and(|s| s == "git-upload-pack")
     {
+        let started = Instant::now();
+        let auth = match direct_git_upstream_auth(&headers) {
+            Ok(auth) => auth,
+            Err(error) => return error.into_response(),
+        };
+        info!(
+            request_id,
+            repo = %repo,
+            auth = auth_label(&auth),
+            "direct git ref advertisement started"
+        );
         state
             .metrics
             .git_remote_refs_total
             .fetch_add(1, Ordering::Relaxed);
+        let materializer = materializer.using_upstream_auth(&auth);
 
         // Fetch upstream refs via ls-remote and synthesize the pkt-line
-        // response directly.  No objects are fetched — the repo may not
-        // even exist locally yet.  Objects are fetched lazily when the
-        // client actually issues an upload-pack POST.
+        // response directly. No objects are fetched here; the repo may not
+        // even exist locally yet. The advertisement is a short-lived
+        // repo-access proof for the matching upload-pack POST. The POST path
+        // then performs the normal read-through availability work using the
+        // same request auth.
+        let refs_started = Instant::now();
         let comparison = match materializer.upstream_refs(&repo).await {
             Ok(c) => c,
             Err(error) => return ApiError::from(error).into_response(),
         };
+        info!(
+            request_id,
+            repo = %repo,
+            refs_count = comparison.all_upstream.len(),
+            elapsed_ms = elapsed_ms(refs_started),
+            "direct git upstream refs fetched"
+        );
+        state
+            .direct_git_proofs
+            .insert(&repo, &auth, comparison.clone());
 
         let output = synthesize_ref_advertisement(&comparison);
-        git_response(
+        let response = git_response(
             "application/x-git-upload-pack-advertisement",
             frame_ref_advertisement(&output),
-        )
+        );
+        info!(
+            request_id,
+            repo = %repo,
+            auth = auth_label(&auth),
+            elapsed_ms = elapsed_ms(started),
+            status = %StatusCode::OK,
+            "direct git ref advertisement finished"
+        );
+        response
     } else if method == Method::POST && path.ends_with("/git-upload-pack") {
+        let started = Instant::now();
+        let auth = match direct_git_upstream_auth(&headers) {
+            Ok(auth) => auth,
+            Err(error) => return error.into_response(),
+        };
+        info!(
+            request_id,
+            repo = %repo,
+            auth = auth_label(&auth),
+            body_bytes = body.len(),
+            "direct git upload-pack started"
+        );
         state
             .metrics
             .git_remote_upload_pack_total
             .fetch_add(1, Ordering::Relaxed);
+        let cached_proof = state.direct_git_proofs.get(&repo, &auth);
+        let (auth, comparison) = match cached_proof {
+            Some((auth, comparison)) => {
+                info!(
+                    request_id,
+                    repo = %repo,
+                    auth = auth_label(&auth),
+                    "direct git upload-pack using cached repo proof"
+                );
+                (auth, Some(comparison))
+            }
+            None => {
+                // Direct Git POSTs can arrive without the matching GET, so
+                // fall back to the same lightweight ref proof used by GET.
+                // This proves repo access without fetching packs. The
+                // materializer then performs the same read-through
+                // availability work as main, using the request-scoped auth.
+                let auth_started = Instant::now();
+                let proof_materializer = materializer.using_upstream_auth(&auth);
+                let comparison = match proof_materializer.upstream_refs(&repo).await {
+                    Ok(comparison) => comparison,
+                    Err(error) => return ApiError::from(error).into_response(),
+                };
+                info!(
+                    request_id,
+                    repo = %repo,
+                    auth = auth_label(&auth),
+                    refs_count = comparison.all_upstream.len(),
+                    elapsed_ms = elapsed_ms(auth_started),
+                    "direct git upload-pack repo access proved"
+                );
+                state
+                    .direct_git_proofs
+                    .insert(&repo, &auth, comparison.clone());
+                (auth, Some(comparison))
+            }
+        };
+        let materializer = materializer.using_upstream_auth(&auth);
 
-        match materializer.handle_upload_pack(&repo, &body).await {
-            Ok(process) => stream_upload_pack_response(&state, process),
-            Err(error) => ApiError::from(error).into_response(),
+        let result =
+            Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await;
+
+        match result {
+            Ok(process) => {
+                info!(
+                    request_id,
+                    repo = %repo,
+                    auth = auth_label(&auth),
+                    elapsed_ms = elapsed_ms(started),
+                    status = %StatusCode::OK,
+                    "direct git upload-pack process spawned"
+                );
+                stream_upload_pack_response(&state, process)
+            }
+            Err(error) => {
+                let error = ApiError::from(error);
+                info!(
+                    request_id,
+                    repo = %repo,
+                    auth = auth_label(&auth),
+                    elapsed_ms = elapsed_ms(started),
+                    status = %error.status,
+                    "direct git upload-pack failed"
+                );
+                error.into_response()
+            }
         }
     } else {
         ApiError::from(GitCacheError::Unsupported(format!(
@@ -382,6 +849,63 @@ async fn git_repo(
         )))
         .into_response()
     }
+}
+
+fn upstream_api_auth(headers: &HeaderMap) -> Result<UpstreamAuth, ApiError> {
+    parse_optional_upstream_auth_header(headers, "git-cache-upstream-authorization")
+}
+
+fn direct_git_upstream_auth(headers: &HeaderMap) -> Result<UpstreamAuth, ApiError> {
+    parse_optional_upstream_auth_header(headers, header::AUTHORIZATION.as_str())
+}
+
+fn parse_optional_upstream_auth_header(
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<UpstreamAuth, ApiError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(UpstreamAuth::Anonymous);
+    };
+    let value = value.to_str().map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "upstream authorization header must be valid ASCII".into(),
+    })?;
+    UpstreamAuth::parse_header(value).map_err(|error| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: error.to_string(),
+    })
+}
+
+fn session_bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        message: "session authorization header must be valid ASCII".into(),
+    })?;
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let scheme = parts.next().unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Ok(None);
+    }
+    let Some(token) = parts.next() else {
+        return Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "session bearer token is invalid".into(),
+        });
+    };
+    if token.trim().is_empty()
+        || token
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "session bearer token is invalid".into(),
+        });
+    }
+    Ok(Some(token.trim().to_string()))
 }
 
 fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackProcess) -> Response {
@@ -425,12 +949,25 @@ struct HealthResponse {
 
 #[derive(Debug, Default)]
 struct Metrics {
+    request_ids: AtomicU64,
     materialize_total: AtomicU64,
     materialize_errors_total: AtomicU64,
     upload_pack_total: AtomicU64,
     rate_limited_total: AtomicU64,
     git_remote_refs_total: AtomicU64,
     git_remote_upload_pack_total: AtomicU64,
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
+}
+
+fn auth_label(auth: &UpstreamAuth) -> &'static str {
+    if auth.is_authenticated() {
+        "authenticated"
+    } else {
+        "anonymous"
+    }
 }
 
 struct RateLimiter {
@@ -487,6 +1024,8 @@ impl From<GitCacheError> for ApiError {
         let status = match error {
             GitCacheError::NotFound(_) => StatusCode::NOT_FOUND,
             GitCacheError::UpstreamUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            GitCacheError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            GitCacheError::Forbidden(_) => StatusCode::FORBIDDEN,
             GitCacheError::DiskFull(_) => StatusCode::INSUFFICIENT_STORAGE,
             GitCacheError::Unsupported(_) => StatusCode::METHOD_NOT_ALLOWED,
             GitCacheError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
@@ -582,7 +1121,9 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use git_cache_core::ObjectStoreConfig;
+    use git_cache_core::{
+        MaterializeRequest, ObjectStoreConfig, RepoKey, Selector, UpstreamAuthorizationMode,
+    };
     use git_cache_domain::parse_want_lines;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -597,6 +1138,148 @@ mod tests {
         assert!(limiter.check());
         assert!(limiter.check());
         assert!(!limiter.check());
+    }
+
+    #[test]
+    fn direct_git_proof_cache_does_not_downshift_basic_auth_to_public_proof() {
+        let cache = DirectGitProofCache::new(Duration::from_secs(30));
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".into()),
+            all_upstream: HashMap::from([("main".into(), "a".repeat(40))]),
+        };
+
+        cache.insert(&repo, &UpstreamAuth::Anonymous, comparison.clone());
+
+        assert!(
+            cache.get(&repo, &auth).is_none(),
+            "token-present POSTs must use token-scoped proof"
+        );
+        let (effective_auth, cached) = cache
+            .get(&repo, &UpstreamAuth::Anonymous)
+            .expect("anonymous POST should reuse anonymous proof");
+        assert_eq!(effective_auth, UpstreamAuth::Anonymous);
+        assert_eq!(cached.default_branch, comparison.default_branch);
+        assert_eq!(cached.all_upstream, comparison.all_upstream);
+    }
+
+    #[test]
+    fn direct_git_proof_cache_keeps_authenticated_proof_scoped() {
+        let cache = DirectGitProofCache::new(Duration::from_secs(30));
+        let repo = RepoKey::parse("github.com/org/private").unwrap();
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".into()),
+            all_upstream: HashMap::from([("main".into(), "b".repeat(40))]),
+        };
+
+        cache.insert(&repo, &auth, comparison.clone());
+
+        assert!(
+            cache.get(&repo, &UpstreamAuth::Anonymous).is_none(),
+            "authenticated proof must not satisfy anonymous POSTs"
+        );
+        let (effective_auth, cached) = cache
+            .get(&repo, &auth)
+            .expect("same Basic auth should reuse proof");
+        assert_eq!(effective_auth, auth);
+        assert_eq!(cached.all_upstream, comparison.all_upstream);
+    }
+
+    #[test]
+    fn direct_git_proof_cache_expires_entries() {
+        let cache = DirectGitProofCache::new(Duration::from_millis(1));
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: None,
+            all_upstream: HashMap::from([("main".into(), "c".repeat(40))]),
+        };
+
+        cache.insert(&repo, &UpstreamAuth::Anonymous, comparison);
+        std::thread::sleep(Duration::from_millis(2));
+
+        assert!(cache.get(&repo, &UpstreamAuth::Anonymous).is_none());
+    }
+
+    #[test]
+    fn upstream_api_auth_ignores_gateway_bearer_authorization() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer gateway-token".parse().unwrap(),
+        );
+
+        let auth = upstream_api_auth(&headers).unwrap();
+
+        assert_eq!(auth, UpstreamAuth::Anonymous);
+    }
+
+    #[test]
+    fn session_bearer_token_accepts_case_insensitive_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "bearer gcs_token".parse().unwrap());
+
+        let token = session_bearer_token(&headers).unwrap();
+
+        assert_eq!(token.as_deref(), Some("gcs_token"));
+    }
+
+    #[test]
+    fn session_bearer_token_ignores_unrelated_authorization_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());
+
+        let token = session_bearer_token(&headers).unwrap();
+
+        assert_eq!(token, None);
+    }
+
+    #[tokio::test]
+    async fn authenticated_resolve_is_rate_limited_before_upstream_work() {
+        let tmp = TempDir::new().unwrap();
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            public_base_url: "http://127.0.0.1:0".into(),
+            cache_root: tmp.path().join("cache"),
+            upstream_root: Some(tmp.path().join("upstreams")),
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 60,
+            max_git_output_bytes: 16 * 1024 * 1024,
+            object_store: ObjectStoreConfig::Local {
+                root: tmp.path().join("objects"),
+            },
+            session_ttl_seconds: 3600,
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 1,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 1024 * 1024 * 1024,
+                min_free_bytes: 0,
+            },
+            git_remote: Default::default(),
+            compaction: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            session_cleanup_interval_secs: 300,
+            max_concurrent_generation_verifications: 1,
+        };
+        let state = Arc::new(ApiState::try_new(config).unwrap());
+        assert!(state.rate_limiter.check(), "first request consumes quota");
+
+        let request = MaterializeRequest {
+            repo: RepoKey::parse("evil.com/org/repo").unwrap(),
+            selector: Selector::DefaultBranch,
+            mode: Default::default(),
+            upstream_authorization: UpstreamAuthorizationMode::Required,
+        };
+        let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
+
+        let result = handle_resolve_request(&state, request, auth).await;
+
+        match result {
+            Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),
+            Ok(_) => panic!("rate-limited authenticated resolve should not succeed"),
+        }
     }
 
     #[tokio::test]
@@ -675,6 +1358,7 @@ mod tests {
                 "github.com/org/repo.git".to_string(),
             )),
             Query(query),
+            HeaderMap::new(),
             Method::GET,
             Uri::from_static(
                 "/git/session/not-a-session/github.com/org/repo.git/info/refs?service=git-receive-pack",

@@ -257,11 +257,22 @@ impl UpdateCoordinator {
             inflight.remove(key);
         }
     }
+
+    #[cfg(test)]
+    async fn inflight_waiter_count(&self, key: &UpdateKey) -> usize {
+        let inflight = self.inner.inflight.lock().await;
+        inflight
+            .get(key)
+            .map(|entry| entry.waiter_count())
+            .unwrap_or(0)
+    }
 }
 
 struct InflightUpdate {
     sender: watch::Sender<Option<SharedUpdateResult>>,
     receiver: watch::Receiver<Option<SharedUpdateResult>>,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
 type SharedUpdateResult = std::result::Result<UpdateOutcome, String>;
@@ -269,10 +280,19 @@ type SharedUpdateResult = std::result::Result<UpdateOutcome, String>;
 impl InflightUpdate {
     fn new() -> Self {
         let (sender, receiver) = watch::channel(None);
-        Self { sender, receiver }
+        Self {
+            sender,
+            receiver,
+            #[cfg(test)]
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     async fn wait(&self) -> SharedUpdateResult {
+        #[cfg(test)]
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         let mut receiver = self.receiver.clone();
 
         loop {
@@ -288,6 +308,11 @@ impl InflightUpdate {
 
     async fn complete(&self, result: SharedUpdateResult) {
         let _ = self.sender.send(Some(result));
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.waiters.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1295,6 +1320,7 @@ mod tests {
     async fn inflight_dedup_thundering_herd() {
         let executor = Arc::new(RecordingExecutor::new(true));
         let coord = coordinator(Arc::clone(&executor));
+        let key = UpdateKey::new(repo(), UpdateTarget::from_selector(&branch("main")));
 
         let first = tokio::spawn({
             let c = coord.clone();
@@ -1310,7 +1336,18 @@ mod tests {
             }));
         }
 
-        tokio::task::yield_now().await;
+        timeout(Duration::from_secs(5), async {
+            while coord.inflight_waiter_count(&key).await < joiners.len() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all joiners should attach to the in-flight update before release");
+        assert_eq!(
+            coord.inflight_waiter_count(&key).await,
+            joiners.len(),
+            "all joiners should attach to the in-flight update before release"
+        );
         assert_eq!(executor.calls(), 1, "executor called exactly once");
 
         executor.release_one();

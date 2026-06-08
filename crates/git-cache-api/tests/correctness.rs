@@ -15,7 +15,8 @@ use tokio::net::TcpListener;
 
 struct TestServer {
     addr: SocketAddr,
-    _tmp: TempDir,
+    tmp: TempDir,
+    upstream_bare: PathBuf,
 }
 
 impl TestServer {
@@ -86,7 +87,11 @@ impl TestServer {
             axum::serve(listener, router).await.unwrap();
         });
 
-        Self { addr, _tmp: tmp }
+        Self {
+            addr,
+            tmp,
+            upstream_bare,
+        }
     }
 
     fn materialize_url(&self) -> String {
@@ -103,6 +108,32 @@ impl TestServer {
 
     fn metrics_url(&self) -> String {
         format!("http://{}/metrics", self.addr)
+    }
+
+    fn warm_local_branch_cache(&self) {
+        let repo_dir = self.tmp.path().join("cache/repos/github.com/org/repo.git");
+        if !repo_dir.join("config").exists() {
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            run_git(
+                self.tmp.path(),
+                &["init", "--bare", repo_dir.to_str().unwrap()],
+            );
+        }
+        run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                self.upstream_bare.to_str().unwrap(),
+                "+refs/heads/main:refs/cache/upstream/heads/main",
+                "+refs/heads/main:refs/heads/main",
+            ],
+        );
+        run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    }
+
+    fn object_store_root(&self) -> PathBuf {
+        self.tmp.path().join("objects-v2")
     }
 }
 
@@ -189,6 +220,39 @@ async fn materialize_missing_repo_returns_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn materialize_hot_local_branch_does_not_publish_generation() {
+    let server = TestServer::start().await;
+    server.warm_local_branch_cache();
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(server.materialize_url())
+        .json(&serde_json::json!({
+            "repo": "github.com/org/repo",
+            "selector": {"branch": "main"}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["source"], "upstream_verified");
+
+    let store_root = server.object_store_root();
+    assert!(
+        !store_root
+            .join("repos/github.com/org/repo/generations")
+            .exists(),
+        "hot branch materialize should not publish a generation"
+    );
+    assert!(
+        !store_root.join("pending-generations").exists(),
+        "hot branch materialize should not enqueue generation verification"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn materialize_invalid_repo_key_returns_error() {
     let server = TestServer::start().await;
     let client = reqwest::Client::new();
@@ -269,10 +333,10 @@ async fn materialize_nonexistent_repo_returns_error() {
     );
 }
 
-// ── Resolve endpoint (same as materialize) ──────────────────────────────
+// ── Resolve endpoint ────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resolve_with_valid_branch_works_like_materialize() {
+async fn resolve_with_valid_branch_returns_lightweight_response() {
     let server = TestServer::start().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -289,7 +353,12 @@ async fn resolve_with_valid_branch_works_like_materialize() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["repo"], "github.com/org/repo");
     assert!(body["commit"].is_string());
-    assert!(body["git_url"].is_string());
+    assert!(body["cache_available"].is_boolean());
+    assert!(body["authorized_at"].is_string());
+    assert!(
+        body.get("git_url").is_none(),
+        "resolve should not create a materialize session"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

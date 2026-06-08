@@ -374,7 +374,7 @@ impl DiskManager {
             .active_reservations
             .keys()
             .copied()
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
         let mut report = CleanupReport {
             removed_temp_dirs: 0,
             removed_reservation_markers: 0,
@@ -419,10 +419,10 @@ impl DiskManager {
                     continue;
                 }
 
-                let Some(id) = uuid_from_dir_name(path.file_name()) else {
-                    continue;
-                };
-                if active_reservations.contains(&id) {
+                if uuid_from_dir_name(path.file_name())
+                    .map(|id| active_reservations.contains(&id))
+                    .unwrap_or(false)
+                {
                     continue;
                 }
 
@@ -956,6 +956,13 @@ mod tests {
         let temp_dir = manager.temp_dir_for(stale_id);
         fs::create_dir_all(&temp_dir).expect("temp dir");
         fs::write(temp_dir.join("pack.tmp"), vec![0u8; 16]).expect("tmp file");
+        let orphan_id = Uuid::now_v7();
+        let orphan_temp_dir = manager.temp_dir_for(orphan_id);
+        fs::create_dir_all(&orphan_temp_dir).expect("orphan temp dir");
+        fs::write(orphan_temp_dir.join("pack.tmp"), vec![0u8; 8]).expect("orphan tmp file");
+        let named_temp_dir = manager.tmp_dir().join("interrupted-verification.git");
+        fs::create_dir_all(&named_temp_dir).expect("named temp dir");
+        fs::write(named_temp_dir.join("pack.tmp"), vec![0u8; 4]).expect("named tmp file");
 
         let marker = ReservationMarker {
             id: stale_id,
@@ -969,10 +976,12 @@ mod tests {
             .cleanup_stale_temps(Duration::ZERO)
             .expect("cleanup");
 
-        assert_eq!(report.removed_temp_dirs, 1);
+        assert_eq!(report.removed_temp_dirs, 3);
         assert_eq!(report.removed_reservation_markers, 1);
-        assert!(report.freed_bytes >= 16);
+        assert!(report.freed_bytes >= 28);
         assert!(!temp_dir.exists());
+        assert!(!orphan_temp_dir.exists());
+        assert!(!named_temp_dir.exists());
         assert!(!manager.marker_path(stale_id).exists());
     }
 

@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
                     repo,
                     selector,
                     mode: mode.into(),
+                    upstream_authorization: Default::default(),
                 })
                 .await;
             match response {

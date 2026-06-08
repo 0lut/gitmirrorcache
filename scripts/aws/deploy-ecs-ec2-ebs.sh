@@ -62,6 +62,7 @@ ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-500}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
 ECS_EBS_DELETE_ON_TERMINATION="${ECS_EBS_DELETE_ON_TERMINATION:-false}"
 ECS_SKIP_DOCKER_BUILD="${ECS_SKIP_DOCKER_BUILD:-false}"
+ECS_DOCKER_BUILD_NO_CACHE="${ECS_DOCKER_BUILD_NO_CACHE:-false}"
 ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS="${ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS:-false}"
 ECR_PUSH_LATEST="${ECR_PUSH_LATEST:-true}"
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
@@ -85,6 +86,11 @@ esac
 case "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" in
   true | false) ;;
   *) die "ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS must be true or false" ;;
+esac
+
+case "$ECS_DOCKER_BUILD_NO_CACHE" in
+  true | false) ;;
+  *) die "ECS_DOCKER_BUILD_NO_CACHE must be true or false" ;;
 esac
 
 case "$ECS_PRECHECK_VCPU_QUOTA" in
@@ -737,11 +743,15 @@ build_and_push_image() {
   fi
 
   aws_cli ecr get-login-password | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+  local build_args=(--platform "$DOCKER_PLATFORM")
   local docker_tags=(-t "$IMAGE_URI")
+  if [[ "$ECS_DOCKER_BUILD_NO_CACHE" == "true" ]]; then
+    build_args+=(--no-cache)
+  fi
   if [[ "$ECR_PUSH_LATEST" == "true" ]]; then
     docker_tags+=(-t "$LATEST_URI")
   fi
-  DOCKER_BUILDKIT="$DOCKER_BUILDKIT" docker build --platform "$DOCKER_PLATFORM" "${docker_tags[@]}" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
+  DOCKER_BUILDKIT="$DOCKER_BUILDKIT" docker build "${build_args[@]}" "${docker_tags[@]}" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
   docker push "$IMAGE_URI"
   if [[ "$ECR_PUSH_LATEST" == "true" ]]; then
     docker push "$LATEST_URI"

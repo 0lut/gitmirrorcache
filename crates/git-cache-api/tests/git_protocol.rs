@@ -48,6 +48,7 @@ impl TestServer {
         );
         run_git(&upstream_work, &["push", "origin", "main"]);
         run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        warm_all_heads(tmp.path(), &upstream_bare);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -114,6 +115,25 @@ fn run_git(cwd: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn warm_all_heads(tmp: &Path, upstream_bare: &Path) {
+    let repo_dir = tmp.join("cache/repos/github.com/org/repo.git");
+    if !repo_dir.join("config").exists() {
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        run_git(tmp, &["init", "--bare", repo_dir.to_str().unwrap()]);
+    }
+    run_git(
+        &repo_dir,
+        &[
+            "fetch",
+            "--no-tags",
+            upstream_bare.to_str().unwrap(),
+            "+refs/heads/*:refs/cache/upstream/heads/*",
+            "+refs/heads/*:refs/heads/*",
+        ],
+    );
+    run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

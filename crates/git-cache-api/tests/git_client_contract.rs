@@ -17,11 +17,19 @@ struct TestServer {
     addr: SocketAddr,
     tmp: TempDir,
     upstream_work: PathBuf,
-    _upstream_bare: PathBuf,
+    upstream_bare: PathBuf,
 }
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_warm_cache(true).await
+    }
+
+    async fn start_unwarmed() -> Self {
+        Self::start_with_warm_cache(false).await
+    }
+
+    async fn start_with_warm_cache(warm_cache: bool) -> Self {
         let tmp = TempDir::new().unwrap();
         let upstream_bare = tmp.path().join("upstreams/github.com/org/repo.git");
         let upstream_work = tmp.path().join("work");
@@ -88,12 +96,16 @@ impl TestServer {
             axum::serve(listener, router).await.unwrap();
         });
 
-        Self {
+        let server = Self {
             addr,
             tmp,
             upstream_work,
-            _upstream_bare: upstream_bare,
+            upstream_bare,
+        };
+        if warm_cache {
+            server.warm_all_heads();
         }
+        server
     }
 
     fn git_url(&self, repo: &str) -> String {
@@ -113,6 +125,7 @@ impl TestServer {
         run_git(&self.upstream_work, &["add", "README.md"]);
         run_git(&self.upstream_work, &["commit", "-m", contents]);
         run_git(&self.upstream_work, &["push", "--force", "origin", "main"]);
+        self.warm_all_heads();
         self.head_commit()
     }
 
@@ -122,6 +135,28 @@ impl TestServer {
 
     fn materialize_url(&self) -> String {
         format!("http://{}/v1/materialize", self.addr)
+    }
+
+    fn warm_all_heads(&self) {
+        let repo_dir = self.tmp.path().join("cache/repos/github.com/org/repo.git");
+        if !repo_dir.join("config").exists() {
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            run_git(
+                self.tmp.path(),
+                &["init", "--bare", repo_dir.to_str().unwrap()],
+            );
+        }
+        run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                self.upstream_bare.to_str().unwrap(),
+                "+refs/heads/*:refs/cache/upstream/heads/*",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 }
 
@@ -225,6 +260,29 @@ async fn post_json(
 }
 
 // ── Clone / fetch tests ─────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_direct_clone_reads_through() {
+    let server = TestServer::start_unwarmed().await;
+    let url = server.git_url("github.com/org/repo");
+    let clone_dir = server.tmp.path().join("cold_direct_clone");
+
+    run_git_async(
+        server.tmp.path(),
+        &[
+            "clone",
+            "--no-tags",
+            "--branch",
+            "main",
+            &url,
+            clone_dir.to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    let cloned_head = git_stdout_async(&clone_dir, &["rev-parse", "HEAD"]).await;
+    assert_eq!(cloned_head, server.head_commit());
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_clone() {
@@ -452,6 +510,7 @@ async fn multiple_branches() {
     run_git(&server.upstream_work, &["commit", "-m", "feature commit"]);
     run_git(&server.upstream_work, &["push", "origin", "feature"]);
     run_git(&server.upstream_work, &["checkout", "main"]);
+    server.warm_all_heads();
 
     let url = server.git_url("github.com/org/repo");
     let clone_dir = server.tmp.path().join("multi_branch_clone");
@@ -501,6 +560,7 @@ async fn force_push_handling() {
         &server.upstream_work,
         &["push", "--force", "origin", "main"],
     );
+    server.warm_all_heads();
     let new_head = server.head_commit();
 
     run_git_async(&clone_dir, &["fetch", "origin"]).await;
@@ -542,6 +602,7 @@ async fn large_file_handling() {
         &server.upstream_work,
         &["push", "--force", "origin", "main"],
     );
+    server.warm_all_heads();
 
     let url = server.git_url("github.com/org/repo");
     let clone_dir = server.tmp.path().join("large_clone");

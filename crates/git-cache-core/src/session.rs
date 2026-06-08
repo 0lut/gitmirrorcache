@@ -56,6 +56,20 @@ pub struct SessionManifest {
     pub synthetic_ref: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub protection: SessionProtection,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionProtection {
+    #[default]
+    Public,
+    BearerToken {
+        token_hash: String,
+        authorized_commits: Vec<CommitSha>,
+        authorized_refs: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -204,6 +218,7 @@ mod tests {
             synthetic_ref: id.synthetic_ref(),
             created_at: test_ts(),
             expires_at: test_ts(),
+            protection: SessionProtection::Public,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let parsed: SessionManifest = serde_json::from_str(&json).unwrap();

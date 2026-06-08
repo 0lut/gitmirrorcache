@@ -180,6 +180,29 @@ async fn git_stdout_async(cwd: &Path, args: &[&str]) -> String {
     .unwrap()
 }
 
+async fn run_git_with_extra_header_async(cwd: &Path, args: &[&str], header: String) {
+    let cwd = cwd.to_path_buf();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let output = Command::new("git")
+            .current_dir(&cwd)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env("GIT_CONFIG_VALUE_0", header)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    })
+    .await
+    .unwrap();
+}
+
 /// POST JSON to a URL, returning the response.
 async fn post_json(
     client: &reqwest::Client,
@@ -201,6 +224,7 @@ struct MaterializeResponse {
     commit: String,
     #[serde(rename = "ref")]
     ref_name: String,
+    session_token: Option<String>,
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -325,6 +349,81 @@ async fn session_upload_pack_accepts_large_request_body() {
         pack_resp.status(),
         reqwest::StatusCode::PAYLOAD_TOO_LARGE,
         "git upload-pack requests over Axum's default 2 MiB body limit should reach the handler"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_materialize_session_requires_bearer_token() {
+    let server = TestServer::start().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(server.materialize_url())
+        .header("content-type", "application/json")
+        .header(
+            "Git-Cache-Upstream-Authorization",
+            "Basic dXNlcjpwYXNzd29yZA==",
+        )
+        .body(
+            serde_json::to_string(&serde_json::json!({
+                "repo": "github.com/org/repo",
+                "selector": {"branch": "main"},
+                "upstream_authorization": "required"
+            }))
+            .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mat: MaterializeResponse = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    let token = mat
+        .session_token
+        .as_deref()
+        .expect("authenticated materialize should return session_token");
+
+    let refs_url = format!("{}/info/refs?service=git-upload-pack", mat.git_url);
+    let missing = client.get(&refs_url).send().await.unwrap();
+    assert_eq!(missing.status(), 401);
+
+    let wrong = client
+        .get(&refs_url)
+        .header("Authorization", "Bearer wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+
+    let refs_resp = client
+        .get(&refs_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refs_resp.status(), 200);
+    let refs_body = refs_resp.text().await.unwrap();
+    assert!(refs_body.contains(&mat.ref_name));
+    assert!(
+        !refs_body.contains(" filter "),
+        "protected session should not advertise filter capability"
+    );
+
+    let clone_dir = server.tmp.path().join("protected_session_clone");
+    run_git_with_extra_header_async(
+        server.tmp.path(),
+        &[
+            "clone",
+            "--no-tags",
+            &mat.git_url,
+            clone_dir.to_str().unwrap(),
+        ],
+        format!("Authorization: Bearer {token}"),
+    )
+    .await;
+    let cloned_head = git_stdout_async(&clone_dir, &["rev-parse", "HEAD"]).await;
+    assert_eq!(
+        cloned_head, mat.commit,
+        "protected session clone should fetch the authorized commit"
     );
 }
 
