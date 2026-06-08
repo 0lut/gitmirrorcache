@@ -220,6 +220,7 @@ impl Materializer {
             );
             let upstream_url = self.upstream_url(repo)?;
             let upstream_git = self.upstream_git(&upstream_url)?;
+            let fetched_via_advertised_ref = advertised_branch.is_some();
             let fetch_result = if let Some(branch) = advertised_branch {
                 let upstream_ref = format!("refs/heads/{branch}");
                 let local_ref = format!("refs/cache/upstream/heads/{branch}");
@@ -291,10 +292,34 @@ impl Materializer {
                 continue;
             }
 
-            match self
+            let prepared = self
                 .prepare_fetched_direct_want(repo, &repo_dir, object_id)
-                .await?
-            {
+                .await;
+            let prepared = match prepared {
+                Ok(kind) => kind,
+                Err(err) if fetched_via_advertised_ref => {
+                    warn!(
+                        %repo,
+                        commit = %object_id,
+                        %err,
+                        "direct git advertised-ref fetch did not include wanted object; falling back to raw object fetch"
+                    );
+                    upstream_git
+                        .fetch_object_with_options(
+                            &repo_dir,
+                            &upstream_url,
+                            object_id,
+                            fetch_options.filter,
+                            fetch_options.depth,
+                        )
+                        .await?;
+                    self.prepare_fetched_direct_want(repo, &repo_dir, object_id)
+                        .await?
+                }
+                Err(err) => return Err(err),
+            };
+
+            match prepared {
                 DirectFetchedWantKind::Commit => fetched_commits += 1,
                 DirectFetchedWantKind::NonCommit => fetched_non_commit_wants += 1,
             }

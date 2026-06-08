@@ -496,6 +496,53 @@ async fn direct_want_for_advertised_branch_preserves_depth_and_fetches_ref() {
 }
 
 #[tokio::test]
+async fn direct_want_falls_back_to_exact_sha_when_advertised_branch_moves_before_post() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+    let advertised_commit = fixture.commit_and_push("advertised");
+    let moved_commit = fixture.commit_and_push("moved");
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+
+    let stale_comparison = UpstreamRefComparison {
+        default_branch: Some("main".to_string()),
+        all_upstream: HashMap::from([("main".to_string(), advertised_commit.to_string())]),
+    };
+    let mut body =
+        make_upload_pack_pkt_line(&format!("want {advertised_commit} multi_ack thin-pack\n"));
+    body.extend_from_slice(b"0000");
+    body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+    body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+    body.extend(make_upload_pack_pkt_line("done\n"));
+    let intent = super::super::direct_git::parse_upload_pack_intent(&body).unwrap();
+
+    materializer
+        .ensure_upload_pack_intent_available_from_comparison(
+            &fixture.repo,
+            &intent,
+            &stale_comparison,
+        )
+        .await
+        .expect("stale advertised-ref fetch should fall back to exact SHA fetch");
+
+    assert!(
+        materializer
+            .commit_ready_for_serving(&repo_dir, &advertised_commit)
+            .await,
+        "the originally advertised wanted commit should be fetched exactly"
+    );
+    assert_eq!(
+        state
+            .git
+            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
+            .await
+            .unwrap(),
+        moved_commit.to_string(),
+        "the ref fetch may still record the newer branch tip"
+    );
+}
+
+#[tokio::test]
 async fn anonymous_direct_want_hydrates_public_ref_manifest_on_post() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
