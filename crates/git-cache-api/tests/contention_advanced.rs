@@ -1,8 +1,8 @@
 //! Advanced API-level resource contention tests.
 //!
 //! Tests cover concurrent materialization across multiple repos, materialize during
-//! active clone, rate limiter fairness, session expiry during clone, concurrent
-//! session creation and expiry, parallel fetch after force-push, and disk pressure.
+//! active clone, rate limiter fairness, parallel fetch after force-push, and disk
+//! pressure.
 
 use git_cache_api::app;
 use git_cache_core::{AppConfig, GitRemoteConfig, ObjectStoreConfig};
@@ -18,6 +18,7 @@ struct TestServer {
     addr: std::net::SocketAddr,
     tmp: TempDir,
     upstream_work: PathBuf,
+    upstream_bare: PathBuf,
 }
 
 impl TestServer {
@@ -68,11 +69,9 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             leases: Default::default(),
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -93,11 +92,14 @@ impl TestServer {
             axum::serve(listener, router).await.unwrap();
         });
 
-        Self {
+        let server = Self {
             addr,
             tmp,
             upstream_work,
-        }
+            upstream_bare,
+        };
+        server.warm_all_heads();
+        server
     }
 
     fn materialize_url(&self) -> String {
@@ -121,7 +123,30 @@ impl TestServer {
         run_git(&self.upstream_work, &["add", "README.md"]);
         run_git(&self.upstream_work, &["commit", "-m", contents]);
         run_git(&self.upstream_work, &["push", "--force", "origin", "main"]);
+        self.warm_all_heads();
         self.head_commit()
+    }
+
+    fn warm_all_heads(&self) {
+        let repo_dir = self.tmp.path().join("cache/repos/github.com/org/repo.git");
+        if !repo_dir.join("config").exists() {
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            run_git(
+                self.tmp.path(),
+                &["init", "--bare", repo_dir.to_str().unwrap()],
+            );
+        }
+        run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                self.upstream_bare.to_str().unwrap(),
+                "+refs/heads/*:refs/cache/upstream/heads/*",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 }
 
@@ -205,11 +230,9 @@ impl MultiRepoTestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             leases: Default::default(),
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -490,131 +513,7 @@ async fn rate_limiter_fairness() {
     );
 }
 
-// ── 4. Session expiry during clone ───────────────────────────────────────
-
-#[tokio::test(flavor = "multi_thread")]
-async fn session_expiry_during_clone() {
-    let server = TestServer::start_with_config(|mut config| {
-        config.session_ttl_seconds = 2;
-        config
-    })
-    .await;
-
-    let client = reqwest::Client::new();
-
-    // Materialize to create a session.
-    let resp = client
-        .post(server.materialize_url())
-        .json(&serde_json::json!({
-            "repo": "github.com/org/repo",
-            "selector": {"branch": "main"}
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let git_url = body["git_url"].as_str().unwrap().to_string();
-
-    // Wait 1 second (session still valid).
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    // Start clone using the session URL — it should complete or fail gracefully.
-    let clone_dir = server.tmp.path().join("expiry-clone");
-    let result = tokio::task::spawn_blocking(move || {
-        Command::new("git")
-            .args([
-                "clone",
-                "--no-tags",
-                "--branch",
-                "main",
-                &git_url,
-                clone_dir.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap()
-    })
-    .await
-    .unwrap();
-
-    // Either it succeeds (session was still valid) or fails gracefully (no panic/crash).
-    if result.status.success() {
-        let clone_dir = server.tmp.path().join("expiry-clone");
-        let head = git_stdout(&clone_dir, &["rev-parse", "HEAD"]);
-        assert_eq!(head, server.head_commit());
-    } else {
-        // Failure is acceptable — session may have expired mid-operation.
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(
-            !stderr.contains("panic") && !stderr.contains("SIGSEGV"),
-            "clone failure should be graceful, got: {stderr}"
-        );
-    }
-}
-
-// ── 5. Concurrent session creation and expiry ────────────────────────────
-
-#[tokio::test(flavor = "multi_thread")]
-async fn concurrent_session_creation_and_expiry() {
-    let server = TestServer::start_with_config(|mut config| {
-        config.session_ttl_seconds = 1;
-        config
-    })
-    .await;
-
-    let client = reqwest::Client::new();
-    let barrier = Arc::new(Barrier::new(20));
-
-    // Rapidly create sessions while old ones expire (ttl=1s).
-    let mut handles = Vec::new();
-    for wave in 0..4u32 {
-        for _ in 0..5 {
-            let bar = Arc::clone(&barrier);
-            let url = server.materialize_url();
-            let c = client.clone();
-            handles.push(tokio::spawn(async move {
-                if wave > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(wave as u64 * 500)).await;
-                }
-                bar.wait().await;
-                let resp = c
-                    .post(&url)
-                    .json(&serde_json::json!({
-                        "repo": "github.com/org/repo",
-                        "selector": {"branch": "main"}
-                    }))
-                    .send()
-                    .await
-                    .unwrap();
-                resp.status().as_u16()
-            }));
-        }
-    }
-
-    let results: Vec<_> = futures::future::join_all(handles)
-        .await
-        .into_iter()
-        .map(|r| r.unwrap())
-        .collect();
-
-    // No panics should occur — verify all statuses are expected HTTP codes.
-    for status in &results {
-        assert!(
-            *status == 200 || *status == 409 || *status == 429 || *status == 500 || *status == 503,
-            "unexpected status {status} during concurrent session creation/expiry"
-        );
-    }
-
-    // At least some should succeed.
-    let successes = results.iter().filter(|&&s| s == 200).count();
-    assert!(
-        successes > 0,
-        "at least one session creation should succeed"
-    );
-}
-
-// ── 6. Parallel fetch after force-push ───────────────────────────────────
+// ── 4. Parallel fetch after force-push ───────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
 async fn parallel_fetch_after_force_push() {

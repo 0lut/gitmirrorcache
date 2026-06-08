@@ -10,6 +10,10 @@ pub enum GitCacheError {
     NotFound(String),
     #[error("upstream unavailable: {0}")]
     UpstreamUnavailable(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("insufficient local disk: {0}")]
     DiskFull(String),
     #[error("unsupported operation: {0}")]

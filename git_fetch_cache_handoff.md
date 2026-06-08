@@ -86,7 +86,7 @@ Response:
 {
   "repo": "github.com/org/repo",
   "commit": "abc123...",
-  "source": "github_verified | cache_verified",
+  "source": "upstream_verified | cache_verified",
   "verified_at": "2026-05-18T19:00:00Z",
   "git_url": "https://git-cache.internal/git/session/01HX.../github.com/org/repo.git",
   "ref": "refs/cache/sessions/01HX...",

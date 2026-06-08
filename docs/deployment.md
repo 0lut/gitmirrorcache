@@ -47,10 +47,21 @@ GITHUB_TOKEN_SECRET_ARN=arn:aws:secretsmanager:us-west-2:123456789012:secret:git
 ECS_COMPACTION_SCHEDULE_EXPRESSION='rate(1 hour)'
 ECS_COMPACTION_MEMORY_RESERVATION=4096
 GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD=10
+ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS=5
+ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS=2
+ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS=15
 ```
 
 If `PUBLIC_BASE_URL` is omitted, the deployment script uses the ALB DNS name and
 sets `GIT_CACHE_PUBLIC_BASE_URL` to `http://<alb-dns-name>`.
+
+For `dev-*` and preview environments, `deploy-and-smoke.sh` defaults to
+5-second ALB health checks, a 15-second ECS health-check grace period, and
+5-second service-stability polling. Those defaults improve startup detection
+without shortening the ALB request-drain window or ECS container stop timeout.
+If a disposable environment can tolerate interrupting in-flight requests during
+deploy, set `ECS_ALB_DEREGISTRATION_DELAY_SECONDS` or
+`ECS_CONTAINER_STOP_TIMEOUT_SECONDS` explicitly.
 
 ## Why EC2/EBS Instead Of App Runner
 
@@ -77,6 +88,107 @@ The application appends the v2 schema suffix to the configured object-store
 namespace at runtime. For example, `S3_PREFIX=repos` is served from `repos-v2`.
 The ECS deploy script grants task IAM access to that runtime prefix while still
 passing the base prefix to the container.
+
+## Preview Commit Stacks
+
+Use preview stacks to deploy any branch, tag, or commit without touching the
+production `main` stack. Production keeps using `NAME_PREFIX=gitmirrorcache-arm`
+and `S3_PREFIX=repos`; every preview gets a derived stack name, an isolated S3
+prefix, and a versioned route on the shared preview ALB.
+
+### Local CLI
+
+Run preview deploys from a shell with AWS CLI credentials. The preview wrapper
+resolves the requested branch, tag, or commit with local Git and derives the
+preview version from that commit:
+
+```sh
+AWS_REGION=us-west-2 scripts/aws/deploy-preview.sh HEAD
+scripts/aws/deploy-preview.sh my-branch
+scripts/aws/deploy-preview.sh d35c30fab123
+```
+
+That command computes:
+
+- `VERSION_ID=$(git rev-parse --short=12 "my-branch^{commit}")`
+- `NAME_PREFIX=gmc-p-$VERSION_ID`
+- `ENVIRONMENT=preview-$VERSION_ID`
+- `S3_PREFIX=previews/$VERSION_ID/repos`
+- `IMAGE_TAG=$VERSION_ID`
+- `ECS_PUBLIC_PATH_PREFIX=/v/$VERSION_ID`
+
+The application still appends the runtime schema suffix, so preview cache
+objects land below `previews/$VERSION_ID/repos-v2`. By default, the preview
+stack uses the shared production-style bucket and ECR repository derived from
+`PREVIEW_SHARED_NAME_PREFIX=gitmirrorcache-arm`. It also uses a static shared
+preview ALB named `$PREVIEW_SHARED_NAME_PREFIX-preview-alb` and creates a
+per-version listener rule for `/v/$VERSION_ID/*`. That rule rewrites the URL to
+strip `/v/$VERSION_ID` before forwarding, so the service still receives normal
+`/healthz`, `/v1/materialize`, and `/git/...` paths while clients use stable
+versioned URLs:
+
+```txt
+http://<preview-alb>/v/$VERSION_ID/healthz
+http://<preview-alb>/v/$VERSION_ID/v1/materialize
+http://<preview-alb>/v/$VERSION_ID/git/github.com/octocat/Hello-World.git
+```
+
+Override the shared bucket, ECR repository, or ALB explicitly when needed:
+
+```sh
+PREVIEW_S3_BUCKET=gitmirrorcache-arm-123456789012-us-west-2 \
+PREVIEW_ECR_REPOSITORY=gitmirrorcache-arm \
+PREVIEW_ALB_NAME=gitmirrorcache-arm-preview-alb \
+scripts/aws/deploy-preview.sh my-branch
+```
+
+Set `GITHUB_TOKEN_SECRET_ARN` if preview tasks should receive the upstream
+GitHub token from Secrets Manager.
+
+Preview deploys set `ECR_PUSH_LATEST=false`,
+`ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true`,
+`ECS_EC2_INSTANCE_TYPE=m8g.2xlarge`, `ECS_PRECHECK_VCPU_QUOTA=true`,
+`ECS_EBS_DELETE_ON_TERMINATION=true`, `ECS_COMPACTION_ENABLED=false`,
+`ECS_LOG_RETENTION_DAYS=3`, `BOOTSTRAP_FAST_EXISTING=true`,
+`PREVIEW_SHARED_ALB=true`, a 15-second ECS health-check grace period, faster ECS
+service polling, and shorter ALB target health-check intervals unless you
+override them. This keeps previews isolated, disposable, faster to redeploy, and
+less noisy while still exercising the ECS, EC2/EBS, ALB listener-rule, IAM, ECR,
+S3, and smoke-test path. The quota preflight fails before creating preview
+infrastructure if launching the preview instance would exceed the account's EC2
+on-demand vCPU quota.
+
+Every preview deploy writes ordered phase timings to stdout. The key phases
+include shared bootstrap, IAM, networking, shared ALB/listener-rule upsert, EC2
+launch/ECS registration, Docker build and push, task registration, ECS service
+stabilization, smoke test, manifest upload, and total preview deployment time.
+To capture the same timing table from lower-level scripts, set
+`DEPLOY_TIMING_FILE=/path/to/timings.tsv` before invoking `deploy-and-smoke.sh`
+or `deploy-ecs-ec2-ebs.sh`.
+
+Destroy a preview with the same ref:
+
+```sh
+scripts/aws/destroy-preview.sh my-branch
+```
+
+If the branch is gone, pass the derived version or full commit SHA directly.
+The script normalizes it to the 12-character preview version:
+
+```sh
+VERSION_ID=d35c30fab123 scripts/aws/destroy-preview.sh
+```
+
+Destroy removes the preview ECS service, cluster, shared ALB listener rule,
+target group, EC2 instance, available preview EBS volume, task definitions,
+EventBridge compaction rule, log group, preview IAM roles, and the preview image
+tag. It also cleans up a legacy per-preview ALB if that version was deployed
+before shared preview ingress was enabled. It removes the deployment manifest by
+default and preserves durable cache objects unless you opt in:
+
+```sh
+DELETE_DATA=true VERSION_ID=d35c30fab123 scripts/aws/destroy-preview.sh
+```
 
 ## Deployment Findings
 
@@ -187,7 +299,6 @@ Object storage is the source of truth for:
 - bundles
 - commit manifests
 - ref manifests
-- session manifests
 - lease objects
 
 ## Credentials

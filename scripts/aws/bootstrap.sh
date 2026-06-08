@@ -7,6 +7,12 @@ source "$SCRIPT_DIR/common.sh"
 init_aws_context
 require_cmd python3
 
+BOOTSTRAP_FAST_EXISTING="${BOOTSTRAP_FAST_EXISTING:-false}"
+case "$BOOTSTRAP_FAST_EXISTING" in
+  true | false) ;;
+  *) die "BOOTSTRAP_FAST_EXISTING must be true or false" ;;
+esac
+
 tmpdir="$(mktemp -d)"
 cleanup() {
   rm -rf "$tmpdir"
@@ -16,6 +22,9 @@ trap cleanup EXIT
 ensure_bucket() {
   if aws_cli s3api head-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1; then
     printf 'using existing S3 bucket: %s\n' "$S3_BUCKET"
+    if [[ "$BOOTSTRAP_FAST_EXISTING" == "true" ]]; then
+      return 0
+    fi
   else
     printf 'creating S3 bucket: %s\n' "$S3_BUCKET"
     if [[ "$AWS_REGION" == "us-east-1" ]]; then
@@ -52,6 +61,9 @@ JSON
 ensure_ecr_repository() {
   if aws_cli ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
     printf 'using existing ECR repository: %s\n' "$ECR_REPOSITORY"
+    if [[ "$BOOTSTRAP_FAST_EXISTING" == "true" ]]; then
+      return 0
+    fi
   else
     printf 'creating ECR repository: %s\n' "$ECR_REPOSITORY"
     aws_cli ecr create-repository \

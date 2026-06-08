@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tracing::info;
 
 const OBJECT_STORE_SCHEMA_SUFFIX: &str = "v2";
 
@@ -106,6 +107,20 @@ impl AppState {
             config.disk.quota_bytes,
             config.disk.min_free_bytes,
         );
+        // On process start, in-memory reservations are empty; anything left on
+        // disk is scratch from a previous process and must not block new work.
+        let startup_cleanup = disk.cleanup_stale_temps(Duration::ZERO)?;
+        if startup_cleanup.removed_temp_dirs > 0
+            || startup_cleanup.removed_reservation_markers > 0
+            || startup_cleanup.freed_bytes > 0
+        {
+            info!(
+                removed_temp_dirs = startup_cleanup.removed_temp_dirs,
+                removed_reservation_markers = startup_cleanup.removed_reservation_markers,
+                freed_bytes = startup_cleanup.freed_bytes,
+                "cleaned stale disk reservations on startup"
+            );
+        }
         let max_concurrent_generation_verifications =
             config.max_concurrent_generation_verifications.max(1);
 
@@ -341,5 +356,49 @@ mod tests {
         assert_eq!(v2_s3_prefix("repos-v2"), "repos-v2");
         assert_eq!(v2_s3_prefix("prod/v2"), "prod/v2");
         assert_eq!(v2_s3_prefix(""), "v2");
+    }
+
+    #[test]
+    fn startup_cleans_stale_disk_reservations() {
+        let root = tempfile::tempdir().expect("cache root");
+        let objects = tempfile::tempdir().expect("object root");
+        let disk = DiskManager::new(root.path(), 10_000, 0);
+        let reservation = disk.reserve(1024).expect("reserve");
+        let temp_path = reservation.temp_path();
+        std::fs::write(temp_path.join("verification.tmp"), vec![0u8; 64]).expect("tmp");
+        std::mem::forget(reservation);
+
+        let mut config = test_config(root.path().to_path_buf(), objects.path().to_path_buf());
+        config.disk.quota_bytes = 10_000;
+        let state = AppState::try_new(config).expect("state");
+        let status = state.disk.inner().status().expect("status");
+
+        assert!(!temp_path.exists());
+        assert_eq!(status.reserved_bytes, 0);
+    }
+
+    fn test_config(cache_root: PathBuf, object_root: PathBuf) -> AppConfig {
+        AppConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_base_url: "http://127.0.0.1:0".into(),
+            cache_root,
+            upstream_root: None,
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 30,
+            max_git_output_bytes: 1024 * 1024,
+            object_store: ObjectStoreConfig::Local { root: object_root },
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 120,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 10_000,
+                min_free_bytes: 0,
+            },
+            git_remote: Default::default(),
+            compaction: Default::default(),
+            max_concurrent_git_processes: 1,
+            max_concurrent_generation_verifications: 1,
+            leases: Default::default(),
+        }
     }
 }

@@ -2,19 +2,18 @@ use crate::{
     acquire_lease, advance_generation_head, commit_manifest_key, generation_manifest_key,
     lease_key, pending_generation_publish_key, read_commit_manifest, read_generation_manifest,
     read_json_with_version, read_lease, read_pending_generation_publish, read_ref_manifest,
-    read_repo_generation_head, read_session_manifest, read_verified_generation_manifest,
-    ref_manifest_key, release_lease_if_token_matches, renew_lease_if_token_matches,
-    repo_generation_head_key, session_manifest_key, validate_key, verified_generation_manifest_key,
-    write_generation_manifest, write_generation_manifest_if_absent_or_matches,
-    write_ref_manifest_if_absent_or_matches, write_repo_generation_head,
-    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, LocalObjectStore,
-    ObjectStore, PendingGenerationPublish, PublishManifests,
+    read_repo_generation_head, read_verified_generation_manifest, ref_manifest_key,
+    release_lease_if_token_matches, renew_lease_if_token_matches, repo_generation_head_key,
+    validate_key, verified_generation_manifest_key, write_generation_manifest,
+    write_generation_manifest_if_absent_or_matches, write_ref_manifest_if_absent_or_matches,
+    write_repo_generation_head, write_verified_generation_manifest_if_absent_or_matches,
+    GenerationPublish, LocalObjectStore, ObjectStore, PendingGenerationPublish, PublishManifests,
 };
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
     CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoGenerationHead,
-    RepoKey, SessionId, SessionManifest, VerifiedGenerationManifest,
+    RepoKey, VerifiedGenerationManifest,
 };
 use std::path::Path;
 use tokio::fs;
@@ -108,17 +107,6 @@ fn ref_manifest_with_gen(repo: &RepoKey, gen: GenerationId) -> RefManifest {
     }
 }
 
-fn session_manifest(repo: &RepoKey) -> SessionManifest {
-    SessionManifest {
-        id: SessionId::new(),
-        repo: repo.clone(),
-        commit: commit('a'),
-        synthetic_ref: "refs/cache/sessions/test".into(),
-        created_at: ts(4),
-        expires_at: ts(5),
-    }
-}
-
 #[tokio::test]
 async fn delete_existing_key_removes_it() {
     let root = temp_root();
@@ -187,25 +175,19 @@ async fn list_prefix_returns_matching_keys() {
     let root = temp_root();
     let store = LocalObjectStore::new(&root);
 
+    store.put("items/a.json", Bytes::from("a")).await.unwrap();
+    store.put("items/b.json", Bytes::from("b")).await.unwrap();
     store
-        .put("sessions/a.json", Bytes::from("a"))
-        .await
-        .unwrap();
-    store
-        .put("sessions/b.json", Bytes::from("b"))
-        .await
-        .unwrap();
-    store
-        .put("sessions/sub/c.json", Bytes::from("c"))
+        .put("items/sub/c.json", Bytes::from("c"))
         .await
         .unwrap();
     store.put("other/d.json", Bytes::from("d")).await.unwrap();
 
-    let mut keys = store.list_prefix("sessions/", None).await.unwrap();
+    let mut keys = store.list_prefix("items/", None).await.unwrap();
     keys.sort();
     assert_eq!(
         keys,
-        vec!["sessions/a.json", "sessions/b.json", "sessions/sub/c.json",]
+        vec!["items/a.json", "items/b.json", "items/sub/c.json",]
     );
 
     let empty = store.list_prefix("nonexistent/", None).await.unwrap();
@@ -268,16 +250,12 @@ async fn manifests_round_trip_as_json() {
     let generation = generation_manifest(&repo);
     let commit = commit_manifest_with_gen(&repo, generation.generation);
     let reference = ref_manifest_with_gen(&repo, generation.generation);
-    let session = session_manifest(&repo);
 
     write_generation_manifest(&store, &generation)
         .await
         .unwrap();
     crate::write_commit_manifest(&store, &commit).await.unwrap();
     crate::write_ref_manifest(&store, &reference).await.unwrap();
-    crate::write_session_manifest(&store, &session)
-        .await
-        .unwrap();
 
     assert_eq!(
         read_generation_manifest(&store, &repo, generation.generation)
@@ -296,12 +274,6 @@ async fn manifests_round_trip_as_json() {
             .await
             .unwrap(),
         Some(reference)
-    );
-    assert_eq!(
-        read_session_manifest(&store, &repo, session.id)
-            .await
-            .unwrap(),
-        Some(session)
     );
 
     let head = RepoGenerationHead {
@@ -532,13 +504,11 @@ async fn publish_writes_bundle_generation_then_manifests() {
     let verification = verified_generation_manifest(&generation);
     let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
     let reference = ref_manifest_with_gen(&repo, generation.generation);
-    let session = session_manifest(&repo);
     let publish = GenerationPublish::with_manifests(
         generation.clone(),
         PublishManifests {
             commits: vec![commit_manifest.clone()],
             refs: vec![reference.clone()],
-            sessions: vec![session.clone()],
         },
     )
     .with_verification(verification.clone());
@@ -584,12 +554,6 @@ async fn publish_writes_bundle_generation_then_manifests() {
             .unwrap(),
         Some(reference.clone())
     );
-    assert_eq!(
-        read_session_manifest(&store, &repo, session.id)
-            .await
-            .unwrap(),
-        Some(session.clone())
-    );
 
     publish
         .publish_bundle_bytes(&store, Bytes::from_static(b"bundle-bytes"))
@@ -617,7 +581,6 @@ async fn pending_publish_writes_only_bundle_and_pending_metadata() {
     let generation = generation_manifest(&repo);
     let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
     let reference = ref_manifest_with_gen(&repo, generation.generation);
-    let session = session_manifest(&repo);
     let head = RepoGenerationHead {
         repo: repo.clone(),
         generation: generation.generation,
@@ -636,7 +599,6 @@ async fn pending_publish_writes_only_bundle_and_pending_metadata() {
         PublishManifests {
             commits: vec![commit_manifest.clone()],
             refs: vec![reference.clone()],
-            sessions: vec![session.clone()],
         },
     );
     let bundle_path = root.join("pending.bundle");
@@ -728,15 +690,6 @@ async fn rejects_traversal_keys() {
             "a".repeat(40)
         )
     );
-    let session = session_manifest(&repo);
-    assert_eq!(
-        session_manifest_key(&repo, session.id),
-        format!(
-            "repos/github.com/org/repo/manifests/sessions/{}.json",
-            session.id
-        )
-    );
-
     let _ = fs::remove_dir_all(root).await;
 }
 
@@ -1147,7 +1100,6 @@ async fn minio_manifest_publish_and_listing_uses_prefix() {
         PublishManifests {
             commits: vec![commit_manifest.clone()],
             refs: vec![reference.clone()],
-            sessions: Vec::new(),
         },
     )
     .publish_bundle_bytes(&store, Bytes::from_static(b"bundle-bytes"))

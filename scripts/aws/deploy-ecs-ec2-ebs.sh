@@ -14,12 +14,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+owns_timing_file=false
+if [[ -z "${DEPLOY_TIMING_FILE:-}" ]]; then
+  DEPLOY_TIMING_FILE="$tmpdir/ecs-ec2-ebs-timings.tsv"
+  owns_timing_file=true
+fi
+export DEPLOY_TIMING_FILE
+deploy_started_at="$(timing_now)"
+
 ECS_CLUSTER_NAME="${ECS_CLUSTER_NAME:-$NAME_PREFIX-ec2}"
 ECS_SERVICE_NAME="${ECS_SERVICE_NAME:-$NAME_PREFIX-ec2-api}"
 ECS_TASK_FAMILY="${ECS_TASK_FAMILY:-$NAME_PREFIX-ec2-api}"
 ECS_CONTAINER_NAME="${ECS_CONTAINER_NAME:-git-cache-api}"
 ECS_COMPACTION_TASK_FAMILY="${ECS_COMPACTION_TASK_FAMILY:-$NAME_PREFIX-ec2-compaction}"
 ECS_COMPACTION_CONTAINER_NAME="${ECS_COMPACTION_CONTAINER_NAME:-git-cache-compaction}"
+ECS_COMPACTION_ENABLED="${ECS_COMPACTION_ENABLED:-true}"
 ECS_COMPACTION_EVENTS_ROLE_NAME="${ECS_COMPACTION_EVENTS_ROLE_NAME:-$NAME_PREFIX-ecs-compaction-events}"
 ECS_COMPACTION_RULE_NAME="${ECS_COMPACTION_RULE_NAME:-$NAME_PREFIX-compact-hourly}"
 ECS_COMPACTION_TARGET_ID="${ECS_COMPACTION_TARGET_ID:-compact-all}"
@@ -44,17 +53,80 @@ ECS_CPU="${ECS_CPU:-8192}"
 ECS_MEMORY="${ECS_MEMORY:-24576}"
 ECS_DESIRED_COUNT="${ECS_DESIRED_COUNT:-1}"
 ECS_EC2_INSTANCE_TYPE="${ECS_EC2_INSTANCE_TYPE:-m8g.2xlarge}"
+ECS_PRECHECK_VCPU_QUOTA="${ECS_PRECHECK_VCPU_QUOTA:-false}"
 ECS_CPU_ARCHITECTURE="${ECS_CPU_ARCHITECTURE:-ARM64}"
 ECS_EBS_SIZE_GIB="${ECS_EBS_SIZE_GIB:-128}"
 ECS_EBS_VOLUME_TYPE="${ECS_EBS_VOLUME_TYPE:-gp3}"
 ECS_EBS_IOPS="${ECS_EBS_IOPS:-8000}"
 ECS_EBS_THROUGHPUT="${ECS_EBS_THROUGHPUT:-500}"
 ECS_EBS_DEVICE_NAME="${ECS_EBS_DEVICE_NAME:-/dev/xvdf}"
+ECS_EBS_DELETE_ON_TERMINATION="${ECS_EBS_DELETE_ON_TERMINATION:-false}"
 ECS_SKIP_DOCKER_BUILD="${ECS_SKIP_DOCKER_BUILD:-false}"
+ECS_DOCKER_BUILD_NO_CACHE="${ECS_DOCKER_BUILD_NO_CACHE:-false}"
+ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS="${ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS:-false}"
+ECR_PUSH_LATEST="${ECR_PUSH_LATEST:-true}"
+DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
+ECS_SERVICE_STABLE_TIMEOUT_SECONDS="${ECS_SERVICE_STABLE_TIMEOUT_SECONDS:-900}"
+ECS_SERVICE_STABLE_POLL_SECONDS="${ECS_SERVICE_STABLE_POLL_SECONDS:-10}"
+ECS_SHARED_ALB="${ECS_SHARED_ALB:-false}"
+ECS_PUBLIC_PATH_PREFIX="${ECS_PUBLIC_PATH_PREFIX:-}"
+ECS_ALB_RULE_PATH_PATTERN="${ECS_ALB_RULE_PATH_PATTERN:-}"
+ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-}"
+ECS_ALB_RULE_REWRITE_REPLACE="${ECS_ALB_RULE_REWRITE_REPLACE:-\$1}"
+ECS_ALB_DEREGISTRATION_DELAY_SECONDS="${ECS_ALB_DEREGISTRATION_DELAY_SECONDS:-300}"
+ECS_CONTAINER_STOP_TIMEOUT_SECONDS="${ECS_CONTAINER_STOP_TIMEOUT_SECONDS:-30}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S)}"
 IMAGE_URI="${IMAGE_URI:-${ECR_REPOSITORY_URI}:${IMAGE_TAG}}"
 LATEST_URI="${ECR_REPOSITORY_URI}:latest"
+
+case "$ECS_EBS_DELETE_ON_TERMINATION" in
+  true | false) ;;
+  *) die "ECS_EBS_DELETE_ON_TERMINATION must be true or false" ;;
+esac
+
+case "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" in
+  true | false) ;;
+  *) die "ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS must be true or false" ;;
+esac
+
+case "$ECS_DOCKER_BUILD_NO_CACHE" in
+  true | false) ;;
+  *) die "ECS_DOCKER_BUILD_NO_CACHE must be true or false" ;;
+esac
+
+case "$ECS_PRECHECK_VCPU_QUOTA" in
+  true | false) ;;
+  *) die "ECS_PRECHECK_VCPU_QUOTA must be true or false" ;;
+esac
+
+case "$ECS_COMPACTION_ENABLED" in
+  true | false) ;;
+  *) die "ECS_COMPACTION_ENABLED must be true or false" ;;
+esac
+
+case "$ECR_PUSH_LATEST" in
+  true | false) ;;
+  *) die "ECR_PUSH_LATEST must be true or false" ;;
+esac
+
+case "$ECS_SHARED_ALB" in
+  true | false) ;;
+  *) die "ECS_SHARED_ALB must be true or false" ;;
+esac
+
+if [[ -n "$ECS_PUBLIC_PATH_PREFIX" ]]; then
+  [[ "$ECS_PUBLIC_PATH_PREFIX" == /* ]] || ECS_PUBLIC_PATH_PREFIX="/$ECS_PUBLIC_PATH_PREFIX"
+  while [[ "$ECS_PUBLIC_PATH_PREFIX" == */ ]]; do
+    ECS_PUBLIC_PATH_PREFIX="${ECS_PUBLIC_PATH_PREFIX%/}"
+  done
+fi
+
+if [[ "$ECS_SHARED_ALB" == "true" ]]; then
+  [[ -n "$ECS_PUBLIC_PATH_PREFIX" ]] || die "ECS_PUBLIC_PATH_PREFIX is required when ECS_SHARED_ALB=true"
+  ECS_ALB_RULE_PATH_PATTERN="${ECS_ALB_RULE_PATH_PATTERN:-$ECS_PUBLIC_PATH_PREFIX/*}"
+  ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-^$ECS_PUBLIC_PATH_PREFIX(/.*)$}"
+fi
 
 runtime_s3_prefix() {
   local prefix="$1"
@@ -87,15 +159,22 @@ if ((GIT_CACHE_DISK_QUOTA_BYTES < 0)); then
 fi
 
 export ECS_CLUSTER_NAME ECS_SERVICE_NAME ECS_TASK_FAMILY ECS_CONTAINER_NAME ECS_CACHE_VOLUME_NAME
-export ECS_COMPACTION_TASK_FAMILY ECS_COMPACTION_CONTAINER_NAME ECS_COMPACTION_EVENTS_ROLE_NAME
+export ECS_COMPACTION_TASK_FAMILY ECS_COMPACTION_CONTAINER_NAME ECS_COMPACTION_ENABLED ECS_COMPACTION_EVENTS_ROLE_NAME
 export ECS_COMPACTION_RULE_NAME ECS_COMPACTION_TARGET_ID ECS_COMPACTION_SCHEDULE_EXPRESSION
 export ECS_COMPACTION_SCHEDULE_STATE ECS_COMPACTION_LOG_STREAM_PREFIX ECS_COMPACTION_LOCK_PATH
 export ECS_COMPACTION_MEMORY_RESERVATION
 export ECS_ALB_NAME ECS_TARGET_GROUP_NAME ECS_ALB_SG_NAME ECS_TASK_SG_NAME ECS_LOG_GROUP
 export ECS_EXECUTION_ROLE_NAME ECS_TASK_ROLE_NAME ECS_INSTANCE_ROLE_NAME ECS_INSTANCE_PROFILE_NAME
 export ECS_INSTANCE_NAME ECS_CPU ECS_MEMORY ECS_DESIRED_COUNT ECS_EC2_INSTANCE_TYPE ECS_CPU_ARCHITECTURE
+export ECS_PRECHECK_VCPU_QUOTA
 export ECS_EBS_SIZE_GIB ECS_EBS_VOLUME_TYPE ECS_EBS_IOPS ECS_EBS_THROUGHPUT ECS_EBS_DEVICE_NAME
+export ECS_EBS_DELETE_ON_TERMINATION
 export IMAGE_URI S3_RUNTIME_PREFIX GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_QUOTA_BYTES
+export ECS_SERVICE_STABLE_TIMEOUT_SECONDS ECS_SERVICE_STABLE_POLL_SECONDS
+export ECS_SHARED_ALB ECS_PUBLIC_PATH_PREFIX ECS_ALB_RULE_PATH_PATTERN
+export ECS_ALB_RULE_REWRITE_REGEX ECS_ALB_RULE_REWRITE_REPLACE
+export ECS_ALB_DEREGISTRATION_DELAY_SECONDS
+export ECS_CONTAINER_STOP_TIMEOUT_SECONDS
 
 ensure_role() {
   local role_name="$1"
@@ -302,6 +381,77 @@ ensure_log_group() {
     --retention-in-days "${ECS_LOG_RETENTION_DAYS:-14}" >/dev/null
 }
 
+preflight_ec2_vcpu_quota() {
+  [[ "$ECS_PRECHECK_VCPU_QUOTA" == "true" ]] || return 0
+
+  local existing_instance_id quota desired_vcpus running_types used_vcpus projected_vcpus
+  existing_instance_id="$(instance_id_by_name)"
+  if [[ "$existing_instance_id" != "None" && -n "$existing_instance_id" ]]; then
+    printf 'skipping EC2 vCPU quota preflight; reusing instance: %s\n' "$existing_instance_id"
+    return 0
+  fi
+
+  quota="$(aws_cli service-quotas get-service-quota \
+    --service-code ec2 \
+    --quota-code L-1216C47A \
+    --query 'Quota.Value' \
+    --output text 2>/dev/null || true)"
+  if [[ -z "$quota" || "$quota" == "None" ]]; then
+    printf 'warning: could not read EC2 vCPU quota; continuing without quota preflight\n' >&2
+    return 0
+  fi
+
+  desired_vcpus="$(aws_cli ec2 describe-instance-types \
+    --instance-types "$ECS_EC2_INSTANCE_TYPE" \
+    --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' \
+    --output text)"
+  [[ "$desired_vcpus" =~ ^[0-9]+$ ]] || die "could not resolve vCPU count for $ECS_EC2_INSTANCE_TYPE"
+
+  running_types="$(aws_cli ec2 describe-instances \
+    --filters Name=instance-state-name,Values=pending,running \
+    --query 'Reservations[].Instances[].InstanceType' \
+    --output text)"
+  used_vcpus=0
+  if [[ -n "$running_types" ]]; then
+    local unique_running_types type_vcpu_rows
+    unique_running_types="$(printf '%s\n' $running_types | sort -u | tr '\n' ' ')"
+    type_vcpu_rows="$(aws_cli ec2 describe-instance-types \
+      --instance-types $unique_running_types \
+      --query 'InstanceTypes[].[InstanceType,VCpuInfo.DefaultVCpus]' \
+      --output text)"
+    for instance_type in $running_types; do
+      local type_vcpus
+      type_vcpus="$(printf '%s\n' "$type_vcpu_rows" | awk -v type="$instance_type" '$1 == type { print $2; exit }')"
+      [[ "$type_vcpus" =~ ^[0-9]+$ ]] || die "could not resolve vCPU count for $instance_type"
+      used_vcpus=$((used_vcpus + type_vcpus))
+    done
+  fi
+
+  projected_vcpus=$((used_vcpus + desired_vcpus))
+  python3 - "$used_vcpus" "$desired_vcpus" "$projected_vcpus" "$quota" "$ECS_EC2_INSTANCE_TYPE" <<'PY'
+import sys
+
+used = int(sys.argv[1])
+desired = int(sys.argv[2])
+projected = int(sys.argv[3])
+quota = float(sys.argv[4])
+instance_type = sys.argv[5]
+
+if projected > quota:
+    raise SystemExit(
+        "EC2 vCPU quota preflight failed: "
+        f"running/pending={used}, requested {instance_type}={desired}, "
+        f"projected={projected}, quota={quota:g}"
+    )
+
+print(
+    "EC2 vCPU quota preflight passed: "
+    f"running/pending={used}, requested {instance_type}={desired}, "
+    f"projected={projected}, quota={quota:g}"
+)
+PY
+}
+
 load_balancer_arn_by_name() {
   aws_cli elbv2 describe-load-balancers \
     --names "$ECS_ALB_NAME" \
@@ -316,11 +466,157 @@ target_group_arn_by_name() {
     --output text 2>/dev/null || true
 }
 
+listener_rule_arn_by_path_pattern() {
+  local listener_arn="$1"
+  local path_pattern="$2"
+  local rules_json
+  rules_json="$(aws_cli elbv2 describe-rules \
+    --listener-arn "$listener_arn" \
+    --output json)"
+  RULES_JSON="$rules_json" python3 - "$path_pattern" <<'PY'
+import json
+import os
+import sys
+
+path_pattern = sys.argv[1]
+rules = json.loads(os.environ["RULES_JSON"]).get("Rules", [])
+for rule in rules:
+    for condition in rule.get("Conditions", []):
+        if condition.get("Field") != "path-pattern":
+            continue
+        values = condition.get("Values") or condition.get("PathPatternConfig", {}).get("Values", [])
+        if path_pattern in values:
+            print(rule["RuleArn"])
+            raise SystemExit(0)
+print("None")
+PY
+}
+
+next_listener_rule_priority() {
+  local listener_arn="$1"
+  local version_seed="${VERSION_ID:-${IMAGE_TAG:-1000}}"
+  local rules_json
+  rules_json="$(aws_cli elbv2 describe-rules \
+    --listener-arn "$listener_arn" \
+    --output json)"
+  RULES_JSON="$rules_json" python3 - "$version_seed" <<'PY'
+import json
+import os
+import sys
+
+seed = sys.argv[1]
+rules = json.loads(os.environ["RULES_JSON"]).get("Rules", [])
+used = set()
+for rule in rules:
+    priority = rule.get("Priority")
+    if priority and priority != "default":
+        used.add(int(priority))
+
+try:
+    base = int(seed[:8], 16)
+except ValueError:
+    base = 1000
+
+candidate = 100 + (base % 49900)
+for offset in range(49900):
+    priority = 100 + ((candidate - 100 + offset) % 49900)
+    if priority not in used:
+        print(priority)
+        raise SystemExit(0)
+
+raise SystemExit("no available ALB listener rule priorities")
+PY
+}
+
+write_shared_listener_rule_inputs() {
+  local target_group_arn="$1"
+
+  ECS_LISTENER_TARGET_GROUP_ARN="$target_group_arn" python3 \
+    - "$tmpdir/shared-listener-conditions.json" \
+      "$tmpdir/shared-listener-actions.json" \
+      "$tmpdir/shared-listener-transforms.json" <<'PY'
+import json
+import os
+import sys
+
+conditions_path, actions_path, transforms_path = sys.argv[1:]
+
+conditions = [{
+    "Field": "path-pattern",
+    "PathPatternConfig": {"Values": [os.environ["ECS_ALB_RULE_PATH_PATTERN"]]},
+}]
+actions = [{
+    "Type": "forward",
+    "TargetGroupArn": os.environ["ECS_LISTENER_TARGET_GROUP_ARN"],
+}]
+transforms = [{
+    "Type": "url-rewrite",
+    "UrlRewriteConfig": {
+        "Rewrites": [{
+            "Regex": os.environ["ECS_ALB_RULE_REWRITE_REGEX"],
+            "Replace": os.environ["ECS_ALB_RULE_REWRITE_REPLACE"],
+        }],
+    },
+}]
+
+json.dump(conditions, open(conditions_path, "w"))
+json.dump(actions, open(actions_path, "w"))
+json.dump(transforms, open(transforms_path, "w"))
+PY
+}
+
+write_shared_listener_default_action() {
+  python3 - "$tmpdir/shared-listener-default-action.json" <<'PY'
+import json
+import sys
+
+actions = [{
+    "Type": "fixed-response",
+    "FixedResponseConfig": {
+        "StatusCode": "404",
+        "ContentType": "text/plain",
+        "MessageBody": "preview version not found",
+    },
+}]
+json.dump(actions, open(sys.argv[1], "w"))
+PY
+}
+
+ensure_shared_listener_rule() {
+  local listener_arn="$1"
+  local target_group_arn="$2"
+  local rule_arn priority
+
+  write_shared_listener_rule_inputs "$target_group_arn"
+  rule_arn="$(listener_rule_arn_by_path_pattern "$listener_arn" "$ECS_ALB_RULE_PATH_PATTERN")"
+  if [[ "$rule_arn" != "None" && -n "$rule_arn" ]]; then
+    printf 'updating shared ALB listener rule for %s\n' "$ECS_ALB_RULE_PATH_PATTERN" >&2
+    aws_cli elbv2 modify-rule \
+      --rule-arn "$rule_arn" \
+      --conditions "file://$tmpdir/shared-listener-conditions.json" \
+      --actions "file://$tmpdir/shared-listener-actions.json" \
+      --transforms "file://$tmpdir/shared-listener-transforms.json" >/dev/null
+  else
+    priority="$(next_listener_rule_priority "$listener_arn")"
+    printf 'creating shared ALB listener rule: %s priority=%s\n' "$ECS_ALB_RULE_PATH_PATTERN" "$priority" >&2
+    rule_arn="$(aws_cli elbv2 create-rule \
+      --listener-arn "$listener_arn" \
+      --priority "$priority" \
+      --conditions "file://$tmpdir/shared-listener-conditions.json" \
+      --actions "file://$tmpdir/shared-listener-actions.json" \
+      --transforms "file://$tmpdir/shared-listener-transforms.json" \
+      --query 'Rules[0].RuleArn' \
+      --output text)"
+  fi
+
+  printf '%s\n' "$rule_arn"
+}
+
 ensure_load_balancer() {
   local vpc_id="$1"
   local subnets_csv="$2"
   local alb_sg_id="$3"
-  local tg_arn lb_arn
+  local tg_arn lb_arn listener_arn rule_arn
 
   tg_arn="$(target_group_arn_by_name)"
   if [[ "$tg_arn" == "None" || -z "$tg_arn" ]]; then
@@ -333,16 +629,30 @@ ensure_load_balancer() {
       --vpc-id "$vpc_id" \
       --health-check-protocol HTTP \
       --health-check-path /healthz \
-      --health-check-interval-seconds 30 \
-      --health-check-timeout-seconds 5 \
-      --healthy-threshold-count 2 \
-      --unhealthy-threshold-count 5 \
+      --health-check-interval-seconds "${ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS:-30}" \
+      --health-check-timeout-seconds "${ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS:-5}" \
+      --healthy-threshold-count "${ECS_ALB_HEALTHY_THRESHOLD_COUNT:-2}" \
+      --unhealthy-threshold-count "${ECS_ALB_UNHEALTHY_THRESHOLD_COUNT:-5}" \
       --matcher HttpCode=200 \
       --query 'TargetGroups[0].TargetGroupArn' \
       --output text)"
   else
     printf 'using existing target group: %s\n' "$ECS_TARGET_GROUP_NAME" >&2
   fi
+
+  aws_cli elbv2 modify-target-group \
+    --target-group-arn "$tg_arn" \
+    --health-check-protocol HTTP \
+    --health-check-path /healthz \
+    --health-check-interval-seconds "${ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS:-30}" \
+    --health-check-timeout-seconds "${ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS:-5}" \
+    --healthy-threshold-count "${ECS_ALB_HEALTHY_THRESHOLD_COUNT:-2}" \
+    --unhealthy-threshold-count "${ECS_ALB_UNHEALTHY_THRESHOLD_COUNT:-5}" \
+    --matcher HttpCode=200 >/dev/null
+
+  aws_cli elbv2 modify-target-group-attributes \
+    --target-group-arn "$tg_arn" \
+    --attributes Key=deregistration_delay.timeout_seconds,Value="$ECS_ALB_DEREGISTRATION_DELAY_SECONDS" >/dev/null
 
   lb_arn="$(load_balancer_arn_by_name)"
   if [[ "$lb_arn" == "None" || -z "$lb_arn" ]]; then
@@ -371,18 +681,43 @@ ensure_load_balancer() {
     --output text)"
   if [[ "$listener_arn" == "None" || -z "$listener_arn" ]]; then
     printf 'creating HTTP listener on ALB\n' >&2
-    aws_cli elbv2 create-listener \
-      --load-balancer-arn "$lb_arn" \
-      --protocol HTTP \
-      --port 80 \
-      --default-actions Type=forward,TargetGroupArn="$tg_arn" >/dev/null
+    if [[ "$ECS_SHARED_ALB" == "true" ]]; then
+      write_shared_listener_default_action
+      listener_arn="$(aws_cli elbv2 create-listener \
+        --load-balancer-arn "$lb_arn" \
+        --protocol HTTP \
+        --port 80 \
+        --default-actions "file://$tmpdir/shared-listener-default-action.json" \
+        --query 'Listeners[0].ListenerArn' \
+        --output text)"
+    else
+      listener_arn="$(aws_cli elbv2 create-listener \
+        --load-balancer-arn "$lb_arn" \
+        --protocol HTTP \
+        --port 80 \
+        --default-actions Type=forward,TargetGroupArn="$tg_arn" \
+        --query 'Listeners[0].ListenerArn' \
+        --output text)"
+    fi
   else
-    aws_cli elbv2 modify-listener \
-      --listener-arn "$listener_arn" \
-      --default-actions Type=forward,TargetGroupArn="$tg_arn" >/dev/null
+    if [[ "$ECS_SHARED_ALB" == "true" ]]; then
+      write_shared_listener_default_action
+      aws_cli elbv2 modify-listener \
+        --listener-arn "$listener_arn" \
+        --default-actions "file://$tmpdir/shared-listener-default-action.json" >/dev/null
+    else
+      aws_cli elbv2 modify-listener \
+        --listener-arn "$listener_arn" \
+        --default-actions Type=forward,TargetGroupArn="$tg_arn" >/dev/null
+    fi
   fi
 
-  printf '%s\n%s\n' "$lb_arn" "$tg_arn"
+  rule_arn=""
+  if [[ "$ECS_SHARED_ALB" == "true" ]]; then
+    rule_arn="$(ensure_shared_listener_rule "$listener_arn" "$tg_arn")"
+  fi
+
+  printf '%s\n%s\n%s\n' "$lb_arn" "$tg_arn" "$rule_arn"
 }
 
 alb_dns_name() {
@@ -407,10 +742,28 @@ build_and_push_image() {
     return
   fi
 
+  if [[ "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" == "true" ]] \
+    && aws_cli ecr describe-images \
+      --repository-name "$ECR_REPOSITORY" \
+      --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+    printf 'skipping Docker build; image already exists: %s\n' "$IMAGE_URI"
+    return
+  fi
+
   aws_cli ecr get-login-password | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-  docker build --platform "$DOCKER_PLATFORM" -t "$IMAGE_URI" -t "$LATEST_URI" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
+  local build_args=(--platform "$DOCKER_PLATFORM")
+  local docker_tags=(-t "$IMAGE_URI")
+  if [[ "$ECS_DOCKER_BUILD_NO_CACHE" == "true" ]]; then
+    build_args+=(--no-cache)
+  fi
+  if [[ "$ECR_PUSH_LATEST" == "true" ]]; then
+    docker_tags+=(-t "$LATEST_URI")
+  fi
+  DOCKER_BUILDKIT="$DOCKER_BUILDKIT" docker build "${build_args[@]}" "${docker_tags[@]}" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
   docker push "$IMAGE_URI"
-  docker push "$LATEST_URI"
+  if [[ "$ECR_PUSH_LATEST" == "true" ]]; then
+    docker push "$LATEST_URI"
+  fi
 }
 
 ecs_optimized_ami_id() {
@@ -507,13 +860,13 @@ ensure_container_instance() {
       "Iops": $ECS_EBS_IOPS,
       "Throughput": $ECS_EBS_THROUGHPUT,
       "Encrypted": true,
-      "DeleteOnTermination": false
+      "DeleteOnTermination": $ECS_EBS_DELETE_ON_TERMINATION
     }
   }
 ]
 EOF
     printf 'launching ECS container instance: %s\n' "$ECS_INSTANCE_NAME" >&2
-    instance_id="$(aws_cli ec2 run-instances \
+    if ! instance_id="$(aws_cli ec2 run-instances \
       --image-id "$ami_id" \
       --instance-type "$ECS_EC2_INSTANCE_TYPE" \
       --iam-instance-profile "Name=$ECS_INSTANCE_PROFILE_NAME" \
@@ -523,7 +876,10 @@ EOF
       --user-data "file://$tmpdir/user-data.sh" \
       --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$ECS_INSTANCE_NAME},{Key=App,Value=$APP_NAME},{Key=Environment,Value=$ENVIRONMENT}]" "ResourceType=volume,Tags=[{Key=Name,Value=$ECS_INSTANCE_NAME-cache},{Key=App,Value=$APP_NAME},{Key=Environment,Value=$ENVIRONMENT}]" \
       --query 'Instances[0].InstanceId' \
-      --output text)"
+      --output text)"; then
+      die "failed to launch ECS container instance: $ECS_INSTANCE_NAME"
+    fi
+    [[ -n "$instance_id" && "$instance_id" != "None" ]] || die "EC2 launch did not return an instance id for $ECS_INSTANCE_NAME"
   else
     state="$(aws_cli ec2 describe-instances --instance-ids "$instance_id" --query 'Reservations[0].Instances[0].State.Name' --output text)"
     printf 'using existing ECS container instance: %s (%s)\n' "$instance_id" "$state" >&2
@@ -532,8 +888,10 @@ EOF
     fi
   fi
 
-  aws_cli ec2 wait instance-running --instance-ids "$instance_id"
+  timed "wait EC2 instance running" aws_cli ec2 wait instance-running --instance-ids "$instance_id"
   printf 'waiting for ECS container instance registration: %s\n' "$instance_id" >&2
+  local registration_started
+  registration_started="$(timing_now)"
   for attempt in $(seq 1 80); do
     container_instance_arn="$(aws_cli ecs list-container-instances \
       --cluster "$ECS_CLUSTER_NAME" \
@@ -547,6 +905,7 @@ EOF
         --query 'containerInstances[0].status' \
         --output text)"
       if [[ "$status" == "ACTIVE" ]]; then
+        timing_record "wait ECS container instance registration" "$(( $(timing_now) - registration_started ))" 0
         printf '%s\n' "$instance_id"
         return 0
       fi
@@ -555,6 +914,7 @@ EOF
     sleep 10
   done
 
+  timing_record "wait ECS container instance registration" "$(( $(timing_now) - registration_started ))" 1
   die "timed out waiting for ECS container instance registration for $instance_id"
 }
 
@@ -643,6 +1003,7 @@ container = {
     "image": os.environ["IMAGE_URI"],
     "essential": True,
     "user": os.environ.get("ECS_CONTAINER_USER", "0"),
+    "stopTimeout": int(os.environ["ECS_CONTAINER_STOP_TIMEOUT_SECONDS"]),
     "portMappings": [{
         "containerPort": 8080,
         "hostPort": 8080,
@@ -945,6 +1306,8 @@ update = {
     "desiredCount": int(os.environ["ECS_DESIRED_COUNT"]),
     "forceNewDeployment": True,
     "loadBalancers": load_balancers,
+    "healthCheckGracePeriodSeconds": base["healthCheckGracePeriodSeconds"],
+    "deploymentConfiguration": base["deploymentConfiguration"],
 }
 json.dump(update, open(sys.argv[2], "w"))
 PY
@@ -958,56 +1321,116 @@ service_exists() {
     --output text 2>/dev/null | grep -Eq '^(ACTIVE|DRAINING)$'
 }
 
+wait_for_ecs_service_stable() {
+  local started now elapsed status desired running pending deployment_count primary_rollout
+  started="$(timing_now)"
+
+  while true; do
+    read -r status desired running pending deployment_count primary_rollout < <(
+      aws_cli ecs describe-services \
+        --cluster "$ECS_CLUSTER_NAME" \
+        --services "$ECS_SERVICE_NAME" \
+        --query 'services[0]' \
+        --output json |
+      python3 -c 'import json, sys
+service = json.load(sys.stdin) or {}
+deployments = service.get("deployments") or []
+primary = next((d for d in deployments if d.get("status") == "PRIMARY"), {})
+print(
+    service.get("status", "None"),
+    service.get("desiredCount", 0),
+    service.get("runningCount", 0),
+    service.get("pendingCount", 0),
+    len(deployments),
+    primary.get("rolloutState", "UNKNOWN"),
+)'
+    )
+
+    now="$(timing_now)"
+    elapsed=$((now - started))
+    if [[ "$status" == "ACTIVE" &&
+      "$desired" == "$running" &&
+      "$pending" == "0" &&
+      "$deployment_count" == "1" &&
+      ( "$primary_rollout" == "COMPLETED" || "$primary_rollout" == "UNKNOWN" ) ]]; then
+      printf 'ECS service stable after %ss: desired=%s running=%s rollout=%s\n' \
+        "$elapsed" "$desired" "$running" "$primary_rollout" >&2
+      return 0
+    fi
+
+    if (( elapsed >= ECS_SERVICE_STABLE_TIMEOUT_SECONDS )); then
+      die "timed out waiting for ECS service stability after ${elapsed}s: status=$status desired=$desired running=$running pending=$pending deployments=$deployment_count rollout=$primary_rollout"
+    fi
+
+    printf 'waiting for ECS service stable (%ss/%ss): status=%s desired=%s running=%s pending=%s deployments=%s rollout=%s\n' \
+      "$elapsed" "$ECS_SERVICE_STABLE_TIMEOUT_SECONDS" "$status" "$desired" "$running" "$pending" "$deployment_count" "$primary_rollout" >&2
+    sleep "$ECS_SERVICE_STABLE_POLL_SECONDS"
+  done
+}
+
 ensure_ecs_service() {
   if service_exists; then
     printf 'updating ECS service: %s\n' "$ECS_SERVICE_NAME"
-    aws_cli ecs update-service \
+    timed "update ECS service" aws_cli ecs update-service \
       --cli-input-json "file://$tmpdir/update-service.json" >/dev/null
   else
     printf 'creating ECS service: %s\n' "$ECS_SERVICE_NAME"
-    aws_cli ecs create-service \
+    timed "create ECS service" aws_cli ecs create-service \
       --cli-input-json "file://$tmpdir/create-service.json" >/dev/null
   fi
-  aws_cli ecs wait services-stable --cluster "$ECS_CLUSTER_NAME" --services "$ECS_SERVICE_NAME"
+  timed "wait ECS service stable" wait_for_ecs_service_stable
 }
 
-ensure_ecs_roles
-ensure_cluster
-ensure_log_group
+timed "preflight EC2 vCPU quota" preflight_ec2_vcpu_quota
+timed "ensure ECS IAM roles" ensure_ecs_roles
+timed "ensure ECS cluster" ensure_cluster
+timed "ensure CloudWatch log group" ensure_log_group
 
-vpc_id="${ECS_VPC_ID:-$(default_vpc_id)}"
+vpc_id="${ECS_VPC_ID:-$(timed "resolve default VPC" default_vpc_id)}"
 [[ "$vpc_id" != "None" && -n "$vpc_id" ]] || die "no default VPC found; set ECS_VPC_ID and ECS_SUBNET_IDS"
-all_subnets_csv="${ECS_SUBNET_IDS:-$(default_subnet_ids "$vpc_id" | tr '\t' ',')}"
+all_subnets_csv="${ECS_SUBNET_IDS:-$(timed "resolve default subnets" default_subnet_ids "$vpc_id" | tr '\t' ',')}"
 [[ -n "$all_subnets_csv" ]] || die "no default subnets found; set ECS_SUBNET_IDS"
 instance_subnet_id="${ECS_EC2_SUBNET_ID:-$(printf '%s' "$all_subnets_csv" | cut -d, -f1)}"
 
-alb_sg_id="$(ensure_security_group "$vpc_id" "$ECS_ALB_SG_NAME" "gitmirrorcache EC2 ECS ALB")"
-task_sg_id="$(ensure_security_group "$vpc_id" "$ECS_TASK_SG_NAME" "gitmirrorcache EC2 ECS tasks")"
+alb_sg_id="$(timed "ensure ALB security group" ensure_security_group "$vpc_id" "$ECS_ALB_SG_NAME" "gitmirrorcache EC2 ECS ALB")"
+task_sg_id="$(timed "ensure task security group" ensure_security_group "$vpc_id" "$ECS_TASK_SG_NAME" "gitmirrorcache EC2 ECS tasks")"
 instance_sg_id="$task_sg_id"
-ensure_sg_rule ingress "$alb_sg_id" --ip-permissions 'IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0,Description="HTTP"}]'
-ensure_sg_rule ingress "$task_sg_id" --ip-permissions "IpProtocol=tcp,FromPort=8080,ToPort=8080,UserIdGroupPairs=[{GroupId=$alb_sg_id,Description=\"ALB to API\"}]"
+timed "ensure ALB ingress rule" ensure_sg_rule ingress "$alb_sg_id" --ip-permissions 'IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0,Description="HTTP"}]'
+timed "ensure task ingress rule" ensure_sg_rule ingress "$task_sg_id" --ip-permissions "IpProtocol=tcp,FromPort=8080,ToPort=8080,UserIdGroupPairs=[{GroupId=$alb_sg_id,Description=\"ALB to API\"}]"
 
-lb_output="$(ensure_load_balancer "$vpc_id" "$all_subnets_csv" "$alb_sg_id")"
+lb_output="$(timed "ensure load balancer" ensure_load_balancer "$vpc_id" "$all_subnets_csv" "$alb_sg_id")"
 load_balancer_arn="$(printf '%s\n' "$lb_output" | sed -n '1p')"
 target_group_arn="$(printf '%s\n' "$lb_output" | sed -n '2p')"
-public_base_url="${PUBLIC_BASE_URL:-http://$(alb_dns_name)}"
+listener_rule_arn="$(printf '%s\n' "$lb_output" | sed -n '3p')"
+public_base_url="${PUBLIC_BASE_URL:-$(public_base_url_by_alb_name "$ECS_ALB_NAME")}"
 
-container_instance_id="$(ensure_container_instance "$instance_subnet_id" "$instance_sg_id")"
-cache_volume_id="$(ensure_cache_volume_performance "$container_instance_id")"
-build_and_push_image
+container_instance_id="$(timed "ensure EC2/ECS container instance" ensure_container_instance "$instance_subnet_id" "$instance_sg_id")"
+cache_volume_id="$(timed "ensure EBS cache volume performance" ensure_cache_volume_performance "$container_instance_id")"
+timed "build and push image" build_and_push_image
 
-execution_role_arn="$(role_arn_by_name "$ECS_EXECUTION_ROLE_NAME")"
-task_role_arn="$(role_arn_by_name "$ECS_TASK_ROLE_NAME")"
+execution_role_arn="$(timed "resolve execution role ARN" role_arn_by_name "$ECS_EXECUTION_ROLE_NAME")"
+task_role_arn="$(timed "resolve task role ARN" role_arn_by_name "$ECS_TASK_ROLE_NAME")"
 export ECS_EXECUTION_ROLE_ARN="$execution_role_arn"
 export ECS_TASK_ROLE_ARN="$task_role_arn"
 
-task_definition_arn="$(register_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
-compaction_task_definition_arn="$(register_compaction_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
-write_service_inputs "$task_definition_arn" "$task_sg_id" "$all_subnets_csv" "$target_group_arn"
+task_definition_arn="$(timed "register API task definition" register_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+compaction_task_definition_arn=""
+if [[ "$ECS_COMPACTION_ENABLED" == "true" ]]; then
+  compaction_task_definition_arn="$(timed "register compaction task definition" register_compaction_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+fi
+
+timed "write ECS service inputs" write_service_inputs "$task_definition_arn" "$task_sg_id" "$all_subnets_csv" "$target_group_arn"
 ensure_ecs_service
-cluster_arn="$(cluster_arn_by_name)"
-compaction_events_role_arn="$(ensure_compaction_events_role "$compaction_task_definition_arn" "$execution_role_arn" "$task_role_arn")"
-ensure_compaction_schedule "$compaction_task_definition_arn" "$compaction_events_role_arn" "$cluster_arn"
+
+if [[ "$ECS_COMPACTION_ENABLED" == "true" ]]; then
+  cluster_arn="$(timed "resolve ECS cluster ARN" cluster_arn_by_name)"
+  compaction_events_role_arn="$(timed "ensure compaction events role" ensure_compaction_events_role "$compaction_task_definition_arn" "$execution_role_arn" "$task_role_arn")"
+  timed "ensure compaction schedule" ensure_compaction_schedule "$compaction_task_definition_arn" "$compaction_events_role_arn" "$cluster_arn"
+else
+  printf 'skipping compaction task and schedule because ECS_COMPACTION_ENABLED=false\n'
+fi
+
+timing_record "ecs/ec2 deployment total" "$(( $(timing_now) - deploy_started_at ))" 0
 
 cat <<EOF
 ECS EC2/EBS deployment complete.
@@ -1015,11 +1438,13 @@ IMAGE_URI=$IMAGE_URI
 ECS_CLUSTER_NAME=$ECS_CLUSTER_NAME
 ECS_SERVICE_NAME=$ECS_SERVICE_NAME
 ECS_TASK_DEFINITION_ARN=$task_definition_arn
+ECS_COMPACTION_ENABLED=$ECS_COMPACTION_ENABLED
 ECS_COMPACTION_TASK_DEFINITION_ARN=$compaction_task_definition_arn
 ECS_COMPACTION_RULE_NAME=$ECS_COMPACTION_RULE_NAME
 ECS_COMPACTION_SCHEDULE_EXPRESSION=$ECS_COMPACTION_SCHEDULE_EXPRESSION
 ECS_CONTAINER_INSTANCE_ID=$container_instance_id
 ECS_LOAD_BALANCER_ARN=$load_balancer_arn
+ECS_LISTENER_RULE_ARN=$listener_rule_arn
 PUBLIC_BASE_URL=$public_base_url
 HEALTH_URL=$public_base_url/healthz
 ECS_CACHE_VOLUME_ID=$cache_volume_id
@@ -1029,3 +1454,8 @@ ECS_EBS_THROUGHPUT=$ECS_EBS_THROUGHPUT
 GIT_CACHE_DISK_QUOTA_BYTES=$GIT_CACHE_DISK_QUOTA_BYTES
 S3_RUNTIME_PREFIX=$S3_RUNTIME_PREFIX
 EOF
+
+if [[ "$owns_timing_file" == "true" ]]; then
+  timing_print_summary
+  timing_write_github_summary "ECS EC2/EBS deployment timings"
+fi

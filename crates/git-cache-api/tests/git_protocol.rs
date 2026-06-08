@@ -48,6 +48,7 @@ impl TestServer {
         );
         run_git(&upstream_work, &["push", "origin", "main"]);
         run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        warm_all_heads(tmp.path(), &upstream_bare);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -63,7 +64,6 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -77,7 +77,6 @@ impl TestServer {
             },
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             leases: Default::default(),
         };
@@ -115,6 +114,25 @@ fn run_git(cwd: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn warm_all_heads(tmp: &Path, upstream_bare: &Path) {
+    let repo_dir = tmp.join("cache/repos/github.com/org/repo.git");
+    if !repo_dir.join("config").exists() {
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        run_git(tmp, &["init", "--bare", repo_dir.to_str().unwrap()]);
+    }
+    run_git(
+        &repo_dir,
+        &[
+            "fetch",
+            "--no-tags",
+            upstream_bare.to_str().unwrap(),
+            "+refs/heads/*:refs/cache/upstream/heads/*",
+            "+refs/heads/*:refs/heads/*",
+        ],
+    );
+    run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

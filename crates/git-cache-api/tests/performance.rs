@@ -13,7 +13,7 @@ struct TestServer {
     addr: SocketAddr,
     tmp: TempDir,
     _upstream_work: PathBuf,
-    _upstream_bare: PathBuf,
+    upstream_bare: PathBuf,
 }
 
 impl TestServer {
@@ -64,7 +64,6 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: rate_limit,
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -78,7 +77,6 @@ impl TestServer {
             },
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             leases: Default::default(),
         };
@@ -89,16 +87,40 @@ impl TestServer {
             axum::serve(listener, router).await.unwrap();
         });
 
-        Self {
+        let server = Self {
             addr,
             tmp,
             _upstream_work: upstream_work,
-            _upstream_bare: upstream_bare,
-        }
+            upstream_bare,
+        };
+        server.warm_all_heads();
+        server
     }
 
     fn git_url(&self, repo: &str) -> String {
         format!("http://{}/git/{}.git", self.addr, repo)
+    }
+
+    fn warm_all_heads(&self) {
+        let repo_dir = self.tmp.path().join("cache/repos/github.com/org/repo.git");
+        if !repo_dir.join("config").exists() {
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            run_git(
+                self.tmp.path(),
+                &["init", "--bare", repo_dir.to_str().unwrap()],
+            );
+        }
+        run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                self.upstream_bare.to_str().unwrap(),
+                "+refs/heads/*:refs/cache/upstream/heads/*",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! These tests stress concurrent access patterns at the HTTP API layer:
 //! parallel materializations, concurrent git clones, rate limiting under load,
-//! and session expiry behavior.
+//! and direct Git fetch behavior.
 
 use git_cache_api::app;
 use git_cache_core::{AppConfig, GitRemoteConfig, ObjectStoreConfig};
@@ -17,6 +17,7 @@ struct TestServer {
     addr: std::net::SocketAddr,
     tmp: TempDir,
     upstream_work: PathBuf,
+    upstream_bare: PathBuf,
 }
 
 impl TestServer {
@@ -68,7 +69,6 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -82,7 +82,6 @@ impl TestServer {
             },
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             leases: Default::default(),
         });
@@ -93,11 +92,14 @@ impl TestServer {
             axum::serve(listener, router).await.unwrap();
         });
 
-        Self {
+        let server = Self {
             addr,
             tmp,
             upstream_work,
-        }
+            upstream_bare,
+        };
+        server.warm_all_heads();
+        server
     }
 
     fn git_url(&self, repo: &str) -> String {
@@ -121,7 +123,30 @@ impl TestServer {
         run_git(&self.upstream_work, &["add", "README.md"]);
         run_git(&self.upstream_work, &["commit", "-m", contents]);
         run_git(&self.upstream_work, &["push", "--force", "origin", "main"]);
+        self.warm_all_heads();
         self.head_commit()
+    }
+
+    fn warm_all_heads(&self) {
+        let repo_dir = self.tmp.path().join("cache/repos/github.com/org/repo.git");
+        if !repo_dir.join("config").exists() {
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            run_git(
+                self.tmp.path(),
+                &["init", "--bare", repo_dir.to_str().unwrap()],
+            );
+        }
+        run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                self.upstream_bare.to_str().unwrap(),
+                "+refs/heads/*:refs/cache/upstream/heads/*",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 }
 
@@ -407,47 +432,5 @@ async fn rate_limiting_under_concurrent_load() {
     assert!(
         succeeded <= 5,
         "at most 5 should succeed under rate limit of 5/min, got {succeeded}"
-    );
-}
-
-// ── 5. Session expiry during use ─────────────────────────────────────────
-
-#[tokio::test(flavor = "multi_thread")]
-async fn session_expiry_during_use() {
-    let server = TestServer::start_with_config(|mut config| {
-        config.session_ttl_seconds = 1;
-        config
-    })
-    .await;
-
-    let client = reqwest::Client::new();
-
-    // Create a session via materialize.
-    let resp = client
-        .post(server.materialize_url())
-        .json(&serde_json::json!({
-            "repo": "github.com/org/repo",
-            "selector": {"branch": "main"}
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let git_url = body["git_url"].as_str().unwrap().to_string();
-
-    // Wait for the session to expire.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    // Try to use the expired session for info/refs.
-    let info_refs_url = format!("{git_url}/info/refs?service=git-upload-pack");
-    let resp = client.get(&info_refs_url).send().await.unwrap();
-
-    // Should get 404 because the session has expired.
-    assert_eq!(
-        resp.status().as_u16(),
-        404,
-        "expired session should return 404"
     );
 }

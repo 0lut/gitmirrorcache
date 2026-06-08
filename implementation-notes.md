@@ -1,152 +1,3 @@
-# Implementation Notes: Multi-Worker Conflict Avoidance
-
-## Running notes for PR #47 implementation
-
-### Decisions not explicit in the spec
-
-1. Implemented local object-store CAS with sidecar version files plus per-key
-   lock files under the local store root. This keeps the same object-store API
-   shape as S3 and exercises stale-version paths locally without adding a new
-   filesystem-lock dependency.
-2. S3 CAS uses ETag/version metadata as an opaque `ObjectVersion` token and
-   conditional `If-Match` writes. Large bundle objects still use immutable
-   create-once semantics; CAS is intended for small mutable JSON records.
-3. Production API wiring now uses an object-store-backed `repo-write` lease via
-   the existing worker `RepoLeaseManager` trait. The in-memory lease manager is
-   retained for focused unit tests.
-4. `repo-write` lease release is fenced by token and implemented as a conditional
-   transition to `released_at` instead of an unconditional delete. Cleanup can
-   safely delete released records later.
-5. Generation-head advancement during pending-generation verification re-reads
-   the actual current head, skips stale/out-of-order verification completions,
-   and CASes forward only when the observed head is older than the verified
-   generation.
-
-### Tradeoffs / follow-ups
-
-1. The implementation keeps asynchronous background verification for already
-   published pending generations. Verification no longer uses wall-clock
-   timestamps as conflict winners, and stale head advances lose CAS rather than
-   replacing newer durable state.
-2. Direct `/git/...` unknown-want read-through now holds the durable
-   `repo-write` lease while `ensure_wants_available()` runs and passes the lease
-   token into the materializer. This keeps fetch/publish under the same fencing
-   path as `/v1/materialize`.
-3. Compaction now checks the generation-head CAS result before cleanup and aborts
-   deletion/repointing when another worker wins the head race.
-
-### Hardening pass (review feedback)
-
-1. **S3 CAS token always uses ETag.** `object_version()` previously preferred
-   `VersionId` over `ETag`, but `put_if_version_matches`/`delete_if_version_matches`
-   use S3 `If-Match` which compares ETags. On versioned buckets VersionId ≠ ETag,
-   so every CAS operation would silently fail. Fixed to always use ETag.
-
-2. **Local CAS crash consistency.** `put_inner` previously wrote the data file
-   (rename) *before* the version sidecar token. A crash between rename and
-   `write_version` left new bytes guarded by the old token — a stale CAS holder
-   could overwrite data it never read. Fixed: version token is now written
-   *before* data rename. A crash between version write and data rename leaves a
-   new token guarding old bytes; any CAS holder with the previous token fails.
-
-3. **Ref manifest conflict resolution moved away from wall-clock timestamps.**
-   This was first replaced with `GenerationId` ordering, then superseded by the
-   later hardening pass below: mutable ref/default manifests are written only
-   after lease/head-context checks, so freshness no longer depends on raw UUID
-   ordering either.
-
-4. **Compaction aborts on head CAS loss.** `compact_generation_chain_inner`
-   previously discarded the return value of `advance_generation_head` (`let _ =
-   ...`). If another worker advanced the head, compaction still repointed
-   manifests and deleted old generations. Now aborts cleanup and returns `None`
-   when the CAS fails.
-
-5. **Lease guard Drop aborts renewal task.** `ObjectStoreRepoLease` now
-   implements `Drop` to abort the renewal `JoinHandle`. Previously a panic or
-   early return could leak the renewal task indefinitely.
-
-6. **Clock-skew-resistant lease steal.** Lease expiry check now uses the
-   object-store `updated_at` metadata (server-side timestamp) when available
-   instead of comparing holder-authored `expires_at` with the local clock.
-   This avoids inter-worker clock skew causing premature lease theft.
-
-7. **Retry-After header on lease busy.** API 503 responses for `LeaseBusy` now
-   include a `Retry-After` header populated from `config.leases.busy_retry_after_seconds`.
-   API handlers also wait/retry for up to this configured window before returning
-   503 so transient multi-worker contention does not unnecessarily fail requests.
-
-8. **All materialize selectors routed through coordinator.** Previously only
-   `Branch`/`DefaultBranch` selectors went through `UpdateCoordinator`;
-   `Commit`/`ShortCommit` bypassed coordination entirely. Now all selectors
-   acquire the repo-write lease before materializing.
-
-9. **Direct `/git/` upload-pack holds repo-write lease.** The
-   `handle_upload_pack` → `ensure_wants_available` path can fetch and publish
-   generations. The API now acquires and holds the durable repo-write lease
-   while processing upload-pack wants and constructs the materializer with that
-   lease token, so any `publish_generation` calls verify ownership before
-   mutating shared state.
-
-10. **Lease token threaded through materializer.** `UpdateRequest` now carries
-    an optional `lease_token` set by `execute_with_lease`. `Materializer` stores
-    the token and calls `verify_lease_held()` before publishing shared state.
-    `RepoLease` trait exposes `token()` to surface the fencing token.
-
-### Second hardening pass (review feedback)
-
-1. **Materialize validation and fast path scope.** `/v1/materialize` now validates
-   the repo host before entering the coordinator. Exact-commit requests with a
-   complete manifest hydrate/create the session directly outside the durable
-   repo-write lease; missing or incomplete state still goes through coordinated
-   read-through.
-
-2. **Session-free coordinator execution.** Coordinator execution for exact and
-   short commits now uses `ensure_commit` / `ensure_short_commit` helpers that
-   warm or publish cache state without creating throwaway session manifests.
-   The API creates the user-facing session only after the coordinated pass.
-
-3. **Short-commit resolution stays local after coordination.** The coordinated
-   pass still fetches upstream refs and resolves the abbreviation under the
-   lease. The post-coordinator response path resolves against local refs only,
-   avoiding a second upstream fetch/resolution outside the lease.
-
-4. **Git upload-pack hides ordinary repo-write contention.** Lazy want hydration
-   now waits internally for the repo-write lease for up to the git operation
-   timeout instead of surfacing the short API busy window as a Git-protocol
-   503/409. Empty-want upload-pack requests skip the lease.
-
-5. **Lease release quiesces renewal.** `ObjectStoreRepoLease::release` now aborts
-   and awaits the renewal task before writing `released_at`, and the object-store
-   release helper retries CAS conflicts while the same token still owns the
-   lease.
-
-6. **Local object-store lock recovery.** Local per-key lock files now record
-   owner PID and creation time. Acquisition attempts remove locks whose owner PID
-   is gone (on `/proc` platforms) or whose mtime exceeds a conservative stale
-   threshold, avoiding permanent lockout after process crashes.
-
-7. **Compaction cleanup is fenced.** Compaction still repoints manifests and
-   advances generation head by CAS, but old-generation deletion now requires the
-   repo-write lease. If another writer holds the lease, compaction skips deletion
-   rather than racing a pending publisher.
-
-8. **Ref/default manifest writes no longer use raw `GenerationId` ordering.**
-   Ref/default manifests are direct writes performed after lease verification
-   and/or generation-head acceptance. Pending verification strips ref writes
-   from `publish_verified_metadata`, advances or validates generation-head
-   ancestry first, and only then writes ref/default manifests.
-
-9. **Pending publish records survive head CAS conflicts.** If verification cannot
-   advance generation head and the refreshed head does not descend from the
-   pending generation, verification now returns a conflict and leaves the pending
-   record intact for a later verifier/repair pass.
-
-10. **Lease checks cover existing-generation writes.** Existing-complete
-    `publish_generation` paths verify the held repo-write lease before updating
-    branch/default manifests, matching the new-generation publish path.
-
----
-
 # Implementation Notes: Read-Through Git Remote
 
 ## Overview
@@ -470,13 +321,14 @@ repoints canonical manifests and updates the head.
 
 ## Tradeoffs added during final implementation
 
-### T3. Startup pending scan resumes interrupted verification
+### T3. Pending generation recovery is request-driven
 
-The verifier is enqueue-on-publish, and API startup also scans the global
-`pending-generations/` prefix and re-enqueues any leftover pending generations.
-This covers process exits after the request path writes pending metadata but
-before background verification finishes. The scan is bounded to avoid unbounded
-object-store listings.
+The verifier is enqueue-on-publish, but API startup no longer scans the global
+`pending-generations/` prefix. That eager scan could turn a deploy into minutes
+of unsolicited LLVM-scale bundle verification and mask otherwise-hot direct Git
+requests. Foreground materialize and direct Git want handling now check for a
+matching pending generation before fetching from upstream, so a process exit
+after writing pending metadata is recovered by the next request for that commit.
 
 ### T4. Configured object-store namespace remains the base name
 
@@ -484,196 +336,431 @@ Operators can keep existing config values such as `prefix = "repos"` or
 `root = "./tmp/object-store"`. The domain state builder appends the v2 suffix at
 runtime and avoids double-suffixing if a config already contains `-v2` or `v2`.
 
-### T5. Verification head advancement is monotonic but tolerant of races
+---
 
-Background verification no longer treats every generation-head CAS miss as a
-hard error. Verifier tasks can complete out of order, so the verifier re-reads
-the current head and only attempts to advance when the current head is older
-than the pending generation. A strict `>` timestamp check is used instead of
-`>=` because tests can publish multiple generations within the same timestamp
-tick; equal timestamps must still allow CAS advancement.
+# Implementation Notes: HTTPS Authorization
 
-### T6. Mutable ref/default manifests use versioned writes
+## Overview
 
-Ref manifests and the default manifest now use object-store versions for writes
-instead of blind overwrites. If a manifest with a strictly newer verification
-timestamp already exists, the older write is skipped. This is a pragmatic
-fencing guard for mutable branch/default state while preserving idempotent
-rewrites of identical content.
+Implemented the HTTPS auth slice from `AUTH-PLAN.md`: request-scoped Basic
+authorization can be forwarded to upstream git commands without putting
+credentials in argv, logs, local repo config, object-store keys, or manifests.
+Credentialed materialization creates bearer-protected session URLs.
 
-### T7. Exact-commit reads can join pending verification
+The final simplification for this PR is repo-level access first, then
+main-like materialize/resolve/direct serving. The API parses upstream auth and
+checks only caller intent such as "auth required"; the domain proves repo/ref
+access by contacting upstream with the selected auth. There is no GitHub REST
+provider layer, no token-present-to-anonymous downshift, and no parallel
+authenticated materializer implementation.
 
-The request path can return from branch/default materialization before the
-background verifier has published canonical commit manifests. Exact-commit
-materialization now scans the repo's bounded pending-generation work queue for a
-matching commit and waits for that generation verification before falling back to
-publishing a new generation. This avoids duplicate generation publication during
-cold-cache rehydrate races.
+## Decisions not in the spec
 
-### T8. Synthetic git performance repos disable auto maintenance
+### 1. Auth type lives in `git-cache-core`
 
-The `git-cache-git` performance tests create hundreds of commits in temporary
-repositories while other tests run concurrently. CI exposed intermittent
-repository corruption from Git auto maintenance/gc during those synthetic setup
-loops, so the test fixture disables `gc.auto` and `maintenance.auto` for those
-temporary repos.
+`UpstreamAuth` is in core so API, domain, and git wrapper code share one parser
+and redacted `Debug` implementation. It accepts only `Basic ...` for this plan,
+rejects empty/control/NUL-containing headers, and exposes the raw header only to
+the git wrapper execution boundary.
 
-### T9. Pending generation verification never rewinds head
+### 2. `/v1/resolve` is lightweight for all callers
 
-Out-of-order background verifiers now first check whether the current
-`generation-head.json` already descends from the pending generation. Pending
-publish metadata records the head observed at publish time (`expected_head`) so
-verification CASes only from that expected head or a safe compaction replacement
-that preserves the same tips. Leased verifiers re-check `repo-write` ownership
-immediately before advancing `generation-head.json`, and branch/default refs are
-attempted whenever the accepted head contains the pending generation. Ref writes
-remain monotonic, so stale manifests are skipped by the helper rather than by
-omitting all refs for an older pending verifier.
+`/v1/resolve` now consistently returns `ResolveResponse` with the resolved
+commit, source label, `cache_available`, and `authorized_at`. It does not create
+sessions and does not fall through to materialize for anonymous callers.
 
-### T10. Lease fencing checks released and expired manifests
+### 3. Protected sessions reuse the existing session repo layout
 
-`verify_lease_held` now treats a matching token as necessary but not sufficient:
-released leases and expired leases are rejected before shared-state writes. The
-expiry check uses object-store metadata time when available, mirroring the
-lease manager's skew-resistant acquisition logic. TTL comparisons use `>=` so
-zero-second or exact-boundary leases are treated as expired consistently by both
-acquisition/steal and fencing checks.
+Protected sessions still create a per-session bare repo with alternates to the
+shared repo. The difference is session manifest protection, bearer-token
+validation on every session Git request, and stricter upload-pack config:
+`allowFilter=false`, `allowAnySHA1InWant=false`, and
+`allowReachableSHA1InWant=false`.
 
-### T11. Compaction uses the repo-write lease manager
+### 4. Session tokens are returned once
 
-Compaction cleanup now acquires `repo-write` through `ObjectStoreRepoLeaseManager`
-instead of hand-rolling lease acquisition/stealing. This gives compaction the
-same renewal, skew handling, and release behavior as coordinated read-through
-updates. When compaction is already running under a fenced materializer, it
-reuses the existing token rather than reacquiring.
+The raw `gcs_...` session token is returned only in the materialize response.
+Only its SHA-256 hash is stored in the session manifest. Public sessions keep
+`session_token: None` and do not require bearer auth.
 
-### T12. Short commit resolution is carried across the coordinator boundary
+## Tradeoffs
 
-`UpdateExecutor` can now return a request-scoped `resolved_commit`. The
-short-commit coordinator path stores the full commit resolved while holding
-`repo-write`, and the post-coordinator response path uses that exact commit
-instead of resolving the abbreviation again after lease release.
+### T1. Direct `/git/...` is repo-gated, not fully ephemeral
 
-### T13. Local object locks are not reclaimed by age alone
+The plan asks for an ephemeral protected serving repo for authenticated direct
+Git. This implementation does not yet build that separate direct-remote repo.
+Instead, direct `info/refs` proves repo-level access with the request's selected
+upstream auth and direct `git-upload-pack` serves from the shared repo after
+local readiness checks. This follows the simplification rule that repo access is
+the authorization boundary. Deployments that need stricter isolation for
+rewritten or hidden history should keep that history in a separate upstream repo
+or revisit ephemeral direct serving repos later.
 
-Local object-store lock recovery no longer deletes PID-owned locks just because
-they are old. A waiter removes a PID-owned lock only when the recorded owner PID
-is proven dead, avoiding concurrent critical sections during valid long-running
-bundle writes. PID-less locks from a crash before metadata write are reclaimed
-only after a conservative stale threshold using `created_at_unix_ms` or file
-mtime.
+### T2. Direct upload-pack read-through is repo-authorized
 
-### T14. Direct Git lease exhaustion is retryable
+Direct Git POST must not run object-level upstream reachability proof. Its job
+is to parse wants after repo access is proven, serve already-ready commits,
+hydrate complete commit manifests when available, fetch missing wanted commits
+from upstream using the same request auth when read-through is enabled, require
+commit wants to have their tree object before exposure, queue background
+`git fsck --connectivity-only` for newly imported commits, and spawn
+`git upload-pack`.
 
-If `/git/.../git-upload-pack` exhausts its internal repo-write wait, it now
-returns the same retryable `LeaseBusy` class as materialize rather than a
-generic conflict. Direct Git and materialize `LeaseBusy` API responses use the
-configured `leases.busy_retry_after_seconds` value for `Retry-After`.
+This intentionally accepts repo-level access as sufficient for all objects in
+the repo-scoped cache. It preserves current `main` behavior where `git clone`
+can read through without prior materialization, while avoiding the duplicated
+authenticated/unauthed method families and per-object authorization machinery.
 
-### T15. Compaction preserves pending expected heads
+### T3. Exact commits use repo-level access
 
-Pending generation publishes can depend on both the bundle parent chain and the
-`expected_head` recorded when the worker observed the repo. Compaction retention
-now walks both seeds before deleting old generation manifests, which keeps
-force-push/full-bundle pending publishes verifiable after compaction replaces the
-visible head.
+Bare exact and short commit selectors are allowed for credentialed and anonymous
+requests after the repo access check. The tradeoff is explicit: a caller who can
+read a repo may materialize cached history from that repo even if a commit is no
+longer reachable from an advertised upstream ref. A future hardening option can
+add a "current reachability required" policy, but it is not the default for this
+PR.
 
-### T16. Background verifiers reacquire `repo-write`
+### T4. Process-wide `upstream_auth_token_env` remains trusted-deployment only
 
-Queued generation verification still runs asynchronously, but token-less
-background workers now acquire their own durable `repo-write` lease before
-publishing verified metadata, advancing the generation head, or writing
-branch/default manifests. Verifiers that are already running inside a fenced
-materializer reuse the existing token.
+I left the existing process-wide bearer-token injection in place for older
+single-tenant/trusted deployments. Request-scoped auth is separate and overrides
+per-command git config env when present.
 
-### T17. Pending public-ref observations are revalidated
+## Things I changed from the plan
 
-Pending branch/default publishes now re-check the upstream branch/default ref
-before advancing `generation-head.json` or writing public ref manifests. If the
-upstream observation changed while verification was pending, the bundle can still
-be verified and indexed for exact commits, but stale branch/default observations
-are dropped instead of promoting old refs.
+### C1. Added auth-scoped git execution context
 
-### T18. Exact local descendants do not depend on head publication timing
+Request-scoped upstream auth lives on a cloned `Git` execution context created
+with `with_upstream_auth(remote_url, auth)`. The ordinary git wrapper methods
+(`ls_remote_heads`, `fetch_branch`, `fetch_refs`, `fetch_object`, and
+`fetch_all_heads`) remain the only command builders; the scoped context injects
+`http.https://.../.extraHeader` through `GIT_CONFIG_*` env. Tokens stay out of
+argv and debug logging.
 
-`index_local_commit_from_known_generation` now checks local cache refs with
-complete commit manifests even when `generation-head.json` has not been
-published yet. This closes the timing leak where a verified full bundle could be
-visible via commit manifests before the background verifier finished the head CAS,
-causing exact descendant requests to fall back to a new GitHub-verified publish.
+### C2. Added bearer-protected session manifests
 
-### T19. PID-less local lock retry budget matches stale threshold
+`SessionManifest` now has `SessionProtection::{Public,BearerToken}`. Session
+Git endpoints parse `Authorization: Bearer ...`, hash the presented token, and
+reject missing/wrong tokens with 401.
 
-The local object-store lock retry budget now spans the PID-less stale-lock
-threshold. A crash that leaves a lock before PID metadata is written should be
-reclaimed by the first waiting acquire attempt rather than producing a short
-failure window followed by later recovery.
+### C3. Added protected direct ref advertisements
 
-### T20. Compaction lease contention is retryable, not a no-op
+Authenticated direct `info/refs` uses a reduced synthesized capability set that
+omits `filter`, `allow-tip-sha1-in-want`, and
+`allow-reachable-sha1-in-want`.
 
-Explicit compaction no longer reports `Ok(None)` when the `repo-write` lease is
-temporarily busy. It waits for the configured lease-busy retry window and then
-either compacts under the acquired lease or returns `LeaseBusy`, keeping
-"contention" distinct from "chain below threshold / no compaction needed". The
-same distinction applies when the generation-head CAS loses to another verifier:
-explicit compaction retries against the refreshed head, then returns the
-remaining CAS conflict instead of reporting an ordinary no-op.
+### C4. Added focused regression coverage
 
-Compaction also read-validates the compacted generation manifest before and
-after head publication/cleanup. If a concurrent verifier or object-store
-ordering gap makes `generation-head.json` point at metadata that is not yet
-readable, explicit compaction rewrites/validates the manifest before returning
-or reports a retryable CAS conflict instead of handing callers a report for an
-unreadable head. Token-less pending verification now waits briefly for the
-`repo-write` lease before surfacing `LeaseBusy`, which avoids 30s background
-retry gaps during ordinary same-repo verifier contention; background verifiers
-also retry lease/head contention immediately rather than sleeping for the long
-non-contention verification retry interval. The async test wait helpers use a
-longer window so they tolerate the configured lease-busy retry budget without
-weakening the asserted manifest/head invariants.
+New coverage asserts Basic auth redaction, protected session token issuance,
+missing/wrong session-token rejection, protected session upload-pack success,
+and preservation of existing public direct remote behavior.
 
-The compaction-chain regression setup now waits for both first-generation commit
-metadata and the first generation head before publishing the second generation.
-That keeps the test aligned with the object-store invariant above: commit
-metadata can be durable before head publication, so commit metadata alone should
-not be used as a proxy for chain ancestry.
+## Merge conflict resolution notes
 
-Local object-store key locks now construct the RAII cleanup guard immediately
-after the lock file is created, before writing lock metadata. That closes a
-cancellation-safety gap where aborting a task in the metadata-write window could
-leave a same-PID lock file behind; same-PID locks are intentionally not stolen
-by stale-lock recovery.
+### M1. Kept main's runtime-cache completeness checks
 
-### T21. API integration CI timeout now matches retry semantics
+While merging `origin/main`, I preserved its `commit_ready_for_serving` checks
+for direct upload-pack wants. Commit wants are not exposed unless both the
+commit and tree are available locally.
 
-The integration-test workflow previously capped the whole matrix job at 3
-minutes while each test command was allowed to run for 120 seconds and retry up
-to three times. With bounded repo-write wait/retry semantics, the API integration
-shard can legitimately run longer under slow GitHub-hosted runners, especially
-the many-branch load test. The workflow timeout is now 8 minutes and each cargo
-attempt is capped at 240 seconds. No tests were edited for this; the CI budget
-now reflects the retry behavior introduced for transient lease contention.
+### M2. Protected session repos do not hide their synthetic ref
 
-### T22. Steal clock recomputed after reading existing lease
+The protected session repo contains only the authorized synthetic session ref
+and uses alternates for objects. Hiding `refs/cache` in that repo also hides the
+synthetic `refs/cache/sessions/...` ref from stateless upload-pack, so protected
+sessions keep the stricter `allow*InWant=false` config but do not set
+`hideRefs=refs/cache`.
 
-The expiry check in `ObjectStoreRepoLeaseManager::acquire` previously used the
-`now` timestamp captured before the failed `acquire_lease_with_token` and
-`read_lease_with_version` round-trip. With a zero or very short TTL (or slow
-object-store reads / coarse metadata granularity), the elapsed time between
-`version.updated_at` and the stale `now` could be negative or too small,
-treating a genuinely expired lease as live. The steal path now captures a fresh
-timestamp (`steal_now`) after reading the existing lease. Non-positive computed
-TTLs (`expires_at <= renewed_at`) are treated as unambiguously expired,
-preventing any clock comparison from keeping a dead lease alive.
+### M3. Session-token test uses a real Git client flow
 
-### T23. Thundering-herd test uses explicit joiner barrier
+After the merge, the single handcrafted upload-pack POST could stop after the
+negotiation `NAK` under the stricter protected config. The regression now uses
+`git clone` with `http.extraHeader` injected through `GIT_CONFIG_*`, which is
+closer to the workflow users actually run and keeps the token out of argv.
 
-The `inflight_dedup_thundering_herd` test previously used a single
-`yield_now()` to ensure all 99 spawned callers had joined the existing
-in-flight entry before releasing the held executor. On a `multi_thread`
-runtime, `yield_now` only yields the current task; some spawned tasks may
-still be unscheduled when the owner completes and removes the inflight entry,
-causing late arrivals to become new owners and block forever. The test now
-polls `inflight_waiter_count()` (backed by `watch::Sender::receiver_count()`)
-until all 99 joiners have cloned the inflight receiver before releasing, with a
-bounded 5-second deadline to prevent silent hangs.
+## Auth-context refactor notes
+
+### R1. Keep permission proof separate from command auth plumbing
+
+I removed the duplicate direct-remote `*_with_auth` method family. The API now
+parses upstream credentials once, creates `materializer.using_upstream_auth(...)`,
+and then calls the ordinary methods such as `upstream_refs`,
+`handle_upload_pack`, `compare_upstream_refs`, and `fetch_changed_refs`.
+
+### R2. Share branch fetch/publish after authorization
+
+Authenticated branch materialization still proves the branch tip with GitHub
+before serving, but the actual fetch, moved-tip check, default-branch update,
+and generation publish now go through the same `ensure_branch_from_verified_tip`
+helper used by the public branch path.
+
+## Devin PR bug-report follow-up notes
+
+### D1. Gateway bearer auth report did not reproduce on this branch
+
+Devin's PR reported that anonymous API requests could fail if a gateway placed
+`Authorization: Bearer ...` on the request. Our current API upstream-auth path
+only reads `Git-Cache-Upstream-Authorization`, so the bug did not reproduce
+here. I added a regression test to keep gateway bearer auth from being parsed as
+upstream GitHub credentials on API endpoints.
+
+### D2. Protected session token entropy report reproduced
+
+The protected session token was `gcs_` plus UUID v7, which exposed timestamp
+structure and provided less entropy than the plan expected. I reproduced this
+with a token-shape test that required `gcs_` plus 32 bytes of lowercase hex,
+then changed token generation to concatenate two UUID v4 byte arrays before
+hex encoding.
+
+### D3. PR #46 follow-up comments were reproduced before fixes
+
+The authenticated `/v1/resolve` rate-limit bypass reproduced with a handler test
+that consumed the quota first and expected 429 before host validation/upstream
+work. The upstream timeout mapping issue reproduced with a git-wrapper unit test
+that expected `GitCacheError::Timeout` to survive `run_upstream` error mapping.
+The GIT_CONFIG clobber issue reproduced with a fake git executable that recorded
+its environment; the fix now composes different-host entries and replaces a
+matching same-host entry so request credentials still take precedence. The
+protected-session tree check was not open as a PR #46 thread, but the code issue
+reproduced with a synthetic commit object whose tree was absent.
+
+### D4. Static-review flag triage after PR #46 fixes
+
+The follow-up static-review flags included several stale positives after D3:
+authenticated resolve is rate-limited, GIT_CONFIG auth entries compose instead
+of clobbering, upstream timeout errors keep their type, and session token entropy
+uses two UUID v4 byte arrays. Two small hardening items were still useful and
+had focused repro tests: `MaterializeResponse` debug output now redacts
+`session_token`, and session Bearer parsing accepts case-insensitive schemes
+while ignoring unrelated auth schemes so public sessions are not rejected by
+cached Basic credentials. The direct Git shared-repo / request-scoped proof
+concerns remain known hardening tradeoffs pending ephemeral repo isolation, with
+the request-scoped proof fallback tightened in D5.
+
+### D5. Preserve auth-free public access with one repo-access model
+
+The auth model remains two separate gates: service auth is deployment/app
+access control, while upstream repo auth proves that the caller can reach a
+repository through upstream Git. This code currently has no in-app service-auth
+gate, so auth-free deployments still work. `/v1/*` keeps upstream repo
+credentials in `Git-Cache-Upstream-Authorization` so a service `Authorization`
+header can coexist. Direct Git still uses `Authorization: Basic ...` as repo
+credentials because that is what Git credential helpers naturally send.
+
+For this PR, repo access is the security boundary. After a request proves it can
+read the upstream repo with either anonymous auth or supplied credentials,
+materialize, resolve, and direct upload-pack stop asking whether the path was
+"authenticated" or "anonymous". This intentionally avoids separate authorized
+method families.
+
+### D6. Domain materialization plans access and target together
+
+Raw `UpstreamAuth` stays out of `MaterializeRequest` because it is transport
+context with secret-bearing data, not JSON request data. The API parses auth and
+passes it through `Materializer::using_upstream_auth`; the domain then builds a
+`MaterializePlan` containing a `RepoAccessContext` and a target commit/ref.
+
+Branch and default-branch selectors prove access by resolving the upstream tip
+with the selected auth. Exact commit selectors first run a lightweight
+`ls_remote_default_branch` repo-access check, then use the main-like exact
+commit flow. Short commits fetch upstream refs with the selected auth before
+resolving. The old authenticated materialization method family was removed.
+
+### D7. Direct Git wants are read-through availability checks after repo proof
+
+Partial clones can later ask upload-pack for blob/tree objects that are not ref
+tips. Under the simplified repo-boundary model, direct Git POST no longer runs
+per-object upstream graph proof. After GET or POST proves repository access, the
+domain treats object presence as cache state: if a wanted commit is already
+ready it is served, if a complete commit manifest exists it is hydrated, and if
+read-through is enabled it is fetched from upstream using the same request auth.
+Commit wants still require `commit_ready_for_serving` before upload-pack can
+expose them, so a commit without its tree is not served.
+
+### D8. Materializer split keeps behavior intact while reducing local coupling
+
+`materializer.rs` is now a facade over focused modules for planning, repo
+operations, generation publishing/compaction, direct Git serving, session
+creation/cleanup, manifest access, executor wiring, and small shared utilities.
+This was intentionally a structural refactor: it did not change the public/auth
+model or add ephemeral direct-Git repos. The direct Git and generation modules
+are still the largest pieces, but their responsibilities are now separated
+enough for smaller follow-up refactors.
+
+Session creation now goes through one `create_session_with_access` path with a
+small `SessionAccess` enum, so public and bearer-protected sessions share the
+readiness checks, repo preparation, manifest write, and response construction.
+Manifest reads/writes used by materialization now go through `ManifestStore`;
+raw prefix scans still exist for cleanup/compaction, but key deserialization is
+centralized in the wrapper. Materializer tests were split into behavior modules
+so future changes can add focused coverage without growing one monolithic test
+file again.
+
+### D9. Direct Git POST preserves main-like read-through
+
+AWS smoke logs for `llvm/llvm-project` showed generation verification conflicts
+for the current `main` commit while the host cache already had the commit and
+tree locally. The surprising part was direct clone POST behavior: after the
+synthesized upstream advertisement, `ensure_wants_available` fetched and
+published every branch that differed from local public `refs/heads/*` before it
+checked whether the requested want was already an advertised, complete cached
+tip. Large repos with many active branches could therefore stall on unrelated
+fetch/publish work and race with existing generation manifests.
+
+After an AWS control run against current `main`, public LLVM direct clones were
+~1.5s while the first auth-aware iteration was ~45s. Several follow-up
+optimizations tried to recover that latency by making direct Git advertise only
+locally ready refs and reject local cache misses. That preserved hot latency,
+but it broke an important property of current `main`: `git clone`
+should work without a prior `/v1/materialize`.
+
+The current simplification keeps the repo-access check boring and leaves
+availability to the main-like direct Git read-through path. Direct Git GET
+proves that the selected auth can read the upstream repo and advertises the
+current upstream refs without fetching objects. Direct Git POST then parses the
+wants, hydrates complete commit manifests when available, otherwise fetches the
+wanted commit from upstream using the same request-scoped auth, configures the
+serving repo, and spawns `git upload-pack`.
+
+A preview run of cold `llvm/llvm-project` direct clone proved correctness but
+also showed that foreground `publish_generation` blocked the client on
+`git bundle create --all`. Direct Git now queues a background
+`git fsck --connectivity-only` after exposing the fetched commit, while
+generation publishing stays on `/v1/materialize` and warmer paths. For blobless
+clients, the upstream read-through fetch also carries `--filter=blob:none`,
+matching the client request and avoiding unnecessary blob transfer into the
+cache.
+
+### D10. Repo access proof uses Git transport, not provider REST
+
+The revised auth model separates the future service-auth gate from the current
+upstream repo-access gate. Service auth answers "can this caller use the cache
+service at all" and is still out of scope for this branch. Repo auth answers
+"can this request reach this upstream repo" and is proven by ordinary upstream
+Git operations using the selected `UpstreamAuth`.
+
+No token means anonymous Git access. Token present means credentialed Git
+access. The implementation does not classify public/private repositories with
+GitHub REST and does not downshift token-present requests to anonymous mode. A
+bad supplied token is therefore visible to the caller instead of silently
+falling back to public access.
+
+For GitHub, GitLab, Bitbucket, and other allowed HTTPS hosts, this pass keeps
+one provider-neutral mechanism: `ls-remote`/Smart HTTP through the existing git
+wrapper. A future provider layer can introduce `GitHubOrigin`, `GitLabOrigin`,
+`BitbucketOrigin`, or `PrivateGitServerOrigin` if measurements show a real need,
+but this PR avoids adding that complexity.
+
+### D11. Direct proof cache is only a GET-to-POST auth handoff
+
+Direct Git GET fetches upstream refs to prove repo access, then synthesizes the
+Smart HTTP advertisement from that upstream state. It stores the comparison for
+a short TTL keyed by repo and the exact auth fingerprint. Direct Git POST may
+use the matching entry to avoid a second upstream ref call. If the handoff is
+absent, expired, or keyed to different credentials, POST re-runs the same
+lightweight upstream ref fetch before read-through serving.
+
+The proof cache deliberately does not authorize individual objects, persist
+across process restarts, downshift credentialed requests to anonymous proofs, or
+authorize across credentials. It is a hot-path optimization for the stateless Git
+GET/POST pair, not a repository visibility cache.
+
+### D12. Direct upload-pack has one read-through entrypoint
+
+Domain serving has one `handle_upload_pack` path for parsing wants, hydrating or
+fetching missing wanted commits, queueing background fsck for newly imported
+commits, serving repo configuration, and spawning `git upload-pack`. The
+optional upstream-ref comparison argument remains only as API context for the
+GET-to-POST handoff; the domain no longer has separate authenticated,
+proof-specific, or fallback-fetch upload-pack implementations.
+
+### D13. Materialize keeps main-like branch behavior
+
+The branch/default materialize path is intentionally close to current `main`:
+resolve the upstream tip with the selected auth, serve immediately if the commit
+and tree are already local, otherwise fetch the target branch, verify the fetched
+SHA matches the earlier upstream tip, publish the generation, and create a
+session. Request-scoped auth changes which upstream credentials are used and
+whether the session is protected; it does not fork the branch materializer.
+
+### D14. Exact commits use repo-level authorization
+
+For the materialize API, repo access is now treated as sufficient authorization
+for exact commit selectors. Exact commit materialization first proves repo access
+with `ls_remote_default_branch`, then uses cached manifests/local generation
+indexes where possible, or fetches upstream refs with the same auth when needed.
+The protected session still requires its bearer token and is pinned to the
+materialized commit.
+
+The tradeoff is that a caller with repo access can materialize a cached commit
+for that repo even when the commit is not currently reachable from an advertised
+upstream ref. That matches the simpler repository-boundary model we want here:
+Git history is effectively repo-scoped, and operators should keep truly
+sensitive histories in separate repositories rather than relying on hidden or
+rewritten commits inside the same repo. The code carries a TODO to make
+"current upstream reachability" an explicit optional policy if deployments need
+that stricter behavior later.
+
+### D15. Resolve uses the same selector policy
+
+`/v1/resolve` now always returns the lightweight `ResolveResponse` shape after
+the same repo-access gate used by materialize. It no longer falls through to
+materialize for anonymous requests, so callers should not expect a session URL
+from resolve. The response reports the resolved commit, whether that commit is
+locally cache-available, and the source label.
+
+The selector policy now matches materialize: repo access is sufficient for exact
+commit selectors, and `reachable_from` is not required by default. Direct Git
+upload-pack follows the same repo-boundary policy and differs only in outcome:
+it streams from local cache when ready, hydrates or fetches the wanted commit
+when read-through is needed, and fails only when the authorized repo cannot
+provide the requested object or read-through is disabled.
+
+### D16. Remaining simplification direction
+
+The remaining cleanup should be small and mechanical: keep `RepoAccessContext`
+as an access/session/source label, keep auth parsing at API boundaries, keep Git
+auth env composition in the git wrapper, and avoid adding provider-specific
+helper families until there is a measured need. Materialize and resolve should
+continue to look as much like current `main` as possible, with request-scoped
+auth carried as upstream Git credentials and session/publication policy.
+
+### D17. API materialize no longer pre-runs the worker coordinator
+
+AWS LLVM benchmarking exposed a bad interaction between the HTTP materialize
+path and `UpdateCoordinator::read_through`: a branch request whose commit/tree
+were already present locally could still join or start warmer-style generation
+work before the unified materializer saw the hot local state. For LLVM this
+looked like an idle client connection or an LLVM-sized pending generation
+verification instead of a fast session response.
+
+The API now calls `Materializer::materialize` directly after rate limiting and
+upstream-auth header checks. The worker coordinator remains available for cron,
+event hints, and explicit warming, but it is no longer in front of interactive
+HTTP materialize/resolve handling. A regression test covers the hot local branch
+case by warming the bare repo, calling `/v1/materialize`, and asserting that no
+generation bundle or pending generation verification is written.
+
+### D18. Pending generation verification has a local-repo fast path
+
+LLVM benchmarking also exposed a second, older cost: after publishing a new
+incremental generation, verification fetched the whole generation chain into a
+temporary repo. For a repo with a large verified parent generation, that meant
+downloading and `index-pack`ing gigabytes of already-verified history before
+later hot requests could get a fair share of CPU and disk.
+
+Verification now first tries the normal HTTP-publish case: if the local repo
+still has the new generation's tip objects and every parent generation is
+already verified, the publisher verifies the just-created bundle file with
+`git bundle verify`, records its size/SHA-256, and writes verified generation
+metadata immediately. That proves the bundle prerequisites without unpacking
+the full parent chain again or re-downloading the bundle from object storage.
+
+If a generation is already pending, the background verifier uses the same local
+proof and downloads only that pending bundle. If the local repo is missing,
+incomplete, or the parent chain is not already verified, automatic background
+verification leaves the generation pending instead of falling back to full-chain
+replay. Explicit verification paths used by compaction/recovery still keep the
+original full-chain fallback. Regression tests cover both the synchronous
+publish path and a child pending generation whose verified parent bundle has
+been deleted.

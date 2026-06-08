@@ -16,7 +16,7 @@ struct TestServer {
     addr: SocketAddr,
     tmp: TempDir,
     upstream_work: PathBuf,
-    _upstream_bare: PathBuf,
+    upstream_bare: PathBuf,
 }
 
 impl TestServer {
@@ -63,11 +63,9 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             leases: Default::default(),
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -88,12 +86,14 @@ impl TestServer {
             axum::serve(listener, router).await.unwrap();
         });
 
-        Self {
+        let server = Self {
             addr,
             tmp,
             upstream_work,
-            _upstream_bare: upstream_bare,
-        }
+            upstream_bare,
+        };
+        server.warm_all_heads();
+        server
     }
 
     fn git_url(&self, repo: &str) -> String {
@@ -117,7 +117,30 @@ impl TestServer {
         run_git(&self.upstream_work, &["add", "README.md"]);
         run_git(&self.upstream_work, &["commit", "-m", contents]);
         run_git(&self.upstream_work, &["push", "--force", "origin", "main"]);
+        self.warm_all_heads();
         self.head_commit()
+    }
+
+    fn warm_all_heads(&self) {
+        let repo_dir = self.tmp.path().join("cache/repos/github.com/org/repo.git");
+        if !repo_dir.join("config").exists() {
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            run_git(
+                self.tmp.path(),
+                &["init", "--bare", repo_dir.to_str().unwrap()],
+            );
+        }
+        run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                self.upstream_bare.to_str().unwrap(),
+                "+refs/heads/*:refs/cache/upstream/heads/*",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 }
 
@@ -222,6 +245,7 @@ async fn clone_single_branch_only_fetches_one_branch() {
     run_git(&server.upstream_work, &["commit", "-m", "feature commit"]);
     run_git(&server.upstream_work, &["push", "origin", "feature"]);
     run_git(&server.upstream_work, &["checkout", "main"]);
+    server.warm_all_heads();
 
     let url = server.git_url("github.com/org/repo");
     let clone_dir = server.tmp.path().join("single_branch_clone");
@@ -363,6 +387,7 @@ async fn ls_remote_heads_lists_all_branches() {
     run_git(&server.upstream_work, &["commit", "-m", "dev commit"]);
     run_git(&server.upstream_work, &["push", "origin", "dev"]);
     run_git(&server.upstream_work, &["checkout", "main"]);
+    server.warm_all_heads();
 
     let url = server.git_url("github.com/org/repo");
 
@@ -514,6 +539,7 @@ async fn fetch_after_upstream_branch_deleted() {
     run_git(&server.upstream_work, &["commit", "-m", "ephemeral"]);
     run_git(&server.upstream_work, &["push", "origin", "ephemeral"]);
     run_git(&server.upstream_work, &["checkout", "main"]);
+    server.warm_all_heads();
 
     let url = server.git_url("github.com/org/repo");
     let clone_dir = server.tmp.path().join("deleted_branch_clone");
@@ -586,6 +612,7 @@ async fn fetch_after_force_push_non_fast_forward() {
         &server.upstream_work,
         &["push", "--force", "origin", "main"],
     );
+    server.warm_all_heads();
     let new_head = server.head_commit();
 
     run_git_async(&clone_dir, &["fetch", "origin"]).await;
@@ -618,6 +645,7 @@ async fn three_branches_all_available_after_clone() {
         run_git(&server.upstream_work, &["push", "origin", branch_name]);
         run_git(&server.upstream_work, &["checkout", "main"]);
     }
+    server.warm_all_heads();
 
     let url = server.git_url("github.com/org/repo");
     let clone_dir = server.tmp.path().join("three_branches");
@@ -656,6 +684,7 @@ async fn binary_file_integrity() {
         &server.upstream_work,
         &["push", "--force", "origin", "main"],
     );
+    server.warm_all_heads();
 
     let url = server.git_url("github.com/org/repo");
     let clone_dir = server.tmp.path().join("binary_clone");
@@ -737,6 +766,7 @@ async fn large_commit_message() {
         &server.upstream_work,
         &["push", "--force", "origin", "main"],
     );
+    server.warm_all_heads();
 
     let url = server.git_url("github.com/org/repo");
     let clone_dir = server.tmp.path().join("large_msg_clone");

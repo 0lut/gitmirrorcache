@@ -107,8 +107,18 @@ jobs:
 
       - name: Start MinIO
         run: |
-          docker compose -f docker-compose.minio.yml up -d minio
-          docker compose -f docker-compose.minio.yml run --rm createbuckets
+          for attempt in 1 2 3; do
+            echo "Starting MinIO attempt ${attempt}"
+            if docker compose -f docker-compose.minio.yml up -d minio &&
+              docker compose -f docker-compose.minio.yml run --rm createbuckets; then
+              exit 0
+            fi
+            docker compose -f docker-compose.minio.yml down -v --remove-orphans || true
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          exit 1
 
       - name: Run MinIO Rust test shard
         run: ${{ matrix.command }}
@@ -159,7 +169,7 @@ jobs:
           - test_name: default-branch
             test_target: integration_tests.test_astral_uv.AstralUvIntegrationTest.test_default_branch_materializes
           - test_name: strict-main
-            test_target: integration_tests.test_astral_uv.AstralUvIntegrationTest.test_strict_main_materializes_astral_uv_and_fetches_session_ref
+            test_target: integration_tests.test_astral_uv.AstralUvIntegrationTest.test_strict_main_materializes_astral_uv_and_fetches_direct_branch
           - test_name: exact-cache-rehydrate
             test_target: integration_tests.test_astral_uv.AstralUvIntegrationTest.test_exact_commit_rehydrates_after_hot_cache_deletion
           - test_name: short-commit
@@ -185,8 +195,18 @@ jobs:
 
       - name: Start MinIO
         run: |
-          docker compose -f docker-compose.minio.yml up -d minio
-          docker compose -f docker-compose.minio.yml run --rm createbuckets
+          for attempt in 1 2 3; do
+            echo "Starting MinIO attempt ${attempt}"
+            if docker compose -f docker-compose.minio.yml up -d minio &&
+              docker compose -f docker-compose.minio.yml run --rm createbuckets; then
+              exit 0
+            fi
+            docker compose -f docker-compose.minio.yml down -v --remove-orphans || true
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          exit 1
 
       - name: Run Python integration tests with MinIO backend
         env:

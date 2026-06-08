@@ -14,7 +14,7 @@ struct TestServer {
     addr: SocketAddr,
     tmp: TempDir,
     _upstream_work: PathBuf,
-    _upstream_bare: PathBuf,
+    upstream_bare: PathBuf,
 }
 
 impl TestServer {
@@ -61,11 +61,9 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             leases: Default::default(),
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -86,16 +84,40 @@ impl TestServer {
             axum::serve(listener, router).await.unwrap();
         });
 
-        Self {
+        let server = Self {
             addr,
             tmp,
             _upstream_work: upstream_work,
-            _upstream_bare: upstream_bare,
-        }
+            upstream_bare,
+        };
+        server.warm_all_heads();
+        server
     }
 
     fn git_url(&self, repo: &str) -> String {
         format!("http://{}/git/{}.git", self.addr, repo)
+    }
+
+    fn warm_all_heads(&self) {
+        let repo_dir = self.tmp.path().join("cache/repos/github.com/org/repo.git");
+        if !repo_dir.join("config").exists() {
+            std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+            run_git(
+                self.tmp.path(),
+                &["init", "--bare", repo_dir.to_str().unwrap()],
+            );
+        }
+        run_git(
+            &repo_dir,
+            &[
+                "fetch",
+                "--no-tags",
+                self.upstream_bare.to_str().unwrap(),
+                "+refs/heads/*:refs/cache/upstream/heads/*",
+                "+refs/heads/*:refs/heads/*",
+            ],
+        );
+        run_git(&repo_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     }
 }
 
@@ -270,6 +292,7 @@ async fn test_clone_fetch_cycle() {
         run_git_async(&upstream_work, &["add", "README.md"]).await;
         run_git_async(&upstream_work, &["commit", "-m", &format!("cycle {i}")]).await;
         run_git_async(&upstream_work, &["push", "origin", "main"]).await;
+        server.warm_all_heads();
 
         // Fetch in the cloned dir.
         run_git_async(&clone_dir, &["fetch", "origin"]).await;
@@ -287,10 +310,10 @@ async fn test_clone_fetch_cycle() {
     );
 }
 
-// ── 4. Session creation throughput ───────────────────────────────────────
+// ── 4. Repeated materialize throughput ───────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_session_creation_throughput() {
+async fn test_repeated_materialize_throughput() {
     let server = TestServer::start().await;
     let client = reqwest::Client::new();
     let url = format!("http://{}/v1/materialize", server.addr);
@@ -300,11 +323,11 @@ async fn test_session_creation_throughput() {
         "selector": {"branch": "main"}
     });
 
-    let session_count = 20;
-    let mut latencies = Vec::with_capacity(session_count);
+    let call_count = 20;
+    let mut latencies = Vec::with_capacity(call_count);
 
     let start = Instant::now();
-    for _ in 0..session_count {
+    for _ in 0..call_count {
         let call_start = Instant::now();
         let resp = client.post(&url).json(&body).send().await.unwrap();
         let call_elapsed = call_start.elapsed();
@@ -317,11 +340,11 @@ async fn test_session_creation_throughput() {
     }
     let total = start.elapsed();
 
-    let avg = total / session_count as u32;
-    eprintln!("session creation: {session_count} sessions in {total:?}, avg={avg:?}");
+    let avg = total / call_count as u32;
+    eprintln!("repeated materialize: {call_count} calls in {total:?}, avg={avg:?}");
     assert!(
         total.as_secs() < 120,
-        "session creation too slow: {total:?}"
+        "repeated materialize too slow: {total:?}"
     );
 }
 

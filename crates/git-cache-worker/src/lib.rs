@@ -360,6 +360,7 @@ fn spawn_lease_renewal(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = time::interval(renew_interval);
+        interval.tick().await;
         loop {
             interval.tick().await;
             match renew_lease_if_token_matches(&*store, &repo, &name, &token, Utc::now(), ttl).await
@@ -520,6 +521,8 @@ impl UpdateCoordinator {
 struct InflightUpdate {
     sender: watch::Sender<Option<SharedUpdateResult>>,
     receiver: watch::Receiver<Option<SharedUpdateResult>>,
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
 type SharedUpdateResult = std::result::Result<UpdateOutcome, String>;
@@ -527,15 +530,19 @@ type SharedUpdateResult = std::result::Result<UpdateOutcome, String>;
 impl InflightUpdate {
     fn new() -> Self {
         let (sender, receiver) = watch::channel(None);
-        Self { sender, receiver }
-    }
-
-    #[cfg(test)]
-    fn waiter_count(&self) -> usize {
-        self.sender.receiver_count()
+        Self {
+            sender,
+            receiver,
+            #[cfg(test)]
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     async fn wait(&self) -> SharedUpdateResult {
+        #[cfg(test)]
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         let mut receiver = self.receiver.clone();
 
         loop {
@@ -551,6 +558,11 @@ impl InflightUpdate {
 
     async fn complete(&self, result: SharedUpdateResult) {
         let _ = self.sender.send(Some(result));
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.waiters.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -647,61 +659,6 @@ impl CronUpdateLoop {
                 _ = stop.cancelled() => return Ok(()),
                 _ = time::sleep(self.config.interval) => {
                     self.tick_once().await?;
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SessionCleanupReport {
-    pub sessions_removed: usize,
-    pub errors: Vec<String>,
-}
-
-#[async_trait]
-pub trait SessionCleaner: Send + Sync {
-    async fn cleanup_expired_sessions(&self) -> Result<SessionCleanupReport>;
-}
-
-#[derive(Clone)]
-pub struct SessionCleanupLoop {
-    cleaner: Arc<dyn SessionCleaner>,
-    interval: Duration,
-}
-
-impl SessionCleanupLoop {
-    pub fn new(cleaner: Arc<dyn SessionCleaner>, interval: Duration) -> Result<Self> {
-        if interval.is_zero() {
-            return Err(GitCacheError::Validation(
-                "session cleanup interval must be greater than zero".into(),
-            ));
-        }
-
-        Ok(Self { cleaner, interval })
-    }
-
-    pub async fn tick_once(&self) -> Result<SessionCleanupReport> {
-        self.cleaner.cleanup_expired_sessions().await
-    }
-
-    pub async fn run_until(self, mut stop: StopSignal) -> Result<()> {
-        loop {
-            tokio::select! {
-                _ = stop.cancelled() => return Ok(()),
-                _ = time::sleep(self.interval) => {
-                    match self.tick_once().await {
-                        Ok(report) => {
-                            debug!(
-                                sessions_removed = report.sessions_removed,
-                                errors = report.errors.len(),
-                                "session cleanup completed"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(%err, "session cleanup failed");
-                        }
-                    }
                 }
             }
         }
@@ -1303,167 +1260,6 @@ mod tests {
             .unwrap();
     }
 
-    // ── SessionCleanupLoop tests ────────────────────────────────────────
-
-    #[derive(Default)]
-    struct RecordingCleaner {
-        calls: AtomicUsize,
-        sessions_to_remove: AtomicUsize,
-    }
-
-    impl RecordingCleaner {
-        fn new(sessions_to_remove: usize) -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-                sessions_to_remove: AtomicUsize::new(sessions_to_remove),
-            }
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait]
-    impl SessionCleaner for RecordingCleaner {
-        async fn cleanup_expired_sessions(&self) -> Result<SessionCleanupReport> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(SessionCleanupReport {
-                sessions_removed: self.sessions_to_remove.load(Ordering::SeqCst),
-                errors: vec![],
-            })
-        }
-    }
-
-    #[test]
-    fn session_cleanup_loop_rejects_zero_interval() {
-        let cleaner: Arc<dyn SessionCleaner> = Arc::new(RecordingCleaner::new(0));
-        let result = SessionCleanupLoop::new(cleaner, Duration::ZERO);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn session_cleanup_loop_accepts_nonzero_interval() {
-        let cleaner: Arc<dyn SessionCleaner> = Arc::new(RecordingCleaner::new(0));
-        let loop_ = SessionCleanupLoop::new(cleaner, Duration::from_secs(60)).unwrap();
-        assert_eq!(loop_.interval, Duration::from_secs(60));
-    }
-
-    #[tokio::test]
-    async fn session_cleanup_loop_tick_once_delegates_to_cleaner() {
-        let cleaner = Arc::new(RecordingCleaner::new(5));
-        let cleaner_dyn: Arc<dyn SessionCleaner> = Arc::clone(&cleaner) as _;
-        let loop_ = SessionCleanupLoop::new(cleaner_dyn, Duration::from_secs(60)).unwrap();
-        let report = loop_.tick_once().await.unwrap();
-        assert_eq!(report.sessions_removed, 5);
-        assert!(report.errors.is_empty());
-        assert_eq!(cleaner.calls(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn session_cleanup_loop_ticks_on_interval_and_stops() {
-        let cleaner = Arc::new(RecordingCleaner::new(2));
-        let cleaner_dyn: Arc<dyn SessionCleaner> = Arc::clone(&cleaner) as _;
-        let loop_ = SessionCleanupLoop::new(cleaner_dyn, Duration::from_secs(10)).unwrap();
-        let (stop, stop_signal) = stop_channel();
-
-        let task = tokio::spawn(loop_.run_until(stop_signal));
-        tokio::task::yield_now().await;
-        assert_eq!(cleaner.calls(), 0);
-
-        advance(Duration::from_secs(9)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(cleaner.calls(), 0);
-
-        advance(Duration::from_secs(1)).await;
-        timeout(Duration::from_secs(1), async {
-            while cleaner.calls() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(cleaner.calls(), 1);
-
-        stop.stop();
-        timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn session_cleanup_loop_multiple_ticks() {
-        let cleaner = Arc::new(RecordingCleaner::new(1));
-        let cleaner_dyn: Arc<dyn SessionCleaner> = Arc::clone(&cleaner) as _;
-        let loop_ = SessionCleanupLoop::new(cleaner_dyn, Duration::from_secs(5)).unwrap();
-        let (stop, stop_signal) = stop_channel();
-
-        let task = tokio::spawn(loop_.run_until(stop_signal));
-        tokio::task::yield_now().await;
-
-        advance(Duration::from_secs(5)).await;
-        timeout(Duration::from_secs(1), async {
-            while cleaner.calls() < 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        advance(Duration::from_secs(5)).await;
-        timeout(Duration::from_secs(1), async {
-            while cleaner.calls() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(cleaner.calls(), 2);
-
-        stop.stop();
-        timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-
-    struct FailingCleaner;
-
-    #[async_trait]
-    impl SessionCleaner for FailingCleaner {
-        async fn cleanup_expired_sessions(&self) -> Result<SessionCleanupReport> {
-            Err(GitCacheError::Internal(
-                "cleanup failed intentionally".into(),
-            ))
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn session_cleanup_loop_continues_after_error() {
-        let cleaner: Arc<dyn SessionCleaner> = Arc::new(FailingCleaner);
-        let loop_ = SessionCleanupLoop::new(cleaner, Duration::from_secs(5)).unwrap();
-        let (stop, stop_signal) = stop_channel();
-
-        let task = tokio::spawn(loop_.run_until(stop_signal));
-
-        // Advance through two ticks — the loop should survive errors.
-        advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-        advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-
-        stop.stop();
-        timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-
     // ── Performance tests ────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1627,6 +1423,7 @@ mod tests {
     async fn inflight_dedup_thundering_herd() {
         let executor = Arc::new(RecordingExecutor::new(true));
         let coord = coordinator(Arc::clone(&executor));
+        let key = UpdateKey::new(repo(), UpdateTarget::from_selector(&branch("main")));
 
         let first = tokio::spawn({
             let c = coord.clone();
@@ -1642,26 +1439,18 @@ mod tests {
             }));
         }
 
-        // Wait until all 99 joiners have cloned the inflight receiver
-        // (receiver_count == 100, including the entry's stored receiver) before
-        // releasing. This eliminates the scheduler race where late-spawned
-        // callers miss the existing entry, become new owners, and block forever.
-        let key = UpdateKey {
-            repo: repo(),
-            target: UpdateTarget::Branch(BranchName::parse("main").unwrap()),
-        };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let count = coord.inflight_waiter_count(&key).await;
-            if count >= 100 {
-                break;
+        timeout(Duration::from_secs(5), async {
+            while coord.inflight_waiter_count(&key).await < joiners.len() {
+                tokio::task::yield_now().await;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for all joiners to register; got {count}/100"
-            );
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("all joiners should attach to the in-flight update before release");
+        assert_eq!(
+            coord.inflight_waiter_count(&key).await,
+            joiners.len(),
+            "all joiners should attach to the in-flight update before release"
+        );
         assert_eq!(executor.calls(), 1, "executor called exactly once");
 
         executor.release_one();
