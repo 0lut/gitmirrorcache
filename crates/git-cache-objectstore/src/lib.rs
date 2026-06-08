@@ -16,15 +16,13 @@ pub use manifests::{
     pending_generation_publish_key, read_commit_manifest, read_generation_manifest, read_json,
     read_lease, read_pending_generation_publish, read_ref_manifest, read_repo_generation_head,
     read_verified_generation_manifest, ref_manifest_key, repo_generation_head_key,
-    verified_generation_manifest_key,
-    write_commit_manifest, write_commit_manifest_if_absent,
+    verified_generation_manifest_key, write_commit_manifest, write_commit_manifest_if_absent,
     write_commit_manifest_if_absent_or_matches, write_generation_manifest,
     write_generation_manifest_if_absent, write_generation_manifest_if_absent_or_matches,
     write_json, write_json_if_absent, write_json_if_absent_or_matches, write_ref_manifest,
     write_ref_manifest_if_absent, write_ref_manifest_if_absent_or_matches,
     write_repo_generation_head, write_verified_generation_manifest_if_absent_or_matches,
-    GenerationPublish, LeaseManifest,
-    PendingGenerationPublish, PublishManifests,
+    GenerationPublish, LeaseManifest, PendingGenerationPublish, PublishManifests,
 };
 
 #[cfg(feature = "s3")]

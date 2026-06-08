@@ -3,11 +3,11 @@ use crate::{
     pending_generation_publish_key, read_commit_manifest, read_generation_manifest, read_lease,
     read_pending_generation_publish, read_ref_manifest, read_repo_generation_head,
     read_verified_generation_manifest, ref_manifest_key, repo_generation_head_key, validate_key,
-    verified_generation_manifest_key,
-    write_generation_manifest, write_generation_manifest_if_absent_or_matches,
-    write_ref_manifest_if_absent_or_matches, write_repo_generation_head,
-    write_verified_generation_manifest_if_absent_or_matches, GenerationPublish, LeaseManifest,
-    LocalObjectStore, ObjectStore, PendingGenerationPublish, PublishManifests,
+    verified_generation_manifest_key, write_generation_manifest,
+    write_generation_manifest_if_absent_or_matches, write_ref_manifest_if_absent_or_matches,
+    write_repo_generation_head, write_verified_generation_manifest_if_absent_or_matches,
+    GenerationPublish, LeaseManifest, LocalObjectStore, ObjectStore, PendingGenerationPublish,
+    PublishManifests,
 };
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
@@ -175,14 +175,8 @@ async fn list_prefix_returns_matching_keys() {
     let root = temp_root();
     let store = LocalObjectStore::new(&root);
 
-    store
-        .put("items/a.json", Bytes::from("a"))
-        .await
-        .unwrap();
-    store
-        .put("items/b.json", Bytes::from("b"))
-        .await
-        .unwrap();
+    store.put("items/a.json", Bytes::from("a")).await.unwrap();
+    store.put("items/b.json", Bytes::from("b")).await.unwrap();
     store
         .put("items/sub/c.json", Bytes::from("c"))
         .await

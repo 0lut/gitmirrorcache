@@ -336,7 +336,6 @@ async fn many_branches_repo() {
         refs_body.contains(ref_name),
         "branch ref {ref_name} should be in ref advertisement"
     );
-
 }
 
 // ── 3. Large files repo ─────────────────────────────────────────────────

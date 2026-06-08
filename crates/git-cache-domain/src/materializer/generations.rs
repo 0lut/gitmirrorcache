@@ -1271,7 +1271,6 @@ impl Materializer {
     ) -> CoreResult<Option<GenerationManifest>> {
         self.manifests().generation(repo, generation).await
     }
-
 }
 
 pub fn default_manifest_key(repo: &RepoKey) -> String {
