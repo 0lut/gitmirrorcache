@@ -450,6 +450,16 @@ impl Materializer {
             }
         }
 
+        if !self.commit_exists(&repo_dir, commit).await {
+            if let Some(generation) = self
+                .index_exact_commit_from_hydrated_generation(repo, &repo_dir, commit)
+                .await?
+            {
+                debug!(%repo, %commit, %generation, "indexed exact commit from hydrated generation");
+                return Ok(MaterializeSource::CacheVerified);
+            }
+        }
+
         self.fetch_all_refs(repo, &repo_dir).await?;
 
         if !self.commit_exists(&repo_dir, commit).await {
@@ -487,6 +497,69 @@ impl Materializer {
             .await?;
         debug!(%repo, %commit, %generation, "published generation for exact commit");
         Ok(source)
+    }
+
+    async fn index_exact_commit_from_hydrated_generation(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> CoreResult<Option<GenerationId>> {
+        let head_started = Instant::now();
+        let Some(head) = self.manifests().repo_head(repo).await? else {
+            debug!(
+                %repo,
+                %commit,
+                elapsed_ms = elapsed_ms(head_started),
+                "exact commit hydrate skipped: no generation head"
+            );
+            return Ok(None);
+        };
+        info!(
+            %repo,
+            %commit,
+            generation = %head.generation,
+            tip_count = head.tip_commits.len(),
+            elapsed_ms = elapsed_ms(head_started),
+            "exact commit generation head loaded"
+        );
+
+        let hydrate_started = Instant::now();
+        self.hydrate_generation(repo, repo_dir, head.generation)
+            .await?;
+        info!(
+            %repo,
+            %commit,
+            generation = %head.generation,
+            elapsed_ms = elapsed_ms(hydrate_started),
+            "exact commit generation head hydrated"
+        );
+
+        if !self.commit_exists(repo_dir, commit).await {
+            info!(
+                %repo,
+                %commit,
+                generation = %head.generation,
+                elapsed_ms = elapsed_ms(hydrate_started),
+                "exact commit not present after generation head hydrate"
+            );
+            return Ok(None);
+        }
+
+        let index_started = Instant::now();
+        let indexed = self
+            .index_local_commit_from_known_generation(repo, repo_dir, commit)
+            .await?;
+        info!(
+            %repo,
+            %commit,
+            generation = indexed
+                .map(|generation| generation.to_string())
+                .unwrap_or_else(|| "<none>".into()),
+            elapsed_ms = elapsed_ms(index_started),
+            "exact commit hydrated generation indexing finished"
+        );
+        Ok(indexed)
     }
 
     async fn index_local_commit_from_known_generation(

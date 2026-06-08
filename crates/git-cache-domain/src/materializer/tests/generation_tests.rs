@@ -235,6 +235,59 @@ async fn exact_ancestor_in_known_generation_indexes_without_new_bundle() {
 }
 
 #[tokio::test]
+async fn exact_ancestor_hydrates_generation_before_broad_upstream_fetch() {
+    let fixture = GitFixture::new();
+    let ancestor_commit = fixture.head_commit();
+    let tip_commit = fixture.commit_and_push("second");
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let tip_manifest = wait_for_commit_manifest(&state, &fixture.repo, &tip_commit).await;
+    wait_for_verified_generation(&state, &fixture.repo, tip_manifest.generation).await;
+    let head_before =
+        Some(wait_for_generation_head(&state, &fixture.repo, tip_manifest.generation).await);
+    let generation_keys_before = generation_object_keys(&state, &fixture.repo).await;
+
+    stdfs::remove_dir_all(materializer.repo_dir(&fixture.repo)).unwrap();
+    let replacement = fixture.replace_history_and_push("replacement");
+    assert_ne!(replacement, ancestor_commit);
+    assert_ne!(replacement, tip_commit);
+
+    let response = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Commit(ancestor_commit.clone()),
+            mode: RequestMode::Strict,
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.source, MaterializeSource::CacheVerified);
+    assert_eq!(response.commit, ancestor_commit);
+
+    let ancestor_manifest = read_commit_manifest(&*state.store, &fixture.repo, &ancestor_commit)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ancestor_manifest.generation, tip_manifest.generation);
+    let head_after = read_repo_generation_head(&*state.store, &fixture.repo)
+        .await
+        .unwrap();
+    let generation_keys_after = generation_object_keys(&state, &fixture.repo).await;
+    assert_eq!(head_after, head_before);
+    assert_eq!(generation_keys_after, generation_keys_before);
+}
+
+#[tokio::test]
 async fn exact_ancestor_uses_local_cache_refs_when_generation_head_is_stale() {
     let fixture = GitFixture::new();
     let ancestor_commit = fixture.commit_and_push("second");
