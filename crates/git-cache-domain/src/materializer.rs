@@ -11,8 +11,6 @@ use git_cache_core::{
 use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateResult, UpdateTarget};
 use git_cache_disk::RepoLock;
 pub use git_cache_git::UploadPackProcess;
-#[cfg(test)]
-use git_cache_objectstore::write_repo_generation_head;
 use git_cache_objectstore::{
     advance_generation_head, generation_manifest_key, pending_generation_publish_key,
     read_commit_manifest, read_generation_manifest, read_json, read_lease_with_version,

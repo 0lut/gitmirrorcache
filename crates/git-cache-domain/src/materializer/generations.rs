@@ -467,7 +467,7 @@ impl Materializer {
         let default_ref_for_verified = default_ref.clone();
         self.verify_lease_held(repo).await?;
         if let Some(verification) = verification {
-            GenerationPublish::with_manifests(generation_manifest.clone(), manifests)
+            GenerationPublish::new(generation_manifest.clone())
                 .with_verification(verification)
                 .publish_bundle_file(&*self.state.store, &bundle_path)
                 .await?;
@@ -475,6 +475,7 @@ impl Materializer {
                 repo,
                 &head,
                 expected_head_generation,
+                &manifests,
                 default_ref_for_verified,
             )
             .await?;
@@ -929,6 +930,7 @@ impl Materializer {
         repo: &RepoKey,
         head: &RepoGenerationHead,
         expected_head: Option<GenerationId>,
+        manifests: &PublishManifests,
         default_ref: Option<RefManifest>,
     ) -> CoreResult<()> {
         self.verify_lease_held(repo).await?;
@@ -940,11 +942,8 @@ impl Materializer {
                 head.generation
             )));
         }
-        if let Some(default_ref) = default_ref {
-            self.manifests()
-                .write_default_ref(repo, &default_ref)
-                .await?;
-        }
+        self.write_publish_indexes_after_head_advance(repo, manifests, default_ref.as_ref())
+            .await?;
         Ok(())
     }
 
@@ -954,24 +953,40 @@ impl Materializer {
         pending: &PendingGenerationPublish,
     ) -> CoreResult<()> {
         self.verify_lease_held(repo).await?;
-        let advanced = advance_generation_head(
-            &*self.state.store,
-            pending.expected_head,
-            None,
-            &pending.head,
-        )
-        .await?;
+        let expected_head = self
+            .effective_expected_generation_head(repo, pending.expected_head)
+            .await?;
+        let advanced =
+            advance_generation_head(&*self.state.store, expected_head, None, &pending.head).await?;
         if !advanced {
             return Err(GitCacheError::CasConflict(format!(
                 "generation head for `{repo}` changed before pending generation `{}` promotion",
                 pending.generation.generation
             )));
         }
+        self.write_publish_indexes_after_head_advance(
+            repo,
+            &pending.manifests,
+            pending.default_ref.as_ref(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_publish_indexes_after_head_advance(
+        &self,
+        repo: &RepoKey,
+        manifests: &PublishManifests,
+        default_ref: Option<&RefManifest>,
+    ) -> CoreResult<()> {
         self.verify_lease_held(repo).await?;
-        for ref_manifest in &pending.manifests.refs {
+        for manifest in &manifests.commits {
+            write_commit_manifest_if_absent_or_matches(&*self.state.store, manifest).await?;
+        }
+        for ref_manifest in &manifests.refs {
             self.manifests().write_ref(ref_manifest).await?;
         }
-        if let Some(default_ref) = &pending.default_ref {
+        if let Some(default_ref) = default_ref {
             self.manifests()
                 .write_default_ref(repo, default_ref)
                 .await?;
@@ -987,7 +1002,7 @@ impl Materializer {
         verification: VerifiedGenerationManifest,
     ) -> CoreResult<()> {
         self.verify_lease_held(repo).await?;
-        self.write_verified_pending_metadata_without_refs(&pending, &verification)
+        self.write_verified_pending_metadata_without_indexes(&pending, &verification)
             .await?;
         self.finish_verified_generation_publish(repo, &pending)
             .await?;
@@ -1049,7 +1064,57 @@ impl Materializer {
         }
     }
 
-    async fn write_verified_pending_metadata_without_refs(
+    async fn effective_expected_generation_head(
+        &self,
+        repo: &RepoKey,
+        expected_head: Option<GenerationId>,
+    ) -> CoreResult<Option<GenerationId>> {
+        let current_head = self.manifests().repo_head(repo).await?;
+        let current_generation = current_head.as_ref().map(|head| head.generation);
+        if current_generation == expected_head {
+            return Ok(expected_head);
+        }
+        if let (Some(expected), Some(current)) = (expected_head, current_generation) {
+            if self.generation_supersedes(repo, current, expected).await? {
+                return Ok(Some(current));
+            }
+        }
+        Err(GitCacheError::CasConflict(format!(
+            "generation head for `{repo}` changed before pending generation promotion: expected `{}`, found `{}`",
+            expected_head
+                .map(|generation| generation.to_string())
+                .unwrap_or_else(|| "<none>".into()),
+            current_generation
+                .map(|generation| generation.to_string())
+                .unwrap_or_else(|| "<none>".into())
+        )))
+    }
+
+    async fn generation_supersedes(
+        &self,
+        repo: &RepoKey,
+        current: GenerationId,
+        expected: GenerationId,
+    ) -> CoreResult<bool> {
+        let Some(current_manifest) = self.get_generation_manifest(repo, current).await? else {
+            return Ok(false);
+        };
+        if current_manifest.parent_generation.is_some() {
+            return Ok(false);
+        }
+        let expected_chain = match self.generation_chain(repo, expected).await {
+            Ok(chain) => chain,
+            Err(GitCacheError::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let current_commits = current_manifest.commits.iter().collect::<HashSet<_>>();
+        Ok(expected_chain
+            .iter()
+            .flat_map(|manifest| manifest.commits.iter())
+            .all(|commit| current_commits.contains(commit)))
+    }
+
+    async fn write_verified_pending_metadata_without_indexes(
         &self,
         pending: &PendingGenerationPublish,
         verification: &VerifiedGenerationManifest,
@@ -1069,9 +1134,6 @@ impl Materializer {
             .await?;
         write_generation_manifest_if_absent_or_matches(&*self.state.store, &pending.generation)
             .await?;
-        for manifest in &pending.manifests.commits {
-            write_commit_manifest_if_absent_or_matches(&*self.state.store, manifest).await?;
-        }
         Ok(())
     }
 

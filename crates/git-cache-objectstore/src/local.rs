@@ -506,11 +506,28 @@ fn process_is_alive(pid: u32) -> Option<bool> {
     if pid == std::process::id() {
         return Some(true);
     }
-    let proc_root = std::path::Path::new("/proc");
-    if !proc_root.exists() {
-        return None;
+    process_is_alive_impl(pid)
+}
+
+#[cfg(unix)]
+fn process_is_alive_impl(pid: u32) -> Option<bool> {
+    if pid > libc::pid_t::MAX as u32 {
+        return Some(false);
     }
-    Some(proc_root.join(pid.to_string()).exists())
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(code) if code == libc::ESRCH => Some(false),
+        Some(code) if code == libc::EPERM => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_is_alive_impl(_pid: u32) -> Option<bool> {
+    None
 }
 
 fn hex_key(key: &str) -> String {
@@ -599,6 +616,31 @@ mod tests {
         fs::write(&lock_path, "created_at_unix_ms=1\n")
             .await
             .unwrap();
+
+        store.recover_stale_lock(&lock_path).await.unwrap();
+
+        assert!(!fs::try_exists(&lock_path).await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_pid_lock_is_reclaimed_without_waiting_for_stale_age() {
+        let tmp = TempDir::new().unwrap();
+        let store = LocalObjectStore::new(tmp.path());
+        let lock_path = store.lock_path("repos/example/object").unwrap();
+        fs::create_dir_all(lock_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(
+            &lock_path,
+            format!(
+                "pid={}\ncreated_at_unix_ms={}\n",
+                u32::MAX,
+                now_unix_millis()
+            ),
+        )
+        .await
+        .unwrap();
 
         store.recover_stale_lock(&lock_path).await.unwrap();
 
