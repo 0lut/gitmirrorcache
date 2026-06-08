@@ -22,7 +22,7 @@ script creates or updates the runtime infrastructure:
 - ECS cluster, service, task definition, and CloudWatch log group
 - hourly EventBridge rule that runs `git-cache compact --all` as a one-off ECS task
 - internet-facing HTTP ALB and target group
-- ECS-optimized EC2 instance
+- Amazon Linux 2023 ECS-optimized EC2 instance
 - non-root gp3 EBS volume mounted on the host at `/cache`
 - Docker image built with `git-cache-api` and `git-cache` CLI S3 support
 
@@ -35,6 +35,7 @@ NAME_PREFIX=gitmirrorcache-arm
 AWS_REGION=us-west-2
 ECS_EC2_INSTANCE_TYPE=m8g.2xlarge
 ECS_CPU_ARCHITECTURE=ARM64
+ECS_EC2_AMI_ID=ami-0ac01d3c8b7a34f9d
 DOCKER_PLATFORM=linux/arm64
 ECS_EBS_SIZE_GIB=128
 ECS_EBS_IOPS=8000
@@ -62,6 +63,37 @@ without shortening the ALB request-drain window or ECS container stop timeout.
 If a disposable environment can tolerate interrupting in-flight requests during
 deploy, set `ECS_ALB_DEREGISTRATION_DELAY_SECONDS` or
 `ECS_CONTAINER_STOP_TIMEOUT_SECONDS` explicitly.
+
+## Amazon Linux 2023 Host AMI
+
+The maintained ECS host default is pinned to the latest Amazon Linux 2023
+ECS-optimized ARM64 AMI verified in `us-west-2` on June 8, 2026:
+
+```sh
+ECS_EC2_AMI_ID=ami-0ac01d3c8b7a34f9d
+```
+
+AWS metadata at pin time:
+
+- image name: `al2023-ami-ecs-hvm-2023.0.20260527-kernel-6.1-arm64`
+- image version: `2023.0.20260527`
+- ECS agent: `1.103.2`
+- ECS runtime: `Docker version 25.0.14`
+
+To intentionally advance the host image later, query AWS's current recommendation
+and update the pinned `ECS_EC2_AMI_ID` in the deploy script and this document:
+
+```sh
+aws ssm get-parameter \
+  --region us-west-2 \
+  --name /aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended \
+  --query Parameter.Value \
+  --output text
+```
+
+Changing the AMI ID only affects newly launched EC2 instances. The completed
+AL2-to-AL2023 migration and validation history is recorded in
+[PR #48](https://github.com/0lut/gitmirrorcache/pull/48).
 
 ## Why EC2/EBS Instead Of App Runner
 
