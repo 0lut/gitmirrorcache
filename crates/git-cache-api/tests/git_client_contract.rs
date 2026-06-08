@@ -262,12 +262,12 @@ async fn post_json(
 // ── Clone / fetch tests ─────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cold_direct_clone_returns_cache_miss() {
+async fn cold_direct_clone_reads_through() {
     let server = TestServer::start_unwarmed().await;
     let url = server.git_url("github.com/org/repo");
     let clone_dir = server.tmp.path().join("cold_direct_clone");
 
-    let output = try_git_async(
+    run_git_async(
         server.tmp.path(),
         &[
             "clone",
@@ -280,15 +280,8 @@ async fn cold_direct_clone_returns_cache_miss() {
     )
     .await;
 
-    assert!(
-        !output.status.success(),
-        "unwarmed direct clone should fail fast instead of building cache"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("503"),
-        "unwarmed direct clone should surface HTTP 503 cache miss, got: {stderr}"
-    );
+    let cloned_head = git_stdout_async(&clone_dir, &["rev-parse", "HEAD"]).await;
+    assert_eq!(cloned_head, server.head_commit());
 }
 
 #[tokio::test(flavor = "multi_thread")]

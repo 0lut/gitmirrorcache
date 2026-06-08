@@ -11,7 +11,7 @@ if [[ -n "${PUBLIC_BASE_URL:-}" ]]; then
   base_url="${PUBLIC_BASE_URL%/}"
 else
   alb_name="${ECS_ALB_NAME:-$NAME_PREFIX-ec2-alb}"
-  base_url="$(alb_base_url_by_name "$alb_name")" || die "could not resolve ALB $alb_name; set PUBLIC_BASE_URL"
+  base_url="$(public_base_url_by_alb_name "$alb_name")" || die "could not resolve ALB $alb_name; set PUBLIC_BASE_URL"
 fi
 
 curl -fsS "$base_url/healthz"

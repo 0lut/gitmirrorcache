@@ -217,7 +217,7 @@ async fn git_stdout_async(cwd: &Path, args: &[&str]) -> String {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cold_direct_ref_advertisement_fails_without_local_repo() {
+async fn cold_direct_ref_advertisement_does_not_require_local_repo() {
     let server = TestServer::start().await;
     let repo_dir = server
         .tmp
@@ -231,7 +231,16 @@ async fn cold_direct_ref_advertisement_fails_without_local_repo() {
     );
     let response = reqwest::get(&url).await.unwrap();
 
-    assert_eq!(response.status(), 503);
+    assert_eq!(response.status(), 200);
+    let body = response.bytes().await.unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("refs/heads/main")
+            || body
+                .windows(b"refs/heads/main".len())
+                .any(|w| w == b"refs/heads/main"),
+        "cold direct GET should advertise upstream refs"
+    );
     assert!(
         !repo_dir.join("config").exists(),
         "cold direct GET must not initialize or fetch the local repo"
@@ -344,7 +353,7 @@ async fn clone_picks_up_new_branch_head() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn clone_advertises_cached_ref_when_upstream_advances_without_warming() {
+async fn clone_reads_through_when_upstream_advances_without_warming() {
     let server = TestServer::start().await;
     let url = server.git_url("github.com/org/repo");
     let cached_head = server.head_commit();
@@ -368,8 +377,8 @@ async fn clone_advertises_cached_ref_when_upstream_advances_without_warming() {
 
     let cloned_head = git_stdout_async(&clone, &["rev-parse", "HEAD"]).await;
     assert_eq!(
-        cloned_head, cached_head,
-        "direct Git must not advertise an upstream tip that has not been fetched locally"
+        cloned_head, upstream_head,
+        "direct Git should advertise and read through the current upstream tip"
     );
 }
 

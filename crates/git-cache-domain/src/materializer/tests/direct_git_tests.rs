@@ -297,7 +297,7 @@ async fn anonymous_direct_want_does_not_verify_pending_generation_on_post() {
 }
 
 #[tokio::test]
-async fn anonymous_direct_want_for_advertised_uncached_commit_fails_fast_without_fetching() {
+async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -320,25 +320,26 @@ async fn anonymous_direct_want_for_advertised_uncached_commit_fails_fast_without
         .await;
 
     assert!(
-        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
-        "direct Git POST should fail fast on an authorized local cache miss: {result:?}"
+        result.is_ok(),
+        "direct Git POST should read through an authorized cache miss: {result:?}"
     );
     assert!(
+        materializer
+            .commit_ready_for_serving(&repo_dir, &commit)
+            .await
+    );
+    assert_eq!(
         state
             .git
-            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
+            .rev_parse(&repo_dir, &format!("refs/cache/commits/{commit}"))
             .await
-            .is_err(),
-        "direct Git POST must not fetch proved refs to satisfy cache misses"
-    );
-    assert!(
-        !materializer.object_exists(&repo_dir, &commit).await,
-        "direct Git POST must not import missing objects from upstream"
+            .unwrap(),
+        commit.to_string()
     );
 }
 
 #[tokio::test]
-async fn authenticated_direct_want_for_advertised_uncached_commit_fails_fast_without_fetching() {
+async fn authenticated_direct_want_for_advertised_uncached_commit_reads_through() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -360,21 +361,18 @@ async fn authenticated_direct_want_for_advertised_uncached_commit_fails_fast_wit
         .await;
 
     assert!(
-        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
-        "authenticated direct Git POST should also fail fast on local cache misses: {result:?}"
+        result.is_ok(),
+        "authenticated direct Git POST should read through local cache misses: {result:?}"
     );
     assert!(
-        state
-            .git
-            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
+        authed_materializer
+            .commit_ready_for_serving(&repo_dir, &commit)
             .await
-            .is_err(),
-        "authenticated direct Git POST must not fetch proved refs to satisfy cache misses"
     );
 }
 
 #[tokio::test]
-async fn anonymous_direct_want_does_not_hydrate_public_ref_manifest_on_post() {
+async fn anonymous_direct_want_hydrates_public_ref_manifest_on_post() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -414,24 +412,16 @@ async fn anonymous_direct_want_does_not_hydrate_public_ref_manifest_on_post() {
         .await;
 
     assert!(
-        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
-        "direct Git POST should fetch proved refs instead of hydrating generation manifests: {result:?}"
+        result.is_ok(),
+        "direct Git POST should hydrate known generation manifests while reading through: {result:?}"
     );
 
     let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
     assert!(
-        state
-            .git
-            .rev_parse(&repo_dir, "refs/cache/upstream/heads/main")
-            .await
-            .is_err(),
-        "direct Git POST must not restore hidden refs by hydrating a manifest"
-    );
-    assert!(
-        !materializer
+        materializer
             .commit_ready_for_serving(&repo_dir, &cached.commit)
             .await,
-        "direct Git POST must not hydrate public ref manifests"
+        "direct Git POST should hydrate public ref manifests"
     );
 
     let result = materializer
@@ -439,8 +429,8 @@ async fn anonymous_direct_want_does_not_hydrate_public_ref_manifest_on_post() {
         .await;
 
     assert!(
-        matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
-        "restored public refs are availability hints, not fresh direct-Git POST proof: {result:?}"
+        result.is_ok(),
+        "restored public refs should remain directly available after hydration: {result:?}"
     );
 }
 

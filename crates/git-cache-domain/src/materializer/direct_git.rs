@@ -294,19 +294,18 @@ impl Materializer {
         Ok(())
     }
 
-    /// Ensure all wanted OIDs are locally ready after repo access is proven.
+    /// Ensure all wanted OIDs are available locally after repo access is
+    /// proven.
     ///
-    /// Authorization is repo-scoped and must happen before this method is
-    /// called. This keeps direct Git aligned with the materialize policy: once
-    /// a caller can read a repo, object presence is an availability check, not
-    /// a second upstream authorization phase. The repo cache is scoped by
-    /// `RepoKey`; deployments that need stricter history isolation should use
-    /// separate upstream repositories for truly separate data.
-    ///
-    /// Direct Git remains a serving path. It must not fetch packs, hydrate
-    /// generation bundles, or publish new generations during upload-pack POST.
+    /// Authorization is repo-scoped. Object presence is cache state, not a
+    /// second permission check: when a client asks for the commit advertised by
+    /// the preceding `info/refs`, direct Git should behave as a read-through
+    /// cache and import/hydrate the missing commit using the same
+    /// request-scoped upstream auth. The repo cache is scoped by `RepoKey`;
+    /// deployments that need stricter history isolation should use separate
+    /// upstream repositories for truly separate data.
     pub async fn ensure_wants_available(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
-        Box::pin(self.ensure_wants_locally_ready(repo, wants)).await
+        Box::pin(self.ensure_wants_read_through(repo, wants)).await
     }
 
     pub(super) async fn ensure_wants_available_from_comparison(
@@ -315,55 +314,91 @@ impl Materializer {
         wants: &[String],
         _comparison: &UpstreamRefComparison,
     ) -> CoreResult<()> {
-        Box::pin(self.ensure_wants_locally_ready(repo, wants)).await
+        Box::pin(self.ensure_wants_read_through(repo, wants)).await
     }
 
-    async fn ensure_wants_locally_ready(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
+    async fn ensure_wants_read_through(&self, repo: &RepoKey, wants: &[String]) -> CoreResult<()> {
         let started = Instant::now();
-        let repo_dir = self.repo_dir(repo);
-        if !repo_dir.join("config").exists() {
-            info!(%repo, "direct git repo missing from local cache");
-            return Err(Self::direct_git_repo_cache_miss(repo));
-        }
-
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let _repo_lock = self.lock_repo(repo).await?;
         let object_ids: Vec<CommitSha> = wants
             .iter()
             .map(|want_sha| CommitSha::parse(want_sha.as_str()))
             .collect::<CoreResult<_>>()?;
         let object_count = object_ids.len();
-        let mut non_commit_wants = 0usize;
-        let mut served_commits = 0usize;
         let object_types = self
             .state
             .git
             .cat_file_batch_types(&repo_dir, &object_ids)
             .await?;
+        let mut non_commit_wants = 0usize;
+        let mut served_commits = 0usize;
+        let mut hydrated_commits = 0usize;
+        let mut fetched_commits = 0usize;
 
         for object_id in object_ids {
-            let Some(object_type) = object_types.get(&object_id) else {
-                info!(
-                    %repo,
-                    want = %object_id,
-                    "direct git want missing from local cache after repo access proof"
-                );
-                return Err(Self::direct_git_cache_miss(&object_id));
-            };
-            if object_type != "commit" {
-                non_commit_wants += 1;
-                continue;
+            if let Some(object_type) = object_types.get(&object_id) {
+                if object_type != "commit" {
+                    non_commit_wants += 1;
+                    continue;
+                }
+
+                if self.commit_tree_exists(&repo_dir, &object_id).await {
+                    self.expose_served_commit(&repo_dir, &object_id).await?;
+                    served_commits += 1;
+                    continue;
+                }
             }
-            served_commits += 1;
+
+            if let Some(manifest) = self.get_commit_manifest(repo, &object_id).await? {
+                if manifest.complete {
+                    Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await?;
+                    self.expose_served_commit(&repo_dir, &object_id).await?;
+                    hydrated_commits += 1;
+                    continue;
+                }
+            }
+
+            if !self.state.config.git_remote.commit_read_through {
+                return Err(GitCacheError::NotFound(format!(
+                    "commit `{object_id}` is not available and read-through is disabled"
+                )));
+            }
+
+            info!(%repo, commit = %object_id, "direct git read-through fetch for wanted commit");
+            let upstream_url = self.upstream_url(repo)?;
+            let upstream_git = self.upstream_git(&upstream_url)?;
+            let fetch_result = upstream_git
+                .fetch_object(&repo_dir, &upstream_url, &object_id)
+                .await;
+
+            if let Err(fetch_err) = fetch_result {
+                upstream_git
+                    .fetch_all_heads(&repo_dir, &upstream_url)
+                    .await?;
+                if self.object_exists(&repo_dir, &object_id).await {
+                    if self.commit_ready_for_serving(&repo_dir, &object_id).await {
+                        self.expose_served_commit(&repo_dir, &object_id).await?;
+                        fetched_commits += 1;
+                    } else if self.commit_exists(&repo_dir, &object_id).await {
+                        return Err(GitCacheError::NotFound(format!(
+                            "commit `{object_id}` is incomplete after upstream fetch"
+                        )));
+                    }
+                    continue;
+                }
+                return Err(GitCacheError::NotFound(format!(
+                    "object `{object_id}` could not be fetched from upstream: {fetch_err}"
+                )));
+            }
 
             if !self.commit_ready_for_serving(&repo_dir, &object_id).await {
-                info!(
-                    %repo,
-                    want = %object_id,
-                    "direct git commit want authorized but incomplete in local cache"
-                );
-                return Err(Self::direct_git_cache_miss(&object_id));
+                return Err(GitCacheError::NotFound(format!(
+                    "commit `{object_id}` not found or incomplete after upstream fetch"
+                )));
             }
-
             self.expose_served_commit(&repo_dir, &object_id).await?;
+            fetched_commits += 1;
 
             // Create a ref so that `bundle create --all` has something
             // to include.  We use refs/cache/ which is hidden from
@@ -373,6 +408,9 @@ impl Materializer {
                 .git
                 .update_ref(&repo_dir, &cache_ref, object_id.as_str())
                 .await?;
+
+            self.publish_generation(repo, &repo_dir, &object_id, None, false)
+                .await?;
         }
 
         info!(
@@ -380,16 +418,12 @@ impl Materializer {
             wants_count = object_count,
             non_commit_wants,
             served_commits,
+            hydrated_commits,
+            fetched_commits,
             elapsed_ms = elapsed_ms(started),
-            "ensured direct git wants locally ready"
+            "ensured direct git wants via read-through"
         );
         Ok(())
-    }
-
-    fn direct_git_cache_miss(object_id: &CommitSha) -> GitCacheError {
-        GitCacheError::UpstreamUnavailable(format!(
-            "authorized object `{object_id}` is not available in the local cache"
-        ))
     }
 
     fn direct_git_repo_cache_miss(repo: &RepoKey) -> GitCacheError {

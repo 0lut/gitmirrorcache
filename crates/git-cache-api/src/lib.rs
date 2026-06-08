@@ -10,8 +10,8 @@ use git_cache_core::{
 use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, synthesize_protected_ref_advertisement, synthesize_ref_advertisement,
-    AppState, Materializer, UpstreamRefComparison,
+    frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
+    UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -709,42 +709,20 @@ async fn git_repo_inner(
             .fetch_add(1, Ordering::Relaxed);
         let materializer = materializer.using_upstream_auth(&auth);
 
-        if !materializer.direct_repo_available(&repo) {
-            let error = ApiError::from(GitCacheError::UpstreamUnavailable(format!(
-                "repo `{repo}` is not available in the local cache"
-            )));
-            info!(
-                request_id,
-                repo = %repo,
-                auth = auth_label(&auth),
-                elapsed_ms = elapsed_ms(started),
-                status = %error.status,
-                "direct git ref advertisement failed: repo missing from local cache"
-            );
-            return error.into_response();
-        }
-
         // Fetch upstream refs via ls-remote and synthesize the pkt-line
-        // response directly. No objects are fetched here. The advertisement
-        // is a short-lived repo-access proof for the matching upload-pack
-        // POST; the fallback POST path re-runs upstream proof when the handoff
-        // has expired or the request credentials differ.
+        // response directly. No objects are fetched here; the repo may not
+        // even exist locally yet. The advertisement is a short-lived
+        // repo-access proof for the matching upload-pack POST. The POST path
+        // then performs the normal read-through availability work using the
+        // same request auth.
         let refs_started = Instant::now();
-        let upstream_comparison = match materializer.upstream_refs(&repo).await {
-            Ok(c) => c,
-            Err(error) => return ApiError::from(error).into_response(),
-        };
-        let comparison = match materializer
-            .locally_available_refs(&repo, &upstream_comparison)
-            .await
-        {
+        let comparison = match materializer.upstream_refs(&repo).await {
             Ok(c) => c,
             Err(error) => return ApiError::from(error).into_response(),
         };
         info!(
             request_id,
             repo = %repo,
-            upstream_refs_count = upstream_comparison.all_upstream.len(),
             refs_count = comparison.all_upstream.len(),
             elapsed_ms = elapsed_ms(refs_started),
             "direct git upstream refs fetched"
@@ -753,11 +731,7 @@ async fn git_repo_inner(
             .direct_git_proofs
             .insert(&repo, &auth, comparison.clone());
 
-        let output = if auth.is_authenticated() {
-            synthesize_protected_ref_advertisement(&comparison)
-        } else {
-            synthesize_ref_advertisement(&comparison)
-        };
+        let output = synthesize_ref_advertisement(&comparison);
         let response = git_response(
             "application/x-git-upload-pack-advertisement",
             frame_ref_advertisement(&output),
@@ -802,8 +776,9 @@ async fn git_repo_inner(
             None => {
                 // Direct Git POSTs can arrive without the matching GET, so
                 // fall back to the same lightweight ref proof used by GET.
-                // This proves repo access without fetching packs; upload-pack
-                // still serves only objects already present in the local repo.
+                // This proves repo access without fetching packs. The
+                // materializer then performs the same read-through
+                // availability work as main, using the request-scoped auth.
                 let auth_started = Instant::now();
                 let proof_materializer = materializer.using_upstream_auth(&auth);
                 let comparison = match proof_materializer.upstream_refs(&repo).await {
