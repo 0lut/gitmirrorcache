@@ -2,8 +2,7 @@
 
 use git_cache_core::{
     AppConfig, BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest,
-    MaterializeRequest, RefManifest, RepoKey, RequestMode, Selector, SessionId, SessionManifest,
-    ShortCommitSha,
+    MaterializeRequest, RefManifest, RepoKey, RequestMode, Selector, ShortCommitSha,
 };
 use std::io::Write;
 
@@ -327,31 +326,6 @@ fn selector_default_branch_false_counts_as_zero() {
     assert!(result.is_err());
 }
 
-// ── SessionId edge cases ────────────────────────────────────────────────
-
-#[test]
-fn session_id_parse_valid_uuid() {
-    let valid = "550e8400-e29b-41d4-a716-446655440000";
-    let id = SessionId::parse(valid).unwrap();
-    assert_eq!(id.to_string(), valid);
-}
-
-#[test]
-fn session_id_parse_invalid() {
-    assert!(SessionId::parse("").is_err());
-    assert!(SessionId::parse("not-a-uuid").is_err());
-    assert!(SessionId::parse("550e8400-e29b-41d4-a716").is_err());
-    assert!(SessionId::parse("550e8400-e29b-41d4-a716-44665544000g").is_err());
-}
-
-#[test]
-fn session_id_round_trip() {
-    let id = SessionId::new();
-    let s = id.to_string();
-    let reparsed = SessionId::parse(&s).unwrap();
-    assert_eq!(id, reparsed);
-}
-
 // ── GenerationId edge cases ─────────────────────────────────────────────
 
 #[test]
@@ -400,7 +374,6 @@ fn app_config_from_path_valid_toml() {
 bind_addr = "127.0.0.1:9090"
 public_base_url = "http://localhost:9090"
 cache_root = "/tmp/cache"
-session_ttl_seconds = 1800
 
 [object_store]
 kind = "local"
@@ -415,7 +388,6 @@ min_free_bytes = 1073741824
 
     let config = AppConfig::from_path(tmp.path()).unwrap();
     assert_eq!(config.bind_addr.port(), 9090);
-    assert_eq!(config.session_ttl_seconds, 1800);
 }
 
 #[test]
@@ -515,15 +487,6 @@ fn branch_name_from_str_trait() {
 }
 
 #[test]
-fn session_id_from_str_trait() {
-    let id = SessionId::new();
-    let s = id.to_string();
-    let parsed: SessionId = s.parse().unwrap();
-    assert_eq!(id, parsed);
-    assert!("bad".parse::<SessionId>().is_err());
-}
-
-#[test]
 fn generation_id_display_is_uuid_format() {
     let id = GenerationId::new();
     let s = id.to_string();
@@ -557,22 +520,5 @@ fn ref_manifest_serde_round_trip_external() {
     };
     let json = serde_json::to_string(&manifest).unwrap();
     let parsed: RefManifest = serde_json::from_str(&json).unwrap();
-    assert_eq!(manifest, parsed);
-}
-
-#[test]
-fn session_manifest_serde_round_trip_external() {
-    let id = SessionId::new();
-    let manifest = SessionManifest {
-        id,
-        repo: RepoKey::parse("github.com/test/repo").unwrap(),
-        commit: CommitSha::parse("d".repeat(40)).unwrap(),
-        synthetic_ref: id.synthetic_ref(),
-        created_at: chrono::Utc::now(),
-        expires_at: chrono::Utc::now(),
-        protection: Default::default(),
-    };
-    let json = serde_json::to_string(&manifest).unwrap();
-    let parsed: SessionManifest = serde_json::from_str(&json).unwrap();
     assert_eq!(manifest, parsed);
 }

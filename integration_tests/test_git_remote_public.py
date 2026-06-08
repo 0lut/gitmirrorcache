@@ -147,7 +147,6 @@ public_base_url = "{cls.base_url}"
 cache_root = "{cls.cache_root}"
 git_timeout_seconds = 1200
 max_git_output_bytes = 1073741824
-session_ttl_seconds = 3600
 rate_limit_per_minute = 0
 allowed_upstream_hosts = ["github.com"]
 

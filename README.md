@@ -7,7 +7,7 @@ Read-only Git fetch cache for GitHub-style upstreams. The service keeps object s
 - `POST /v1/materialize` for exact commits, strict branches, and strict default branch requests.
 - Known-complete exact commits are served from cache without contacting upstream.
 - Strict branch/default requests verify upstream with `git ls-remote` before serving.
-- Session URLs expose pinned synthetic refs through `git-upload-pack`.
+- Optional read-through Git remote at `/git/{host}/{owner}/{repo}.git`.
 - `git-receive-pack` is rejected and never advertised.
 - Local object-store adapter and feature-gated S3-compatible adapter.
 - Disk reservations, LRU eviction, repo locks, protected repos, stale temp cleanup, and `git-cache disk-status`.
@@ -33,10 +33,11 @@ curl -s http://127.0.0.1:8080/v1/materialize \
   -d '{"repo":"github.com/org/repo","selector":{"branch":"main"},"mode":"strict"}'
 ```
 
-The response contains a short-lived Git URL and a synthetic ref:
+The response contains the verified commit, source, and timestamp. When the
+read-through Git remote is enabled, fetch or clone through `/git/...`:
 
 ```sh
-git fetch "$git_url" "$ref"
+git fetch http://127.0.0.1:8080/git/github.com/org/repo.git refs/heads/main
 ```
 
 Full commit IDs belong in the `commit` selector. Abbreviated hashes are accepted

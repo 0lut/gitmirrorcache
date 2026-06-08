@@ -39,11 +39,9 @@ impl TestServer {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 0,
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
             allowed_upstream_hosts: vec!["github.com".into()],
             disk: git_cache_core::DiskConfig {
@@ -67,6 +65,10 @@ impl TestServer {
 
     fn materialize_url(&self) -> String {
         format!("http://{}/v1/materialize", self.addr)
+    }
+
+    fn git_url(&self, repo: &str) -> String {
+        format!("http://{}/git/{repo}.git", self.addr)
     }
 }
 
@@ -247,15 +249,15 @@ async fn many_commits_repo() {
 
     assert_eq!(resp.status().as_u16(), 200, "materialize should succeed");
     let body: serde_json::Value = resp.json().await.unwrap();
-    let git_url = body["git_url"].as_str().unwrap().to_string();
     let commit = body["commit"].as_str().unwrap().to_string();
+    let git_url = server.git_url("github.com/org/many-commits");
 
     assert_eq!(
         commit, expected_head,
         "materialized commit should match HEAD"
     );
 
-    // Clone through the cache (session URLs use synthetic refs, not "main")
+    // Clone through the cache's direct Git remote.
     let clone_dir = server.tmp.path().join("many-commits-clone");
     run_git_async(
         server.tmp.path(),
@@ -311,7 +313,7 @@ async fn many_branches_repo() {
         "at least half of branch materializations should succeed, got {successes}/{branch_count}"
     );
 
-    // Verify main branch materializes and clones successfully
+    // Verify main branch materializes and is advertised by the direct remote.
     let resp = client
         .post(server.materialize_url())
         .json(&serde_json::json!({
@@ -322,29 +324,18 @@ async fn many_branches_repo() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let git_url = body["git_url"].as_str().unwrap().to_string();
-    let ref_name = body["ref"].as_str().unwrap().to_string();
+    let git_url = server.git_url("github.com/org/many-branches");
+    let ref_name = "refs/heads/main";
 
-    // Verify session ref is advertised via info/refs
+    // Verify the branch ref is advertised via info/refs.
     let refs_url = format!("{git_url}/info/refs?service=git-upload-pack");
     let refs_resp = client.get(&refs_url).send().await.unwrap();
     assert_eq!(refs_resp.status().as_u16(), 200);
     let refs_body = refs_resp.text().await.unwrap();
     assert!(
-        refs_body.contains(&ref_name),
-        "session ref {ref_name} should be in ref advertisement"
+        refs_body.contains(ref_name),
+        "branch ref {ref_name} should be in ref advertisement"
     );
-
-    let clone_dir = server.tmp.path().join("many-branches-clone");
-    run_git_async(
-        server.tmp.path(),
-        &["clone", &git_url, clone_dir.to_str().unwrap()],
-    )
-    .await;
-
-    let clone_head = git_stdout(&clone_dir, &["rev-parse", "HEAD"]);
-    assert!(!clone_head.is_empty(), "clone should have a HEAD commit");
 }
 
 // ── 3. Large files repo ─────────────────────────────────────────────────
@@ -394,8 +385,7 @@ async fn large_files_repo() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let git_url = body["git_url"].as_str().unwrap().to_string();
+    let git_url = server.git_url("github.com/org/large-files");
 
     let clone_dir = server.tmp.path().join("large-files-clone");
     run_git_async(
@@ -452,8 +442,8 @@ async fn deep_history_fetch() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let git_url = body["git_url"].as_str().unwrap().to_string();
     let commit = body["commit"].as_str().unwrap().to_string();
+    let git_url = server.git_url("github.com/org/deep-history");
     assert_eq!(commit, initial_head);
 
     let clone_dir = server.tmp.path().join("deep-history-clone");
@@ -484,7 +474,6 @@ async fn deep_history_fetch() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let git_url2 = body["git_url"].as_str().unwrap().to_string();
     let commit2 = body["commit"].as_str().unwrap().to_string();
     assert_eq!(
         commit2, new_head,
@@ -495,7 +484,7 @@ async fn deep_history_fetch() {
     let clone_dir2 = server.tmp.path().join("deep-history-clone2");
     run_git_async(
         server.tmp.path(),
-        &["clone", &git_url2, clone_dir2.to_str().unwrap()],
+        &["clone", &git_url, clone_dir2.to_str().unwrap()],
     )
     .await;
 
@@ -587,7 +576,7 @@ async fn concurrent_large_clones() {
     let server = TestServer::start_with_upstream(upstream_root.path()).await;
     let client = reqwest::Client::new();
 
-    // Materialize to populate cache and get a session URL
+    // Materialize to populate cache before direct Git clones.
     let resp = client
         .post(server.materialize_url())
         .json(&serde_json::json!({
@@ -602,39 +591,24 @@ async fn concurrent_large_clones() {
     let commit = body["commit"].as_str().unwrap().to_string();
     assert_eq!(commit, expected_head);
 
-    // Each concurrent clone gets its own session via materialize
+    let git_url = server.git_url("github.com/org/concurrent-large");
+
+    // Concurrent clones share the normal direct Git remote URL.
     let barrier = Arc::new(Barrier::new(10));
     let handles: Vec<_> = (0..10)
         .map(|i| {
             let bar = Arc::clone(&barrier);
-            let mat_url = server.materialize_url();
             let clone_base = server.tmp.path().to_path_buf();
-            let c = client.clone();
+            let clone_url = git_url.clone();
             tokio::spawn(async move {
                 bar.wait().await;
-                // Each clone gets its own session
-                let resp = c
-                    .post(&mat_url)
-                    .json(&serde_json::json!({
-                        "repo": "github.com/org/concurrent-large",
-                        "selector": {"branch": "main"}
-                    }))
-                    .send()
-                    .await
-                    .unwrap();
-                let status = resp.status().as_u16();
-                if status != 200 {
-                    return None; // contention-related failures acceptable
-                }
-                let body: serde_json::Value = resp.json().await.unwrap();
-                let git_url = body["git_url"].as_str().unwrap().to_string();
-
                 let clone_dir = clone_base.join(format!("conc-clone-{i}"));
                 let dest = clone_dir.to_str().unwrap().to_string();
                 let cwd = clone_base.clone();
-                let ok = tokio::task::spawn_blocking(move || try_git_clone(&cwd, &git_url, &dest))
-                    .await
-                    .unwrap();
+                let ok =
+                    tokio::task::spawn_blocking(move || try_git_clone(&cwd, &clone_url, &dest))
+                        .await
+                        .unwrap();
                 if ok {
                     let cd = clone_dir.clone();
                     let head = tokio::task::spawn_blocking(move || {

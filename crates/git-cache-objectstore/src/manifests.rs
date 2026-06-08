@@ -3,7 +3,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
     CommitManifest, GenerationId, GenerationManifest, GitCacheError, RefManifest,
-    RepoGenerationHead, RepoKey, Result, SessionManifest, VerifiedGenerationManifest,
+    RepoGenerationHead, RepoKey, Result, VerifiedGenerationManifest,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt::Debug;
@@ -22,7 +22,6 @@ pub struct LeaseManifest {
 pub struct PublishManifests {
     pub commits: Vec<CommitManifest>,
     pub refs: Vec<RefManifest>,
-    pub sessions: Vec<SessionManifest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,10 +227,6 @@ pub fn ref_manifest_key(repo: &RepoKey, ref_name: &str) -> Result<String> {
             encode_component(ref_name)
         ))
     }
-}
-
-pub fn session_manifest_key(repo: &RepoKey, session: git_cache_core::SessionId) -> String {
-    format!("repos/{repo}/manifests/sessions/{session}.json")
 }
 
 pub fn repo_generation_head_key(repo: &RepoKey) -> String {
@@ -486,59 +481,6 @@ where
     .await
 }
 
-pub async fn read_session_manifest<S>(
-    store: &S,
-    repo: &RepoKey,
-    session: git_cache_core::SessionId,
-) -> Result<Option<SessionManifest>>
-where
-    S: ObjectStore + ?Sized,
-{
-    read_json(store, &session_manifest_key(repo, session)).await
-}
-
-pub async fn write_session_manifest<S>(store: &S, manifest: &SessionManifest) -> Result<()>
-where
-    S: ObjectStore + ?Sized,
-{
-    write_json(
-        store,
-        &session_manifest_key(&manifest.repo, manifest.id),
-        manifest,
-    )
-    .await
-}
-
-pub async fn write_session_manifest_if_absent<S>(
-    store: &S,
-    manifest: &SessionManifest,
-) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    write_json_if_absent(
-        store,
-        &session_manifest_key(&manifest.repo, manifest.id),
-        manifest,
-    )
-    .await
-}
-
-pub async fn write_session_manifest_if_absent_or_matches<S>(
-    store: &S,
-    manifest: &SessionManifest,
-) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    write_json_if_absent_or_matches(
-        store,
-        &session_manifest_key(&manifest.repo, manifest.id),
-        manifest,
-    )
-    .await
-}
-
 pub async fn acquire_lease<S>(
     store: &S,
     repo: &RepoKey,
@@ -584,10 +526,6 @@ where
         write_json_if_absent_or_matches(store, &ref_observation_manifest_key(manifest)?, manifest)
             .await?;
         write_ref_manifest(store, manifest).await?;
-    }
-
-    for manifest in &manifests.sessions {
-        write_session_manifest_if_absent_or_matches(store, manifest).await?;
     }
 
     Ok(())
@@ -656,15 +594,6 @@ fn validate_publish(publish: &GenerationPublish) -> Result<()> {
             return Err(GitCacheError::Validation(format!(
                 "ref manifest for `{}` does not match generation `{generation}`",
                 manifest.ref_name
-            )));
-        }
-    }
-
-    for manifest in &publish.manifests.sessions {
-        if manifest.repo != *repo {
-            return Err(GitCacheError::Validation(format!(
-                "session manifest `{}` does not match repo `{repo}`",
-                manifest.id
             )));
         }
     }

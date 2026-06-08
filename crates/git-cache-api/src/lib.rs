@@ -7,7 +7,7 @@ use futures::Stream;
 use git_cache_core::{
     AppConfig, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult, UpstreamAuth,
 };
-use git_cache_domain::materializer::{advertise_refs, repo_from_git_path};
+use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
     frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
@@ -55,11 +55,7 @@ fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> 
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/v1/materialize", post(materialize))
-        .route("/v1/resolve", post(resolve))
-        .route(
-            "/git/session/{session_id}/{*repo_path}",
-            any(git_session).layer(DefaultBodyLimit::max(git_body_limit)),
-        );
+        .route("/v1/resolve", post(resolve));
 
     if git_remote_enabled {
         router = router.route(
@@ -230,7 +226,6 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
     let body = format!(
         "git_cache_materialize_total {}\n\
          git_cache_materialize_errors_total {}\n\
-         git_cache_git_upload_pack_total {}\n\
          git_cache_rate_limited_total {}\n\
          git_cache_git_remote_refs_total {}\n\
          git_cache_git_remote_upload_pack_total {}\n",
@@ -239,7 +234,6 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
             .metrics
             .materialize_errors_total
             .load(Ordering::Relaxed),
-        state.metrics.upload_pack_total.load(Ordering::Relaxed),
         state.metrics.rate_limited_total.load(Ordering::Relaxed),
         state.metrics.git_remote_refs_total.load(Ordering::Relaxed),
         state
@@ -383,7 +377,6 @@ async fn run_materialize_request(
             repo = %response.repo,
             commit = %response.commit,
             source = ?response.source,
-            session_protected = response.session_token.is_some(),
             elapsed_ms = elapsed_ms(domain_started),
             "domain materialize finished"
         ),
@@ -533,91 +526,6 @@ async fn check_materialize_upstream_auth(
         );
     }
     Ok(CheckedMaterializeRequest { request, auth })
-}
-
-async fn git_session(
-    State(state): State<Arc<ApiState>>,
-    Path((session_id, repo_path)): Path<(String, String)>,
-    Query(query): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    method: Method,
-    uri: Uri,
-    body: Bytes,
-) -> Response {
-    let path = uri.path();
-    if path.contains("git-receive-pack")
-        || query
-            .get("service")
-            .is_some_and(|service| service == "git-receive-pack")
-    {
-        return ApiError::from(GitCacheError::Unsupported(
-            "git-receive-pack is disabled".into(),
-        ))
-        .into_response();
-    }
-
-    let session_id = match git_cache_core::SessionId::parse(&session_id) {
-        Ok(id) => id,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
-
-    let repo = match repo_from_git_path(&repo_path) {
-        Ok(repo) => repo,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
-
-    let materializer = Materializer::new(Arc::clone(&state.domain));
-    let session_token = match session_bearer_token(&headers) {
-        Ok(token) => token,
-        Err(error) => return error.into_response(),
-    };
-    let session_repo = match materializer
-        .session_repo_from_manifest(&repo, session_id, session_token.as_deref())
-        .await
-    {
-        Ok(repo) => repo,
-        Err(error) => return ApiError::from(error).into_response(),
-    };
-
-    let result = if method == Method::GET
-        && path.ends_with("/info/refs")
-        && query
-            .get("service")
-            .is_some_and(|service| service == "git-upload-pack")
-    {
-        state
-            .metrics
-            .upload_pack_total
-            .fetch_add(1, Ordering::Relaxed);
-        advertise_refs(&state.domain, &session_repo)
-            .await
-            .map(|output| {
-                git_response(
-                    "application/x-git-upload-pack-advertisement",
-                    frame_ref_advertisement(&output),
-                )
-            })
-    } else if method == Method::POST && path.ends_with("/git-upload-pack") {
-        state
-            .metrics
-            .upload_pack_total
-            .fetch_add(1, Ordering::Relaxed);
-        state
-            .domain
-            .git
-            .upload_pack_spawn(&session_repo, body)
-            .await
-            .map(|process| stream_upload_pack_response(&state, process))
-    } else {
-        Err(GitCacheError::Unsupported(format!(
-            "unsupported git session request: {method} {path}"
-        )))
-    };
-
-    match result {
-        Ok(response) => response,
-        Err(error) => ApiError::from(error).into_response(),
-    }
 }
 
 /// Direct Git remote handler: `/git/{host}/{owner}/{repo}.git/...`
@@ -876,38 +784,6 @@ fn parse_optional_upstream_auth_header(
     })
 }
 
-fn session_bearer_token(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return Ok(None);
-    };
-    let value = value.to_str().map_err(|_| ApiError {
-        status: StatusCode::UNAUTHORIZED,
-        message: "session authorization header must be valid ASCII".into(),
-    })?;
-    let mut parts = value.splitn(2, char::is_whitespace);
-    let scheme = parts.next().unwrap_or_default();
-    if !scheme.eq_ignore_ascii_case("Bearer") {
-        return Ok(None);
-    }
-    let Some(token) = parts.next() else {
-        return Err(ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            message: "session bearer token is invalid".into(),
-        });
-    };
-    if token.trim().is_empty()
-        || token
-            .bytes()
-            .any(|byte| byte == 0 || byte.is_ascii_control())
-    {
-        return Err(ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            message: "session bearer token is invalid".into(),
-        });
-    }
-    Ok(Some(token.trim().to_string()))
-}
-
 fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackProcess) -> Response {
     let timeout_duration = process.timeout();
     let permit = process.take_permit();
@@ -952,7 +828,6 @@ struct Metrics {
     request_ids: AtomicU64,
     materialize_total: AtomicU64,
     materialize_errors_total: AtomicU64,
-    upload_pack_total: AtomicU64,
     rate_limited_total: AtomicU64,
     git_remote_refs_total: AtomicU64,
     git_remote_upload_pack_total: AtomicU64,
@@ -1215,26 +1090,6 @@ mod tests {
         assert_eq!(auth, UpstreamAuth::Anonymous);
     }
 
-    #[test]
-    fn session_bearer_token_accepts_case_insensitive_scheme() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "bearer gcs_token".parse().unwrap());
-
-        let token = session_bearer_token(&headers).unwrap();
-
-        assert_eq!(token.as_deref(), Some("gcs_token"));
-    }
-
-    #[test]
-    fn session_bearer_token_ignores_unrelated_authorization_scheme() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Basic dXNlcjpwYXNz".parse().unwrap());
-
-        let token = session_bearer_token(&headers).unwrap();
-
-        assert_eq!(token, None);
-    }
-
     #[tokio::test]
     async fn authenticated_resolve_is_rate_limited_before_upstream_work() {
         let tmp = TempDir::new().unwrap();
@@ -1249,7 +1104,6 @@ mod tests {
             object_store: ObjectStoreConfig::Local {
                 root: tmp.path().join("objects"),
             },
-            session_ttl_seconds: 3600,
             upstream_auth_token_env: None,
             rate_limit_per_minute: 1,
             allowed_upstream_hosts: vec!["github.com".into()],
@@ -1260,7 +1114,6 @@ mod tests {
             git_remote: Default::default(),
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
             max_concurrent_generation_verifications: 1,
         };
         let state = Arc::new(ApiState::try_new(config).unwrap());
@@ -1317,57 +1170,6 @@ mod tests {
                 .contains("git upload-pack response exceeded timeout"),
             "unexpected timeout error: {error}"
         );
-    }
-
-    #[tokio::test]
-    async fn receive_pack_requests_are_rejected_before_session_lookup() {
-        let tmp = TempDir::new().unwrap();
-        let config = AppConfig {
-            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            public_base_url: "http://127.0.0.1:0".into(),
-            cache_root: tmp.path().join("cache"),
-            upstream_root: Some(tmp.path().join("upstreams")),
-            git_binary: PathBuf::from("git"),
-            git_timeout_seconds: 60,
-            max_git_output_bytes: 16 * 1024 * 1024,
-            object_store: ObjectStoreConfig::Local {
-                root: tmp.path().join("objects"),
-            },
-            session_ttl_seconds: 3600,
-            upstream_auth_token_env: None,
-            rate_limit_per_minute: 0,
-            allowed_upstream_hosts: vec!["github.com".into()],
-            disk: git_cache_core::DiskConfig {
-                quota_bytes: 1024 * 1024 * 1024,
-                min_free_bytes: 0,
-            },
-            git_remote: Default::default(),
-            compaction: Default::default(),
-            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            session_cleanup_interval_secs: 300,
-            max_concurrent_generation_verifications: 1,
-        };
-        let api_state = ApiState::try_new(config).unwrap();
-        let mut query = HashMap::new();
-        query.insert("service".to_string(), "git-receive-pack".to_string());
-
-        let response = git_session(
-            State(Arc::new(api_state)),
-            Path((
-                "not-a-session".to_string(),
-                "github.com/org/repo.git".to_string(),
-            )),
-            Query(query),
-            HeaderMap::new(),
-            Method::GET,
-            Uri::from_static(
-                "/git/session/not-a-session/github.com/org/repo.git/info/refs?service=git-receive-pack",
-            ),
-            Bytes::new(),
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     // ── parse_want_lines contract tests ─────────────────────────────────

@@ -125,7 +125,6 @@ public_base_url = "{cls.base_url}"
 cache_root = "{cls.cache_root}"
 git_timeout_seconds = 600
 max_git_output_bytes = {512 * 1024 * 1024}
-session_ttl_seconds = 3600
 rate_limit_per_minute = 120
 allowed_upstream_hosts = ["github.com"]
 
@@ -268,7 +267,10 @@ commit_read_through = true
         )
         return output.split()[0]
 
-    def fetch_session_ref(self, materialized: dict[str, object], label: str) -> str:
+    def git_url(self) -> str:
+        return f"{self.base_url}/git/{self.repo}.git"
+
+    def fetch_direct_branch(self, materialized: dict[str, object], label: str) -> str:
         checkout = self.tmp / f"fetch-{label}"
         checkout.mkdir()
         run(["git", "init"], cwd=checkout)
@@ -276,8 +278,8 @@ commit_read_through = true
             [
                 "git",
                 "fetch",
-                str(materialized["git_url"]),
-                str(materialized["ref"]),
+                self.git_url(),
+                f"refs/heads/{self.branch}",
             ],
             cwd=checkout,
         )
@@ -285,14 +287,14 @@ commit_read_through = true
         self.assertEqual(fetched, materialized["commit"])
         return fetched
 
-    def test_strict_main_materializes_astral_uv_and_fetches_session_ref(self) -> None:
+    def test_strict_main_materializes_astral_uv_and_fetches_direct_branch(self) -> None:
         materialized = self.materialize({"branch": self.branch})
 
         self.assertEqual(materialized["repo"], self.repo)
         self.assertEqual(materialized["source"], "upstream_verified")
         self.assertEqual(materialized["commit"], self.expected_branch_commit())
 
-        fetched = self.fetch_session_ref(materialized, "strict-main")
+        fetched = self.fetch_direct_branch(materialized, "strict-main")
         self.assertEqual(fetched, materialized["commit"])
         self.assert_minio_backend_used()
 
@@ -300,13 +302,12 @@ commit_read_through = true
         first = self.materialize({"branch": self.branch})
 
         shutil.rmtree(self.cache_root / "repos", ignore_errors=True)
-        shutil.rmtree(self.cache_root / "sessions", ignore_errors=True)
 
         cached = self.materialize({"commit": first["commit"]})
         self.assertEqual(cached["source"], "cache_verified")
         self.assertEqual(cached["commit"], first["commit"])
 
-        fetched = self.fetch_session_ref(cached, "cached-commit")
+        fetched = self.fetch_direct_branch(cached, "cached-commit")
         self.assertEqual(fetched, first["commit"])
         self.assert_minio_backend_used()
 
@@ -318,7 +319,7 @@ commit_read_through = true
         self.assertEqual(resolved["source"], "upstream_verified")
         self.assertEqual(resolved["commit"], branch["commit"])
 
-        fetched = self.fetch_session_ref(resolved, "short-commit")
+        fetched = self.fetch_direct_branch(resolved, "short-commit")
         self.assertEqual(fetched, branch["commit"])
 
     def test_default_branch_materializes(self) -> None:

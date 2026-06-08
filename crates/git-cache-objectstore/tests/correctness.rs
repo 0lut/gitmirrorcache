@@ -3,16 +3,13 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use git_cache_core::{
-    CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoKey, SessionId,
-    SessionManifest,
+    CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest, RepoKey,
 };
 use git_cache_objectstore::{
     commit_manifest_key, generation_manifest_key, read_commit_manifest, read_generation_manifest,
-    read_ref_manifest, read_session_manifest, ref_manifest_key, repo_generation_head_key,
-    session_manifest_key, write_commit_manifest, write_commit_manifest_if_absent_or_matches,
-    write_generation_manifest, write_ref_manifest, write_ref_manifest_if_absent_or_matches,
-    write_session_manifest, write_session_manifest_if_absent_or_matches, LocalObjectStore,
-    ObjectStore,
+    read_ref_manifest, ref_manifest_key, repo_generation_head_key, write_commit_manifest,
+    write_commit_manifest_if_absent_or_matches, write_generation_manifest, write_ref_manifest,
+    write_ref_manifest_if_absent_or_matches, LocalObjectStore, ObjectStore,
 };
 use tokio::fs;
 
@@ -354,30 +351,6 @@ async fn ref_manifest_write_read_round_trip() {
     let _ = fs::remove_dir_all(&root).await;
 }
 
-#[tokio::test]
-async fn session_manifest_write_read_round_trip() {
-    let root = temp_root();
-    let store = LocalObjectStore::new(&root);
-    let repo = repo();
-    let sid = SessionId::new();
-
-    let manifest = SessionManifest {
-        id: sid,
-        repo: repo.clone(),
-        commit: commit('d'),
-        synthetic_ref: sid.synthetic_ref(),
-        created_at: ts(4),
-        expires_at: ts(5),
-        protection: Default::default(),
-    };
-
-    write_session_manifest(&store, &manifest).await.unwrap();
-    let read = read_session_manifest(&store, &repo, sid).await.unwrap();
-    assert_eq!(read, Some(manifest));
-
-    let _ = fs::remove_dir_all(&root).await;
-}
-
 // ── write_*_if_absent_or_matches tests ──────────────────────────────────
 
 #[tokio::test]
@@ -452,91 +425,6 @@ async fn commit_manifest_if_absent_or_matches_conflicting() {
     conflicting.complete = false;
     assert!(
         write_commit_manifest_if_absent_or_matches(&store, &conflicting)
-            .await
-            .is_err()
-    );
-
-    let _ = fs::remove_dir_all(&root).await;
-}
-
-#[tokio::test]
-async fn session_manifest_if_absent_or_matches_first_write() {
-    let root = temp_root();
-    let store = LocalObjectStore::new(&root);
-    let repo = repo();
-    let sid = SessionId::new();
-
-    let manifest = SessionManifest {
-        id: sid,
-        repo: repo.clone(),
-        commit: commit('f'),
-        synthetic_ref: sid.synthetic_ref(),
-        created_at: ts(7),
-        expires_at: ts(8),
-        protection: Default::default(),
-    };
-
-    let first = write_session_manifest_if_absent_or_matches(&store, &manifest)
-        .await
-        .unwrap();
-    assert!(first);
-
-    let _ = fs::remove_dir_all(&root).await;
-}
-
-#[tokio::test]
-async fn session_manifest_if_absent_or_matches_identical_second() {
-    let root = temp_root();
-    let store = LocalObjectStore::new(&root);
-    let repo = repo();
-    let sid = SessionId::new();
-
-    let manifest = SessionManifest {
-        id: sid,
-        repo: repo.clone(),
-        commit: commit('f'),
-        synthetic_ref: sid.synthetic_ref(),
-        created_at: ts(7),
-        expires_at: ts(8),
-        protection: Default::default(),
-    };
-
-    write_session_manifest_if_absent_or_matches(&store, &manifest)
-        .await
-        .unwrap();
-    let second = write_session_manifest_if_absent_or_matches(&store, &manifest)
-        .await
-        .unwrap();
-    assert!(!second);
-
-    let _ = fs::remove_dir_all(&root).await;
-}
-
-#[tokio::test]
-async fn session_manifest_if_absent_or_matches_conflicting() {
-    let root = temp_root();
-    let store = LocalObjectStore::new(&root);
-    let repo = repo();
-    let sid = SessionId::new();
-
-    let manifest = SessionManifest {
-        id: sid,
-        repo: repo.clone(),
-        commit: commit('f'),
-        synthetic_ref: sid.synthetic_ref(),
-        created_at: ts(7),
-        expires_at: ts(8),
-        protection: Default::default(),
-    };
-
-    write_session_manifest_if_absent_or_matches(&store, &manifest)
-        .await
-        .unwrap();
-
-    let mut conflicting = manifest;
-    conflicting.commit = commit('a');
-    assert!(
-        write_session_manifest_if_absent_or_matches(&store, &conflicting)
             .await
             .is_err()
     );
@@ -635,17 +523,6 @@ fn ref_manifest_key_encodes_slashes_in_branch() {
 }
 
 #[test]
-fn session_manifest_key_format() {
-    let repo = repo();
-    let sid = SessionId::new();
-    let key = session_manifest_key(&repo, sid);
-    assert_eq!(
-        key,
-        format!("repos/github.com/test/correctness/manifests/sessions/{sid}.json")
-    );
-}
-
-#[test]
 fn repo_generation_head_key_format() {
     let repo = repo();
     let key = repo_generation_head_key(&repo);
@@ -678,20 +555,6 @@ async fn read_nonexistent_commit_manifest_returns_none() {
     let repo = repo();
 
     let result = read_commit_manifest(&store, &repo, &commit('f'))
-        .await
-        .unwrap();
-    assert!(result.is_none());
-
-    let _ = fs::remove_dir_all(&root).await;
-}
-
-#[tokio::test]
-async fn read_nonexistent_session_manifest_returns_none() {
-    let root = temp_root();
-    let store = LocalObjectStore::new(&root);
-    let repo = repo();
-
-    let result = read_session_manifest(&store, &repo, SessionId::new())
         .await
         .unwrap();
     assert!(result.is_none());

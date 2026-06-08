@@ -18,7 +18,6 @@ pub struct AppConfig {
     #[serde(default = "default_max_git_output_bytes")]
     pub max_git_output_bytes: usize,
     pub object_store: ObjectStoreConfig,
-    pub session_ttl_seconds: u64,
     #[serde(default)]
     pub upstream_auth_token_env: Option<String>,
     #[serde(default = "default_rate_limit_per_minute")]
@@ -32,8 +31,6 @@ pub struct AppConfig {
     pub compaction: CompactionConfig,
     #[serde(default = "default_max_concurrent_git_processes")]
     pub max_concurrent_git_processes: usize,
-    #[serde(default = "default_session_cleanup_interval_secs")]
-    pub session_cleanup_interval_secs: u64,
     #[serde(default = "default_max_concurrent_generation_verifications")]
     pub max_concurrent_generation_verifications: usize,
 }
@@ -84,7 +81,6 @@ impl AppConfig {
                 default_max_git_output_bytes(),
             )?,
             object_store,
-            session_ttl_seconds: parse_env("GIT_CACHE_SESSION_TTL_SECONDS", 3600)?,
             upstream_auth_token_env: env::var("GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV").ok(),
             rate_limit_per_minute: parse_env(
                 "GIT_CACHE_RATE_LIMIT_PER_MINUTE",
@@ -113,10 +109,6 @@ impl AppConfig {
             max_concurrent_git_processes: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
                 default_max_concurrent_git_processes(),
-            )?,
-            session_cleanup_interval_secs: parse_env(
-                "GIT_CACHE_SESSION_CLEANUP_INTERVAL_SECS",
-                default_session_cleanup_interval_secs(),
             )?,
             max_concurrent_generation_verifications: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
@@ -267,10 +259,6 @@ pub fn default_max_concurrent_git_processes() -> usize {
     64
 }
 
-fn default_session_cleanup_interval_secs() -> u64 {
-    300
-}
-
 pub fn default_max_concurrent_generation_verifications() -> usize {
     1
 }
@@ -341,7 +329,6 @@ mod tests {
         "GIT_CACHE_GIT_BINARY",
         "GIT_CACHE_GIT_TIMEOUT_SECONDS",
         "GIT_CACHE_MAX_GIT_OUTPUT_BYTES",
-        "GIT_CACHE_SESSION_TTL_SECONDS",
         "GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV",
         "GIT_CACHE_RATE_LIMIT_PER_MINUTE",
         "GIT_CACHE_ALLOWED_UPSTREAM_HOSTS",
@@ -352,7 +339,6 @@ mod tests {
         "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
         "GIT_CACHE_COMPACTION_INLINE",
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
-        "GIT_CACHE_SESSION_CLEANUP_INTERVAL_SECS",
         "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
     ];
 
@@ -401,7 +387,6 @@ bind_addr = "127.0.0.1:9090"
 public_base_url = "http://localhost:9090"
 cache_root = "/tmp/cache"
 git_timeout_seconds = 60
-session_ttl_seconds = 1800
 rate_limit_per_minute = 500
 
 [object_store]
@@ -419,7 +404,6 @@ min_free_bytes = 1073741824
         assert_eq!(config.bind_addr.port(), 9090);
         assert_eq!(config.cache_root, PathBuf::from("/tmp/cache"));
         assert_eq!(config.git_timeout_seconds, 60);
-        assert_eq!(config.session_ttl_seconds, 1800);
         assert_eq!(config.rate_limit_per_minute, 500);
     }
 
@@ -432,7 +416,6 @@ min_free_bytes = 1073741824
 bind_addr = "0.0.0.0:8080"
 public_base_url = "http://example.com"
 cache_root = "/cache"
-session_ttl_seconds = 3600
 
 [object_store]
 kind = "local"

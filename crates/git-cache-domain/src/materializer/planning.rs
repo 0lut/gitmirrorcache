@@ -253,8 +253,7 @@ impl Materializer {
     async fn materialize_plan(&self, plan: MaterializePlan) -> CoreResult<MaterializeResponse> {
         match plan.target {
             MaterializeTarget::Commit { commit, source } => {
-                self.create_session_for_access(plan.access, commit, source)
-                    .await
+                Ok(self.materialize_response(plan.access.repo, commit, source))
             }
             MaterializeTarget::BranchTip {
                 branch,
@@ -264,8 +263,7 @@ impl Materializer {
                 let source = self
                     .ensure_branch_tip(&plan.access, &branch, &commit, default_branch)
                     .await?;
-                self.create_session_for_access(plan.access, commit, source)
-                    .await
+                Ok(self.materialize_response(plan.access.repo, commit, source))
             }
         }
     }
@@ -356,14 +354,18 @@ impl Materializer {
         Ok(access.fetched_source())
     }
 
-    async fn create_session_for_access(
+    fn materialize_response(
         &self,
-        access: RepoAccessContext,
+        repo: RepoKey,
         commit: CommitSha,
         source: MaterializeSource,
-    ) -> CoreResult<MaterializeResponse> {
-        self.create_session_from_access(access, commit, source)
-            .await
+    ) -> MaterializeResponse {
+        MaterializeResponse {
+            repo,
+            commit,
+            source,
+            verified_at: Utc::now(),
+        }
     }
 
     fn source_for_access(
@@ -395,7 +397,7 @@ impl Materializer {
         short_commit: ShortCommitSha,
     ) -> CoreResult<MaterializeResponse> {
         let (commit, source) = self.ensure_short_commit(&repo, short_commit).await?;
-        self.create_session(repo, commit, source).await
+        Ok(self.materialize_response(repo, commit, source))
     }
 
     pub async fn materialize_commit(
@@ -404,7 +406,7 @@ impl Materializer {
         commit: CommitSha,
     ) -> CoreResult<MaterializeResponse> {
         let source = self.ensure_exact_commit(&repo, &commit).await?;
-        self.create_session(repo, commit, source).await
+        Ok(self.materialize_response(repo, commit, source))
     }
 
     async fn ensure_short_commit(
@@ -588,8 +590,7 @@ impl Materializer {
         default_branch: bool,
     ) -> CoreResult<MaterializeResponse> {
         let commit = self.ensure_branch(&repo, &branch, default_branch).await?;
-        self.create_session(repo, commit, MaterializeSource::UpstreamVerified)
-            .await
+        Ok(self.materialize_response(repo, commit, MaterializeSource::UpstreamVerified))
     }
 
     /// Fetch and publish a branch from upstream without creating a session.
@@ -821,8 +822,7 @@ impl Materializer {
         _mode: RequestMode,
     ) -> CoreResult<MaterializeResponse> {
         let commit = self.ensure_default_branch(&repo).await?;
-        self.create_session(repo, commit, MaterializeSource::UpstreamVerified)
-            .await
+        Ok(self.materialize_response(repo, commit, MaterializeSource::UpstreamVerified))
     }
 
     /// Resolve, fetch and publish the default branch without creating a session.
