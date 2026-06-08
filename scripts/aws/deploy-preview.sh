@@ -124,7 +124,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     printf '- URL: %s\n' "$public_base_url"
     printf '- Health: %s/healthz\n' "$public_base_url"
     printf '- Manifest: `s3://%s/%s`\n\n' "$S3_BUCKET" "$manifest_key"
-    printf 'To tear this down, run **Preview Stack** with action `destroy` and version_id `%s`.\n\n' "$VERSION_ID"
+    printf 'To tear this down, run `VERSION_ID=%s scripts/aws/destroy-preview.sh`.\n\n' "$VERSION_ID"
   } >>"$GITHUB_STEP_SUMMARY"
   timing_write_github_summary "Preview deployment timings"
 fi

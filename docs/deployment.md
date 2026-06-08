@@ -85,47 +85,16 @@ production `main` stack. Production keeps using `NAME_PREFIX=gitmirrorcache-arm`
 and `S3_PREFIX=repos`; every preview gets a derived stack name, an isolated S3
 prefix, and a versioned route on the shared preview ALB.
 
-### GitHub Actions Button
+### Local CLI
 
-After `.github/workflows/preview-stack.yml` is merged to the default branch, use
-**Actions > Preview Stack > Run workflow** as the one-button path:
-
-1. Run the workflow from `main`.
-2. For deploy, set `action=deploy` and put the branch, tag, or commit SHA in
-   `ref`.
-3. For teardown, set `action=destroy` and use the same `ref`, or set
-   `version_id` to the 12-character preview version if the branch no longer
-   exists.
-4. Leave `delete_data=false` for normal teardown. Set it to `true` only when the
-   preview's durable S3 cache prefix should also be removed.
-
-The workflow checks out deployment tooling from the workflow branch and the
-target source separately. That lets the button deploy older branches or commits
-that do not contain the preview scripts themselves, as long as the commit is
-reachable to `actions/checkout`. The job summary includes the preview URL,
-health URL, manifest location, the exact version to use for destroy, and a
-phase-by-phase timing table for the deploy.
-
-Configure these repository variables:
-
-- `AWS_ROLE_TO_ASSUME`: IAM role for GitHub OIDC deployments.
-- `AWS_REGION`: optional, defaults to `us-west-2`.
-- `PREVIEW_SHARED_NAME_PREFIX`: optional, defaults to `gitmirrorcache-arm`.
-- `PREVIEW_SHARED_ALB`: optional, defaults to `true`.
-- `GIT_CACHE_PREVIEW_ALB_NAME`: optional shared preview ALB name.
-- `GIT_CACHE_PREVIEW_S3_BUCKET`: optional explicit shared bucket.
-- `GIT_CACHE_PREVIEW_ECR_REPOSITORY`: optional explicit shared ECR repository.
-
-Configure `GIT_CACHE_GITHUB_TOKEN_SECRET_ARN` as a repository secret if preview
-tasks should receive the upstream GitHub token from Secrets Manager.
-
-### Local Scripts
-
-The local preview wrapper uses the same lifecycle and resolves the version with
-Git:
+Run preview deploys from a shell with AWS CLI credentials. The preview wrapper
+resolves the requested branch, tag, or commit with local Git and derives the
+preview version from that commit:
 
 ```sh
+AWS_REGION=us-west-2 scripts/aws/deploy-preview.sh HEAD
 scripts/aws/deploy-preview.sh my-branch
+scripts/aws/deploy-preview.sh d35c30fab123
 ```
 
 That command computes:
@@ -162,6 +131,9 @@ PREVIEW_ALB_NAME=gitmirrorcache-arm-preview-alb \
 scripts/aws/deploy-preview.sh my-branch
 ```
 
+Set `GITHUB_TOKEN_SECRET_ARN` if preview tasks should receive the upstream
+GitHub token from Secrets Manager.
+
 Preview deploys set `ECR_PUSH_LATEST=false`,
 `ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true`,
 `ECS_EC2_INSTANCE_TYPE=m8g.2xlarge`, `ECS_PRECHECK_VCPU_QUOTA=true`,
@@ -175,13 +147,13 @@ S3, and smoke-test path. The quota preflight fails before creating preview
 infrastructure if launching the preview instance would exceed the account's EC2
 on-demand vCPU quota.
 
-Every preview deploy writes ordered phase timings to stdout and, in GitHub
-Actions, to the job summary. The key phases include shared bootstrap, IAM,
-networking, shared ALB/listener-rule upsert, EC2 launch/ECS registration, Docker
-build and push, task registration, ECS service stabilization, smoke test,
-manifest upload, and total preview deployment time. To capture the same timing
-table from lower-level scripts, set `DEPLOY_TIMING_FILE=/path/to/timings.tsv`
-before invoking `deploy-and-smoke.sh` or `deploy-ecs-ec2-ebs.sh`.
+Every preview deploy writes ordered phase timings to stdout. The key phases
+include shared bootstrap, IAM, networking, shared ALB/listener-rule upsert, EC2
+launch/ECS registration, Docker build and push, task registration, ECS service
+stabilization, smoke test, manifest upload, and total preview deployment time.
+To capture the same timing table from lower-level scripts, set
+`DEPLOY_TIMING_FILE=/path/to/timings.tsv` before invoking `deploy-and-smoke.sh`
+or `deploy-ecs-ec2-ebs.sh`.
 
 Destroy a preview with the same ref:
 
