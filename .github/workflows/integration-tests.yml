@@ -159,7 +159,7 @@ jobs:
           - test_name: default-branch
             test_target: integration_tests.test_astral_uv.AstralUvIntegrationTest.test_default_branch_materializes
           - test_name: strict-main
-            test_target: integration_tests.test_astral_uv.AstralUvIntegrationTest.test_strict_main_materializes_astral_uv_and_fetches_session_ref
+            test_target: integration_tests.test_astral_uv.AstralUvIntegrationTest.test_strict_main_materializes_astral_uv_and_fetches_direct_branch
           - test_name: exact-cache-rehydrate
             test_target: integration_tests.test_astral_uv.AstralUvIntegrationTest.test_exact_commit_rehydrates_after_hot_cache_deletion
           - test_name: short-commit
