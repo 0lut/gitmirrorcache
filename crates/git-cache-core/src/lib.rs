@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub use auth::{SecretString, UpstreamAuth, UpstreamAuthorizationMode};
 pub use config::{
-    default_max_concurrent_git_processes, AppConfig, BranchRefCheck, CompactionConfig, DiskConfig,
-    GitRemoteConfig, LeaseConfig, ObjectStoreConfig,
+    default_max_concurrent_git_processes, AppConfig, CompactionConfig, DiskConfig, GitRemoteConfig,
+    LeaseConfig, ObjectStoreConfig,
 };
 pub use error::{GitCacheError, Result};
 pub use manifest::{
@@ -20,18 +20,11 @@ pub use manifest::{
     VerifiedGenerationManifest,
 };
 pub use repo::{CommitSha, RepoKey, ShortCommitSha};
-pub use selector::{BranchName, ReachabilitySelector, Selector};
+pub use selector::{BranchName, Selector};
 pub use update::{
     validate_event_ref, UpdateDisposition, UpdateExecutor, UpdateKey, UpdateOutcome, UpdateRequest,
     UpdateResult, UpdateSource, UpdateTarget,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestMode {
-    Strict,
-    Cached,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,16 +34,13 @@ pub enum MaterializeSource {
     CacheVerified,
     UpstreamAuthorizedCacheHit,
     UpstreamAuthorizedFetched,
-    PublicCacheHit,
-    PublicFetched,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterializeRequest {
     pub repo: RepoKey,
     pub selector: Selector,
-    #[serde(default = "default_request_mode")]
-    pub mode: RequestMode,
     #[serde(default)]
     pub upstream_authorization: UpstreamAuthorizationMode,
 }
@@ -58,10 +48,6 @@ pub struct MaterializeRequest {
 impl MaterializeRequest {
     pub fn requires_upstream_auth(&self) -> bool {
         self.upstream_authorization.is_required()
-    }
-
-    pub fn uses_upstream_auth(&self, auth: &UpstreamAuth) -> bool {
-        auth.is_authenticated() || self.requires_upstream_auth()
     }
 }
 
@@ -81,16 +67,6 @@ pub struct ResolveResponse {
     pub source: MaterializeSource,
     pub cache_available: bool,
     pub authorized_at: DateTime<Utc>,
-}
-
-fn default_request_mode() -> RequestMode {
-    RequestMode::Strict
-}
-
-impl Default for RequestMode {
-    fn default() -> Self {
-        default_request_mode()
-    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,6 @@ async fn test_repeated_materialize_same_branch() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -26,7 +25,6 @@ async fn test_repeated_materialize_same_branch() {
             .materialize(MaterializeRequest {
                 repo: fixture.repo.clone(),
                 selector: Selector::Branch(BranchName::parse("main").unwrap()),
-                mode: RequestMode::Strict,
                 upstream_authorization: Default::default(),
             })
             .await

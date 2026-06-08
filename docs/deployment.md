@@ -53,8 +53,8 @@ ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS=2
 ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS=15
 ```
 
-If `PUBLIC_BASE_URL` is omitted, the deployment script uses the ALB DNS name and
-sets `GIT_CACHE_PUBLIC_BASE_URL` to `http://<alb-dns-name>`.
+If `PUBLIC_BASE_URL` is omitted, the deployment script uses the ALB DNS name for
+smoke tests and deployment output.
 
 For `dev-*` and preview environments, `deploy-and-smoke.sh` defaults to
 5-second ALB health checks, a 15-second ECS health-check grace period, and

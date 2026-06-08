@@ -172,7 +172,6 @@ async fn anonymous_direct_want_allows_cached_public_ancestor_when_current_tip_is
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -182,7 +181,6 @@ async fn anonymous_direct_want_allows_cached_public_ancestor_when_current_tip_is
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -212,7 +210,6 @@ async fn anonymous_direct_want_for_cached_ancestor_without_local_current_tip_sta
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -240,7 +237,6 @@ async fn anonymous_direct_want_uses_cached_local_objects_when_upstream_is_offlin
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -569,7 +565,6 @@ async fn anonymous_direct_want_hydrates_public_ref_manifest_on_post() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -632,7 +627,6 @@ async fn anonymous_direct_want_skips_manifest_restore_when_ref_is_already_hot() 
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -692,7 +686,6 @@ async fn public_ref_manifest_restore_seeds_hidden_base_without_public_ref() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -740,7 +733,6 @@ async fn authenticated_direct_want_uses_local_readiness_after_repo_authorization
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -770,7 +762,6 @@ async fn anonymous_direct_want_does_not_fetch_unrequested_changed_refs() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -826,7 +817,6 @@ async fn anonymous_direct_want_allows_cached_public_blob() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await

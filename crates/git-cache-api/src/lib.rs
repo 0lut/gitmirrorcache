@@ -147,7 +147,6 @@ impl ApiState {
 struct MaterializeInflightKey {
     repo: RepoKey,
     selector: String,
-    mode: String,
     upstream_authorization: String,
     auth: DirectGitProofAuth,
 }
@@ -159,7 +158,6 @@ impl MaterializeInflightKey {
         Self {
             repo: request.repo.clone(),
             selector,
-            mode: format!("{:?}", request.mode),
             upstream_authorization: format!("{:?}", request.upstream_authorization),
             auth: DirectGitProofAuth::from_auth(auth),
         }
@@ -397,8 +395,40 @@ async fn resolve(
     handle_resolve_request(&state, request, auth).await
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MaterializeEndpoint {
+    Materialize,
+    Resolve,
+}
+
+impl MaterializeEndpoint {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Materialize => "materialize",
+            Self::Resolve => "resolve",
+        }
+    }
+}
+
 async fn handle_materialize_request(
     state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<Response, ApiError> {
+    handle_checked_materialize_request(state, MaterializeEndpoint::Materialize, request, auth).await
+}
+
+async fn handle_resolve_request(
+    state: &Arc<ApiState>,
+    request: MaterializeRequest,
+    auth: UpstreamAuth,
+) -> Result<Response, ApiError> {
+    handle_checked_materialize_request(state, MaterializeEndpoint::Resolve, request, auth).await
+}
+
+async fn handle_checked_materialize_request(
+    state: &Arc<ApiState>,
+    endpoint: MaterializeEndpoint,
     request: MaterializeRequest,
     auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
@@ -408,18 +438,22 @@ async fn handle_materialize_request(
     let span = info_span!(
         "api_request",
         request_id,
-        endpoint = "materialize",
+        endpoint = endpoint.name(),
         repo = %repo
     );
     async move {
-        handle_materialize_request_inner(state, request, auth, request_id, selector).await
+        handle_checked_materialize_request_inner(
+            state, endpoint, request, auth, request_id, selector,
+        )
+        .await
     }
     .instrument(span)
     .await
 }
 
-async fn handle_materialize_request_inner(
+async fn handle_checked_materialize_request_inner(
     state: &Arc<ApiState>,
+    endpoint: MaterializeEndpoint,
     request: MaterializeRequest,
     auth: UpstreamAuth,
     request_id: u64,
@@ -429,10 +463,11 @@ async fn handle_materialize_request_inner(
     let repo = request.repo.clone();
     info!(
         request_id,
+        endpoint = endpoint.name(),
         repo = %repo,
         selector,
         auth = auth_label(&auth),
-        "materialize request started"
+        "api request started"
     );
     if !state.rate_limiter.check() {
         state
@@ -441,10 +476,11 @@ async fn handle_materialize_request_inner(
             .fetch_add(1, Ordering::Relaxed);
         info!(
             request_id,
+            endpoint = endpoint.name(),
             repo = %repo,
             elapsed_ms = elapsed_ms(started),
             status = %StatusCode::TOO_MANY_REQUESTS,
-            "materialize request finished"
+            "api request finished"
         );
         return Err(ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -468,28 +504,34 @@ async fn handle_materialize_request_inner(
                     .fetch_add(1, Ordering::Relaxed);
                 info!(
                     request_id,
+                    endpoint = endpoint.name(),
                     repo = %repo,
                     elapsed_ms = elapsed_ms(started),
                     status = %error.status,
-                    "materialize request finished"
+                    "api request finished"
                 );
                 return Err(error);
             }
         };
 
-    let result = run_materialize_request(state, request, auth).await;
+    let result = match endpoint {
+        MaterializeEndpoint::Materialize => run_materialize_request(state, request, auth).await,
+        MaterializeEndpoint::Resolve => run_resolve_request(state, request, auth).await,
+    };
     match &result {
         Ok(_) => info!(
             request_id,
+            endpoint = endpoint.name(),
             elapsed_ms = elapsed_ms(started),
             status = %StatusCode::OK,
-            "materialize request finished"
+            "api request finished"
         ),
         Err(error) => info!(
             request_id,
+            endpoint = endpoint.name(),
             elapsed_ms = elapsed_ms(started),
             status = %error.status,
-            "materialize request finished"
+            "api request finished"
         ),
     }
     result
@@ -600,7 +642,7 @@ async fn run_materialize_request_owner(
     }
 }
 
-async fn handle_resolve_request(
+async fn run_resolve_request(
     state: &Arc<ApiState>,
     request: MaterializeRequest,
     auth: UpstreamAuth,
@@ -677,7 +719,6 @@ async fn handle_resolve_request_inner(
                 return Err(error);
             }
         };
-
     let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
     if let Err(error) = materializer.validate_materialize_request(&request) {
         state
@@ -1349,7 +1390,6 @@ mod tests {
         let request = MaterializeRequest {
             repo: RepoKey::parse("github.com/org/repo").unwrap(),
             selector: Selector::DefaultBranch,
-            mode: Default::default(),
             upstream_authorization: UpstreamAuthorizationMode::Anonymous,
         };
         let anonymous = MaterializeInflightKey::new(&request, &UpstreamAuth::Anonymous);
@@ -1460,7 +1500,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = AppConfig {
             bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            public_base_url: "http://127.0.0.1:0".into(),
             cache_root: tmp.path().join("cache"),
             upstream_root: Some(tmp.path().join("upstreams")),
             git_binary: PathBuf::from("git"),
@@ -1488,7 +1527,6 @@ mod tests {
         let request = MaterializeRequest {
             repo: RepoKey::parse("evil.com/org/repo").unwrap(),
             selector: Selector::DefaultBranch,
-            mode: Default::default(),
             upstream_authorization: UpstreamAuthorizationMode::Required,
         };
         let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();

@@ -1,5 +1,4 @@
 bind_addr = "127.0.0.1:8080"
-public_base_url = "http://127.0.0.1:8080"
 cache_root = "./cache"
 upstream_root = "./tmp/upstreams"
 git_binary = "git"
@@ -21,7 +20,6 @@ min_free_bytes = 1073741824
 
 [git_remote]
 enabled = true
-branch_ref_check = "always"
 commit_read_through = true
 
 [compaction]

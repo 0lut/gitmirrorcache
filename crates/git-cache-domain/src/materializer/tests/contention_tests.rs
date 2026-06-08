@@ -14,7 +14,6 @@ async fn concurrent_materialize_same_branch() {
                 m.materialize(MaterializeRequest {
                     repo,
                     selector: Selector::Branch(BranchName::parse("main").unwrap()),
-                    mode: RequestMode::Strict,
                     upstream_authorization: Default::default(),
                 })
                 .await
@@ -56,7 +55,6 @@ async fn materialize_during_upstream_change() {
         m1.materialize(MaterializeRequest {
             repo: repo1,
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await
@@ -84,7 +82,6 @@ async fn materialize_during_upstream_change() {
         .materialize(MaterializeRequest {
             repo: fixture.repo.clone(),
             selector: Selector::Branch(BranchName::parse("main").unwrap()),
-            mode: RequestMode::Strict,
             upstream_authorization: Default::default(),
         })
         .await

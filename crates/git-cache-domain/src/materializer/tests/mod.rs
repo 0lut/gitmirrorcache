@@ -114,7 +114,6 @@ impl GitFixture {
     pub fn state_config(&self) -> AppConfig {
         AppConfig {
             bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            public_base_url: "http://127.0.0.1:0".into(),
             cache_root: self.cache_root(),
             upstream_root: Some(self.tmp.path().join("upstreams")),
             git_binary: PathBuf::from("git"),

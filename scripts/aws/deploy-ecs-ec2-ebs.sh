@@ -973,9 +973,8 @@ ensure_cache_volume_performance() {
 register_task_definition() {
   local execution_role_arn="$1"
   local task_role_arn="$2"
-  local public_base_url="$3"
 
-  PUBLIC_BASE_URL_VALUE="$public_base_url" python3 - "$tmpdir/task-definition.json" <<'PY'
+  python3 - "$tmpdir/task-definition.json" <<'PY'
 import json
 import os
 import sys
@@ -996,7 +995,6 @@ env = [
     {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
     {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "1073741824")},
     {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
-    {"name": "GIT_CACHE_PUBLIC_BASE_URL", "value": os.environ["PUBLIC_BASE_URL_VALUE"]},
     {"name": "GIT_CACHE_RATE_LIMIT_PER_MINUTE", "value": os.environ.get("GIT_CACHE_RATE_LIMIT_PER_MINUTE", "120")},
     {"name": "GIT_CACHE_ROOT", "value": "/cache"},
     {"name": "GIT_CACHE_S3_BUCKET", "value": os.environ["S3_BUCKET"]},
@@ -1070,9 +1068,8 @@ PY
 register_compaction_task_definition() {
   local execution_role_arn="$1"
   local task_role_arn="$2"
-  local public_base_url="$3"
 
-  PUBLIC_BASE_URL_VALUE="$public_base_url" python3 - "$tmpdir/compaction-task-definition.json" <<'PY'
+  python3 - "$tmpdir/compaction-task-definition.json" <<'PY'
 import json
 import os
 import shlex
@@ -1094,7 +1091,6 @@ env = [
     {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
     {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "1073741824")},
     {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
-    {"name": "GIT_CACHE_PUBLIC_BASE_URL", "value": os.environ["PUBLIC_BASE_URL_VALUE"]},
     {"name": "GIT_CACHE_RATE_LIMIT_PER_MINUTE", "value": os.environ.get("GIT_CACHE_RATE_LIMIT_PER_MINUTE", "120")},
     {"name": "GIT_CACHE_ROOT", "value": "/cache"},
     {"name": "GIT_CACHE_S3_BUCKET", "value": os.environ["S3_BUCKET"]},
@@ -1425,10 +1421,10 @@ task_role_arn="$(timed "resolve task role ARN" role_arn_by_name "$ECS_TASK_ROLE_
 export ECS_EXECUTION_ROLE_ARN="$execution_role_arn"
 export ECS_TASK_ROLE_ARN="$task_role_arn"
 
-task_definition_arn="$(timed "register API task definition" register_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+task_definition_arn="$(timed "register API task definition" register_task_definition "$execution_role_arn" "$task_role_arn")"
 compaction_task_definition_arn=""
 if [[ "$ECS_COMPACTION_ENABLED" == "true" ]]; then
-  compaction_task_definition_arn="$(timed "register compaction task definition" register_compaction_task_definition "$execution_role_arn" "$task_role_arn" "$public_base_url")"
+  compaction_task_definition_arn="$(timed "register compaction task definition" register_compaction_task_definition "$execution_role_arn" "$task_role_arn")"
 fi
 
 timed "write ECS service inputs" write_service_inputs "$task_definition_arn" "$task_sg_id" "$all_subnets_csv" "$target_group_arn"

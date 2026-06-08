@@ -3,8 +3,8 @@
 Automated tests currently cover the key local chaos cases:
 
 - cached exact commit materialization after upstream is removed
-- strict branch failure when upstream is unavailable
-- strict default branch resolution
+- branch selector failure when upstream is unavailable
+- default branch selector resolution
 - branch force-push updating the branch manifest while retaining the old commit manifest
 - local bundle hydration after deleting the local hot repo
 - disk reservation failure and LRU eviction behavior
@@ -23,4 +23,3 @@ cargo test -p git-cache-worker dedupes_concurrent_updates_for_same_repo_and_ref
 ```
 
 For a multi-worker deployment drill, run two API processes against the same object store and separate `cache_root` directories. Materialize a branch on one process, delete the second process's local cache, then materialize the exact commit on the second process. It should hydrate from object storage without contacting upstream.
-

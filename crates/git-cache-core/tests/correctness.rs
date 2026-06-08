@@ -2,7 +2,7 @@
 
 use git_cache_core::{
     AppConfig, BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest,
-    MaterializeRequest, RefManifest, RepoKey, RequestMode, Selector, ShortCommitSha,
+    MaterializeRequest, RefManifest, RepoKey, Selector, ShortCommitSha,
 };
 use std::io::Write;
 
@@ -372,7 +372,6 @@ fn app_config_from_path_valid_toml() {
         tmp,
         r#"
 bind_addr = "127.0.0.1:9090"
-public_base_url = "http://localhost:9090"
 cache_root = "/tmp/cache"
 
 [object_store]
@@ -412,29 +411,28 @@ fn materialize_request_missing_selector() {
 }
 
 #[test]
-fn materialize_request_extra_fields_ignored() {
-    let json = r#"{"repo":"github.com/org/repo","selector":{"branch":"main"},"extra":"value"}"#;
-    let req: MaterializeRequest = serde_json::from_str(json).unwrap();
-    assert_eq!(req.repo, RepoKey::parse("github.com/org/repo").unwrap());
-    assert_eq!(
-        req.selector,
-        Selector::Branch(BranchName::parse("main").unwrap())
+fn selector_rejects_reachable_from_contract() {
+    let json = format!(
+        r#"{{"commit":"{}","reachable_from":{{"branch":"main"}}}}"#,
+        "a".repeat(40)
     );
+    let error = serde_json::from_str::<Selector>(&json).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("reachable_from selectors are not supported"));
 }
 
 #[test]
-fn materialize_request_default_mode_is_strict() {
-    let json = r#"{"repo":"github.com/org/repo","selector":{"default_branch":true}}"#;
-    let req: MaterializeRequest = serde_json::from_str(json).unwrap();
-    assert_eq!(req.mode, RequestMode::Strict);
+fn materialize_request_extra_fields_rejected() {
+    let json = r#"{"repo":"github.com/org/repo","selector":{"branch":"main"},"extra":"value"}"#;
+    assert!(serde_json::from_str::<MaterializeRequest>(json).is_err());
 }
 
 #[test]
-fn materialize_request_explicit_mode_cached() {
+fn materialize_request_legacy_mode_field_is_rejected() {
     let json =
         r#"{"repo":"github.com/org/repo","selector":{"default_branch":true},"mode":"cached"}"#;
-    let req: MaterializeRequest = serde_json::from_str(json).unwrap();
-    assert_eq!(req.mode, RequestMode::Cached);
+    assert!(serde_json::from_str::<MaterializeRequest>(json).is_err());
 }
 
 #[test]
@@ -442,7 +440,6 @@ fn materialize_request_serde_round_trip() {
     let req = MaterializeRequest {
         repo: RepoKey::parse("github.com/org/repo").unwrap(),
         selector: Selector::Branch(BranchName::parse("main").unwrap()),
-        mode: RequestMode::Strict,
         upstream_authorization: Default::default(),
     };
     let json = serde_json::to_string(&req).unwrap();

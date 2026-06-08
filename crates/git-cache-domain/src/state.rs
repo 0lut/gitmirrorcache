@@ -380,7 +380,6 @@ mod tests {
     fn test_config(cache_root: PathBuf, object_root: PathBuf) -> AppConfig {
         AppConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
-            public_base_url: "http://127.0.0.1:0".into(),
             cache_root,
             upstream_root: None,
             git_binary: PathBuf::from("git"),

@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
-    pub public_base_url: String,
     pub cache_root: PathBuf,
     #[serde(default)]
     pub upstream_root: Option<PathBuf>,
@@ -54,9 +53,6 @@ impl AppConfig {
             .parse()
             .map_err(|err| crate::GitCacheError::Validation(format!("invalid bind addr: {err}")))?;
 
-        let public_base_url =
-            env::var("GIT_CACHE_PUBLIC_BASE_URL").unwrap_or_else(|_| format!("http://{bind_addr}"));
-
         let cache_root =
             PathBuf::from(env::var("GIT_CACHE_ROOT").unwrap_or_else(|_| "./cache".into()));
         let object_store = object_store_from_env()?;
@@ -68,7 +64,6 @@ impl AppConfig {
 
         Ok(Self {
             bind_addr,
-            public_base_url,
             cache_root,
             upstream_root,
             git_binary: PathBuf::from(
@@ -95,7 +90,6 @@ impl AppConfig {
             },
             git_remote: GitRemoteConfig {
                 enabled: parse_bool_env("GIT_CACHE_GIT_REMOTE_ENABLED", false)?,
-                branch_ref_check: BranchRefCheck::Always,
                 commit_read_through: parse_bool_env(
                     "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
                     true,
@@ -265,8 +259,6 @@ fn default_compaction_threshold() -> u32 {
 pub struct GitRemoteConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_branch_ref_check")]
-    pub branch_ref_check: BranchRefCheck,
     #[serde(default = "default_true")]
     pub commit_read_through: bool,
 }
@@ -275,20 +267,9 @@ impl Default for GitRemoteConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            branch_ref_check: BranchRefCheck::Always,
             commit_read_through: true,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BranchRefCheck {
-    Always,
-}
-
-fn default_branch_ref_check() -> BranchRefCheck {
-    BranchRefCheck::Always
 }
 
 fn default_true() -> bool {
@@ -375,7 +356,6 @@ mod tests {
     const ENV_KEYS: &[&str] = &[
         "GIT_CACHE_CONFIG",
         "GIT_CACHE_BIND_ADDR",
-        "GIT_CACHE_PUBLIC_BASE_URL",
         "GIT_CACHE_ROOT",
         "GIT_CACHE_OBJECT_STORE_KIND",
         "GIT_CACHE_OBJECT_STORE_ROOT",
@@ -449,7 +429,6 @@ mod tests {
             tmp,
             r#"
 bind_addr = "127.0.0.1:9090"
-public_base_url = "http://localhost:9090"
 cache_root = "/tmp/cache"
 git_timeout_seconds = 60
 rate_limit_per_minute = 500
@@ -479,7 +458,6 @@ min_free_bytes = 1073741824
             tmp,
             r#"
 bind_addr = "0.0.0.0:8080"
-public_base_url = "http://example.com"
 cache_root = "/cache"
 
 [object_store]
@@ -524,7 +502,6 @@ min_free_bytes = 100000
     fn git_remote_config_default_values() {
         let config = GitRemoteConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.branch_ref_check, BranchRefCheck::Always);
         assert!(config.commit_read_through);
     }
 
@@ -532,7 +509,6 @@ min_free_bytes = 100000
     fn git_remote_config_serde_round_trip() {
         let config = GitRemoteConfig {
             enabled: true,
-            branch_ref_check: BranchRefCheck::Always,
             commit_read_through: false,
         };
         let json = serde_json::to_string(&config).unwrap();
@@ -544,7 +520,6 @@ min_free_bytes = 100000
     fn from_env_configures_s3_object_store_and_git_remote() {
         let _env = EnvGuard::new(&[
             ("GIT_CACHE_BIND_ADDR", "0.0.0.0:8080"),
-            ("GIT_CACHE_PUBLIC_BASE_URL", "https://cache.example.com"),
             ("GIT_CACHE_ROOT", "/cache"),
             ("GIT_CACHE_OBJECT_STORE_KIND", "s3"),
             ("GIT_CACHE_S3_BUCKET", "git-cache-bucket"),
@@ -565,7 +540,6 @@ min_free_bytes = 100000
 
         let config = AppConfig::from_env().unwrap();
         assert_eq!(config.bind_addr.port(), 8080);
-        assert_eq!(config.public_base_url, "https://cache.example.com");
         assert_eq!(config.cache_root, PathBuf::from("/cache"));
         assert_eq!(
             config.allowed_upstream_hosts,

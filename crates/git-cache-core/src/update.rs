@@ -24,7 +24,6 @@ impl UpdateTarget {
             Selector::Branch(branch) => Self::Branch(branch.clone()),
             Selector::DefaultBranch => Self::DefaultBranch,
             Selector::Commit(commit) => Self::Commit(commit.clone()),
-            Selector::CommitReachableFrom { commit, .. } => Self::Commit(commit.clone()),
             Selector::ShortCommit(commit) => Self::ShortCommit(commit.clone()),
         }
     }
