@@ -12,8 +12,8 @@ per-object upstream proof. Those ideas are deliberately superseded here.
 - Avoid authenticated/unauthed materializer method forks.
 - Preserve the current `main` speed profile for hot materialize and hot direct
   clones.
-- Make expensive upstream fetch/hydrate/publish work explicit through
-  `/v1/materialize`, not hidden inside direct Git POST.
+- Preserve current `main` read-through behavior for direct Git clones, including
+  cold clones that have not been pre-materialized.
 
 ## Core Rule
 
@@ -112,17 +112,14 @@ Direct Git GET:
 
 - validates the repo;
 - parses upstream auth;
-- requires the local bare repo to exist;
 - fetches upstream refs with selected auth as the repo-access proof;
-- synthesizes the Smart HTTP ref advertisement from refs that are already
-  locally ready and whose branch names still exist upstream;
+- synthesizes the Smart HTTP ref advertisement from the current upstream refs;
 - stores a short-lived proof handoff keyed by repo and exact auth fingerprint.
 
 Direct Git POST:
 
 - validates the repo;
 - parses upstream auth;
-- requires the local bare repo to exist;
 - uses the matching GET proof handoff when present;
 - otherwise reruns the same lightweight upstream ref fetch;
 - calls one domain `handle_upload_pack` path.
@@ -130,23 +127,21 @@ Direct Git POST:
 Domain upload-pack:
 
 - parses wants;
-- checks wanted OIDs are locally present;
-- for commit wants, requires `commit_ready_for_serving`;
+- serves locally ready wanted commits immediately;
+- hydrates complete commit manifests when available;
+- fetches missing wanted commits from upstream using the same request auth;
+- requires `commit_ready_for_serving` before exposing a fetched or hydrated
+  commit;
+- publishes a generation for newly imported commits;
 - exposes served commits through hidden refs;
 - configures the served repo;
 - spawns `git upload-pack`.
 
-It must not fetch packs, fetch all heads, hydrate generation bundles, verify
-pending generations, publish generations, or treat stale manifests as upload-pack
-work items. If a wanted object is authorized by repo access but missing locally,
-return a fast cache miss (`503`) and let `/v1/materialize` or a warmer build the
-cache.
-
-The advertised direct-Git refs may lag the current upstream tips. That is
-intentional for this PR: direct Git is a serving path, not a hidden materializer.
-When upstream advances before the cache has fetched the new commit, direct Git
-continues to advertise the last locally ready branch tip instead of advertising
-an object it cannot serve.
+The direct Git POST path is still one path, not an authenticated/unauthed fork.
+Object checks are availability checks after repo access, not a second
+authorization phase. A future stricter mode can add current-reachability proof,
+but the default PR behavior follows current `main`: repository access is
+sufficient and direct clone can read through.
 
 ## Provider Plan
 
@@ -170,13 +165,12 @@ origin types such as `GitHubOrigin`, `GitLabOrigin`, `BitbucketOrigin`, and
 
 - Hot branch/default materialize should be close to current `main`: one upstream
   ref resolution plus local readiness/session work.
-- Hot direct clone after a matching GET should not do an upstream POST-side
-  proof or any materialization work.
-- Cold direct clone should fail fast on missing local objects instead of running
-  a multi-minute upstream fetch/index-pack.
-- Cold direct clone should also fail fast when the local bare repo itself is
-  absent; direct Git must not initialize an empty repo and continue negotiation.
-- Expensive rebuilds belong to `/v1/materialize` and background warmers.
+- Hot direct clone after a matching GET should avoid the second upstream ref
+  proof and stay near current `main`.
+- Cold direct clone should work without pre-materialization by read-through
+  fetching the wanted commit, then publishing the generation.
+- Expensive rebuilds must be no worse than current `main` for the same cache
+  state; auth should add only the repo-access proof.
 - New generation publication should verify the just-created bundle from the
   local repo when parents are already verified, then publish verified metadata
   immediately.

@@ -3,7 +3,6 @@ use super::*;
 #[test]
 fn synthesize_ref_advertisement_contains_head_and_refs() {
     let comparison = UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: Some("main".to_string()),
         all_upstream: {
             let mut m = HashMap::new();
@@ -24,7 +23,6 @@ fn synthesize_ref_advertisement_contains_head_and_refs() {
 #[test]
 fn synthesize_ref_advertisement_valid_pkt_line_format() {
     let comparison = UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: Some("main".to_string()),
         all_upstream: {
             let mut m = HashMap::new();
@@ -47,7 +45,6 @@ fn synthesize_ref_advertisement_valid_pkt_line_format() {
 #[test]
 fn synthesize_ref_advertisement_contains_capability_line() {
     let comparison = UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: Some("main".to_string()),
         all_upstream: {
             let mut m = HashMap::new();
@@ -266,7 +263,6 @@ async fn anonymous_direct_want_does_not_verify_pending_generation_on_post() {
     .unwrap();
 
     let comparison = UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: Some("main".to_string()),
         all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
     };
@@ -310,7 +306,6 @@ async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
     );
 
     let comparison = UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: Some("main".to_string()),
         all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
     };
@@ -351,7 +346,6 @@ async fn authenticated_direct_want_for_advertised_uncached_commit_reads_through(
         .await
         .unwrap();
     let comparison = UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: Some("main".to_string()),
         all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
     };
@@ -398,7 +392,6 @@ async fn anonymous_direct_want_hydrates_public_ref_manifest_on_post() {
     .unwrap();
 
     let comparison = UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: Some("main".to_string()),
         all_upstream: HashMap::from([("main".to_string(), cached.commit.to_string())]),
     };
@@ -479,7 +472,6 @@ async fn anonymous_direct_want_skips_manifest_restore_when_ref_is_already_hot() 
     .unwrap();
 
     let comparison = UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: Some("main".to_string()),
         all_upstream: HashMap::from([("main".to_string(), cached.commit.to_string())]),
     };
@@ -667,7 +659,6 @@ async fn anonymous_direct_want_allows_cached_public_blob() {
 fn synth_no_symref_when_default_branch_absent_from_refs() {
     let sha = "a".repeat(40);
     let comp = UpstreamRefComparison {
-        changed: HashMap::new(),
         all_upstream: HashMap::from([("feature".to_string(), sha.clone())]),
         default_branch: Some("main".to_string()),
     };

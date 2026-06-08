@@ -334,7 +334,6 @@ where
 
 fn make_comparison(refs: &[(&str, &str)], default_branch: Option<&str>) -> UpstreamRefComparison {
     UpstreamRefComparison {
-        changed: HashMap::new(),
         default_branch: default_branch.map(|s| s.to_string()),
         all_upstream: refs
             .iter()

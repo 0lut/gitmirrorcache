@@ -13,7 +13,7 @@ use git_cache_disk::RepoLock;
 pub use git_cache_git::UploadPackProcess;
 use git_cache_objectstore::{
     generation_manifest_key, pending_generation_publish_key, read_commit_manifest,
-    read_generation_manifest, read_json, read_pending_generation_publish, read_ref_manifest,
+    read_generation_manifest, read_json, read_pending_generation_publish,
     read_repo_generation_head, read_session_manifest, read_verified_generation_manifest,
     verified_generation_manifest_key, write_commit_manifest, write_json, write_ref_manifest,
     write_repo_generation_head, write_session_manifest,
@@ -42,9 +42,8 @@ mod sessions;
 mod util;
 
 pub use direct_git::{
-    advertise_refs, frame_ref_advertisement, parse_want_lines,
-    synthesize_protected_ref_advertisement, synthesize_ref_advertisement, upload_pack,
-    UpstreamRefComparison,
+    advertise_refs, frame_ref_advertisement, parse_want_lines, synthesize_ref_advertisement,
+    upload_pack, UpstreamRefComparison,
 };
 pub use executor::MaterializerExecutor;
 pub use generations::{bundle_key, default_manifest_key, CompactionReport};

@@ -1132,7 +1132,6 @@ mod tests {
         let repo = RepoKey::parse("github.com/org/repo").unwrap();
         let auth = UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap();
         let comparison = UpstreamRefComparison {
-            changed: HashMap::new(),
             default_branch: Some("main".into()),
             all_upstream: HashMap::from([("main".into(), "a".repeat(40))]),
         };
@@ -1157,7 +1156,6 @@ mod tests {
         let repo = RepoKey::parse("github.com/org/private").unwrap();
         let auth = UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap();
         let comparison = UpstreamRefComparison {
-            changed: HashMap::new(),
             default_branch: Some("main".into()),
             all_upstream: HashMap::from([("main".into(), "b".repeat(40))]),
         };
@@ -1180,7 +1178,6 @@ mod tests {
         let cache = DirectGitProofCache::new(Duration::from_millis(1));
         let repo = RepoKey::parse("github.com/org/repo").unwrap();
         let comparison = UpstreamRefComparison {
-            changed: HashMap::new(),
             default_branch: None,
             all_upstream: HashMap::from([("main".into(), "c".repeat(40))]),
         };

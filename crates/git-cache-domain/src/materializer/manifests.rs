@@ -49,12 +49,13 @@ impl<'a> ManifestStore<'a> {
         read_json::<_, RefManifest>(&*self.state.store, key).await
     }
 
+    #[cfg(test)]
     pub(super) async fn ref_manifest(
         &self,
         repo: &RepoKey,
         ref_name: &str,
     ) -> CoreResult<Option<RefManifest>> {
-        read_ref_manifest(&*self.state.store, repo, ref_name).await
+        git_cache_objectstore::read_ref_manifest(&*self.state.store, repo, ref_name).await
     }
 
     pub(super) async fn write_ref(&self, manifest: &RefManifest) -> CoreResult<()> {

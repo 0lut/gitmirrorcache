@@ -396,18 +396,19 @@ the authorization boundary. Deployments that need stricter isolation for
 rewritten or hidden history should keep that history in a separate upstream repo
 or revisit ephemeral direct serving repos later.
 
-### T2. Direct upload-pack does local readiness only
+### T2. Direct upload-pack read-through is repo-authorized
 
-Direct Git POST must not fetch packs, hydrate generations, publish generations,
-or run object-level upstream reachability proof. Its job is to parse wants,
-check that wanted objects are already locally present, require commit wants to
-have their tree object, expose served commits through hidden refs, and spawn
-`git upload-pack`. If an authorized object is not locally ready, the request
-fails fast with a cache-miss `503`.
+Direct Git POST must not run object-level upstream reachability proof. Its job
+is to parse wants after repo access is proven, serve already-ready commits,
+hydrate complete commit manifests when available, fetch missing wanted commits
+from upstream using the same request auth when read-through is enabled, require
+commit wants to have their tree object before exposure, publish newly imported
+generations, and spawn `git upload-pack`.
 
 This intentionally accepts repo-level access as sufficient for all objects in
-the repo-scoped cache. It removes the LLVM hot-clone regression caused by
-per-POST upstream proof and hidden materialization work.
+the repo-scoped cache. It preserves current `main` behavior where `git clone`
+can read through without prior materialization, while avoiding the duplicated
+authenticated/unauthed method families and per-object authorization machinery.
 
 ### T3. Exact commits use repo-level access
 
@@ -564,14 +565,16 @@ with the selected auth. Exact commit selectors first run a lightweight
 commit flow. Short commits fetch upstream refs with the selected auth before
 resolving. The old authenticated materialization method family was removed.
 
-### D7. Direct Git wants are availability checks after repo proof
+### D7. Direct Git wants are read-through availability checks after repo proof
 
 Partial clones can later ask upload-pack for blob/tree objects that are not ref
 tips. Under the simplified repo-boundary model, direct Git POST no longer runs
-per-object upstream graph proof. It requires that requested OIDs already exist
-locally, and commit wants additionally require `commit_ready_for_serving` so a
-commit without its tree is not exposed. Missing or incomplete wants return a
-fast cache miss instead of triggering upstream fetch/hydration work.
+per-object upstream graph proof. After GET or POST proves repository access, the
+domain treats object presence as cache state: if a wanted commit is already
+ready it is served, if a complete commit manifest exists it is hydrated, and if
+read-through is enabled it is fetched from upstream using the same request auth.
+Commit wants still require `commit_ready_for_serving` before upload-pack can
+expose them, so a commit without its tree is not served.
 
 ### D8. Materializer split keeps behavior intact while reducing local coupling
 
@@ -592,7 +595,7 @@ centralized in the wrapper. Materializer tests were split into behavior modules
 so future changes can add focused coverage without growing one monolithic test
 file again.
 
-### D9. Direct Git POST no longer materializes
+### D9. Direct Git POST preserves main-like read-through
 
 AWS smoke logs for `llvm/llvm-project` showed generation verification conflicts
 for the current `main` commit while the host cache already had the commit and
@@ -604,17 +607,20 @@ tip. Large repos with many active branches could therefore stall on unrelated
 fetch/publish work and race with existing generation manifests.
 
 After an AWS control run against current `main`, public LLVM direct clones were
-~1.5s while the first version of this fix was ~45s. Several follow-up
-optimizations tried to recover that latency by using locally published public
-refs/manifests as direct Git POST proof. Those optimizations were subtle and
-easy to get wrong in the shared repo model, especially once credentialed and
-anonymous requests shared code paths.
+~1.5s while the first auth-aware iteration was ~45s. Several follow-up
+optimizations tried to recover that latency by making direct Git advertise only
+locally ready refs and reject local cache misses. That preserved hot latency,
+but it broke an important property of current `main`: `git clone`
+should work without a prior `/v1/materialize`.
 
-The current simplification makes direct Git POST a serving path only. It parses
-wants, checks local readiness, configures the served repo, and spawns
-`git upload-pack`. It does not fetch refs/objects, hydrate generation bundles,
-verify pending generations, publish generation metadata, or use stale ref
-manifests to rebuild serving state during a clone/fetch request.
+The current simplification keeps the repo-access check boring and leaves
+availability to the main-like direct Git read-through path. Direct Git GET
+proves that the selected auth can read the upstream repo and advertises the
+current upstream refs without fetching objects. Direct Git POST then parses the
+wants, hydrates complete commit manifests when available, otherwise fetches the
+wanted commit from upstream using the same request-scoped auth, publishes a
+generation for newly imported commits, configures the serving repo, and spawns
+`git upload-pack`.
 
 ### D10. Repo access proof uses Git transport, not provider REST
 
@@ -636,33 +642,27 @@ wrapper. A future provider layer can introduce `GitHubOrigin`, `GitLabOrigin`,
 `BitbucketOrigin`, or `PrivateGitServerOrigin` if measurements show a real need,
 but this PR avoids adding that complexity.
 
-### D11. Direct proof cache is only a GET-to-POST hot-path handoff
+### D11. Direct proof cache is only a GET-to-POST auth handoff
 
 Direct Git GET fetches upstream refs to prove repo access, then synthesizes the
-advertisement from refs that are already locally ready and whose branch names
-still exist upstream. It stores that local-ready advertisement for a short TTL
-keyed by repo and the exact auth fingerprint. Direct Git POST may use the
-matching entry to avoid a second upstream ref call. If the handoff is absent,
-expired, or keyed to different credentials, POST re-runs the same lightweight
-upstream ref fetch before serving.
+Smart HTTP advertisement from that upstream state. It stores the comparison for
+a short TTL keyed by repo and the exact auth fingerprint. Direct Git POST may
+use the matching entry to avoid a second upstream ref call. If the handoff is
+absent, expired, or keyed to different credentials, POST re-runs the same
+lightweight upstream ref fetch before read-through serving.
 
-This means direct Git may intentionally advertise a cached branch tip that lags
-the current upstream tip. That is preferable to advertising a fresh upstream tip
-that upload-pack cannot serve without doing hidden fetch/index-pack work.
-`/v1/materialize` or a warmer is responsible for moving the cache forward.
-
-The proof cache deliberately does not downshift credentialed requests to
-anonymous proofs, does not persist across process restarts, and does not
+The proof cache deliberately does not authorize individual objects, persist
+across process restarts, downshift credentialed requests to anonymous proofs, or
 authorize across credentials. It is a hot-path optimization for the stateless Git
 GET/POST pair, not a repository visibility cache.
 
-### D12. Direct upload-pack has one serving entrypoint
+### D12. Direct upload-pack has one read-through entrypoint
 
-Domain serving has one `handle_upload_pack` path for parsing wants, local
-readiness checks, serving repo configuration, and spawning `git upload-pack`.
-The optional upstream-ref comparison argument remains only as API context for
-the GET-to-POST handoff; the domain no longer has separate authenticated,
-proof-specific, or fallback-fetch upload-pack implementations.
+Domain serving has one `handle_upload_pack` path for parsing wants, hydrating or
+fetching missing wanted commits, serving repo configuration, and spawning
+`git upload-pack`. The optional upstream-ref comparison argument remains only as
+API context for the GET-to-POST handoff; the domain no longer has separate
+authenticated, proof-specific, or fallback-fetch upload-pack implementations.
 
 ### D13. Materialize keeps main-like branch behavior
 
@@ -702,8 +702,9 @@ locally cache-available, and the source label.
 The selector policy now matches materialize: repo access is sufficient for exact
 commit selectors, and `reachable_from` is not required by default. Direct Git
 upload-pack follows the same repo-boundary policy and differs only in outcome:
-it streams from local cache if ready, or fails fast when the local cache is not
-ready.
+it streams from local cache when ready, hydrates or fetches the wanted commit
+when read-through is needed, and fails only when the authorized repo cannot
+provide the requested object or read-through is disabled.
 
 ### D16. Remaining simplification direction
 
