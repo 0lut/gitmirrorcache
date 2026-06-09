@@ -12,10 +12,12 @@ recover a stuck ECS rollout.
 ## AWS credentials
 
 The `AWS_Access_Key` secret env var holds a 2-line CSV (header + key,secret).
-Export it in each new shell before any AWS command:
+Export it in each new shell before any AWS command (no `eval` — parse and
+assign directly):
 
 ```sh
-eval "$(python3 -c "import os; lines=os.environ['AWS_Access_Key'].strip().splitlines(); k,s=lines[-1].split(','); print(f'export AWS_ACCESS_KEY_ID={k}; export AWS_SECRET_ACCESS_KEY={s}')")"
+IFS=, read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY <<< "$(printf '%s' "$AWS_Access_Key" | tail -n 1)"
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 ```
 
 Account 411474713009, region us-west-2. EC2 vCPU quota is 32 — check running
@@ -24,8 +26,10 @@ instances before launching large instance types (VcpuLimitExceeded otherwise).
 ## AWS CLI v2 required
 
 The preview shared-ALB listener rule uses `aws elbv2 ... --transforms`, which
-AWS CLI v1 does not support. Install CLI v2 (lands at /usr/local/bin/aws) and
-run deploy scripts with `PATH=/usr/local/bin:$PATH` if v1 is also installed.
+AWS CLI v1 does not support. Check `aws --version` reports `aws-cli/2.x`; if a
+v1 binary shadows v2, find the v2 install with `command -v -a aws` and put its
+directory first on `PATH` (e.g. `/usr/local/bin` on the Devin VM,
+`/opt/homebrew/bin` on macOS).
 
 ## Standard deployment
 
