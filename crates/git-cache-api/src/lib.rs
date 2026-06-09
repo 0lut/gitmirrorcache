@@ -5,7 +5,8 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult, UpstreamAuth,
+    AppConfig, CommitSha, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult,
+    UpstreamAuth,
 };
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
@@ -15,9 +16,9 @@ use git_cache_domain::{
 };
 use git_cache_git::UploadPackProcess;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +74,7 @@ struct ApiState {
     domain: Arc<AppState>,
     direct_git_proofs: Arc<DirectGitProofCache>,
     direct_git_background_imports: Arc<Semaphore>,
+    async_materialize_jobs: Arc<AsyncMaterializeJobs>,
     upstream_http: reqwest::Client,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
@@ -103,10 +105,14 @@ impl ApiState {
             .git_remote
             .background_import_concurrency
             .max(1);
+        let async_materialize_concurrency = domain.config.async_materialize_concurrency.max(1);
         Ok(Self {
             domain,
             direct_git_proofs: Arc::new(DirectGitProofCache::new(DIRECT_GIT_PROOF_TTL)),
             direct_git_background_imports: Arc::new(Semaphore::new(background_import_concurrency)),
+            async_materialize_jobs: Arc::new(AsyncMaterializeJobs::new(
+                async_materialize_concurrency,
+            )),
             upstream_http,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
@@ -267,11 +273,23 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
 
 async fn materialize(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<MaterializeQuery>,
     headers: HeaderMap,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
     let auth = upstream_api_auth(&headers)?;
-    handle_materialize_request(&state, request, auth).await
+    let endpoint = if query.r#async {
+        MaterializeEndpoint::MaterializeAsync
+    } else {
+        MaterializeEndpoint::Materialize
+    };
+    handle_checked_materialize_request(&state, endpoint, request, auth).await
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MaterializeQuery {
+    #[serde(default, rename = "async")]
+    r#async: bool,
 }
 
 async fn resolve(
@@ -280,12 +298,13 @@ async fn resolve(
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
     let auth = upstream_api_auth(&headers)?;
-    handle_resolve_request(&state, request, auth).await
+    handle_checked_materialize_request(&state, MaterializeEndpoint::Resolve, request, auth).await
 }
 
 #[derive(Debug, Clone, Copy)]
 enum MaterializeEndpoint {
     Materialize,
+    MaterializeAsync,
     Resolve,
 }
 
@@ -293,25 +312,10 @@ impl MaterializeEndpoint {
     fn name(self) -> &'static str {
         match self {
             Self::Materialize => "materialize",
+            Self::MaterializeAsync => "materialize_async",
             Self::Resolve => "resolve",
         }
     }
-}
-
-async fn handle_materialize_request(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-) -> Result<Response, ApiError> {
-    handle_checked_materialize_request(state, MaterializeEndpoint::Materialize, request, auth).await
-}
-
-async fn handle_resolve_request(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-) -> Result<Response, ApiError> {
-    handle_checked_materialize_request(state, MaterializeEndpoint::Resolve, request, auth).await
 }
 
 async fn handle_checked_materialize_request(
@@ -401,16 +405,13 @@ async fn handle_checked_materialize_request_inner(
             }
         };
 
-    let result = match endpoint {
-        MaterializeEndpoint::Materialize => run_materialize_request(state, request, auth).await,
-        MaterializeEndpoint::Resolve => run_resolve_request(state, request, auth).await,
-    };
+    let result = run_domain_request(state, endpoint, request, auth).await;
     match &result {
-        Ok(_) => info!(
+        Ok(response) => info!(
             request_id,
             endpoint = endpoint.name(),
             elapsed_ms = elapsed_ms(started),
-            status = %StatusCode::OK,
+            status = %response.status(),
             "api request finished"
         ),
         Err(error) => info!(
@@ -424,75 +425,80 @@ async fn handle_checked_materialize_request_inner(
     result
 }
 
-async fn run_materialize_request(
+async fn run_domain_request(
     state: &Arc<ApiState>,
+    endpoint: MaterializeEndpoint,
     request: MaterializeRequest,
     auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
     let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
     let domain_started = Instant::now();
-    let result = materializer.materialize(request).await;
-    match &result {
-        Ok(response) => info!(
-            repo = %response.repo,
-            commit = %response.commit,
-            source = ?response.source,
-            elapsed_ms = elapsed_ms(domain_started),
-            "domain materialize finished"
-        ),
-        Err(error) => info!(
+    let result = match endpoint {
+        MaterializeEndpoint::Materialize => {
+            materializer.materialize(request).await.map(|response| {
+                info!(
+                    repo = %response.repo,
+                    commit = %response.commit,
+                    source = ?response.source,
+                    elapsed_ms = elapsed_ms(domain_started),
+                    "domain materialize finished"
+                );
+                Json(response).into_response()
+            })
+        }
+        MaterializeEndpoint::MaterializeAsync => {
+            materializer.resolve(request.clone()).await.map(|response| {
+                if response.cache_available {
+                    info!(
+                        repo = %response.repo,
+                        commit = %response.commit,
+                        elapsed_ms = elapsed_ms(domain_started),
+                        "async materialize already cached"
+                    );
+                    Json(response).into_response()
+                } else {
+                    let queued = state.async_materialize_jobs.spawn(
+                        materializer.clone(),
+                        request,
+                        response.commit.clone(),
+                    );
+                    info!(
+                        repo = %response.repo,
+                        commit = %response.commit,
+                        queued,
+                        elapsed_ms = elapsed_ms(domain_started),
+                        "async materialize accepted"
+                    );
+                    (StatusCode::ACCEPTED, Json(response)).into_response()
+                }
+            })
+        }
+        MaterializeEndpoint::Resolve => materializer.resolve(request).await.map(|response| {
+            info!(
+                repo = %response.repo,
+                commit = %response.commit,
+                source = ?response.source,
+                cache_available = response.cache_available,
+                elapsed_ms = elapsed_ms(domain_started),
+                "domain resolve finished"
+            );
+            Json(response).into_response()
+        }),
+    };
+
+    result.map_err(|error| {
+        info!(
+            endpoint = endpoint.name(),
             error = %error,
             elapsed_ms = elapsed_ms(domain_started),
-            "domain materialize failed"
-        ),
-    }
-
-    match result {
-        Ok(response) => Ok(Json(response).into_response()),
-        Err(error) => {
-            state
-                .metrics
-                .materialize_errors_total
-                .fetch_add(1, Ordering::Relaxed);
-            Err(error.into())
-        }
-    }
-}
-
-async fn run_resolve_request(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-) -> Result<Response, ApiError> {
-    let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
-    let domain_started = Instant::now();
-    let result = materializer.resolve(request).await;
-    match &result {
-        Ok(response) => info!(
-            repo = %response.repo,
-            commit = %response.commit,
-            source = ?response.source,
-            cache_available = response.cache_available,
-            elapsed_ms = elapsed_ms(domain_started),
-            "domain resolve finished"
-        ),
-        Err(error) => info!(
-            error = %error,
-            elapsed_ms = elapsed_ms(domain_started),
-            "domain resolve failed"
-        ),
-    }
-
-    match result {
-        Ok(response) => Ok(Json(response).into_response()),
-        Err(error) => {
-            state
-                .metrics
-                .materialize_errors_total
-                .fetch_add(1, Ordering::Relaxed);
-            Err(error.into())
-        }
-    }
+            "domain request failed"
+        );
+        state
+            .metrics
+            .materialize_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        error.into()
+    })
 }
 
 struct CheckedMaterializeRequest {
@@ -657,6 +663,12 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
             Ok(auth) => auth,
             Err(error) => return error.into_response(),
         };
+        let body =
+            match decode_git_request_body(&headers, body, state.domain.config.max_git_output_bytes)
+            {
+                Ok(body) => body,
+                Err(error) => return error.into_response(),
+            };
         info!(
             request_id,
             repo = %repo,
@@ -966,6 +978,51 @@ fn proxy_on_miss_disabled(headers: &HeaderMap, default_enabled: bool) -> bool {
     )
 }
 
+/// Decode a Git smart HTTP request body according to its `Content-Encoding`.
+///
+/// Git clients gzip upload-pack request bodies above a small threshold
+/// (`Content-Encoding: gzip`), so the body must be inflated before pkt-line
+/// parsing. Decompression is bounded by `max_bytes` to keep allocations
+/// bounded; unknown encodings are rejected.
+fn decode_git_request_body(
+    headers: &HeaderMap,
+    body: Bytes,
+    max_bytes: usize,
+) -> Result<Bytes, ApiError> {
+    let encoding = match headers.get(header::CONTENT_ENCODING) {
+        Some(value) => value,
+        None => return Ok(body),
+    };
+    let encoding = encoding.to_str().map_err(|_| {
+        ApiError::from(GitCacheError::Validation(
+            "invalid content-encoding header".into(),
+        ))
+    })?;
+    match encoding.trim().to_ascii_lowercase().as_str() {
+        "" | "identity" => Ok(body),
+        "gzip" | "x-gzip" => {
+            use std::io::Read;
+            let limit = max_bytes as u64;
+            let mut decoder = flate2::bufread::GzDecoder::new(body.as_ref()).take(limit + 1);
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).map_err(|error| {
+                ApiError::from(GitCacheError::Validation(format!(
+                    "invalid gzip request body: {error}"
+                )))
+            })?;
+            if decoded.len() as u64 > limit {
+                return Err(ApiError::from(GitCacheError::Validation(format!(
+                    "gzip request body exceeded {max_bytes} byte limit"
+                ))));
+            }
+            Ok(Bytes::from(decoded))
+        }
+        other => Err(ApiError::from(GitCacheError::Unsupported(format!(
+            "unsupported content-encoding: {other}"
+        )))),
+    }
+}
+
 struct DirectGitWarmTask {
     imports: Arc<Semaphore>,
     materializer: Materializer,
@@ -1030,6 +1087,75 @@ impl DirectGitWarmTask {
                 ),
             }
         });
+    }
+}
+
+/// Bounded background runner for `/v1/materialize?async=true`. Jobs are
+/// deduplicated per repo+commit; callers poll `/v1/resolve` for completion.
+struct AsyncMaterializeJobs {
+    permits: Arc<Semaphore>,
+    inflight: Mutex<HashSet<(RepoKey, CommitSha)>>,
+}
+
+impl AsyncMaterializeJobs {
+    fn new(concurrency: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(concurrency)),
+            inflight: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Queues a background materialize for the resolved commit. Returns false
+    /// when an equivalent job is already in flight.
+    fn spawn(
+        self: &Arc<Self>,
+        materializer: Materializer,
+        request: MaterializeRequest,
+        commit: CommitSha,
+    ) -> bool {
+        let key = (request.repo.clone(), commit);
+        {
+            let Ok(mut inflight) = self.inflight.lock() else {
+                warn!(
+                    repo = %key.0,
+                    commit = %key.1,
+                    "async materialize in-flight lock poisoned"
+                );
+                return false;
+            };
+            if !inflight.insert(key.clone()) {
+                return false;
+            }
+        }
+        let jobs = Arc::clone(self);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let result = match jobs.permits.acquire().await {
+                Ok(_permit) => materializer.materialize(request).await.map(|_| ()),
+                Err(_) => Err(GitCacheError::Internal(
+                    "async materialize semaphore closed".into(),
+                )),
+            };
+            match result {
+                Ok(()) => info!(
+                    repo = %key.0,
+                    commit = %key.1,
+                    elapsed_ms = elapsed_ms(started),
+                    "async materialize finished"
+                ),
+                Err(error) => warn!(
+                    repo = %key.0,
+                    commit = %key.1,
+                    %error,
+                    elapsed_ms = elapsed_ms(started),
+                    "async materialize failed"
+                ),
+            }
+            if let Ok(mut inflight) = jobs.inflight.lock() {
+                inflight.remove(&key);
+            }
+        });
+        true
     }
 }
 
@@ -1316,6 +1442,56 @@ mod tests {
     use tokio::io::duplex;
     use tokio::process::Command;
 
+    fn gzip_compress(data: &[u8]) -> Bytes {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        Bytes::from(encoder.finish().unwrap())
+    }
+
+    #[test]
+    fn decode_git_request_body_passes_through_without_encoding() {
+        let body = Bytes::from_static(b"0032want abc\n00000009done\n");
+        let decoded = decode_git_request_body(&HeaderMap::new(), body.clone(), 1024).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn decode_git_request_body_inflates_gzip() {
+        let plain = b"0032want abcdef0123456789\n00000009done\n";
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let decoded = decode_git_request_body(&headers, gzip_compress(plain), 1024).unwrap();
+        assert_eq!(decoded.as_ref(), plain);
+    }
+
+    #[test]
+    fn decode_git_request_body_bounds_inflated_size() {
+        let plain = vec![b'a'; 4096];
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let error = decode_git_request_body(&headers, gzip_compress(&plain), 1024).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_git_request_body_rejects_invalid_gzip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let error =
+            decode_git_request_body(&headers, Bytes::from_static(b"not gzip"), 1024).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_git_request_body_rejects_unknown_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "br".parse().unwrap());
+        let error =
+            decode_git_request_body(&headers, Bytes::from_static(b"data"), 1024).unwrap_err();
+        assert_eq!(error.status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
     #[test]
     fn rate_limiter_blocks_after_limit() {
         let limiter = RateLimiter::new(2);
@@ -1454,6 +1630,7 @@ mod tests {
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             max_concurrent_generation_verifications: 1,
+            async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
         };
         let state = Arc::new(ApiState::try_new(config).unwrap());
         assert!(state.rate_limiter.check(), "first request consumes quota");
@@ -1465,7 +1642,9 @@ mod tests {
         };
         let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
 
-        let result = handle_resolve_request(&state, request, auth).await;
+        let result =
+            handle_checked_materialize_request(&state, MaterializeEndpoint::Resolve, request, auth)
+                .await;
 
         match result {
             Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),

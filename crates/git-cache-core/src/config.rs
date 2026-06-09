@@ -32,6 +32,8 @@ pub struct AppConfig {
     pub max_concurrent_git_processes: usize,
     #[serde(default = "default_max_concurrent_generation_verifications")]
     pub max_concurrent_generation_verifications: usize,
+    #[serde(default = "default_async_materialize_concurrency")]
+    pub async_materialize_concurrency: usize,
 }
 
 impl AppConfig {
@@ -115,6 +117,10 @@ impl AppConfig {
             max_concurrent_generation_verifications: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
                 default_max_concurrent_generation_verifications(),
+            )?,
+            async_materialize_concurrency: parse_env(
+                "GIT_CACHE_ASYNC_MATERIALIZE_CONCURRENCY",
+                default_async_materialize_concurrency(),
             )?,
         })
     }
@@ -262,6 +268,10 @@ pub fn default_max_concurrent_generation_verifications() -> usize {
     1
 }
 
+pub fn default_async_materialize_concurrency() -> usize {
+    2
+}
+
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> crate::Result<T>
 where
     T::Err: std::fmt::Display,
@@ -340,6 +350,7 @@ mod tests {
         "GIT_CACHE_COMPACTION_INLINE",
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
         "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
+        "GIT_CACHE_ASYNC_MATERIALIZE_CONCURRENCY",
     ];
 
     struct EnvGuard {
@@ -434,6 +445,7 @@ min_free_bytes = 100000
         assert_eq!(config.git_remote, GitRemoteConfig::default());
         assert_eq!(config.compaction, CompactionConfig::default());
         assert_eq!(config.max_concurrent_generation_verifications, 1);
+        assert_eq!(config.async_materialize_concurrency, 2);
     }
 
     #[test]
