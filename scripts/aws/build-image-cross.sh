@@ -89,5 +89,5 @@ timed "build image ($IMAGE_URI)" build_image
 
 printf 'IMAGE_URI=%s\n' "$IMAGE_URI"
 if [[ "$PUSH" == "true" ]]; then
-  printf 'Deploy with: ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true IMAGE_TAG=%s\n' "$IMAGE_TAG"
+  printf 'Deploy with: ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true IMAGE_TAG=%s scripts/aws/deploy-and-smoke.sh\n' "$IMAGE_TAG"
 fi
