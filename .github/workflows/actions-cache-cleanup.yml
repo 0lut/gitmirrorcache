@@ -1,0 +1,40 @@
+name: Actions Cache Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      older_than_days:
+        description: Delete caches last accessed more than this many days ago
+        required: true
+        default: "7"
+      delete_all:
+        description: Delete every GitHub Actions cache
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 9 * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: actions-cache-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Delete stale Actions caches
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Delete GitHub Actions caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OLDER_THAN_DAYS: ${{ github.event.inputs.older_than_days || '7' }}
+          DELETE_ALL: ${{ github.event.inputs.delete_all || 'false' }}
+        run: scripts/github/cleanup-actions-caches.sh
