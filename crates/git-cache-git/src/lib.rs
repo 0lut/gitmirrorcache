@@ -975,6 +975,7 @@ fn reject_remote_url(url: &str) -> Result<()> {
 /// `refs/cache/upstream/heads/{branch}`, validating the upstream-supplied
 /// branch name before it is interpolated into git arguments.
 pub fn branch_cache_refspec(branch: &str) -> Result<String> {
+    reject_branch_name(branch)?;
     let upstream_ref = format!("refs/heads/{branch}");
     let local_ref = format!("refs/cache/upstream/heads/{branch}");
     reject_ref_arg(&upstream_ref, "upstream ref")?;
@@ -982,6 +983,36 @@ pub fn branch_cache_refspec(branch: &str) -> Result<String> {
     let refspec = format!("+{upstream_ref}:{local_ref}");
     reject_refspec(&refspec)?;
     Ok(refspec)
+}
+
+/// Enforces `git check-ref-format` rules in-process so upstream-supplied
+/// branch names cannot smuggle glob patterns or malformed ref syntax into a
+/// refspec. Mirrors the documented rules: no control chars, space, `~`, `^`,
+/// `:`, `?`, `*`, `[`, or `\`; no `..`, `@{`, or bare `@`; components must be
+/// non-empty and must not start with `.`, end with `.`, or end with `.lock`;
+/// the name must not start or end with `/` or end with `.`.
+fn reject_branch_name(branch: &str) -> Result<()> {
+    let invalid = || GitCacheError::Validation(format!("invalid branch name argument: {branch:?}"));
+    if branch.is_empty() || branch == "@" {
+        return Err(invalid());
+    }
+    if branch.starts_with('/') || branch.ends_with('/') || branch.ends_with('.') {
+        return Err(invalid());
+    }
+    if branch.contains("..") || branch.contains("@{") {
+        return Err(invalid());
+    }
+    if branch.bytes().any(|b| {
+        b < 0x20 || b == 0x7f || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    }) {
+        return Err(invalid());
+    }
+    for component in branch.split('/') {
+        if component.is_empty() || component.starts_with('.') || component.ends_with(".lock") {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 fn reject_refspec(refspec: &str) -> Result<()> {

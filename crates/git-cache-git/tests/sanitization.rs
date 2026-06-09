@@ -465,6 +465,33 @@ mod tests {
         assert!(git_cache_git::branch_cache_refspec("bad\0branch").is_err());
     }
 
+    #[test]
+    fn branch_cache_refspec_rejects_glob_characters() {
+        assert!(git_cache_git::branch_cache_refspec("*").is_err());
+        assert!(git_cache_git::branch_cache_refspec("feature/*").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a?b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a[b]").is_err());
+    }
+
+    #[test]
+    fn branch_cache_refspec_rejects_check_ref_format_violations() {
+        assert!(git_cache_git::branch_cache_refspec("a..b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a@{b}").is_err());
+        assert!(git_cache_git::branch_cache_refspec("@").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a~b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a^b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a\\b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a\x07b").is_err());
+        assert!(git_cache_git::branch_cache_refspec(".hidden").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a/.b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("branch.lock").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a//b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("/leading").is_err());
+        assert!(git_cache_git::branch_cache_refspec("trailing/").is_err());
+        assert!(git_cache_git::branch_cache_refspec("trailing.").is_err());
+    }
+
     // ── fetch_objects sanitization ──────────────────────────────────────────
 
     #[tokio::test]
