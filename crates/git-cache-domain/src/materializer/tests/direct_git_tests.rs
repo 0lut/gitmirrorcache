@@ -444,7 +444,7 @@ async fn upload_pack_cache_prepare_is_false_for_uncached_want() {
 }
 
 #[tokio::test]
-async fn upload_pack_cache_prepare_hydrates_manifest_only_cache() {
+async fn upload_pack_cache_prepare_is_false_for_manifest_only_cache() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -465,17 +465,17 @@ async fn upload_pack_cache_prepare_hydrates_manifest_only_cache() {
     let body = make_upload_pack_pkt_line(&format!("want {} multi_ack thin-pack\n", cached.commit));
 
     assert!(
-        materializer
+        !materializer
             .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(body))
             .await
             .unwrap(),
-        "proxy-on-miss should treat object-store generation manifests as warm cache state"
+        "proxy-on-miss should use upstream proxying when only object-store generation manifests exist"
     );
     assert!(
-        materializer
+        !materializer
             .commit_ready_for_serving(&repo_dir, &cached.commit)
             .await,
-        "cache prepare should establish the repo on EBS from the verified generation"
+        "cache prepare should not hydrate EBS from the verified generation"
     );
 }
 

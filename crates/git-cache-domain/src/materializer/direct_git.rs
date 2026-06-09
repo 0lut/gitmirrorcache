@@ -510,7 +510,6 @@ impl Materializer {
         let wants_count = intent.wants.len();
         let mut served_commits = 0usize;
         let mut served_non_commit_wants = 0usize;
-        let mut hydrated_commits = 0usize;
         for object_id in &intent.wants {
             if let Some(object_type) = object_types.get(object_id).map(String::as_str) {
                 if object_type != "commit" {
@@ -524,59 +523,21 @@ impl Materializer {
                 }
             }
 
-            let Some(manifest) = self.get_commit_manifest(repo, object_id).await? else {
-                info!(
-                    %repo,
-                    commit = %object_id,
-                    wants_count,
-                    served_commits,
-                    served_non_commit_wants,
-                    hydrated_commits,
-                    elapsed_ms = elapsed_ms(started),
-                    "direct git cache prepare missed commit manifest"
-                );
-                return Ok(false);
-            };
-            if !manifest.complete {
-                info!(
-                    %repo,
-                    commit = %object_id,
-                    generation = %manifest.generation,
-                    wants_count,
-                    served_commits,
-                    served_non_commit_wants,
-                    hydrated_commits,
-                    elapsed_ms = elapsed_ms(started),
-                    "direct git cache prepare found incomplete commit manifest"
-                );
-                return Ok(false);
-            }
-
-            let hydrate_started = Instant::now();
-            self.hydrate_generation(repo, &repo_dir, manifest.generation)
-                .await?;
-            let object_types = self
-                .state
-                .git
-                .cat_file_batch_types_no_lazy(&repo_dir, std::slice::from_ref(object_id))
-                .await?;
-            if object_types.get(object_id).map(String::as_str) != Some("commit")
-                || !self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
-            {
-                return Err(GitCacheError::NotFound(format!(
-                    "hydrated generation `{}` did not contain complete commit `{}`",
-                    manifest.generation, object_id
-                )));
-            }
-            self.expose_served_commit(&repo_dir, object_id).await?;
-            hydrated_commits += 1;
+            // This readiness check is intentionally EBS-local. Pulling a
+            // generation bundle from object storage can require importing a
+            // multi-GB pack before serving a tiny shallow/blobless clone; with
+            // proxy-on-miss requested, an EBS miss should proxy immediately and
+            // let the background warm path fill the local repo.
             info!(
                 %repo,
                 commit = %object_id,
-                generation = %manifest.generation,
-                elapsed_ms = elapsed_ms(hydrate_started),
-                "direct git cache prepare hydrated commit"
+                wants_count,
+                served_commits,
+                served_non_commit_wants,
+                elapsed_ms = elapsed_ms(started),
+                "direct git cache prepare missed local object"
             );
+            return Ok(false);
         }
 
         info!(
@@ -584,7 +545,6 @@ impl Materializer {
             wants_count,
             served_commits,
             served_non_commit_wants,
-            hydrated_commits,
             elapsed_ms = elapsed_ms(started),
             "direct git cache prepare satisfied upload-pack wants"
         );

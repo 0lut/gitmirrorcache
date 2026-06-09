@@ -768,20 +768,21 @@ Track 3 adds a request-scoped direct Git cold-miss proxy path. A direct
 upload-pack POST only considers proxying when the request includes
 `git-cache-use-proxy-on-miss`. After the normal repo-access proof, the API asks
 the domain to prepare the upload-pack wants from cache before proxying:
-EBS-local objects are checked without lazy fetching, and complete object-store
-commit manifests are hydrated into the local bare repo. If that cache prepare
-succeeds, the existing local `git upload-pack` path is used. If the cache still
-cannot satisfy the wants, HTTP(S) origins are proxied to upstream immediately
-and cache import is queued after the upstream response stream completes.
+EBS-local objects are checked without lazy fetching. This foreground readiness
+check intentionally does not hydrate object-store generation manifests, because
+restoring a large generation can block a tiny shallow/blobless clone on a
+multi-GB `index-pack`. If the local EBS cache can satisfy the wants, the
+existing local `git upload-pack` path is used. If EBS cannot satisfy the wants,
+HTTP(S) origins are proxied to upstream immediately and cache import is queued
+after the upstream response stream completes.
 
 Without the header, direct Git keeps the existing local read-through behavior.
 Background imports are bounded by `git_remote.background_import_concurrency`.
 
 This is Option A from the cold-fast plan: proxy first, then refetch/import in
 the background using the same request-scoped upstream auth. It intentionally
-duplicates upstream work on cache misses that are not recoverable from EBS or
-object-store manifests, but keeps first-clone latency close to the origin and
-avoids parsing or persisting upstream pack bytes in the HTTP hot path. Request
-auth is forwarded only as an upstream HTTP header, never logged or stored.
-Non-HTTP origins, including local test upstreams, fall back to the existing
-local read-through path.
+duplicates upstream work on cache misses, but keeps first-clone latency close
+to the origin and avoids parsing or persisting upstream pack bytes in the HTTP
+hot path. Request auth is forwarded only as an upstream HTTP header, never
+logged or stored. Non-HTTP origins, including local test upstreams, fall back to
+the existing local read-through path.
