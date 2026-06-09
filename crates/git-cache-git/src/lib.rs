@@ -306,6 +306,15 @@ impl Git {
         Ok(types)
     }
 
+    pub async fn cat_file_batch_types_no_lazy(
+        &self,
+        repo_dir: &Path,
+        object_ids: &[CommitSha],
+    ) -> Result<HashMap<CommitSha, String>> {
+        let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
+        git.cat_file_batch_types(repo_dir, object_ids).await
+    }
+
     pub async fn fsck(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(Some(repo_dir), ["fsck", "--connectivity-only"])
             .await
@@ -883,6 +892,15 @@ impl Git {
     {
         self.run_with_stdin_and_limits(cwd, args, None, self.output_limit, self.output_limit)
             .await
+    }
+
+    pub async fn run_no_lazy<I, S>(&self, cwd: Option<&Path>, args: I) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
+        git.run(cwd, args).await
     }
 
     fn map_upstream_git_error(&self, error: GitCacheError) -> GitCacheError {

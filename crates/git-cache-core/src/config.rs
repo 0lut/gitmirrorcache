@@ -94,6 +94,10 @@ impl AppConfig {
                     "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
                     true,
                 )?,
+                background_import_concurrency: parse_env(
+                    "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
+                    default_background_import_concurrency(),
+                )?,
             },
             compaction: CompactionConfig {
                 chain_depth_threshold: parse_env(
@@ -261,6 +265,8 @@ pub struct GitRemoteConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub commit_read_through: bool,
+    #[serde(default = "default_background_import_concurrency")]
+    pub background_import_concurrency: usize,
 }
 
 impl Default for GitRemoteConfig {
@@ -268,12 +274,17 @@ impl Default for GitRemoteConfig {
         Self {
             enabled: false,
             commit_read_through: true,
+            background_import_concurrency: default_background_import_concurrency(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_background_import_concurrency() -> usize {
+    1
 }
 
 fn default_allowed_upstream_hosts() -> Vec<String> {
@@ -376,6 +387,7 @@ mod tests {
         "GIT_CACHE_DISK_MIN_FREE_BYTES",
         "GIT_CACHE_GIT_REMOTE_ENABLED",
         "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
+        "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
         "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
         "GIT_CACHE_COMPACTION_INLINE",
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
@@ -476,6 +488,7 @@ min_free_bytes = 100000
         assert_eq!(config.git_timeout_seconds, 120);
         assert_eq!(config.rate_limit_per_minute, 120);
         assert_eq!(config.max_git_output_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.git_remote, GitRemoteConfig::default());
         assert_eq!(config.compaction, CompactionConfig::default());
         assert_eq!(config.max_concurrent_generation_verifications, 1);
         assert_eq!(config.leases, LeaseConfig::default());
@@ -503,6 +516,7 @@ min_free_bytes = 100000
         let config = GitRemoteConfig::default();
         assert!(!config.enabled);
         assert!(config.commit_read_through);
+        assert_eq!(config.background_import_concurrency, 1);
     }
 
     #[test]
@@ -510,6 +524,7 @@ min_free_bytes = 100000
         let config = GitRemoteConfig {
             enabled: true,
             commit_read_through: false,
+            background_import_concurrency: 2,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: GitRemoteConfig = serde_json::from_str(&json).unwrap();
@@ -528,6 +543,7 @@ min_free_bytes = 100000
             ("GIT_CACHE_ALLOWED_UPSTREAM_HOSTS", "github.com, gitlab.com"),
             ("GIT_CACHE_GIT_REMOTE_ENABLED", "true"),
             ("GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "off"),
+            ("GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY", "4"),
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
             ("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "3"),
@@ -547,6 +563,7 @@ min_free_bytes = 100000
         );
         assert!(config.git_remote.enabled);
         assert!(!config.git_remote.commit_read_through);
+        assert_eq!(config.git_remote.background_import_concurrency, 4);
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
         assert_eq!(config.max_concurrent_generation_verifications, 3);

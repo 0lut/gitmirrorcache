@@ -761,15 +761,39 @@ replay. Explicit verification paths used by compaction/recovery still keep the
 original full-chain fallback. Regression tests cover both the synchronous
 publish path and a child pending generation whose verified parent bundle has
 been deleted.
+### D19. Direct Git cold misses can proxy upstream before warming
 
-### D19. HTTP materialize uses API-local singleflight around leased work
+Track 3 adds a request-scoped direct Git cold-miss proxy path. A direct
+upload-pack POST only considers proxying when the request includes
+`git-cache-use-proxy-on-miss`. After the normal repo-access proof, the API asks
+the domain to prepare the upload-pack wants from cache before proxying:
+EBS-local objects are checked without lazy fetching. This foreground readiness
+check intentionally does not hydrate object-store generation manifests, because
+restoring a large generation can block a tiny shallow/blobless clone on a
+multi-GB `index-pack`. If the local EBS cache can satisfy the wants, the
+existing local `git upload-pack` path is used. If EBS cannot satisfy the wants,
+HTTP(S) origins are proxied to upstream immediately and cache import is queued
+after the upstream response stream completes.
+
+Without the header, direct Git keeps the existing local read-through behavior.
+Background imports are bounded by `git_remote.background_import_concurrency`.
+
+This is Option A from the cold-fast plan: proxy first, then refetch/import in
+the background using the same request-scoped upstream auth. It intentionally
+duplicates upstream work on cache misses, but keeps first-clone latency close
+to the origin and avoids parsing or persisting upstream pack bytes in the HTTP
+hot path. Request auth is forwarded only as an upstream HTTP header, never
+logged or stored. Non-HTTP origins, including local test upstreams, fall back to
+the existing local read-through path.
+
+### D20. HTTP materialize uses API-local singleflight around leased work
 
 After the current-`main` refactor, direct `/v1/materialize` lease acquisition
 regressed same-worker singleflight: every waiter could acquire `repo-write` in
 turn and repeat the same update. The API now keeps an in-process in-flight map
-keyed by repo, selector, request mode, upstream authorization policy, and auth
-scope. Host/auth validation and exact complete-commit cache hits run before that
-map and before durable lease acquisition; only cache misses join the leased
+keyed by repo, selector, upstream authorization policy, and auth scope.
+Host/auth validation and exact complete-commit cache hits run before that map
+and before durable lease acquisition; only cache misses join the leased
 materialize owner.
 
 The worker `UpdateCoordinator` remains the background/event coordinator. The
@@ -777,7 +801,7 @@ HTTP path uses an equivalent API-local singleflight instead of reusing the
 worker request type because HTTP materialize must carry request-scoped upstream
 auth and return the full `MaterializeResponse` to all waiters.
 
-### D20. Tokenless background paths reacquire durable leases
+### D21. Tokenless background paths reacquire durable leases
 
 Background pending-generation verification and inline/CLI compaction can be
 started from `Materializer::new(...)`, where `verify_lease_held()` intentionally
@@ -792,7 +816,7 @@ inside a held lease. Its cleanup validates that the compacted head promotion is
 still current before repointing manifests/deleting old generations, and final
 head publication uses the same CAS helper instead of an unconditional write.
 
-### D21. Portable local lock stale recovery
+### D22. Portable local lock stale recovery
 
 Local CAS locks still prefer PID liveness when `/proc` is available, but
 non-Linux hosts can no longer treat every PID-bearing lock as permanently live.
