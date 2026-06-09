@@ -117,11 +117,34 @@ impl AppConfig {
 }
 
 fn object_store_from_env() -> crate::Result<ObjectStoreConfig> {
-    match env::var("GIT_CACHE_OBJECT_STORE_KIND")
+    let kind = env::var("GIT_CACHE_OBJECT_STORE_KIND")
         .unwrap_or_else(|_| "local".into())
-        .to_ascii_lowercase()
-        .as_str()
-    {
+        .to_ascii_lowercase();
+
+    let s3_configured = env_present("GIT_CACHE_S3_BUCKET");
+    let gcs_configured = env_present("GIT_CACHE_GCS_BUCKET");
+    if s3_configured && gcs_configured {
+        return Err(crate::GitCacheError::Validation(
+            "a deployment uses exactly one durable object-store backend: \
+             both GIT_CACHE_S3_BUCKET and GIT_CACHE_GCS_BUCKET are set"
+                .into(),
+        ));
+    }
+    match (kind.as_str(), s3_configured, gcs_configured) {
+        ("s3", _, true) => {
+            return Err(crate::GitCacheError::Validation(
+                "GIT_CACHE_OBJECT_STORE_KIND=s3 conflicts with GIT_CACHE_GCS_BUCKET".into(),
+            ));
+        }
+        ("gcs", true, _) => {
+            return Err(crate::GitCacheError::Validation(
+                "GIT_CACHE_OBJECT_STORE_KIND=gcs conflicts with GIT_CACHE_S3_BUCKET".into(),
+            ));
+        }
+        _ => {}
+    }
+
+    match kind.as_str() {
         "local" => Ok(ObjectStoreConfig::Local {
             root: PathBuf::from(
                 env::var("GIT_CACHE_OBJECT_STORE_ROOT")
@@ -182,6 +205,12 @@ fn object_store_from_env() -> crate::Result<ObjectStoreConfig> {
             "unsupported GIT_CACHE_OBJECT_STORE_KIND `{other}`"
         ))),
     }
+}
+
+fn env_present(key: &str) -> bool {
+    env::var(key)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +596,34 @@ min_free_bytes = 100000
     #[test]
     fn from_env_rejects_s3_without_bucket() {
         let _env = EnvGuard::new(&[("GIT_CACHE_OBJECT_STORE_KIND", "s3")]);
+        assert!(AppConfig::from_env().is_err());
+    }
+
+    #[test]
+    fn from_env_rejects_both_s3_and_gcs_buckets() {
+        let _env = EnvGuard::new(&[
+            ("GIT_CACHE_OBJECT_STORE_KIND", "s3"),
+            ("GIT_CACHE_S3_BUCKET", "s3-bucket"),
+            ("GIT_CACHE_GCS_BUCKET", "gcs-bucket"),
+        ]);
+        assert!(AppConfig::from_env().is_err());
+    }
+
+    #[test]
+    fn from_env_rejects_s3_kind_with_gcs_bucket() {
+        let _env = EnvGuard::new(&[
+            ("GIT_CACHE_OBJECT_STORE_KIND", "s3"),
+            ("GIT_CACHE_GCS_BUCKET", "gcs-bucket"),
+        ]);
+        assert!(AppConfig::from_env().is_err());
+    }
+
+    #[test]
+    fn from_env_rejects_gcs_kind_with_s3_bucket() {
+        let _env = EnvGuard::new(&[
+            ("GIT_CACHE_OBJECT_STORE_KIND", "gcs"),
+            ("GIT_CACHE_S3_BUCKET", "s3-bucket"),
+        ]);
         assert!(AppConfig::from_env().is_err());
     }
 

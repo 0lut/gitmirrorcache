@@ -1,3 +1,9 @@
+#[cfg(all(feature = "s3", feature = "gcs"))]
+compile_error!(
+    "features `s3` and `gcs` are mutually exclusive: a deployment uses exactly one \
+     durable object-store backend"
+);
+
 mod local;
 mod manifests;
 

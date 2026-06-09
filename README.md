@@ -144,6 +144,10 @@ and setting `GIT_CACHE_OBJECT_STORE_KIND=s3`, `GIT_CACHE_S3_BUCKET`, and
 `GIT_CACHE_S3_PREFIX`. Runtime object-store namespaces are suffixed with `-v2`,
 so `GIT_CACHE_S3_PREFIX=repos` stores cache objects under `repos-v2`.
 
+A deployment uses exactly one durable backend: the `s3` and `gcs` features are
+mutually exclusive (enforced at compile time), and configuration rejects mixed
+`GIT_CACHE_S3_*` / `GIT_CACHE_GCS_*` bucket settings at startup.
+
 A Google Cloud Storage backend is available behind the `gcs` feature with
 `GIT_CACHE_OBJECT_STORE_KIND=gcs`, `GIT_CACHE_GCS_BUCKET`, and optional
 `GIT_CACHE_GCS_PREFIX` / `GIT_CACHE_GCS_ENDPOINT` (for emulators such as
