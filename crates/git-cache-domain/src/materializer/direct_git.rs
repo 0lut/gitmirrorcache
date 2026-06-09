@@ -251,10 +251,20 @@ impl Materializer {
             let mut refspecs: Vec<String> = Vec::new();
             let mut raw_objects: Vec<CommitSha> = Vec::new();
             for object_id in &pending {
-                match comparison.and_then(|comparison| comparison.branch_for_commit(object_id)) {
-                    Some(branch) => refspecs.push(format!(
-                        "+refs/heads/{branch}:refs/cache/upstream/heads/{branch}"
-                    )),
+                match comparison
+                    .and_then(|comparison| comparison.branch_for_commit(object_id))
+                    .map(git_cache_git::branch_cache_refspec)
+                {
+                    Some(Ok(refspec)) => refspecs.push(refspec),
+                    Some(Err(err)) => {
+                        warn!(
+                            %repo,
+                            %object_id,
+                            %err,
+                            "advertised branch name failed refspec validation; fetching as raw object"
+                        );
+                        raw_objects.push(object_id.clone());
+                    }
                     None => raw_objects.push(object_id.clone()),
                 }
             }

@@ -445,6 +445,26 @@ mod tests {
             .is_err());
     }
 
+    // ── branch_cache_refspec validation ─────────────────────────────────────
+
+    #[test]
+    fn branch_cache_refspec_accepts_normal_branch() {
+        assert_eq!(
+            git_cache_git::branch_cache_refspec("feature/foo-1.2").unwrap(),
+            "+refs/heads/feature/foo-1.2:refs/cache/upstream/heads/feature/foo-1.2"
+        );
+    }
+
+    #[test]
+    fn branch_cache_refspec_rejects_colon_in_branch() {
+        assert!(git_cache_git::branch_cache_refspec("evil:refs/heads/main").is_err());
+    }
+
+    #[test]
+    fn branch_cache_refspec_rejects_nul_in_branch() {
+        assert!(git_cache_git::branch_cache_refspec("bad\0branch").is_err());
+    }
+
     // ── fetch_objects sanitization ──────────────────────────────────────────
 
     #[tokio::test]

@@ -971,8 +971,21 @@ fn reject_remote_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Builds a force-fetch refspec that mirrors `refs/heads/{branch}` into
+/// `refs/cache/upstream/heads/{branch}`, validating the upstream-supplied
+/// branch name before it is interpolated into git arguments.
+pub fn branch_cache_refspec(branch: &str) -> Result<String> {
+    let upstream_ref = format!("refs/heads/{branch}");
+    let local_ref = format!("refs/cache/upstream/heads/{branch}");
+    reject_ref_arg(&upstream_ref, "upstream ref")?;
+    reject_ref_arg(&local_ref, "local ref")?;
+    let refspec = format!("+{upstream_ref}:{local_ref}");
+    reject_refspec(&refspec)?;
+    Ok(refspec)
+}
+
 fn reject_refspec(refspec: &str) -> Result<()> {
-    if refspec.is_empty() || refspec.contains('\0') {
+    if refspec.is_empty() || refspec.starts_with('-') || refspec.contains('\0') {
         return Err(GitCacheError::Validation(format!(
             "invalid refspec argument: {refspec:?}"
         )));
