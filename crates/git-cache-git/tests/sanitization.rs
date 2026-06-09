@@ -391,4 +391,77 @@ mod tests {
             .await
             .is_err());
     }
+
+    // ── fetch_refspecs sanitization ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_refspecs_rejects_dash_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_refspecs(Path::new("/unused"), "-evil", &[], Default::default())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refspecs_rejects_dash_refspec() {
+        let git = test_git();
+        assert!(git
+            .fetch_refspecs(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &["--upload-pack=evil".to_string()],
+                Default::default()
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refspecs_rejects_nul_in_refspec() {
+        let git = test_git();
+        assert!(git
+            .fetch_refspecs(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &["bad\0spec".to_string()],
+                Default::default()
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refspecs_rejects_empty_refspec() {
+        let git = test_git();
+        assert!(git
+            .fetch_refspecs(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &["".to_string()],
+                Default::default()
+            )
+            .await
+            .is_err());
+    }
+
+    // ── fetch_objects sanitization ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_objects_rejects_dash_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_objects(Path::new("/unused"), "-evil", &[], Default::default())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_objects_rejects_nul_in_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_objects(Path::new("/unused"), "url\0bad", &[], Default::default())
+            .await
+            .is_err());
+    }
 }

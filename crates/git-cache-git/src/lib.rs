@@ -619,14 +619,48 @@ impl Git {
         object_id: &CommitSha,
         options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
+        self.fetch_objects(
+            repo_dir,
+            remote_url,
+            std::slice::from_ref(object_id),
+            options,
+        )
+        .await
+    }
+
+    pub async fn fetch_objects(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        object_ids: &[CommitSha],
+        options: FetchOptions<'_>,
+    ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        reject_revision_arg(object_id.as_str())?;
+        for object_id in object_ids {
+            reject_revision_arg(object_id.as_str())?;
+        }
         let mut args = fetch_args_with_options(options)?;
-        args.extend([
-            OsString::from("--"),
-            OsString::from(remote_url),
-            OsString::from(object_id.as_str()),
-        ]);
+        args.push(OsString::from("--"));
+        args.push(OsString::from(remote_url));
+        args.extend(object_ids.iter().map(|id| OsString::from(id.as_str())));
+        self.run_upstream(Some(repo_dir), args).await
+    }
+
+    pub async fn fetch_refspecs(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        refspecs: &[String],
+        options: FetchOptions<'_>,
+    ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        for refspec in refspecs {
+            reject_refspec(refspec)?;
+        }
+        let mut args = fetch_args_with_options(options)?;
+        args.push(OsString::from("--"));
+        args.push(OsString::from(remote_url));
+        args.extend(refspecs.iter().map(OsString::from));
         self.run_upstream(Some(repo_dir), args).await
     }
 
