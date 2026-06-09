@@ -707,7 +707,10 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
         };
         let materializer = materializer.using_upstream_auth(&auth);
 
-        if proxy_on_miss_requested(&headers) {
+        if proxy_on_miss_enabled(
+            &headers,
+            state.domain.config.git_remote.proxy_on_miss_by_default,
+        ) {
             let local_check_started = Instant::now();
             let can_serve_locally = match materializer
                 .prepare_upload_pack_from_cache(&repo, &body)
@@ -945,8 +948,22 @@ fn upload_pack_endpoint(upstream_url: &str) -> Option<String> {
     ))
 }
 
-fn proxy_on_miss_requested(headers: &HeaderMap) -> bool {
-    headers.contains_key(PROXY_ON_MISS_HEADER)
+/// Whether the cold-miss upstream proxy should be used for this request.
+///
+/// The `git-cache-use-proxy-on-miss` header overrides the configured default:
+/// a falsey value (`0`, `false`, `no`, `off`) opts out, any other value opts
+/// in, and an absent header falls back to `default_enabled`.
+fn proxy_on_miss_enabled(headers: &HeaderMap, default_enabled: bool) -> bool {
+    let Some(value) = headers.get(PROXY_ON_MISS_HEADER) else {
+        return default_enabled;
+    };
+    let Ok(value) = value.to_str() else {
+        return default_enabled;
+    };
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 struct DirectGitWarmTask {
@@ -1363,13 +1380,21 @@ mod tests {
     }
 
     #[test]
-    fn proxy_on_miss_is_requested_by_header_presence() {
+    fn proxy_on_miss_header_overrides_configured_default() {
         let mut headers = HeaderMap::new();
-        assert!(!proxy_on_miss_requested(&headers));
+        assert!(!proxy_on_miss_enabled(&headers, false));
+        assert!(proxy_on_miss_enabled(&headers, true));
 
         headers.insert(PROXY_ON_MISS_HEADER, "1".parse().unwrap());
+        assert!(proxy_on_miss_enabled(&headers, false));
 
-        assert!(proxy_on_miss_requested(&headers));
+        for opt_out in ["0", "false", "no", "off", " Off "] {
+            headers.insert(PROXY_ON_MISS_HEADER, opt_out.parse().unwrap());
+            assert!(
+                !proxy_on_miss_enabled(&headers, true),
+                "{opt_out} should opt out"
+            );
+        }
     }
 
     #[test]

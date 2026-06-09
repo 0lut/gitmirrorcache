@@ -96,6 +96,10 @@ impl AppConfig {
                     "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
                     default_background_import_concurrency(),
                 )?,
+                proxy_on_miss_by_default: parse_bool_env(
+                    "GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT",
+                    true,
+                )?,
             },
             compaction: CompactionConfig {
                 chain_depth_threshold: parse_env(
@@ -207,6 +211,8 @@ pub struct GitRemoteConfig {
     pub commit_read_through: bool,
     #[serde(default = "default_background_import_concurrency")]
     pub background_import_concurrency: usize,
+    #[serde(default = "default_true")]
+    pub proxy_on_miss_by_default: bool,
 }
 
 impl Default for GitRemoteConfig {
@@ -215,6 +221,7 @@ impl Default for GitRemoteConfig {
             enabled: false,
             commit_read_through: true,
             background_import_concurrency: default_background_import_concurrency(),
+            proxy_on_miss_by_default: true,
         }
     }
 }
@@ -328,6 +335,7 @@ mod tests {
         "GIT_CACHE_GIT_REMOTE_ENABLED",
         "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
         "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
+        "GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT",
         "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
         "GIT_CACHE_COMPACTION_INLINE",
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
@@ -441,6 +449,7 @@ min_free_bytes = 100000
         assert!(!config.enabled);
         assert!(config.commit_read_through);
         assert_eq!(config.background_import_concurrency, 1);
+        assert!(config.proxy_on_miss_by_default);
     }
 
     #[test]
@@ -449,6 +458,7 @@ min_free_bytes = 100000
             enabled: true,
             commit_read_through: false,
             background_import_concurrency: 2,
+            proxy_on_miss_by_default: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: GitRemoteConfig = serde_json::from_str(&json).unwrap();
@@ -468,6 +478,7 @@ min_free_bytes = 100000
             ("GIT_CACHE_GIT_REMOTE_ENABLED", "true"),
             ("GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "off"),
             ("GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY", "4"),
+            ("GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT", "off"),
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
             ("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "3"),
@@ -483,6 +494,7 @@ min_free_bytes = 100000
         assert!(config.git_remote.enabled);
         assert!(!config.git_remote.commit_read_through);
         assert_eq!(config.git_remote.background_import_concurrency, 4);
+        assert!(!config.git_remote.proxy_on_miss_by_default);
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
         assert_eq!(config.max_concurrent_generation_verifications, 3);
