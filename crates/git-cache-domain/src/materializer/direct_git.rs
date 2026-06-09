@@ -74,6 +74,13 @@ impl DirectFetchOptions {
         self.hydrate_manifests = false;
         self
     }
+
+    fn git_options(self) -> git_cache_git::FetchOptions<'static> {
+        git_cache_git::FetchOptions {
+            filter: self.filter,
+            depth: self.depth,
+        }
+    }
 }
 
 impl Materializer {
@@ -250,13 +257,12 @@ impl Materializer {
                 let upstream_ref = format!("refs/heads/{branch}");
                 let local_ref = format!("refs/cache/upstream/heads/{branch}");
                 let ref_fetch_result = upstream_git
-                    .fetch_ref_with_options(
+                    .fetch_ref(
                         &repo_dir,
                         &upstream_url,
                         &upstream_ref,
                         &local_ref,
-                        fetch_options.filter,
-                        fetch_options.depth,
+                        fetch_options.git_options(),
                     )
                     .await;
                 match ref_fetch_result {
@@ -271,36 +277,29 @@ impl Materializer {
                             "direct git advertised-ref fetch failed; falling back to raw object fetch"
                         );
                         upstream_git
-                            .fetch_object_with_options(
+                            .fetch_object(
                                 &repo_dir,
                                 &upstream_url,
                                 object_id,
-                                fetch_options.filter,
-                                fetch_options.depth,
+                                fetch_options.git_options(),
                             )
                             .await
                     }
                 }
             } else {
                 upstream_git
-                    .fetch_object_with_options(
+                    .fetch_object(
                         &repo_dir,
                         &upstream_url,
                         object_id,
-                        fetch_options.filter,
-                        fetch_options.depth,
+                        fetch_options.git_options(),
                     )
                     .await
             };
 
             if let Err(fetch_err) = fetch_result {
                 upstream_git
-                    .fetch_all_heads_with_options(
-                        &repo_dir,
-                        &upstream_url,
-                        fetch_options.filter,
-                        fetch_options.depth,
-                    )
+                    .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
                     .await?;
                 match self
                     .prepare_fetched_direct_want(repo, &repo_dir, object_id)
@@ -330,12 +329,11 @@ impl Materializer {
                         "direct git advertised-ref fetch did not include wanted object; falling back to raw object fetch"
                     );
                     upstream_git
-                        .fetch_object_with_options(
+                        .fetch_object(
                             &repo_dir,
                             &upstream_url,
                             object_id,
-                            fetch_options.filter,
-                            fetch_options.depth,
+                            fetch_options.git_options(),
                         )
                         .await?;
                     self.prepare_fetched_direct_want(repo, &repo_dir, object_id)

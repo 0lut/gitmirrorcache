@@ -33,6 +33,32 @@ pub struct GitOutput {
     pub stderr: Vec<u8>,
 }
 
+impl GitOutput {
+    /// Decode stdout as UTF-8, mapping failures to a `Validation` error
+    /// naming the originating git command.
+    pub fn stdout_utf8(self, command: &str) -> Result<String> {
+        String::from_utf8(self.stdout).map_err(|err| {
+            GitCacheError::Validation(format!("git {command} returned non-utf8: {err}"))
+        })
+    }
+
+    /// Decode stdout as UTF-8, mapping failures to an `UpstreamUnavailable`
+    /// error for commands that talk to a remote.
+    pub fn stdout_utf8_upstream(self, command: &str) -> Result<String> {
+        String::from_utf8(self.stdout).map_err(|err| {
+            GitCacheError::UpstreamUnavailable(format!("{command} returned non-utf8: {err}"))
+        })
+    }
+}
+
+/// Optional flags shared by upstream fetch helpers. All fields are validated
+/// (`reject_fetch_filter`, `reject_fetch_depth`) before reaching git argv.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FetchOptions<'a> {
+    pub filter: Option<&'a str>,
+    pub depth: Option<u32>,
+}
+
 impl Git {
     pub fn new(binary: impl Into<PathBuf>, timeout: Duration) -> Self {
         Self::with_concurrency_limit(
@@ -113,11 +139,9 @@ impl Git {
                 ["rev-parse", "--verify", "--end-of-options", rev],
             )
             .await?;
-        String::from_utf8(output.stdout)
+        output
+            .stdout_utf8("rev-parse")
             .map(|value| value.trim().to_string())
-            .map_err(|err| {
-                GitCacheError::Validation(format!("git rev-parse returned non-utf8: {err}"))
-            })
     }
 
     pub async fn is_ancestor(
@@ -156,9 +180,7 @@ impl Git {
                 ["for-each-ref", "--format=%(objectname)", "--", ref_prefix],
             )
             .await?;
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
-        })?;
+        let text = output.stdout_utf8("for-each-ref")?;
         text.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| CommitSha::parse(line.trim()))
@@ -182,9 +204,7 @@ impl Git {
                 ],
             )
             .await?;
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
-        })?;
+        let text = output.stdout_utf8("for-each-ref")?;
         let mut refs = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -224,9 +244,7 @@ impl Git {
         }
 
         let output = self.run(Some(repo_dir), args).await?;
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
-        })?;
+        let text = output.stdout_utf8("for-each-ref")?;
         text.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| CommitSha::parse(line.trim()))
@@ -260,9 +278,7 @@ impl Git {
                 self.output_limit,
             )
             .await?;
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::Validation(format!("git rev-list returned non-utf8: {err}"))
-        })?;
+        let text = output.stdout_utf8("rev-list")?;
         Ok(text.lines().any(|line| line.trim() == object_id.as_str()))
     }
 
@@ -287,9 +303,7 @@ impl Git {
                 self.output_limit,
             )
             .await?;
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::Validation(format!("git cat-file returned non-utf8: {err}"))
-        })?;
+        let text = output.stdout_utf8("cat-file")?;
 
         let mut types = HashMap::new();
         for line in text.lines() {
@@ -411,9 +425,7 @@ impl Git {
             )
             .await?;
 
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
-        })?;
+        let text = output.stdout_utf8_upstream("ls-remote")?;
 
         let mut refs = HashMap::new();
         let mut default_branch: Option<String> = None;
@@ -451,9 +463,7 @@ impl Git {
             .run_upstream(None, ["ls-remote", "--symref", "--", remote, "HEAD"])
             .await?;
 
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::UpstreamUnavailable(format!("ls-remote returned non-utf8: {err}"))
-        })?;
+        let text = output.stdout_utf8_upstream("ls-remote")?;
 
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
@@ -607,33 +617,11 @@ impl Git {
         repo_dir: &Path,
         remote_url: &str,
         object_id: &CommitSha,
-    ) -> Result<GitOutput> {
-        self.fetch_object_with_options(repo_dir, remote_url, object_id, None, None)
-            .await
-    }
-
-    pub async fn fetch_object_with_filter(
-        &self,
-        repo_dir: &Path,
-        remote_url: &str,
-        object_id: &CommitSha,
-        filter: Option<&str>,
-    ) -> Result<GitOutput> {
-        self.fetch_object_with_options(repo_dir, remote_url, object_id, filter, None)
-            .await
-    }
-
-    pub async fn fetch_object_with_options(
-        &self,
-        repo_dir: &Path,
-        remote_url: &str,
-        object_id: &CommitSha,
-        filter: Option<&str>,
-        depth: Option<u32>,
+        options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
         reject_revision_arg(object_id.as_str())?;
-        let mut args = fetch_args_with_options(filter, depth)?;
+        let mut args = fetch_args_with_options(options)?;
         args.extend([
             OsString::from("--"),
             OsString::from(remote_url),
@@ -642,30 +630,14 @@ impl Git {
         self.run_upstream(Some(repo_dir), args).await
     }
 
-    pub async fn fetch_all_heads(&self, repo_dir: &Path, remote_url: &str) -> Result<GitOutput> {
-        self.fetch_all_heads_with_filter(repo_dir, remote_url, None)
-            .await
-    }
-
-    pub async fn fetch_all_heads_with_filter(
+    pub async fn fetch_all_heads(
         &self,
         repo_dir: &Path,
         remote_url: &str,
-        filter: Option<&str>,
-    ) -> Result<GitOutput> {
-        self.fetch_all_heads_with_options(repo_dir, remote_url, filter, None)
-            .await
-    }
-
-    pub async fn fetch_all_heads_with_options(
-        &self,
-        repo_dir: &Path,
-        remote_url: &str,
-        filter: Option<&str>,
-        depth: Option<u32>,
+        options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        let mut args = fetch_args_with_options(filter, depth)?;
+        let mut args = fetch_args_with_options(options)?;
         args.push(OsString::from("--prune"));
         args.extend([
             OsString::from("--"),
@@ -675,14 +647,13 @@ impl Git {
         self.run_upstream(Some(repo_dir), args).await
     }
 
-    pub async fn fetch_ref_with_options(
+    pub async fn fetch_ref(
         &self,
         repo_dir: &Path,
         remote_url: &str,
         upstream_ref: &str,
         local_ref: &str,
-        filter: Option<&str>,
-        depth: Option<u32>,
+        options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
         reject_ref_arg(upstream_ref, "upstream ref")?;
@@ -692,7 +663,7 @@ impl Git {
 
         let refspec = format!("+{upstream_ref}:{local_ref}");
         reject_refspec(&refspec)?;
-        let mut args = fetch_args_with_options(filter, depth)?;
+        let mut args = fetch_args_with_options(options)?;
         args.extend([
             OsString::from("--"),
             OsString::from(remote_url),
@@ -993,13 +964,13 @@ fn reject_fetch_depth(depth: u32) -> Result<()> {
     Ok(())
 }
 
-fn fetch_args_with_options(filter: Option<&str>, depth: Option<u32>) -> Result<Vec<OsString>> {
+fn fetch_args_with_options(options: FetchOptions<'_>) -> Result<Vec<OsString>> {
     let mut args = vec![OsString::from("fetch"), OsString::from("--no-tags")];
-    if let Some(depth) = depth {
+    if let Some(depth) = options.depth {
         reject_fetch_depth(depth)?;
         args.push(OsString::from(format!("--depth={depth}")));
     }
-    if let Some(filter) = filter {
+    if let Some(filter) = options.filter {
         reject_fetch_filter(filter)?;
         args.push(OsString::from("--filter=blob:none"));
     }
@@ -1486,7 +1457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_ref_with_options_passes_depth_and_filter_before_remote() {
+    async fn fetch_ref_passes_depth_and_filter_before_remote() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1520,13 +1491,15 @@ printf '\n' >> "$FAKE_ARGS_OUT"
 
         let git = Git::new(&script, Duration::from_secs(5))
             .with_env("FAKE_ARGS_OUT", args_out.as_os_str().to_os_string());
-        git.fetch_ref_with_options(
+        git.fetch_ref(
             &repo_dir,
             "https://github.com/org/repo.git",
             "refs/heads/main",
             "refs/cache/upstream/heads/main",
-            Some("blob:none"),
-            Some(1),
+            FetchOptions {
+                filter: Some("blob:none"),
+                depth: Some(1),
+            },
         )
         .await
         .unwrap();
@@ -1675,64 +1648,63 @@ printf '\n' >> "$FAKE_ARGS_OUT"
     }
 
     #[tokio::test]
-    async fn fetch_ref_with_options_rejects_dash_url() {
+    async fn fetch_ref_rejects_dash_url() {
         let git = test_git();
         assert!(git
-            .fetch_ref_with_options(
+            .fetch_ref(
                 Path::new("/unused"),
                 "-evil",
                 "refs/heads/main",
                 "refs/cache/upstream/heads/main",
-                None,
-                None,
+                FetchOptions::default(),
             )
             .await
             .is_err());
     }
 
     #[tokio::test]
-    async fn fetch_ref_with_options_rejects_dash_upstream_ref() {
+    async fn fetch_ref_rejects_dash_upstream_ref() {
         let git = test_git();
         assert!(git
-            .fetch_ref_with_options(
+            .fetch_ref(
                 Path::new("/unused"),
                 "https://example.com/repo.git",
                 "-evil",
                 "refs/cache/upstream/heads/main",
-                None,
-                None,
+                FetchOptions::default(),
             )
             .await
             .is_err());
     }
 
     #[tokio::test]
-    async fn fetch_ref_with_options_rejects_dash_local_ref() {
+    async fn fetch_ref_rejects_dash_local_ref() {
         let git = test_git();
         assert!(git
-            .fetch_ref_with_options(
+            .fetch_ref(
                 Path::new("/unused"),
                 "https://example.com/repo.git",
                 "refs/heads/main",
                 "-evil",
-                None,
-                None,
+                FetchOptions::default(),
             )
             .await
             .is_err());
     }
 
     #[tokio::test]
-    async fn fetch_object_with_options_rejects_zero_depth() {
+    async fn fetch_object_rejects_zero_depth() {
         let git = test_git();
         let commit = CommitSha::parse("a".repeat(40)).unwrap();
         assert!(git
-            .fetch_object_with_options(
+            .fetch_object(
                 Path::new("/unused"),
                 "https://example.com/repo.git",
                 &commit,
-                None,
-                Some(0),
+                FetchOptions {
+                    filter: None,
+                    depth: Some(0),
+                },
             )
             .await
             .is_err());

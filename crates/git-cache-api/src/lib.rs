@@ -271,7 +271,8 @@ async fn materialize(
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
     let auth = upstream_api_auth(&headers)?;
-    handle_materialize_request(&state, request, auth).await
+    handle_checked_materialize_request(&state, MaterializeEndpoint::Materialize, request, auth)
+        .await
 }
 
 async fn resolve(
@@ -280,7 +281,7 @@ async fn resolve(
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
     let auth = upstream_api_auth(&headers)?;
-    handle_resolve_request(&state, request, auth).await
+    handle_checked_materialize_request(&state, MaterializeEndpoint::Resolve, request, auth).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -296,22 +297,6 @@ impl MaterializeEndpoint {
             Self::Resolve => "resolve",
         }
     }
-}
-
-async fn handle_materialize_request(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-) -> Result<Response, ApiError> {
-    handle_checked_materialize_request(state, MaterializeEndpoint::Materialize, request, auth).await
-}
-
-async fn handle_resolve_request(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-) -> Result<Response, ApiError> {
-    handle_checked_materialize_request(state, MaterializeEndpoint::Resolve, request, auth).await
 }
 
 async fn handle_checked_materialize_request(
@@ -401,10 +386,7 @@ async fn handle_checked_materialize_request_inner(
             }
         };
 
-    let result = match endpoint {
-        MaterializeEndpoint::Materialize => run_materialize_request(state, request, auth).await,
-        MaterializeEndpoint::Resolve => run_resolve_request(state, request, auth).await,
-    };
+    let result = run_domain_request(state, endpoint, request, auth).await;
     match &result {
         Ok(_) => info!(
             request_id,
@@ -424,75 +406,53 @@ async fn handle_checked_materialize_request_inner(
     result
 }
 
-async fn run_materialize_request(
+async fn run_domain_request(
     state: &Arc<ApiState>,
+    endpoint: MaterializeEndpoint,
     request: MaterializeRequest,
     auth: UpstreamAuth,
 ) -> Result<Response, ApiError> {
     let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
     let domain_started = Instant::now();
-    let result = materializer.materialize(request).await;
-    match &result {
-        Ok(response) => info!(
-            repo = %response.repo,
-            commit = %response.commit,
-            source = ?response.source,
-            elapsed_ms = elapsed_ms(domain_started),
-            "domain materialize finished"
-        ),
-        Err(error) => info!(
+    let result = match endpoint {
+        MaterializeEndpoint::Materialize => {
+            materializer.materialize(request).await.map(|response| {
+                info!(
+                    repo = %response.repo,
+                    commit = %response.commit,
+                    source = ?response.source,
+                    elapsed_ms = elapsed_ms(domain_started),
+                    "domain materialize finished"
+                );
+                Json(response).into_response()
+            })
+        }
+        MaterializeEndpoint::Resolve => materializer.resolve(request).await.map(|response| {
+            info!(
+                repo = %response.repo,
+                commit = %response.commit,
+                source = ?response.source,
+                cache_available = response.cache_available,
+                elapsed_ms = elapsed_ms(domain_started),
+                "domain resolve finished"
+            );
+            Json(response).into_response()
+        }),
+    };
+
+    result.map_err(|error| {
+        info!(
+            endpoint = endpoint.name(),
             error = %error,
             elapsed_ms = elapsed_ms(domain_started),
-            "domain materialize failed"
-        ),
-    }
-
-    match result {
-        Ok(response) => Ok(Json(response).into_response()),
-        Err(error) => {
-            state
-                .metrics
-                .materialize_errors_total
-                .fetch_add(1, Ordering::Relaxed);
-            Err(error.into())
-        }
-    }
-}
-
-async fn run_resolve_request(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-) -> Result<Response, ApiError> {
-    let materializer = Materializer::new(Arc::clone(&state.domain)).using_upstream_auth(&auth);
-    let domain_started = Instant::now();
-    let result = materializer.resolve(request).await;
-    match &result {
-        Ok(response) => info!(
-            repo = %response.repo,
-            commit = %response.commit,
-            source = ?response.source,
-            cache_available = response.cache_available,
-            elapsed_ms = elapsed_ms(domain_started),
-            "domain resolve finished"
-        ),
-        Err(error) => info!(
-            error = %error,
-            elapsed_ms = elapsed_ms(domain_started),
-            "domain resolve failed"
-        ),
-    }
-
-    match result {
-        Ok(response) => Ok(Json(response).into_response()),
-        Err(error) => {
-            state
-                .metrics
-                .materialize_errors_total
-                .fetch_add(1, Ordering::Relaxed);
-            Err(error.into())
-        }
-    }
+            "domain request failed"
+        );
+        state
+            .metrics
+            .materialize_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        error.into()
+    })
 }
 
 struct CheckedMaterializeRequest {
@@ -1420,7 +1380,9 @@ mod tests {
         };
         let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
 
-        let result = handle_resolve_request(&state, request, auth).await;
+        let result =
+            handle_checked_materialize_request(&state, MaterializeEndpoint::Resolve, request, auth)
+                .await;
 
         match result {
             Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),
