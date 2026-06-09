@@ -826,3 +826,11 @@ non-Linux hosts can no longer treat every PID-bearing lock as permanently live.
 When liveness is unknown, PID-bearing locks fall back to the same age-based
 stale threshold used for legacy PID-less locks, so crash leftovers eventually
 recover without manual cleanup.
+
+### D23. Test module hosting merge keeps existing regressions
+
+Latest `main` moved test shards under private `tests` modules. The conflict
+resolution preserves the multi-worker regression tests and adopts the module
+hosting layout. The object-store strace helper's exact test path now includes
+the nested module name so the parent durability test still invokes the ignored
+helper under `strace`.
