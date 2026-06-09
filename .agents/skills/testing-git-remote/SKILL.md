@@ -81,51 +81,30 @@ curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8080/git/evil.com/org/r
 curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8080/git/github.com/octocat/Hello-World.git/info/refs?service=git-receive-pack"
 ```
 
-## Cold-Cache Perf Testing on an AWS Preview Stack
+## Cold-Cache Perf Testing
 
-A fresh preview stack (`scripts/aws/deploy-preview.sh <ref>`) guarantees a cold EBS
-cache (isolated stack + S3 prefix), making it the right environment for read-through
-perf measurements.
+Local perf observations that apply regardless of where the server runs:
 
 - **Opt out of proxy-on-miss or you measure the proxy, not the cache.** Since
   proxy-on-miss became the default, read-through benchmarks must send a falsey header:
   ```bash
-  git clone -c http.extraHeader="git-cache-use-proxy-on-miss: 0" \
-    http://<ALB>/v/<VERSION_ID>/git/github.com/<owner>/<repo>.git
+  git clone -c http.extraHeader="git-cache-use-proxy-on-miss: 0" <base-url>/git/github.com/<owner>/<repo>.git
   ```
-- **Time the clone yourself** (`S=$(date +%s.%N); git clone ...; date +%s.%N`).
-  `/usr/bin/time` may not be installed.
-- **Assert on server logs, not just wall time.** Tail CloudWatch
-  (`aws logs tail /ecs/gmc-p-<VERSION_ID>/ec2-api --region us-west-2 --since 20m --format short`)
-  and check:
+- **Assert on server logs, not just wall time.** A healthy cold clone shows:
   - one `direct git batched read-through fetch for wanted commits` line with
     `refspec_count` ≈ the repo's advertised ref count (700+ for astral repos);
-  - upstream `git command finished args=["fetch", ...]` lines: should be ≤ 3 per cold
+  - upstream `git command finished args=["fetch", ...]` lines: ≤ 3 per cold
     clone, not one per want;
   - exactly one `queued direct git background fsck` per upload-pack request.
-- **Reference numbers** (m8g.2xlarge preview, full clone of astral-sh/ruff, ~727 refs):
-  batched cold ≈ 37s, warm ≈ 9s, GitHub direct ≈ 9s. If cold is in the hundreds of
-  seconds, the per-want fetch storm may have regressed.
 - A fresh `git clone` wants the tip of EVERY advertised ref, so many-ref repos
   (astral-sh/ruff, astral-sh/uv, llvm) are the right stress tests; few-ref repos
   (octocat/Hello-World) won't exercise batching.
+- **Time the clone yourself** (`S=$(date +%s.%N); git clone ...; date +%s.%N`).
+  `/usr/bin/time` may not be installed.
 
-### Cross-build + preview deploy gotchas
-
-- `scripts/aws/build-image-cross.sh` tags the ECR image with the SHORT commit sha,
-  but `deploy-preview.sh` defaults `IMAGE_TAG` to the 12-char VERSION_ID. To reuse a
-  cross-built image, pass it explicitly:
-  ```bash
-  IMAGE_TAG=$(git rev-parse --short HEAD) ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true \
-    AWS_REGION=us-west-2 scripts/aws/deploy-preview.sh $(git rev-parse HEAD)
-  ```
-  Otherwise the deploy falls back to a slow QEMU docker build on the box.
-- The cross build needs `gcc-aarch64-linux-gnu`; if `apt-get install` 404s, run
-  `sudo apt-get update` first (stale package index).
-- Export AWS creds in EVERY shell that runs AWS scripts (they don't inherit across
-  shell tabs).
-- A killed/partial preview deploy still leaves billable resources (EC2 instance, ALB
-  rule); clean up with `VERSION_ID=<id> scripts/aws/destroy-preview.sh`.
+For perf testing against live AWS preview stacks (deploy, CloudWatch log
+assertions, cross-build gotchas, reference numbers), see the privileged runbook:
+[gitmirrorcache-deploy](../../../.devin/skills/gitmirrorcache-deploy/SKILL.md).
 
 ## Known Limitations
 
@@ -147,6 +126,8 @@ When modifying input validators (`reject_remote_url`, `reject_refspec`, `reject_
    refspecs must be validated per-component (e.g. `branch_cache_refspec`) — `reject_refspec`
    alone allows `:` because refspecs legitimately contain it
 
-## Devin Secrets Needed
+## Secrets Needed
 
-- `AWS_Access_Key` — only for live preview-stack testing (format: `ACCESS_KEY_ID,SECRET_ACCESS_KEY` on the last line). Local testing needs no secrets.
+None — all testing uses public GitHub repos and local infrastructure.
+For AWS preview-stack perf testing, see
+[gitmirrorcache-deploy](../../../.devin/skills/gitmirrorcache-deploy/SKILL.md).

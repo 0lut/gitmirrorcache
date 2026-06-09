@@ -72,7 +72,31 @@ VERSION_ID=<12-char-commit> scripts/aws/destroy-preview.sh   # teardown
   `/v/<VERSION_ID>` (e.g. `http://gitmirrorcache-arm-preview-alb-<id>.us-west-2.elb.amazonaws.com/v/<VERSION_ID>/healthz`).
 - Set `ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true` to skip the local Docker
   build when the ECR tag already exists (e.g. after `build-image-cross.sh`).
+- **IMAGE_TAG mismatch gotcha**: `build-image-cross.sh` pushes the ECR image
+  tagged with the SHORT commit sha, but `deploy-preview.sh` defaults `IMAGE_TAG`
+  to the 12-char VERSION_ID. To reuse a cross-built image, pass it explicitly
+  or the deploy silently falls back to a slow QEMU docker build:
+  ```sh
+  IMAGE_TAG=$(git rev-parse --short HEAD) ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true \
+    AWS_REGION=us-west-2 scripts/aws/deploy-preview.sh $(git rev-parse HEAD)
+  ```
 - API logs: `aws logs tail /ecs/gmc-p-<VERSION_ID>/ec2-api --region us-west-2 --since 15m --format short`
+- A killed/partial preview deploy still leaves billable resources (EC2
+  instance, ALB rule); clean up with `VERSION_ID=<id> scripts/aws/destroy-preview.sh`.
+
+### Cold-cache perf testing on a preview stack
+
+A fresh preview stack guarantees a cold EBS cache (isolated stack + S3 prefix),
+making it the right environment for read-through perf measurements. Benchmarks
+must opt out of proxy-on-miss (`-c http.extraHeader="git-cache-use-proxy-on-miss: 0"`)
+or they measure the proxy, not the cache; use many-ref repos (astral-sh/ruff,
+astral-sh/uv) as stress tests. Assert on CloudWatch logs, not just wall time —
+see "Cold-Cache Perf Testing" in
+[testing-git-remote](../../../.agents/skills/testing-git-remote/SKILL.md) for
+the expected log lines. Reference numbers (m8g.2xlarge preview, full clone of
+astral-sh/ruff, ~727 refs): batched cold ≈ 37s, warm ≈ 9s, GitHub direct ≈ 9s.
+If cold is in the hundreds of seconds, the per-want fetch storm may have
+regressed.
 
 ## arm64 image build WITHOUT a buildbox (preferred)
 
@@ -88,8 +112,9 @@ ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true IMAGE_TAG=<tag> \
   AWS_REGION=us-west-2 scripts/aws/deploy-and-smoke.sh
 ```
 
-Prereqs (baked into the Devin VM snapshot): `gcc-aarch64-linux-gnu`, the
-`aarch64-unknown-linux-gnu` rustup target, AWS CLI v2. The script registers
+Prereqs: `gcc-aarch64-linux-gnu`, the `aarch64-unknown-linux-gnu` rustup
+target, AWS CLI v2. If `apt-get install gcc-aarch64-linux-gnu` 404s, run
+`sudo apt-get update` first (stale package index). The script registers
 the qemu binfmt handler itself if missing. `PUSH=false` does a local-only
 `--load` build (no AWS access needed). The script is Linux-only; on macOS
 (Apple Silicon) build the full Dockerfile natively:
