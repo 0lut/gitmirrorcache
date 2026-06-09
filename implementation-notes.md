@@ -834,3 +834,12 @@ resolution preserves the multi-worker regression tests and adopts the module
 hosting layout. The object-store strace helper's exact test path now includes
 the nested module name so the parent durability test still invokes the ignored
 helper under `strace`.
+
+### D24. Latest main API simplification keeps fenced materialize/resolve
+
+Latest `main` simplified materialize/resolve request plumbing around direct
+domain calls. The merge keeps the shared checked-request wrapper where possible,
+but preserves the PR's split execution paths for mutable work: `/v1/materialize`
+still uses cache-hit-before-lease plus API-local singleflight around the leased
+owner, and short-commit `/v1/resolve` still reacquires `repo-write` before
+calling `Materializer::resolve`.

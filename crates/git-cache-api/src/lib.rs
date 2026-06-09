@@ -399,7 +399,8 @@ async fn materialize(
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
     let auth = upstream_api_auth(&headers)?;
-    handle_materialize_request(&state, request, auth).await
+    handle_checked_materialize_request(&state, MaterializeEndpoint::Materialize, request, auth)
+        .await
 }
 
 async fn resolve(
@@ -408,7 +409,7 @@ async fn resolve(
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
     let auth = upstream_api_auth(&headers)?;
-    handle_resolve_request(&state, request, auth).await
+    handle_checked_materialize_request(&state, MaterializeEndpoint::Resolve, request, auth).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -424,22 +425,6 @@ impl MaterializeEndpoint {
             Self::Resolve => "resolve",
         }
     }
-}
-
-async fn handle_materialize_request(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-) -> Result<Response, ApiError> {
-    handle_checked_materialize_request(state, MaterializeEndpoint::Materialize, request, auth).await
-}
-
-async fn handle_resolve_request(
-    state: &Arc<ApiState>,
-    request: MaterializeRequest,
-    auth: UpstreamAuth,
-) -> Result<Response, ApiError> {
-    handle_checked_materialize_request(state, MaterializeEndpoint::Resolve, request, auth).await
 }
 
 async fn handle_checked_materialize_request(
@@ -1859,7 +1844,9 @@ mod tests {
         };
         let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
 
-        let result = handle_resolve_request(&state, request, auth).await;
+        let result =
+            handle_checked_materialize_request(&state, MaterializeEndpoint::Resolve, request, auth)
+                .await;
 
         match result {
             Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),

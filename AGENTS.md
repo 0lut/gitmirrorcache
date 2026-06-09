@@ -1,94 +1,118 @@
-# Agent Guidelines — gitmirrorcache
+# Agent Guidelines - gitmirrorcache
 
-## Git argument sanitization
+Keep this file short and current. Prefer the repo's checked-in docs, scripts,
+and tests over ad-hoc operational steps.
 
-All `git-cache-git` methods that shell out to `git` **must** validate caller-supplied args. Unvalidated strings risk flag injection (`-` prefix) or NUL-byte truncation.
+## Git Boundaries
 
-### Rules
+- Unvalidated git arguments are production-safety bugs: option-looking values
+  can become flag injection, and NUL bytes can truncate what git receives.
+- Any public or private boundary that moves external or caller-derived input
+  toward `git` must validate at the top, before building refspecs/config/env
+  entries or calling `self.run(...)`, `run_upstream(...)`, or `spawn(...)`.
+- Treat API paths, query params, request bodies, headers, config, URLs, refs,
+  revisions, refspecs, filters, depths, and upload-pack intent as external
+  unless the value was created entirely inside the wrapper.
+- Keep repo path inputs behind `RepoKey`, `repo_from_git_path`, and
+  `validate_host`; never join raw URL/path segments into cache paths.
+- Use the narrowest helper: `reject_ref_arg`, `reject_revision_arg`,
+  `reject_config_key`, `reject_remote_url`, `reject_refspec`,
+  `reject_fetch_filter`, `reject_fetch_depth`, or `reject_nul`.
+- External strings must reject empty values, leading `-` when git may parse them
+  as args, and NUL bytes. Refs reject `:`; revisions may allow `HEAD:path`;
+  refspecs may allow `+` and `:`.
+- Put `--` before positional args wherever git accepts it.
+- Keep upstream auth out of argv, logs, and manifests. Use `with_upstream_auth`
+  and the wrapper's `GIT_CONFIG_*` env plumbing for credentials.
+- Remote Git URLs should come from configured upstream roots or validated
+  `upstream_url` construction; do not add arbitrary caller-supplied fetch/proxy
+  URLs.
+- New wrapper checklist: identify external inputs, choose/create the narrowest
+  validator, validate before composing git args, add `--` or `--end-of-options`
+  where supported, and test rejected leading-dash/NUL input plus any
+  helper-specific constraints.
 
-1. **Validate early** — call `reject_*` helpers (`reject_ref_arg`, `reject_revision_arg`, `reject_config_key`, …) at the top of every public method forwarding input to git. Reject: empty strings, `-`-prefixed, `\0`-containing.
-2. **Use `--`** to separate flags from positional args wherever git accepts it.
-3. **Pick the narrowest validator** — `reject_config_key` for config (allows `=`), `reject_ref_arg` for refs (rejects `:`), `reject_revision_arg` for revisions (allows `:` for `HEAD:path`).
-4. **Never pass unvalidated external input to git** — URLs, query params, request body fields included.
+## Current Cache Contract
 
-### New git wrapper checklist
+- `MaterializeRequest` is intentionally small: `repo`, `selector`, and optional
+  `upstream_authorization`. Request bodies deny unknown fields; do not revive
+  the removed `mode` or session contract.
+- HTTP materialize/resolve should call `Materializer::materialize` or
+  `Materializer::resolve` directly after rate limiting and auth checks. Keep the
+  worker coordinator for cron, event hints, and explicit warming.
+- Exact commit materialization should use complete cached generation metadata
+  before contacting upstream. Branch and default-branch materialization must
+  verify upstream refs.
+- Direct Git uses `/git/{host}/{owner}/{repo}.git`, rejects receive-pack, and
+  serves from the shared bare repo under `cache_root/repos/...`.
+- Direct Git GET proves repo access via `ls-remote` only. POST read-through uses
+  the same request-scoped auth and must preserve shallow/blobless intent
+  (`depth`, `blob:none`) when fetching wants.
+- `git-cache-use-proxy-on-miss` is the only cold-miss proxy opt-in. Proxy only
+  HTTP(S) upstreams, enforce streamed byte limits, forward auth only to upstream,
+  then queue a bounded background warm. The proxy readiness/background warm
+  paths should not hydrate generation manifests.
 
-1. Identify external-input args.
-2. Choose/create appropriate `reject_*` validator.
-3. Call validator before `self.run(…)`.
-4. Add `--` where git supports it.
-5. Test that `-`-prefixed input is rejected.
+## Runtime Safety
 
-## Runtime safety
+- Production code must not panic for recoverable errors.
 
-Panics must never happen in production code. OOM from unbounded allocations
-must not happen. Resource exhaustion (processes, file descriptors, disk) must
-be bounded.
+### Mutex Poisoning
 
-### Mutex poisoning
-
-**Never use `.expect()` or `.unwrap()` on `Mutex::lock()` in production code.**
-A poisoned mutex means another thread panicked while holding the lock. Calling
-`.expect()` converts that into a second panic, permanently bricking the
-subsystem.
-
-Correct pattern (already used in `git-cache-worker`):
+- Never use `.expect()` or `.unwrap()` on `Mutex::lock()` outside `#[cfg(test)]`.
+  A poisoned lock means another thread panicked while holding it; panicking again
+  can permanently brick the subsystem.
+- When returning `Result`, map poison to an internal error:
 
 ```rust
 let state = self.state.lock()
     .map_err(|_| GitCacheError::Internal("description of what poisoned".into()))?;
 ```
 
-When the return type is not `Result` (e.g. `-> bool`), use:
+- When the function cannot return `Result`, use a fail-closed safe default:
 
 ```rust
 let Ok(mut state) = self.state.lock() else {
-    return <safe_default>;
+    return <fail_closed_default>;
 };
 ```
 
-`.expect()` / `.unwrap()` on locks is acceptable **only** in `#[cfg(test)]` code.
+### Bounded Allocations
 
-### Bounded allocations
+- Do not download a whole remote object when only metadata is needed; use
+  `ObjectStore::head()`.
+- Stream large bundles and pack files through disk. Use `ObjectStore::put_file()`
+  for uploads from local files instead of accumulating a `Vec<u8>`.
+- Bound every `AsyncRead` sent to an HTTP response; streaming Git responses
+  should enforce `max_git_output_bytes` with guards such as `ChildGuardStream`.
+- Pass `max_keys` to `list_prefix` when a full listing is unnecessary.
+- Keep subprocess stdout/stderr behind `read_bounded()`.
+- Bound HTTP request bodies, Git POST input, upstream/proxy streams, retries, and
+  timeouts; do not add unbounded ingress while fixing outbound reads.
 
-1. **Never load an entire remote object into memory when only metadata is
-   needed.** Use `ObjectStore::head()` to get size without downloading.
-2. **Stream large blobs (bundles, pack files) through disk** — do not
-   accumulate in a `Vec<u8>`. Use `ObjectStore::put_file()` for uploads
-   from local files.
-3. **Bound every output stream.** Any `AsyncRead` piped to an HTTP response
-   must enforce a byte limit (see `ChildGuardStream`). Unbounded streams
-   let a malicious or corrupted repo exhaust memory.
-4. **`list_prefix` accepts `max_keys`** — pass a reasonable limit when the
-   full listing is not required. Unbounded key listing can OOM on large
-   namespaces.
-5. **Git subprocess output is bounded** by `read_bounded()` with
-   `max_git_output_bytes`. Never bypass this by reading stdout directly
-   without a limit.
+### Resource Bounds
 
-### Resource exhaustion
+- Every git subprocess spawn must acquire the `Git` semaphore. Streaming
+  upload-pack responses must hold the permit until exit.
+- Keep child handles owned until completion or kill, and drain stdout/stderr
+  through bounded readers or streams to avoid deadlocks.
+- Every `tokio::process::Command` child needs `kill_on_drop(true)`.
+- Prefer explicit disk reservation release; never call `temp_path()` after
+  `release()`.
 
-1. **Concurrent git processes are bounded** by a `tokio::sync::Semaphore`
-   on the `Git` struct. Every `spawn()` must acquire a permit first.
-   For streaming responses (`UploadPackProcess`), the permit is held until
-   the process exits.
-2. **Disk reservations clean up on drop** via `Reservation::Drop` /
-   `AsyncReservation::release()`. Always prefer explicit `release()` over
-   relying on drop, and never call `temp_path()` after `release()`.
-3. **`kill_on_drop(true)`** is mandatory on all `tokio::process::Command`
-   child processes to prevent zombie accumulation.
+## Deployments
 
-## Deployment operations
-
-Use checked-in deployment scripts instead of ad-hoc AWS/SSM/Docker commands.
-For the maintained ECS/EC2/EBS deployment, use:
+- Use checked-in AWS scripts instead of raw AWS/SSM/Docker command sequences.
+  The maintained path is ECS on Graviton EC2 with host-mounted EBS and S3:
 
 ```sh
 AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-and-smoke.sh
 ```
 
-If an ECS rollout is stuck because a prior-revision container is still holding
-host port `8080`, inspect with `scripts/aws/ecs-host-diagnostics.sh`, then use
-`scripts/aws/stop-stale-ecs-container.sh` with `ECS_STALE_CONTAINER_ID` and
-`CONFIRM_STOP=true`. This script validates the ECS task family/container labels
-before stopping anything.
+- Preview stacks go through `scripts/aws/deploy-preview.sh <ref>` and
+  `scripts/aws/destroy-preview.sh <ref>`; they use isolated S3 prefixes and
+  shared preview ALB routes.
+- If a rollout is stuck because an old task still owns host port `8080`, inspect
+  with `scripts/aws/ecs-host-diagnostics.sh`, then use
+  `scripts/aws/stop-stale-ecs-container.sh` with `ECS_STALE_CONTAINER_ID` and
+  `CONFIRM_STOP=true`.
