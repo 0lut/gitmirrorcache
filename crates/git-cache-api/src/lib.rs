@@ -719,7 +719,10 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
         };
         let materializer = materializer.using_upstream_auth(&auth);
 
-        if proxy_on_miss_requested(&headers) {
+        if !proxy_on_miss_disabled(
+            &headers,
+            state.domain.config.git_remote.proxy_on_miss_by_default,
+        ) {
             let local_check_started = Instant::now();
             let can_serve_locally = match materializer
                 .prepare_upload_pack_from_cache(&repo, &body)
@@ -957,8 +960,22 @@ fn upload_pack_endpoint(upstream_url: &str) -> Option<String> {
     ))
 }
 
-fn proxy_on_miss_requested(headers: &HeaderMap) -> bool {
-    headers.contains_key(PROXY_ON_MISS_HEADER)
+/// Whether the cold-miss upstream proxy is disabled for this request.
+///
+/// The `git-cache-use-proxy-on-miss` header overrides the configured default:
+/// a falsey value (`0`, `false`, `no`, `off`) disables the proxy, any other
+/// value enables it, and an absent header falls back to `default_enabled`.
+fn proxy_on_miss_disabled(headers: &HeaderMap, default_enabled: bool) -> bool {
+    let Some(value) = headers.get(PROXY_ON_MISS_HEADER) else {
+        return !default_enabled;
+    };
+    let Ok(value) = value.to_str() else {
+        return !default_enabled;
+    };
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 /// Decode a Git smart HTTP request body according to its `Content-Encoding`.
@@ -1161,6 +1178,11 @@ impl Stream for UpstreamProxyStream {
             Poll::Ready(Some(Ok(chunk))) => {
                 this.bytes_sent = this.bytes_sent.saturating_add(chunk.len() as u64);
                 if this.bytes_sent > this.max_bytes {
+                    warn!(
+                        bytes_sent = this.bytes_sent,
+                        max_bytes = this.max_bytes,
+                        "upstream upload-pack proxy response exceeded byte limit; aborting stream"
+                    );
                     Poll::Ready(Some(Err(std::io::Error::other(format!(
                         "upstream upload-pack proxy response exceeded {} byte limit",
                         this.max_bytes
@@ -1179,6 +1201,21 @@ impl Stream for UpstreamProxyStream {
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// The background warm must run regardless of how the proxied stream ends:
+/// byte-limit aborts, upstream errors, and client disconnects all drop the
+/// stream without reaching `Poll::Ready(None)`, and without the warm a repo
+/// whose proxied response cannot complete would never become servable from
+/// the local cache.
+impl Drop for UpstreamProxyStream {
+    fn drop(&mut self) {
+        if let Some(task) = self.warm_task.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                task.spawn();
+            }
         }
     }
 }
@@ -1539,13 +1576,21 @@ mod tests {
     }
 
     #[test]
-    fn proxy_on_miss_is_requested_by_header_presence() {
+    fn proxy_on_miss_header_overrides_configured_default() {
         let mut headers = HeaderMap::new();
-        assert!(!proxy_on_miss_requested(&headers));
+        assert!(proxy_on_miss_disabled(&headers, false));
+        assert!(!proxy_on_miss_disabled(&headers, true));
 
         headers.insert(PROXY_ON_MISS_HEADER, "1".parse().unwrap());
+        assert!(!proxy_on_miss_disabled(&headers, false));
 
-        assert!(proxy_on_miss_requested(&headers));
+        for opt_out in ["0", "false", "no", "off", " Off "] {
+            headers.insert(PROXY_ON_MISS_HEADER, opt_out.parse().unwrap());
+            assert!(
+                proxy_on_miss_disabled(&headers, true),
+                "{opt_out} should opt out"
+            );
+        }
     }
 
     #[test]

@@ -48,10 +48,21 @@ and tests over ad-hoc operational steps.
 - Direct Git GET proves repo access via `ls-remote` only. POST read-through uses
   the same request-scoped auth and must preserve shallow/blobless intent
   (`depth`, `blob:none`) when fetching wants.
-- `git-cache-use-proxy-on-miss` is the only cold-miss proxy opt-in. Proxy only
+- Cold-miss proxying defaults to `git_remote.proxy_on_miss_by_default` (on);
+  the `git-cache-use-proxy-on-miss` header is the only per-request override
+  (falsey values opt out). Proxy only
   HTTP(S) upstreams, enforce streamed byte limits, forward auth only to upstream,
   then queue a bounded background warm. The proxy readiness/background warm
   paths should not hydrate generation manifests.
+- IMPORTANT testing caveat: because proxying is on by default, any test or
+  benchmark that means to exercise the local read-through (cache-fill) path
+  against an HTTP(S) upstream MUST opt out explicitly — set
+  `git_remote.proxy_on_miss_by_default = false` in test configs (the shared
+  API test support config does this), or send
+  `git -c http.extraHeader='git-cache-use-proxy-on-miss: false'` per request.
+  Otherwise cold-miss measurements measure the upstream proxy, not the cache.
+  Tests using local filesystem upstreams are unaffected (the proxy only
+  engages for HTTP(S) upstream URLs).
 
 ## Runtime Safety
 
