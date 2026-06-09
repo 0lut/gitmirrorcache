@@ -56,6 +56,11 @@ and tests over ad-hoc operational steps.
 - Exact commit materialization should use complete cached generation metadata
   before contacting upstream. Branch and default-branch materialization must
   verify upstream refs.
+- Upstream want hydration flows through the shared batched read-through fetch
+  core (direct Git read-through and the proxy-on-miss warm); branch
+  materialization shares the same `branch_cache_refspec` construction. Exact
+  commit cold misses deliberately fetch all heads so descendant exact-commit
+  requests reuse the full generation bundle.
 - Direct Git uses `/git/{host}/{owner}/{repo}.git`, rejects receive-pack, and
   serves from the shared bare repo under `cache_root/repos/...`.
 - Direct Git GET proves repo access via `ls-remote` only. POST read-through uses
