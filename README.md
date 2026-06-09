@@ -144,6 +144,13 @@ and setting `GIT_CACHE_OBJECT_STORE_KIND=s3`, `GIT_CACHE_S3_BUCKET`, and
 `GIT_CACHE_S3_PREFIX`. Runtime object-store namespaces are suffixed with `-v2`,
 so `GIT_CACHE_S3_PREFIX=repos` stores cache objects under `repos-v2`.
 
+A Google Cloud Storage backend is available behind the `gcs` feature with
+`GIT_CACHE_OBJECT_STORE_KIND=gcs`, `GIT_CACHE_GCS_BUCKET`, and optional
+`GIT_CACHE_GCS_PREFIX` / `GIT_CACHE_GCS_ENDPOINT` (for emulators such as
+fake-gcs-server, combined with `GIT_CACHE_GCS_ANONYMOUS=1`). Credentials are
+resolved through Application Default Credentials
+(`GOOGLE_APPLICATION_CREDENTIALS` or the GCE metadata server).
+
 ## Deployment
 
 The maintained AWS deployment path is ECS on Graviton EC2 with host-mounted EBS

@@ -23,3 +23,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 [features]
 default = []
 s3 = ["git-cache-domain/s3"]
+gcs = ["git-cache-domain/gcs"]

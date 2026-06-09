@@ -1,6 +1,8 @@
 mod local;
 mod manifests;
 
+#[cfg(feature = "gcs")]
+mod gcs;
 #[cfg(feature = "s3")]
 mod s3;
 
@@ -25,6 +27,8 @@ pub use manifests::{
     GenerationPublish, LeaseManifest, PendingGenerationPublish, PublishManifests,
 };
 
+#[cfg(feature = "gcs")]
+pub use gcs::GcsObjectStore;
 #[cfg(feature = "s3")]
 pub use s3::S3ObjectStore;
 

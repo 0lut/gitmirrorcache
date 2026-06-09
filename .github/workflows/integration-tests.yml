@@ -123,6 +123,53 @@ jobs:
       - name: Run MinIO Rust test shard
         run: ${{ matrix.command }}
 
+  fake-gcs-rust-tests:
+    name: Fake GCS Rust Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      CARGO_TERM_COLOR: always
+      GIT_CACHE_GCS_INTEGRATION: "1"
+      GIT_CACHE_GCS_ENDPOINT: http://127.0.0.1:4443
+      GIT_CACHE_GCS_BUCKET: gitmirrorcache-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-fake-gcs-rust-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fake-gcs-rust-
+            ${{ runner.os }}-cargo-
+
+      - name: Start fake-gcs-server
+        run: |
+          for attempt in 1 2 3; do
+            echo "Starting fake-gcs-server attempt ${attempt}"
+            if docker compose -f docker-compose.fake-gcs.yml up -d fake-gcs; then
+              exit 0
+            fi
+            docker compose -f docker-compose.fake-gcs.yml down -v --remove-orphans || true
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          exit 1
+
+      - name: Run fake GCS Rust tests
+        run: cargo test -p git-cache-objectstore --features gcs fake_gcs_
+
+      - name: Build git-cache-api with GCS backend
+        run: cargo build -p git-cache-api --features gcs
+
   minio-python-api-build:
     name: MinIO Python API Build
     runs-on: ubuntu-latest

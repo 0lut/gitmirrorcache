@@ -153,6 +153,31 @@ fn object_store_from_env() -> crate::Result<ObjectStoreConfig> {
                     .filter(|value| !value.trim().is_empty()),
             })
         }
+        "gcs" => {
+            let bucket = env::var("GIT_CACHE_GCS_BUCKET")
+                .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_BUCKET"))
+                .map_err(|_| {
+                    crate::GitCacheError::Validation(
+                        "GIT_CACHE_OBJECT_STORE_KIND=gcs requires GIT_CACHE_GCS_BUCKET".into(),
+                    )
+                })?;
+            if bucket.trim().is_empty() {
+                return Err(crate::GitCacheError::Validation(
+                    "GIT_CACHE_GCS_BUCKET must not be empty".into(),
+                ));
+            }
+
+            Ok(ObjectStoreConfig::Gcs {
+                bucket,
+                prefix: env::var("GIT_CACHE_GCS_PREFIX")
+                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_PREFIX"))
+                    .unwrap_or_else(|_| "repos".into()),
+                endpoint: env::var("GIT_CACHE_GCS_ENDPOINT")
+                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_ENDPOINT"))
+                    .ok()
+                    .filter(|value| !value.trim().is_empty()),
+            })
+        }
         other => Err(crate::GitCacheError::Validation(format!(
             "unsupported GIT_CACHE_OBJECT_STORE_KIND `{other}`"
         ))),
@@ -166,6 +191,11 @@ pub enum ObjectStoreConfig {
         root: PathBuf,
     },
     S3 {
+        bucket: String,
+        prefix: String,
+        endpoint: Option<String>,
+    },
+    Gcs {
         bucket: String,
         prefix: String,
         endpoint: Option<String>,
@@ -316,6 +346,9 @@ mod tests {
         "GIT_CACHE_S3_BUCKET",
         "GIT_CACHE_S3_PREFIX",
         "GIT_CACHE_S3_ENDPOINT",
+        "GIT_CACHE_GCS_BUCKET",
+        "GIT_CACHE_GCS_PREFIX",
+        "GIT_CACHE_GCS_ENDPOINT",
         "GIT_CACHE_UPSTREAM_ROOT",
         "GIT_CACHE_GIT_BINARY",
         "GIT_CACHE_GIT_TIMEOUT_SECONDS",
@@ -497,8 +530,38 @@ min_free_bytes = 100000
                 assert_eq!(prefix, "prod");
                 assert_eq!(endpoint.as_deref(), Some("https://s3.example.com"));
             }
-            ObjectStoreConfig::Local { .. } => panic!("expected s3 object store"),
+            _ => panic!("expected s3 object store"),
         }
+    }
+
+    #[test]
+    fn from_env_configures_gcs_object_store() {
+        let _env = EnvGuard::new(&[
+            ("GIT_CACHE_OBJECT_STORE_KIND", "gcs"),
+            ("GIT_CACHE_GCS_BUCKET", "git-cache-bucket"),
+            ("GIT_CACHE_GCS_PREFIX", "prod"),
+            ("GIT_CACHE_GCS_ENDPOINT", "http://127.0.0.1:4443"),
+        ]);
+
+        let config = AppConfig::from_env().unwrap();
+        match config.object_store {
+            ObjectStoreConfig::Gcs {
+                bucket,
+                prefix,
+                endpoint,
+            } => {
+                assert_eq!(bucket, "git-cache-bucket");
+                assert_eq!(prefix, "prod");
+                assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:4443"));
+            }
+            other => panic!("expected gcs object store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_env_rejects_gcs_without_bucket() {
+        let _env = EnvGuard::new(&[("GIT_CACHE_OBJECT_STORE_KIND", "gcs")]);
+        assert!(AppConfig::from_env().is_err());
     }
 
     #[test]

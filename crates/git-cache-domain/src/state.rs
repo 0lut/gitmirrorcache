@@ -8,13 +8,17 @@ use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::Client;
 #[cfg(feature = "s3")]
 use aws_types::region::Region;
+#[cfg(feature = "gcs")]
+use gcloud_storage::client::{Client as GcsClient, ClientConfig as GcsClientConfig};
 use git_cache_core::{AppConfig, GitCacheError, ObjectStoreConfig, Result as CoreResult};
 use git_cache_disk::{AsyncDiskManager, DiskManager};
 use git_cache_git::Git;
+#[cfg(feature = "gcs")]
+use git_cache_objectstore::GcsObjectStore;
 #[cfg(feature = "s3")]
 use git_cache_objectstore::S3ObjectStore;
 use git_cache_objectstore::{LocalObjectStore, ObjectStore};
-#[cfg(feature = "s3")]
+#[cfg(any(feature = "s3", feature = "gcs"))]
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,7 +52,7 @@ impl AppState {
                 {
                     Arc::new(s3_store(
                         bucket,
-                        &v2_s3_prefix(prefix),
+                        &v2_object_store_prefix(prefix),
                         endpoint.as_deref(),
                     )?)
                 }
@@ -57,6 +61,27 @@ impl AppState {
                     let _ = (bucket, prefix, endpoint);
                     return Err(GitCacheError::NotImplemented(
                         "S3 object store wiring requires the s3 feature".into(),
+                    ));
+                }
+            }
+            ObjectStoreConfig::Gcs {
+                bucket,
+                prefix,
+                endpoint,
+            } => {
+                #[cfg(feature = "gcs")]
+                {
+                    Arc::new(gcs_store_sync(
+                        bucket,
+                        &v2_object_store_prefix(prefix),
+                        endpoint.as_deref(),
+                    )?)
+                }
+                #[cfg(not(feature = "gcs"))]
+                {
+                    let _ = (bucket, prefix, endpoint);
+                    return Err(GitCacheError::NotImplemented(
+                        "GCS object store wiring requires the gcs feature".into(),
                     ));
                 }
             }
@@ -78,7 +103,12 @@ impl AppState {
                 #[cfg(feature = "s3")]
                 {
                     Arc::new(
-                        s3_store_async(bucket, &v2_s3_prefix(prefix), endpoint.as_deref()).await?,
+                        s3_store_async(
+                            bucket,
+                            &v2_object_store_prefix(prefix),
+                            endpoint.as_deref(),
+                        )
+                        .await?,
                     )
                 }
                 #[cfg(not(feature = "s3"))]
@@ -86,6 +116,30 @@ impl AppState {
                     let _ = (bucket, prefix, endpoint);
                     return Err(GitCacheError::NotImplemented(
                         "S3 object store wiring requires the s3 feature".into(),
+                    ));
+                }
+            }
+            ObjectStoreConfig::Gcs {
+                bucket,
+                prefix,
+                endpoint,
+            } => {
+                #[cfg(feature = "gcs")]
+                {
+                    Arc::new(
+                        gcs_store_async(
+                            bucket,
+                            &v2_object_store_prefix(prefix),
+                            endpoint.as_deref(),
+                        )
+                        .await?,
+                    )
+                }
+                #[cfg(not(feature = "gcs"))]
+                {
+                    let _ = (bucket, prefix, endpoint);
+                    return Err(GitCacheError::NotImplemented(
+                        "GCS object store wiring requires the gcs feature".into(),
                     ));
                 }
             }
@@ -146,8 +200,8 @@ fn v2_local_store_root(root: &Path) -> PathBuf {
     root.with_file_name(format!("{file_name}-{OBJECT_STORE_SCHEMA_SUFFIX}"))
 }
 
-#[cfg(any(feature = "s3", test))]
-fn v2_s3_prefix(prefix: &str) -> String {
+#[cfg(any(feature = "s3", feature = "gcs", test))]
+fn v2_object_store_prefix(prefix: &str) -> String {
     let normalized = prefix.trim_matches('/');
     if normalized.is_empty() {
         return OBJECT_STORE_SCHEMA_SUFFIX.to_string();
@@ -169,6 +223,65 @@ fn v2_s3_prefix(prefix: &str) -> String {
 fn is_v2_component(component: &str) -> bool {
     component == OBJECT_STORE_SCHEMA_SUFFIX
         || component.ends_with(&format!("-{OBJECT_STORE_SCHEMA_SUFFIX}"))
+}
+
+#[cfg(feature = "gcs")]
+fn gcs_store_sync(
+    bucket: &str,
+    prefix: &str,
+    endpoint: Option<&str>,
+) -> CoreResult<GcsObjectStore> {
+    if !gcs_anonymous_from_env() {
+        return Err(GitCacheError::NotImplemented(
+            "authenticated GCS object store requires async initialization; \
+             use try_new_async or set GIT_CACHE_GCS_ANONYMOUS=1 for emulators"
+                .into(),
+        ));
+    }
+    let config = apply_gcs_endpoint(GcsClientConfig::default().anonymous(), endpoint);
+    GcsObjectStore::new(GcsClient::new(config), bucket, prefix)
+}
+
+#[cfg(feature = "gcs")]
+async fn gcs_store_async(
+    bucket: &str,
+    prefix: &str,
+    endpoint: Option<&str>,
+) -> CoreResult<GcsObjectStore> {
+    let config = if gcs_anonymous_from_env() {
+        GcsClientConfig::default().anonymous()
+    } else {
+        GcsClientConfig::default()
+            .with_auth()
+            .await
+            .map_err(|err| {
+                GitCacheError::Validation(format!(
+                    "GCS object store requires credentials (GOOGLE_APPLICATION_CREDENTIALS, \
+                 GOOGLE_APPLICATION_CREDENTIALS_JSON, or metadata server): {err}"
+                ))
+            })?
+    };
+    let config = apply_gcs_endpoint(config, endpoint);
+    GcsObjectStore::new(GcsClient::new(config), bucket, prefix)
+}
+
+#[cfg(feature = "gcs")]
+fn apply_gcs_endpoint(mut config: GcsClientConfig, endpoint: Option<&str>) -> GcsClientConfig {
+    if let Some(endpoint) = endpoint.filter(|value| !value.trim().is_empty()) {
+        config.storage_endpoint = endpoint.trim_end_matches('/').to_string();
+    }
+    config
+}
+
+#[cfg(feature = "gcs")]
+fn gcs_anonymous_from_env() -> bool {
+    matches!(
+        env::var("GIT_CACHE_GCS_ANONYMOUS")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(feature = "s3")]
@@ -349,13 +462,13 @@ mod tests {
     }
 
     #[test]
-    fn s3_prefix_gets_v2_suffix() {
-        assert_eq!(v2_s3_prefix("repos"), "repos-v2");
-        assert_eq!(v2_s3_prefix("prod/repos"), "prod/repos-v2");
-        assert_eq!(v2_s3_prefix("/prod/repos/"), "prod/repos-v2");
-        assert_eq!(v2_s3_prefix("repos-v2"), "repos-v2");
-        assert_eq!(v2_s3_prefix("prod/v2"), "prod/v2");
-        assert_eq!(v2_s3_prefix(""), "v2");
+    fn object_store_prefix_gets_v2_suffix() {
+        assert_eq!(v2_object_store_prefix("repos"), "repos-v2");
+        assert_eq!(v2_object_store_prefix("prod/repos"), "prod/repos-v2");
+        assert_eq!(v2_object_store_prefix("/prod/repos/"), "prod/repos-v2");
+        assert_eq!(v2_object_store_prefix("repos-v2"), "repos-v2");
+        assert_eq!(v2_object_store_prefix("prod/v2"), "prod/v2");
+        assert_eq!(v2_object_store_prefix(""), "v2");
     }
 
     #[test]
