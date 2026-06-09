@@ -427,7 +427,7 @@ async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
 }
 
 #[tokio::test]
-async fn upload_pack_local_readiness_is_false_for_uncached_want() {
+async fn upload_pack_cache_prepare_is_false_for_uncached_want() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -436,7 +436,7 @@ async fn upload_pack_local_readiness_is_false_for_uncached_want() {
 
     assert!(
         !materializer
-            .can_serve_upload_pack_locally(&fixture.repo, &Bytes::from(body))
+            .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(body))
             .await
             .unwrap(),
         "cold proxy mode should not treat missing local objects as cheaply serveable"
@@ -444,7 +444,7 @@ async fn upload_pack_local_readiness_is_false_for_uncached_want() {
 }
 
 #[tokio::test]
-async fn upload_pack_local_readiness_does_not_hydrate_manifest_only_cache() {
+async fn upload_pack_cache_prepare_hydrates_manifest_only_cache() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -465,20 +465,22 @@ async fn upload_pack_local_readiness_does_not_hydrate_manifest_only_cache() {
     let body = make_upload_pack_pkt_line(&format!("want {} multi_ack thin-pack\n", cached.commit));
 
     assert!(
-        !materializer
-            .can_serve_upload_pack_locally(&fixture.repo, &Bytes::from(body))
+        materializer
+            .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(body))
             .await
             .unwrap(),
-        "Track 3 proxy readiness should stay cheap and leave manifest hydration to the warmer"
+        "proxy-on-miss should treat object-store generation manifests as warm cache state"
     );
     assert!(
-        !repo_dir.join("config").exists(),
-        "readiness check must not recreate or hydrate the local repo"
+        materializer
+            .commit_ready_for_serving(&repo_dir, &cached.commit)
+            .await,
+        "cache prepare should establish the repo on EBS from the verified generation"
     );
 }
 
 #[tokio::test]
-async fn upload_pack_local_readiness_is_true_for_hot_commit() {
+async fn upload_pack_cache_prepare_is_true_for_hot_commit() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
     let materializer = Materializer::new(Arc::clone(&state));
@@ -495,7 +497,7 @@ async fn upload_pack_local_readiness_is_true_for_hot_commit() {
 
     assert!(
         materializer
-            .can_serve_upload_pack_locally(&fixture.repo, &Bytes::from(body))
+            .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(body))
             .await
             .unwrap(),
         "hot direct clone should continue down the local upload-pack path"

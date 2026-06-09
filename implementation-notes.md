@@ -764,25 +764,24 @@ been deleted.
 
 ### D19. Direct Git cold misses can proxy upstream before warming
 
-Track 3 adds an opt-in direct Git cold-miss mode:
-`git_remote.cold_miss_mode = "upstream_proxy"`. In this mode, after the normal
-repo-access proof, direct upload-pack POST first performs a no-lazy local
-readiness check. If the local bare repo can already serve every wanted object,
-the existing local `git upload-pack` path is used. If not, HTTP(S) origins are
-proxied to upstream immediately and the cache import is queued after the
-upstream response stream completes.
+Track 3 adds a request-scoped direct Git cold-miss proxy path. A direct
+upload-pack POST only considers proxying when the request includes
+`git-cache-use-proxy-on-miss`. After the normal repo-access proof, the API asks
+the domain to prepare the upload-pack wants from cache before proxying:
+EBS-local objects are checked without lazy fetching, and complete object-store
+commit manifests are hydrated into the local bare repo. If that cache prepare
+succeeds, the existing local `git upload-pack` path is used. If the cache still
+cannot satisfy the wants, HTTP(S) origins are proxied to upstream immediately
+and cache import is queued after the upstream response stream completes.
 
-The default remains `local_read_through`, preserving existing behavior unless an
-operator opts in. `git_remote.cold_miss_proxy_repos` is an optional exact repo
-allowlist for previewing the mode on large repositories such as
-`github.com/llvm/llvm-project`; an empty list means all repos are eligible when
-proxy mode is enabled. Background imports are bounded by
-`git_remote.background_import_concurrency`.
+Without the header, direct Git keeps the existing local read-through behavior.
+Background imports are bounded by `git_remote.background_import_concurrency`.
 
 This is Option A from the cold-fast plan: proxy first, then refetch/import in
 the background using the same request-scoped upstream auth. It intentionally
-duplicates upstream work on cold misses, but keeps first-clone latency close to
-the origin and avoids parsing or persisting upstream pack bytes in the HTTP hot
-path. Request auth is forwarded only as an upstream HTTP header, never logged or
-stored. Non-HTTP origins, including local test upstreams, fall back to the
-existing local read-through path.
+duplicates upstream work on cache misses that are not recoverable from EBS or
+object-store manifests, but keeps first-clone latency close to the origin and
+avoids parsing or persisting upstream pack bytes in the HTTP hot path. Request
+auth is forwarded only as an upstream HTTP header, never logged or stored.
+Non-HTTP origins, including local test upstreams, fall back to the existing
+local read-through path.

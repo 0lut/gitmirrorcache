@@ -5,8 +5,7 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, GitCacheError, GitRemoteColdMissMode, MaterializeRequest, RepoKey,
-    Result as CoreResult, UpstreamAuth,
+    AppConfig, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult, UpstreamAuth,
 };
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
@@ -33,6 +32,7 @@ use tracing::{info, info_span, warn, Instrument};
 
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const DIRECT_GIT_PROOF_TTL: Duration = Duration::from_secs(30);
+const PROXY_ON_MISS_HEADER: &str = "git-cache-use-proxy-on-miss";
 
 pub fn app(config: AppConfig) -> Router {
     app_result(config).expect("failed to initialize git-cache-api")
@@ -707,10 +707,10 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
         };
         let materializer = materializer.using_upstream_auth(&auth);
 
-        if cold_miss_proxy_enabled_for_repo(&state.domain.config, &repo) {
+        if proxy_on_miss_requested(&headers) {
             let local_check_started = Instant::now();
             let can_serve_locally = match materializer
-                .can_serve_upload_pack_locally(&repo, &body)
+                .prepare_upload_pack_from_cache(&repo, &body)
                 .await
             {
                 Ok(can_serve) => can_serve,
@@ -722,7 +722,7 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
                 auth = auth_label(&auth),
                 can_serve_locally,
                 elapsed_ms = elapsed_ms(local_check_started),
-                "direct git cold-miss proxy local readiness checked"
+                "direct git proxy-on-miss cache readiness checked"
             );
 
             if !can_serve_locally {
@@ -745,7 +745,7 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
                             request_id,
                             repo = %repo,
                             auth = auth_label(&auth),
-                            "direct git cold-miss proxy unavailable; using local read-through"
+                            "direct git proxy-on-miss unavailable; using local read-through"
                         );
                     }
                     Err(ProxyFallback::Error(error)) => return error.into_response(),
@@ -923,16 +923,8 @@ fn upload_pack_endpoint(upstream_url: &str) -> Option<String> {
     ))
 }
 
-fn cold_miss_proxy_enabled_for_repo(config: &AppConfig, repo: &RepoKey) -> bool {
-    if config.git_remote.cold_miss_mode != GitRemoteColdMissMode::UpstreamProxy {
-        return false;
-    }
-    config.git_remote.cold_miss_proxy_repos.is_empty()
-        || config
-            .git_remote
-            .cold_miss_proxy_repos
-            .iter()
-            .any(|allowed| allowed == repo.as_str())
+fn proxy_on_miss_requested(headers: &HeaderMap) -> bool {
+    headers.contains_key(PROXY_ON_MISS_HEADER)
 }
 
 struct DirectGitWarmTask {
@@ -1337,45 +1329,13 @@ mod tests {
     }
 
     #[test]
-    fn cold_miss_proxy_repo_allowlist_is_exact_and_optional() {
-        let tmp = TempDir::new().unwrap();
-        let mut config = AppConfig {
-            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            cache_root: tmp.path().join("cache"),
-            upstream_root: None,
-            git_binary: PathBuf::from("git"),
-            git_timeout_seconds: 60,
-            max_git_output_bytes: 16 * 1024 * 1024,
-            object_store: ObjectStoreConfig::Local {
-                root: tmp.path().join("objects"),
-            },
-            upstream_auth_token_env: None,
-            rate_limit_per_minute: 120,
-            allowed_upstream_hosts: vec!["github.com".into()],
-            disk: git_cache_core::DiskConfig {
-                quota_bytes: 1024 * 1024 * 1024,
-                min_free_bytes: 0,
-            },
-            git_remote: git_cache_core::GitRemoteConfig {
-                enabled: true,
-                cold_miss_mode: GitRemoteColdMissMode::UpstreamProxy,
-                ..Default::default()
-            },
-            compaction: Default::default(),
-            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            max_concurrent_generation_verifications: 1,
-        };
-        let llvm = RepoKey::parse("github.com/llvm/llvm-project").unwrap();
-        let linux = RepoKey::parse("github.com/torvalds/linux").unwrap();
+    fn proxy_on_miss_is_requested_by_header_presence() {
+        let mut headers = HeaderMap::new();
+        assert!(!proxy_on_miss_requested(&headers));
 
-        assert!(
-            cold_miss_proxy_enabled_for_repo(&config, &llvm),
-            "empty allowlist enables proxy mode for every repo"
-        );
-        config.git_remote.cold_miss_proxy_repos = vec![llvm.to_string()];
+        headers.insert(PROXY_ON_MISS_HEADER, "1".parse().unwrap());
 
-        assert!(cold_miss_proxy_enabled_for_repo(&config, &llvm));
-        assert!(!cold_miss_proxy_enabled_for_repo(&config, &linux));
+        assert!(proxy_on_miss_requested(&headers));
     }
 
     #[test]

@@ -482,45 +482,112 @@ impl Materializer {
         Ok(())
     }
 
-    /// Return whether direct Git can serve this upload-pack request from the
-    /// local bare repo without hydrating manifests or contacting upstream.
+    /// Prepare direct Git wants from the cache without contacting upstream.
     ///
-    /// This is intentionally stricter than `handle_upload_pack`: Track 3's
-    /// upstream-proxy mode uses it only to avoid making a cold client wait for
-    /// cache import. If this check says "not local", the existing read-through
-    /// path still remains the authoritative warmer/import path.
-    pub async fn can_serve_upload_pack_locally(
+    /// Proxy-on-miss uses this before falling through to the upstream proxy:
+    /// EBS-local objects and complete object-store commit manifests both count
+    /// as warm. If this returns `false`, the existing read-through path still
+    /// remains the authoritative warmer/import path.
+    pub async fn prepare_upload_pack_from_cache(
         &self,
         repo: &RepoKey,
         body: &Bytes,
     ) -> CoreResult<bool> {
+        let started = Instant::now();
         let intent = parse_upload_pack_intent(body)?;
-        let repo_dir = self.repo_dir(repo);
-        if !repo_dir.join("config").exists() {
-            return Ok(false);
-        }
+        let repo_dir = self.ensure_repo_dir(repo).await?;
 
         if intent.wants.is_empty() {
             return Ok(true);
         }
 
+        let _repo_lock = self.lock_repo(repo).await?;
         let object_types = self
             .state
             .git
             .cat_file_batch_types_no_lazy(&repo_dir, &intent.wants)
             .await?;
+        let wants_count = intent.wants.len();
+        let mut served_commits = 0usize;
+        let mut served_non_commit_wants = 0usize;
+        let mut hydrated_commits = 0usize;
         for object_id in &intent.wants {
-            let Some(object_type) = object_types.get(object_id).map(String::as_str) else {
+            if let Some(object_type) = object_types.get(object_id).map(String::as_str) {
+                if object_type != "commit" {
+                    served_non_commit_wants += 1;
+                    continue;
+                }
+                if self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
+                    self.expose_served_commit(&repo_dir, object_id).await?;
+                    served_commits += 1;
+                    continue;
+                }
+            }
+
+            let Some(manifest) = self.get_commit_manifest(repo, object_id).await? else {
+                info!(
+                    %repo,
+                    commit = %object_id,
+                    wants_count,
+                    served_commits,
+                    served_non_commit_wants,
+                    hydrated_commits,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git cache prepare missed commit manifest"
+                );
                 return Ok(false);
             };
-            if object_type != "commit" {
-                continue;
-            }
-            if !self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
+            if !manifest.complete {
+                info!(
+                    %repo,
+                    commit = %object_id,
+                    generation = %manifest.generation,
+                    wants_count,
+                    served_commits,
+                    served_non_commit_wants,
+                    hydrated_commits,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git cache prepare found incomplete commit manifest"
+                );
                 return Ok(false);
             }
+
+            let hydrate_started = Instant::now();
+            self.hydrate_generation(repo, &repo_dir, manifest.generation)
+                .await?;
+            let object_types = self
+                .state
+                .git
+                .cat_file_batch_types_no_lazy(&repo_dir, std::slice::from_ref(object_id))
+                .await?;
+            if object_types.get(object_id).map(String::as_str) != Some("commit")
+                || !self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
+            {
+                return Err(GitCacheError::NotFound(format!(
+                    "hydrated generation `{}` did not contain complete commit `{}`",
+                    manifest.generation, object_id
+                )));
+            }
+            self.expose_served_commit(&repo_dir, object_id).await?;
+            hydrated_commits += 1;
+            info!(
+                %repo,
+                commit = %object_id,
+                generation = %manifest.generation,
+                elapsed_ms = elapsed_ms(hydrate_started),
+                "direct git cache prepare hydrated commit"
+            );
         }
 
+        info!(
+            %repo,
+            wants_count,
+            served_commits,
+            served_non_commit_wants,
+            hydrated_commits,
+            elapsed_ms = elapsed_ms(started),
+            "direct git cache prepare satisfied upload-pack wants"
+        );
         Ok(true)
     }
 
