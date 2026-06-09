@@ -49,9 +49,9 @@ and tests over ad-hoc operational steps.
   the same request-scoped auth and must preserve shallow/blobless intent
   (`depth`, `blob:none`) when fetching wants.
 - `git-cache-use-proxy-on-miss` is the only cold-miss proxy opt-in. Proxy only
-  HTTP(S) upstreams, bound streamed bytes, forward auth only to upstream, then
-  queue a bounded background warm. The proxy readiness/background warm paths
-  should not hydrate generation manifests.
+  HTTP(S) upstreams, enforce streamed byte limits, forward auth only to upstream,
+  then queue a bounded background warm. The proxy readiness/background warm
+  paths should not hydrate generation manifests.
 
 ## Runtime Safety
 
@@ -69,11 +69,11 @@ let state = self.state.lock()
     .map_err(|_| GitCacheError::Internal("description of what poisoned".into()))?;
 ```
 
-- When the function cannot return `Result`, use a safe default:
+- When the function cannot return `Result`, use a fail-closed safe default:
 
 ```rust
 let Ok(mut state) = self.state.lock() else {
-    return <safe_default>;
+    return <fail_closed_default>;
 };
 ```
 
