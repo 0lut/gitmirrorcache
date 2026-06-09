@@ -407,11 +407,11 @@ async fn handle_checked_materialize_request_inner(
 
     let result = run_domain_request(state, endpoint, request, auth).await;
     match &result {
-        Ok(_) => info!(
+        Ok(response) => info!(
             request_id,
             endpoint = endpoint.name(),
             elapsed_ms = elapsed_ms(started),
-            status = %StatusCode::OK,
+            status = %response.status(),
             "api request finished"
         ),
         Err(error) => info!(
