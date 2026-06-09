@@ -43,13 +43,23 @@ and tests over ad-hoc operational steps.
 - Production code must not panic for recoverable errors. Never use
   `.expect()`/`.unwrap()` on `Mutex::lock()` outside `#[cfg(test)]`; map poison
   to `GitCacheError::Internal` or return a safe default.
-- Bound memory: use `ObjectStore::head()` for metadata, stream large bundles or
-  packs through disk with `ObjectStore::put_file()`, pass `max_keys` to
-  `list_prefix` when a full listing is unnecessary, and keep subprocess output
-  behind `read_bounded()`.
-- Bound resources: every git subprocess spawn must acquire the `Git` semaphore,
-  streaming upload-pack responses must hold the permit until exit, and every
-  `tokio::process::Command` child needs `kill_on_drop(true)`.
+
+### Bounded Allocations
+
+- Do not download a whole remote object when only metadata is needed; use
+  `ObjectStore::head()`.
+- Stream large bundles and pack files through disk. Use `ObjectStore::put_file()`
+  for uploads from local files instead of accumulating a `Vec<u8>`.
+- Bound every `AsyncRead` sent to an HTTP response; streaming Git responses
+  should enforce `max_git_output_bytes` with guards such as `ChildGuardStream`.
+- Pass `max_keys` to `list_prefix` when a full listing is unnecessary.
+- Keep subprocess stdout/stderr behind `read_bounded()`.
+
+### Resource Bounds
+
+- Every git subprocess spawn must acquire the `Git` semaphore. Streaming
+  upload-pack responses must hold the permit until exit.
+- Every `tokio::process::Command` child needs `kill_on_drop(true)`.
 - Prefer explicit disk reservation release; never call `temp_path()` after
   `release()`.
 
