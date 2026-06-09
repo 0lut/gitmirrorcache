@@ -5,7 +5,8 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult, UpstreamAuth,
+    AppConfig, GitCacheError, GitRemoteColdMissMode, MaterializeRequest, RepoKey,
+    Result as CoreResult, UpstreamAuth,
 };
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
@@ -25,10 +26,10 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
-use tracing::{info, info_span, Instrument};
+use tracing::{info, info_span, warn, Instrument};
 
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const DIRECT_GIT_PROOF_TTL: Duration = Duration::from_secs(30);
@@ -71,6 +72,8 @@ fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> 
 struct ApiState {
     domain: Arc<AppState>,
     direct_git_proofs: Arc<DirectGitProofCache>,
+    direct_git_background_imports: Arc<Semaphore>,
+    upstream_http: reqwest::Client,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
 }
@@ -89,9 +92,22 @@ impl ApiState {
     }
 
     fn with_domain(rate_limiter: RateLimiter, domain: Arc<AppState>) -> CoreResult<Self> {
+        let upstream_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(domain.config.git_timeout_seconds))
+            .build()
+            .map_err(|err| {
+                GitCacheError::Internal(format!("failed to build HTTP client: {err}"))
+            })?;
+        let background_import_concurrency = domain
+            .config
+            .git_remote
+            .background_import_concurrency
+            .max(1);
         Ok(Self {
             domain,
             direct_git_proofs: Arc::new(DirectGitProofCache::new(DIRECT_GIT_PROOF_TTL)),
+            direct_git_background_imports: Arc::new(Semaphore::new(background_import_concurrency)),
+            upstream_http,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
         })
@@ -691,6 +707,52 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
         };
         let materializer = materializer.using_upstream_auth(&auth);
 
+        if cold_miss_proxy_enabled_for_repo(&state.domain.config, &repo) {
+            let local_check_started = Instant::now();
+            let can_serve_locally = match materializer
+                .can_serve_upload_pack_locally(&repo, &body)
+                .await
+            {
+                Ok(can_serve) => can_serve,
+                Err(error) => return ApiError::from(error).into_response(),
+            };
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                can_serve_locally,
+                elapsed_ms = elapsed_ms(local_check_started),
+                "direct git cold-miss proxy local readiness checked"
+            );
+
+            if !can_serve_locally {
+                match proxy_upload_pack_to_upstream(
+                    &state,
+                    &materializer,
+                    &repo,
+                    &auth,
+                    &headers,
+                    body.clone(),
+                    comparison.clone(),
+                    request_id,
+                    started,
+                )
+                .await
+                {
+                    Ok(response) => return response,
+                    Err(ProxyFallback::UseLocal) => {
+                        info!(
+                            request_id,
+                            repo = %repo,
+                            auth = auth_label(&auth),
+                            "direct git cold-miss proxy unavailable; using local read-through"
+                        );
+                    }
+                    Err(ProxyFallback::Error(error)) => return error.into_response(),
+                }
+            }
+        }
+
         let result =
             Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await;
 
@@ -750,6 +812,223 @@ fn parse_optional_upstream_auth_header(
         status: StatusCode::BAD_REQUEST,
         message: error.to_string(),
     })
+}
+
+enum ProxyFallback {
+    UseLocal,
+    Error(ApiError),
+}
+
+async fn proxy_upload_pack_to_upstream(
+    state: &Arc<ApiState>,
+    materializer: &Materializer,
+    repo: &RepoKey,
+    auth: &UpstreamAuth,
+    headers: &HeaderMap,
+    body: Bytes,
+    comparison: Option<UpstreamRefComparison>,
+    request_id: u64,
+    request_started: Instant,
+) -> Result<Response, ProxyFallback> {
+    let upstream_url = materializer
+        .upstream_url(repo)
+        .map_err(|error| ProxyFallback::Error(error.into()))?;
+    let Some(upload_pack_url) = upload_pack_endpoint(&upstream_url) else {
+        return Err(ProxyFallback::UseLocal);
+    };
+
+    let proxy_started = Instant::now();
+    let mut request = state
+        .upstream_http
+        .post(upload_pack_url)
+        .header(
+            header::CONTENT_TYPE.as_str(),
+            "application/x-git-upload-pack-request",
+        )
+        .header(header::CACHE_CONTROL.as_str(), "no-cache")
+        .body(body.clone());
+    if let Some(raw_auth) = auth.raw_header() {
+        request = request.header(header::AUTHORIZATION.as_str(), raw_auth);
+    }
+    if let Some(value) = headers
+        .get("Git-Protocol")
+        .and_then(|value| value.to_str().ok())
+    {
+        request = request.header("Git-Protocol", value);
+    }
+
+    info!(
+        request_id,
+        repo = %repo,
+        auth = auth_label(auth),
+        "direct git cold-miss upstream proxy started"
+    );
+    let response = request.send().await.map_err(|error| {
+        ProxyFallback::Error(
+            GitCacheError::UpstreamUnavailable(format!(
+                "upstream upload-pack proxy request failed: {error}"
+            ))
+            .into(),
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ProxyFallback::Error(
+            GitCacheError::UpstreamUnavailable(format!(
+                "upstream upload-pack proxy returned HTTP {status}"
+            ))
+            .into(),
+        ));
+    }
+
+    let warm_task = DirectGitWarmTask {
+        imports: Arc::clone(&state.direct_git_background_imports),
+        materializer: materializer.clone(),
+        repo: repo.clone(),
+        body,
+        comparison,
+        request_id,
+    };
+    let stream = UpstreamProxyStream {
+        inner: Box::pin(response.bytes_stream()),
+        warm_task: Some(warm_task),
+        bytes_sent: 0,
+        max_bytes: state.domain.config.max_git_output_bytes as u64,
+    };
+
+    info!(
+        request_id,
+        repo = %repo,
+        auth = auth_label(auth),
+        proxy_setup_elapsed_ms = elapsed_ms(proxy_started),
+        elapsed_ms = elapsed_ms(request_started),
+        status = %StatusCode::OK,
+        "direct git cold-miss upstream proxy streaming"
+    );
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .expect("git upload-pack proxy response"))
+}
+
+fn upload_pack_endpoint(upstream_url: &str) -> Option<String> {
+    if !(upstream_url.starts_with("https://") || upstream_url.starts_with("http://")) {
+        return None;
+    }
+    Some(format!(
+        "{}/git-upload-pack",
+        upstream_url.trim_end_matches('/')
+    ))
+}
+
+fn cold_miss_proxy_enabled_for_repo(config: &AppConfig, repo: &RepoKey) -> bool {
+    if config.git_remote.cold_miss_mode != GitRemoteColdMissMode::UpstreamProxy {
+        return false;
+    }
+    config.git_remote.cold_miss_proxy_repos.is_empty()
+        || config
+            .git_remote
+            .cold_miss_proxy_repos
+            .iter()
+            .any(|allowed| allowed == repo.as_str())
+}
+
+struct DirectGitWarmTask {
+    imports: Arc<Semaphore>,
+    materializer: Materializer,
+    repo: RepoKey,
+    body: Bytes,
+    comparison: Option<UpstreamRefComparison>,
+    request_id: u64,
+}
+
+impl DirectGitWarmTask {
+    fn spawn(self) {
+        tokio::spawn(async move {
+            let permit = match self.imports.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!(
+                        request_id = self.request_id,
+                        repo = %self.repo,
+                        "direct git background import semaphore closed"
+                    );
+                    return;
+                }
+            };
+            let started = Instant::now();
+            info!(
+                request_id = self.request_id,
+                repo = %self.repo,
+                "direct git background import started"
+            );
+            let result = Box::pin(self.materializer.warm_upload_pack(
+                &self.repo,
+                &self.body,
+                self.comparison.as_ref(),
+            ))
+            .await;
+            drop(permit);
+            match result {
+                Ok(()) => info!(
+                    request_id = self.request_id,
+                    repo = %self.repo,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git background import finished"
+                ),
+                Err(error) => warn!(
+                    request_id = self.request_id,
+                    repo = %self.repo,
+                    %error,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git background import failed"
+                ),
+            }
+        });
+    }
+}
+
+type ReqwestBytesStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+struct UpstreamProxyStream {
+    inner: ReqwestBytesStream,
+    warm_task: Option<DirectGitWarmTask>,
+    bytes_sent: u64,
+    max_bytes: u64,
+}
+
+impl Stream for UpstreamProxyStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.bytes_sent = this.bytes_sent.saturating_add(chunk.len() as u64);
+                if this.bytes_sent > this.max_bytes {
+                    Poll::Ready(Some(Err(std::io::Error::other(format!(
+                        "upstream upload-pack proxy response exceeded {} byte limit",
+                        this.max_bytes
+                    )))))
+                } else {
+                    Poll::Ready(Some(Ok(chunk)))
+                }
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(std::io::Error::other(
+                format!("upstream upload-pack proxy stream failed: {error}"),
+            )))),
+            Poll::Ready(None) => {
+                if let Some(task) = this.warm_task.take() {
+                    task.spawn();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackProcess) -> Response {
@@ -1042,6 +1321,61 @@ mod tests {
         std::thread::sleep(Duration::from_millis(2));
 
         assert!(cache.get(&repo, &UpstreamAuth::Anonymous).is_none());
+    }
+
+    #[test]
+    fn upload_pack_endpoint_is_only_for_http_origins() {
+        assert_eq!(
+            upload_pack_endpoint("https://github.com/org/repo.git").as_deref(),
+            Some("https://github.com/org/repo.git/git-upload-pack")
+        );
+        assert_eq!(
+            upload_pack_endpoint("http://git.example.com/org/repo.git/").as_deref(),
+            Some("http://git.example.com/org/repo.git/git-upload-pack")
+        );
+        assert_eq!(upload_pack_endpoint("/tmp/upstreams/org/repo.git"), None);
+    }
+
+    #[test]
+    fn cold_miss_proxy_repo_allowlist_is_exact_and_optional() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            cache_root: tmp.path().join("cache"),
+            upstream_root: None,
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 60,
+            max_git_output_bytes: 16 * 1024 * 1024,
+            object_store: ObjectStoreConfig::Local {
+                root: tmp.path().join("objects"),
+            },
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 120,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 1024 * 1024 * 1024,
+                min_free_bytes: 0,
+            },
+            git_remote: git_cache_core::GitRemoteConfig {
+                enabled: true,
+                cold_miss_mode: GitRemoteColdMissMode::UpstreamProxy,
+                ..Default::default()
+            },
+            compaction: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            max_concurrent_generation_verifications: 1,
+        };
+        let llvm = RepoKey::parse("github.com/llvm/llvm-project").unwrap();
+        let linux = RepoKey::parse("github.com/torvalds/linux").unwrap();
+
+        assert!(
+            cold_miss_proxy_enabled_for_repo(&config, &llvm),
+            "empty allowlist enables proxy mode for every repo"
+        );
+        config.git_remote.cold_miss_proxy_repos = vec![llvm.to_string()];
+
+        assert!(cold_miss_proxy_enabled_for_repo(&config, &llvm));
+        assert!(!cold_miss_proxy_enabled_for_repo(&config, &linux));
     }
 
     #[test]

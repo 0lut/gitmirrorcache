@@ -761,3 +761,28 @@ replay. Explicit verification paths used by compaction/recovery still keep the
 original full-chain fallback. Regression tests cover both the synchronous
 publish path and a child pending generation whose verified parent bundle has
 been deleted.
+
+### D19. Direct Git cold misses can proxy upstream before warming
+
+Track 3 adds an opt-in direct Git cold-miss mode:
+`git_remote.cold_miss_mode = "upstream_proxy"`. In this mode, after the normal
+repo-access proof, direct upload-pack POST first performs a no-lazy local
+readiness check. If the local bare repo can already serve every wanted object,
+the existing local `git upload-pack` path is used. If not, HTTP(S) origins are
+proxied to upstream immediately and the cache import is queued after the
+upstream response stream completes.
+
+The default remains `local_read_through`, preserving existing behavior unless an
+operator opts in. `git_remote.cold_miss_proxy_repos` is an optional exact repo
+allowlist for previewing the mode on large repositories such as
+`github.com/llvm/llvm-project`; an empty list means all repos are eligible when
+proxy mode is enabled. Background imports are bounded by
+`git_remote.background_import_concurrency`.
+
+This is Option A from the cold-fast plan: proxy first, then refetch/import in
+the background using the same request-scoped upstream auth. It intentionally
+duplicates upstream work on cold misses, but keeps first-clone latency close to
+the origin and avoids parsing or persisting upstream pack bytes in the HTTP hot
+path. Request auth is forwarded only as an upstream HTTP header, never logged or
+stored. Non-HTTP origins, including local test upstreams, fall back to the
+existing local read-through path.

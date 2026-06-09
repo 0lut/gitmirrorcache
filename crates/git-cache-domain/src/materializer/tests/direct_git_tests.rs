@@ -427,6 +427,82 @@ async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
 }
 
 #[tokio::test]
+async fn upload_pack_local_readiness_is_false_for_uncached_want() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+    let commit = fixture.head_commit();
+    let body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack thin-pack\n"));
+
+    assert!(
+        !materializer
+            .can_serve_upload_pack_locally(&fixture.repo, &Bytes::from(body))
+            .await
+            .unwrap(),
+        "cold proxy mode should not treat missing local objects as cheaply serveable"
+    );
+}
+
+#[tokio::test]
+async fn upload_pack_local_readiness_does_not_hydrate_manifest_only_cache() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let cached = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let manifest = wait_for_commit_manifest(&state, &fixture.repo, &cached.commit).await;
+    wait_for_verified_generation(&state, &fixture.repo, manifest.generation).await;
+    let repo_dir = materializer.repo_dir(&fixture.repo);
+    stdfs::remove_dir_all(&repo_dir).unwrap();
+
+    let body = make_upload_pack_pkt_line(&format!("want {} multi_ack thin-pack\n", cached.commit));
+
+    assert!(
+        !materializer
+            .can_serve_upload_pack_locally(&fixture.repo, &Bytes::from(body))
+            .await
+            .unwrap(),
+        "Track 3 proxy readiness should stay cheap and leave manifest hydration to the warmer"
+    );
+    assert!(
+        !repo_dir.join("config").exists(),
+        "readiness check must not recreate or hydrate the local repo"
+    );
+}
+
+#[tokio::test]
+async fn upload_pack_local_readiness_is_true_for_hot_commit() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+
+    let cached = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    let body = make_upload_pack_pkt_line(&format!("want {} multi_ack thin-pack\n", cached.commit));
+
+    assert!(
+        materializer
+            .can_serve_upload_pack_locally(&fixture.repo, &Bytes::from(body))
+            .await
+            .unwrap(),
+        "hot direct clone should continue down the local upload-pack path"
+    );
+}
+
+#[tokio::test]
 async fn authenticated_direct_want_for_advertised_uncached_commit_reads_through() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());

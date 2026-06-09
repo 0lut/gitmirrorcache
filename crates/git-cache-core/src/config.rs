@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -91,6 +92,18 @@ impl AppConfig {
                 commit_read_through: parse_bool_env(
                     "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
                     true,
+                )?,
+                cold_miss_mode: parse_env(
+                    "GIT_CACHE_GIT_REMOTE_COLD_MISS_MODE",
+                    GitRemoteColdMissMode::LocalReadThrough,
+                )?,
+                cold_miss_proxy_repos: parse_csv_env(
+                    "GIT_CACHE_GIT_REMOTE_COLD_MISS_PROXY_REPOS",
+                    Vec::new(),
+                ),
+                background_import_concurrency: parse_env(
+                    "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
+                    default_background_import_concurrency(),
                 )?,
             },
             compaction: CompactionConfig {
@@ -201,6 +214,12 @@ pub struct GitRemoteConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub commit_read_through: bool,
+    #[serde(default)]
+    pub cold_miss_mode: GitRemoteColdMissMode,
+    #[serde(default)]
+    pub cold_miss_proxy_repos: Vec<String>,
+    #[serde(default = "default_background_import_concurrency")]
+    pub background_import_concurrency: usize,
 }
 
 impl Default for GitRemoteConfig {
@@ -208,12 +227,39 @@ impl Default for GitRemoteConfig {
         Self {
             enabled: false,
             commit_read_through: true,
+            cold_miss_mode: GitRemoteColdMissMode::LocalReadThrough,
+            cold_miss_proxy_repos: Vec::new(),
+            background_import_concurrency: default_background_import_concurrency(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRemoteColdMissMode {
+    #[default]
+    LocalReadThrough,
+    UpstreamProxy,
+}
+
+impl FromStr for GitRemoteColdMissMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "local_read_through" | "local" => Ok(Self::LocalReadThrough),
+            "upstream_proxy" | "proxy" => Ok(Self::UpstreamProxy),
+            _ => Err("expected local_read_through or upstream_proxy".into()),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_background_import_concurrency() -> usize {
+    1
 }
 
 fn default_allowed_upstream_hosts() -> Vec<String> {
@@ -316,6 +362,9 @@ mod tests {
         "GIT_CACHE_DISK_MIN_FREE_BYTES",
         "GIT_CACHE_GIT_REMOTE_ENABLED",
         "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
+        "GIT_CACHE_GIT_REMOTE_COLD_MISS_MODE",
+        "GIT_CACHE_GIT_REMOTE_COLD_MISS_PROXY_REPOS",
+        "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
         "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
         "GIT_CACHE_COMPACTION_INLINE",
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
@@ -411,6 +460,7 @@ min_free_bytes = 100000
         assert_eq!(config.git_timeout_seconds, 120);
         assert_eq!(config.rate_limit_per_minute, 120);
         assert_eq!(config.max_git_output_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.git_remote, GitRemoteConfig::default());
         assert_eq!(config.compaction, CompactionConfig::default());
         assert_eq!(config.max_concurrent_generation_verifications, 1);
     }
@@ -427,6 +477,12 @@ min_free_bytes = 100000
         let config = GitRemoteConfig::default();
         assert!(!config.enabled);
         assert!(config.commit_read_through);
+        assert_eq!(
+            config.cold_miss_mode,
+            GitRemoteColdMissMode::LocalReadThrough
+        );
+        assert!(config.cold_miss_proxy_repos.is_empty());
+        assert_eq!(config.background_import_concurrency, 1);
     }
 
     #[test]
@@ -434,6 +490,9 @@ min_free_bytes = 100000
         let config = GitRemoteConfig {
             enabled: true,
             commit_read_through: false,
+            cold_miss_mode: GitRemoteColdMissMode::UpstreamProxy,
+            cold_miss_proxy_repos: vec!["github.com/llvm/llvm-project".into()],
+            background_import_concurrency: 2,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: GitRemoteConfig = serde_json::from_str(&json).unwrap();
@@ -452,6 +511,12 @@ min_free_bytes = 100000
             ("GIT_CACHE_ALLOWED_UPSTREAM_HOSTS", "github.com, gitlab.com"),
             ("GIT_CACHE_GIT_REMOTE_ENABLED", "true"),
             ("GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "off"),
+            ("GIT_CACHE_GIT_REMOTE_COLD_MISS_MODE", "upstream_proxy"),
+            (
+                "GIT_CACHE_GIT_REMOTE_COLD_MISS_PROXY_REPOS",
+                "github.com/llvm/llvm-project,github.com/torvalds/linux",
+            ),
+            ("GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY", "4"),
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
             ("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "3"),
@@ -466,6 +531,18 @@ min_free_bytes = 100000
         );
         assert!(config.git_remote.enabled);
         assert!(!config.git_remote.commit_read_through);
+        assert_eq!(
+            config.git_remote.cold_miss_mode,
+            GitRemoteColdMissMode::UpstreamProxy
+        );
+        assert_eq!(
+            config.git_remote.cold_miss_proxy_repos,
+            vec![
+                "github.com/llvm/llvm-project".to_string(),
+                "github.com/torvalds/linux".to_string(),
+            ]
+        );
+        assert_eq!(config.git_remote.background_import_concurrency, 4);
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
         assert_eq!(config.max_concurrent_generation_verifications, 3);

@@ -482,6 +482,72 @@ impl Materializer {
         Ok(())
     }
 
+    /// Return whether direct Git can serve this upload-pack request from the
+    /// local bare repo without hydrating manifests or contacting upstream.
+    ///
+    /// This is intentionally stricter than `handle_upload_pack`: Track 3's
+    /// upstream-proxy mode uses it only to avoid making a cold client wait for
+    /// cache import. If this check says "not local", the existing read-through
+    /// path still remains the authoritative warmer/import path.
+    pub async fn can_serve_upload_pack_locally(
+        &self,
+        repo: &RepoKey,
+        body: &Bytes,
+    ) -> CoreResult<bool> {
+        let intent = parse_upload_pack_intent(body)?;
+        let repo_dir = self.repo_dir(repo);
+        if !repo_dir.join("config").exists() {
+            return Ok(false);
+        }
+
+        if intent.wants.is_empty() {
+            return Ok(true);
+        }
+
+        let object_types = self
+            .state
+            .git
+            .cat_file_batch_types_no_lazy(&repo_dir, &intent.wants)
+            .await?;
+        for object_id in &intent.wants {
+            let Some(object_type) = object_types.get(object_id).map(String::as_str) else {
+                return Ok(false);
+            };
+            if object_type != "commit" {
+                continue;
+            }
+            if !self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    pub async fn warm_upload_pack(
+        &self,
+        repo: &RepoKey,
+        body: &Bytes,
+        comparison: Option<&UpstreamRefComparison>,
+    ) -> CoreResult<()> {
+        let intent = parse_upload_pack_intent(body)?;
+        if intent.wants.is_empty() {
+            return Ok(());
+        }
+
+        match comparison {
+            Some(comparison) => {
+                Box::pin(
+                    self.ensure_upload_pack_intent_available_from_comparison(
+                        repo, &intent, comparison,
+                    ),
+                )
+                .await
+            }
+            None => Box::pin(self.ensure_upload_pack_intent_available(repo, &intent)).await,
+        }
+    }
+
     /// Handle a direct Git remote upload-pack request end-to-end:
     /// parse want lines, ensure objects are available, configure the repo,
     /// and spawn the upload-pack process for streaming.
