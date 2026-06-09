@@ -304,9 +304,7 @@ impl Materializer {
                 ],
             )
             .await?;
-        let text = String::from_utf8(output.stdout).map_err(|err| {
-            GitCacheError::Validation(format!("git for-each-ref returned non-utf8: {err}"))
-        })?;
+        let text = output.stdout_utf8("for-each-ref")?;
         Ok(text.lines().any(|line| !line.trim().is_empty()))
     }
 
@@ -314,7 +312,7 @@ impl Materializer {
         let _repo_lock = self.lock_repo(repo).await?;
         let remote = self.upstream_url(repo)?;
         self.upstream_git(&remote)?
-            .fetch_all_heads(repo_dir, &remote)
+            .fetch_all_heads(repo_dir, &remote, git_cache_git::FetchOptions::default())
             .await?;
         Ok(())
     }
