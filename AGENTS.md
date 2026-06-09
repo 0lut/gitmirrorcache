@@ -7,12 +7,14 @@ and tests over ad-hoc operational steps.
 
 - Unvalidated git arguments are production-safety bugs: option-looking values
   can become flag injection, and NUL bytes can truncate what git receives.
-- Any public `git-cache-git` method that forwards caller input to `git` must
-  validate at the top of the method, before building refspecs/config/env entries
-  or calling `self.run(...)`, `run_upstream(...)`, or `spawn(...)`.
+- Any public or private boundary that moves external or caller-derived input
+  toward `git` must validate at the top, before building refspecs/config/env
+  entries or calling `self.run(...)`, `run_upstream(...)`, or `spawn(...)`.
 - Treat API paths, query params, request bodies, headers, config, URLs, refs,
   revisions, refspecs, filters, depths, and upload-pack intent as external
   unless the value was created entirely inside the wrapper.
+- Keep repo path inputs behind `RepoKey`, `repo_from_git_path`, and
+  `validate_host`; never join raw URL/path segments into cache paths.
 - Use the narrowest helper: `reject_ref_arg`, `reject_revision_arg`,
   `reject_config_key`, `reject_remote_url`, `reject_refspec`,
   `reject_fetch_filter`, `reject_fetch_depth`, or `reject_nul`.
@@ -22,6 +24,9 @@ and tests over ad-hoc operational steps.
 - Put `--` before positional args wherever git accepts it.
 - Keep upstream auth out of argv, logs, and manifests. Use `with_upstream_auth`
   and the wrapper's `GIT_CONFIG_*` env plumbing for credentials.
+- Remote Git URLs should come from configured upstream roots or validated
+  `upstream_url` construction; do not add arbitrary caller-supplied fetch/proxy
+  URLs.
 - New wrapper checklist: identify external inputs, choose/create the narrowest
   validator, validate before composing git args, add `--` or `--end-of-options`
   where supported, and test rejected leading-dash/NUL input plus any
@@ -50,9 +55,27 @@ and tests over ad-hoc operational steps.
 
 ## Runtime Safety
 
-- Production code must not panic for recoverable errors. Never use
-  `.expect()`/`.unwrap()` on `Mutex::lock()` outside `#[cfg(test)]`; map poison
-  to `GitCacheError::Internal` or return a safe default.
+- Production code must not panic for recoverable errors.
+
+### Mutex Poisoning
+
+- Never use `.expect()` or `.unwrap()` on `Mutex::lock()` outside `#[cfg(test)]`.
+  A poisoned lock means another thread panicked while holding it; panicking again
+  can permanently brick the subsystem.
+- When returning `Result`, map poison to an internal error:
+
+```rust
+let state = self.state.lock()
+    .map_err(|_| GitCacheError::Internal("description of what poisoned".into()))?;
+```
+
+- When the function cannot return `Result`, use a safe default:
+
+```rust
+let Ok(mut state) = self.state.lock() else {
+    return <safe_default>;
+};
+```
 
 ### Bounded Allocations
 
@@ -64,11 +87,15 @@ and tests over ad-hoc operational steps.
   should enforce `max_git_output_bytes` with guards such as `ChildGuardStream`.
 - Pass `max_keys` to `list_prefix` when a full listing is unnecessary.
 - Keep subprocess stdout/stderr behind `read_bounded()`.
+- Bound HTTP request bodies, Git POST input, upstream/proxy streams, retries, and
+  timeouts; do not add unbounded ingress while fixing outbound reads.
 
 ### Resource Bounds
 
 - Every git subprocess spawn must acquire the `Git` semaphore. Streaming
   upload-pack responses must hold the permit until exit.
+- Keep child handles owned until completion or kill, and drain stdout/stderr
+  through bounded readers or streams to avoid deadlocks.
 - Every `tokio::process::Command` child needs `kill_on_drop(true)`.
 - Prefer explicit disk reservation release; never call `temp_path()` after
   `release()`.
