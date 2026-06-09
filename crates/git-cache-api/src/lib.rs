@@ -1052,6 +1052,11 @@ impl Stream for UpstreamProxyStream {
             Poll::Ready(Some(Ok(chunk))) => {
                 this.bytes_sent = this.bytes_sent.saturating_add(chunk.len() as u64);
                 if this.bytes_sent > this.max_bytes {
+                    warn!(
+                        bytes_sent = this.bytes_sent,
+                        max_bytes = this.max_bytes,
+                        "upstream upload-pack proxy response exceeded byte limit; aborting stream"
+                    );
                     Poll::Ready(Some(Err(std::io::Error::other(format!(
                         "upstream upload-pack proxy response exceeded {} byte limit",
                         this.max_bytes
@@ -1070,6 +1075,21 @@ impl Stream for UpstreamProxyStream {
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// The background warm must run regardless of how the proxied stream ends:
+/// byte-limit aborts, upstream errors, and client disconnects all drop the
+/// stream without reaching `Poll::Ready(None)`, and without the warm a repo
+/// whose proxied response cannot complete would never become servable from
+/// the local cache.
+impl Drop for UpstreamProxyStream {
+    fn drop(&mut self) {
+        if let Some(task) = self.warm_task.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                task.spawn();
+            }
         }
     }
 }
