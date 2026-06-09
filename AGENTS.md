@@ -5,17 +5,27 @@ and tests over ad-hoc operational steps.
 
 ## Git Boundaries
 
+- Unvalidated git arguments are production-safety bugs: option-looking values
+  can become flag injection, and NUL bytes can truncate what git receives.
 - Any public `git-cache-git` method that forwards caller input to `git` must
-  validate at the top of the method before `self.run(...)` or `spawn(...)`.
+  validate at the top of the method, before building refspecs/config/env entries
+  or calling `self.run(...)`, `run_upstream(...)`, or `spawn(...)`.
+- Treat API paths, query params, request bodies, headers, config, URLs, refs,
+  revisions, refspecs, filters, depths, and upload-pack intent as external
+  unless the value was created entirely inside the wrapper.
 - Use the narrowest helper: `reject_ref_arg`, `reject_revision_arg`,
   `reject_config_key`, `reject_remote_url`, `reject_refspec`,
   `reject_fetch_filter`, `reject_fetch_depth`, or `reject_nul`.
-- External strings must reject empty values, leading `-` where they become git
-  args, and NUL bytes. Refs reject `:`; revisions may allow `HEAD:path`;
+- External strings must reject empty values, leading `-` when git may parse them
+  as args, and NUL bytes. Refs reject `:`; revisions may allow `HEAD:path`;
   refspecs may allow `+` and `:`.
 - Put `--` before positional args wherever git accepts it.
-- Add or update tests for rejected flag-looking input and NUL bytes when adding
-  a wrapper or accepting new query/body/header data.
+- Keep upstream auth out of argv, logs, and manifests. Use `with_upstream_auth`
+  and the wrapper's `GIT_CONFIG_*` env plumbing for credentials.
+- New wrapper checklist: identify external inputs, choose/create the narrowest
+  validator, validate before composing git args, add `--` or `--end-of-options`
+  where supported, and test rejected leading-dash/NUL input plus any
+  helper-specific constraints.
 
 ## Current Cache Contract
 
