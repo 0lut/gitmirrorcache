@@ -780,9 +780,12 @@ Without the header, direct Git keeps the existing local read-through behavior.
 Background imports are bounded by `git_remote.background_import_concurrency`.
 
 This is Option A from the cold-fast plan: proxy first, then refetch/import in
-the background using the same request-scoped upstream auth. It intentionally
-duplicates upstream work on cache misses, but keeps first-clone latency close
-to the origin and avoids parsing or persisting upstream pack bytes in the HTTP
-hot path. Request auth is forwarded only as an upstream HTTP header, never
-logged or stored. Non-HTTP origins, including local test upstreams, fall back to
-the existing local read-through path.
+the background using the same request-scoped upstream auth and the client's
+upload-pack depth/filter options. The background warm path also skips
+object-store generation hydration; otherwise an S3 manifest hit can turn a
+small proxy clone into an asynchronous multi-GB bundle import. It intentionally
+duplicates upstream work on cache misses, but keeps first-clone latency close to
+the origin and avoids parsing or persisting upstream pack bytes in the HTTP hot
+path. Request auth is forwarded only as an upstream HTTP header, never logged or
+stored. Non-HTTP origins, including local test upstreams, fall back to the
+existing local read-through path.
