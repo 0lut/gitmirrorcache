@@ -3,6 +3,19 @@
 Keep this file short and current. Prefer the repo's checked-in docs, scripts,
 and tests over ad-hoc operational steps.
 
+## Agent Docs Layout
+
+- This file is shared guidance for any agent working in this repository. Keep
+  repo-wide safety rules and current architecture contracts here.
+- Codex task runbooks live under [`.agents/skills/`](.agents/skills/). They
+  should cover focused implementation or testing workflows and refer back here
+  for shared rules.
+- Devin task runbooks live under [`.devin/skills/`](.devin/skills/). They should
+  cover Devin-specific environment details and operational workflows, such as
+  AWS deployment, and refer back here for shared rules.
+- When a workflow applies to multiple agents, keep the policy here and link to
+  the agent-specific runbook that owns the step-by-step procedure.
+
 ## Git Boundaries
 
 - Unvalidated git arguments are production-safety bugs: option-looking values
@@ -114,16 +127,6 @@ let Ok(mut state) = self.state.lock() else {
 ## Deployments
 
 - Use checked-in AWS scripts instead of raw AWS/SSM/Docker command sequences.
-  The maintained path is ECS on Graviton EC2 with host-mounted EBS and S3:
-
-```sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-and-smoke.sh
-```
-
-- Preview stacks go through `scripts/aws/deploy-preview.sh <ref>` and
-  `scripts/aws/destroy-preview.sh <ref>`; they use isolated S3 prefixes and
-  shared preview ALB routes.
-- If a rollout is stuck because an old task still owns host port `8080`, inspect
-  with `scripts/aws/ecs-host-diagnostics.sh`, then use
-  `scripts/aws/stop-stale-ecs-container.sh` with `ECS_STALE_CONTAINER_ID` and
-  `CONFIRM_STOP=true`.
+  The Devin deployment runbook owns exact commands, credentials, preview-stack
+  steps, image build options, and stale ECS container recovery:
+  [gitmirrorcache-deploy](.devin/skills/gitmirrorcache-deploy/SKILL.md).

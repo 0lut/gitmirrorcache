@@ -9,6 +9,10 @@ triggers:
 Use this skill when asked to deploy gitmirrorcache, check a deployment, or
 recover a stuck ECS rollout.
 
+This Devin runbook owns AWS deployment and recovery procedures. Follow the
+shared repository rules in [AGENTS.md](../../../AGENTS.md); Codex-focused local
+testing runbooks live under [`.agents/skills`](../../../.agents/skills/).
+
 ## AWS credentials
 
 The `AWS_Access_Key` secret env var holds a 2-line CSV (header + key,secret).
@@ -33,15 +37,16 @@ directory first on `PATH` (e.g. `/usr/local/bin` on the Devin VM,
 
 ## Standard deployment
 
-1. Confirm the working tree is clean and switch to `main`.
-2. Pull latest `main`.
-3. Use the checked-in deployment wrapper, not one-off AWS/Docker commands:
+1. Confirm the working tree is clean and based on latest `origin/main` (`main`
+   on the Devin VM; detached worktrees are fine for Codex if they point at
+   `origin/main`).
+2. Use the checked-in deployment wrapper, not one-off AWS/Docker commands:
 
    ```sh
    AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-and-smoke.sh
    ```
 
-4. Verify the ECS service and task definition:
+3. Verify the ECS service and task definition:
 
    ```sh
    aws ecs describe-services \

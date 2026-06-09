@@ -5,6 +5,11 @@ description: Test the read-through Git remote feature end-to-end. Use when verif
 
 # Testing the Read-Through Git Remote
 
+This Codex runbook covers local and public-GitHub validation for the read-through
+Git remote. Follow the shared repository rules in [AGENTS.md](../../../AGENTS.md);
+deployment and AWS operations live in
+[gitmirrorcache-deploy](../../../.devin/skills/gitmirrorcache-deploy/SKILL.md).
+
 ## Quick Checks
 
 ```bash
@@ -88,6 +93,6 @@ When modifying input validators (`reject_remote_url`, `reject_refspec`, `reject_
 3. Verify `git clone` through the proxy still works (validators not too strict)
 4. Verify disallowed hosts return 4xx (validators not too loose)
 
-## Devin Secrets Needed
+## Secrets Needed
 
 None — all testing uses public GitHub repos and local infrastructure.
