@@ -204,6 +204,7 @@ impl Materializer {
         let mut hydrated_commits = 0usize;
         let mut fetched_commits = 0usize;
         let mut fetched_non_commit_wants = 0usize;
+        let mut pending: Vec<CommitSha> = Vec::new();
 
         for object_id in object_ids {
             if let Some(object_type) = object_types.get(object_id) {
@@ -236,115 +237,158 @@ impl Materializer {
                 )));
             }
 
-            let advertised_branch = comparison
-                .and_then(|comparison| comparison.branch_for_commit(object_id).map(str::to_string));
-            let advertised_ref = advertised_branch
-                .as_ref()
-                .map(|branch| format!("refs/heads/{branch}"))
-                .unwrap_or_else(|| "<none>".to_string());
-            info!(
-                %repo,
-                commit = %object_id,
-                advertised_ref = %advertised_ref,
-                depth = fetch_options.depth,
-                blobless_fetch = fetch_options.blobless_fetch(),
-                "direct git read-through fetch for wanted commit"
-            );
+            pending.push(object_id.clone());
+        }
+
+        if !pending.is_empty() {
+            // A fresh clone wants the tip of every advertised ref, so missing
+            // wants must be fetched in batched upstream invocations: one fetch
+            // for all advertised refspecs plus one for raw SHAs, instead of one
+            // subprocess per want.
             let upstream_url = self.upstream_url(repo)?;
             let upstream_git = self.upstream_git(&upstream_url)?;
-            let fetched_via_advertised_ref = advertised_branch.is_some();
-            let fetch_result = if let Some(branch) = advertised_branch {
-                let upstream_ref = format!("refs/heads/{branch}");
-                let local_ref = format!("refs/cache/upstream/heads/{branch}");
-                let ref_fetch_result = upstream_git
-                    .fetch_ref(
-                        &repo_dir,
-                        &upstream_url,
-                        &upstream_ref,
-                        &local_ref,
-                        fetch_options.git_options(),
-                    )
-                    .await;
-                match ref_fetch_result {
-                    Ok(output) => Ok(output),
-                    Err(err) => {
+
+            let mut refspecs: Vec<String> = Vec::new();
+            let mut raw_objects: Vec<CommitSha> = Vec::new();
+            for object_id in &pending {
+                match comparison
+                    .and_then(|comparison| comparison.branch_for_commit(object_id))
+                    .map(git_cache_git::branch_cache_refspec)
+                {
+                    Some(Ok(refspec)) => refspecs.push(refspec),
+                    Some(Err(err)) => {
                         warn!(
                             %repo,
-                            commit = %object_id,
-                            upstream_ref,
-                            local_ref,
+                            %object_id,
                             %err,
-                            "direct git advertised-ref fetch failed; falling back to raw object fetch"
+                            "advertised branch name failed refspec validation; fetching as raw object"
                         );
-                        upstream_git
-                            .fetch_object(
-                                &repo_dir,
-                                &upstream_url,
-                                object_id,
-                                fetch_options.git_options(),
-                            )
-                            .await
+                        raw_objects.push(object_id.clone());
                     }
+                    None => raw_objects.push(object_id.clone()),
                 }
-            } else {
-                upstream_git
-                    .fetch_object(
+            }
+            refspecs.sort();
+            refspecs.dedup();
+
+            info!(
+                %repo,
+                pending_wants = pending.len(),
+                refspec_count = refspecs.len(),
+                raw_object_count = raw_objects.len(),
+                depth = fetch_options.depth,
+                blobless_fetch = fetch_options.blobless_fetch(),
+                "direct git batched read-through fetch for wanted commits"
+            );
+
+            let mut fetched_all_heads = false;
+            if !refspecs.is_empty() {
+                if let Err(err) = upstream_git
+                    .fetch_refspecs(
                         &repo_dir,
                         &upstream_url,
-                        object_id,
+                        &refspecs,
                         fetch_options.git_options(),
                     )
                     .await
-            };
-
-            if let Err(fetch_err) = fetch_result {
-                upstream_git
-                    .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
-                    .await?;
-                match self
-                    .prepare_fetched_direct_want(repo, &repo_dir, object_id)
-                    .await
                 {
-                    Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
-                    Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
-                    Err(_) => {
-                        return Err(GitCacheError::NotFound(format!(
-                            "object `{object_id}` could not be fetched from upstream: {fetch_err}"
-                        )));
-                    }
-                }
-                continue;
-            }
-
-            let prepared = self
-                .prepare_fetched_direct_want(repo, &repo_dir, object_id)
-                .await;
-            let prepared = match prepared {
-                Ok(kind) => kind,
-                Err(err) if fetched_via_advertised_ref => {
                     warn!(
                         %repo,
-                        commit = %object_id,
+                        refspec_count = refspecs.len(),
                         %err,
-                        "direct git advertised-ref fetch did not include wanted object; falling back to raw object fetch"
+                        "direct git batched advertised-ref fetch failed; falling back to all-heads fetch"
                     );
                     upstream_git
-                        .fetch_object(
-                            &repo_dir,
-                            &upstream_url,
-                            object_id,
-                            fetch_options.git_options(),
-                        )
+                        .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
                         .await?;
-                    self.prepare_fetched_direct_want(repo, &repo_dir, object_id)
-                        .await?
+                    fetched_all_heads = true;
                 }
-                Err(err) => return Err(err),
-            };
+            }
+            if !raw_objects.is_empty() {
+                if let Err(err) = upstream_git
+                    .fetch_objects(
+                        &repo_dir,
+                        &upstream_url,
+                        &raw_objects,
+                        fetch_options.git_options(),
+                    )
+                    .await
+                {
+                    warn!(
+                        %repo,
+                        raw_object_count = raw_objects.len(),
+                        %err,
+                        "direct git batched raw-object fetch failed; falling back to all-heads fetch"
+                    );
+                    if !fetched_all_heads {
+                        upstream_git
+                            .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
+                            .await?;
+                        fetched_all_heads = true;
+                    }
+                }
+            }
 
-            match prepared {
-                DirectFetchedWantKind::Commit => fetched_commits += 1,
-                DirectFetchedWantKind::NonCommit => fetched_non_commit_wants += 1,
+            let mut missing: Vec<CommitSha> = Vec::new();
+            for object_id in &pending {
+                match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
+                    Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
+                    Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
+                    Err(_) => missing.push(object_id.clone()),
+                }
+            }
+
+            if !missing.is_empty() {
+                // Wants the batched fetch did not cover (e.g. an advertised
+                // branch moved between the GET advertisement and this POST)
+                // are retried as exact-SHA fetches, then as an all-heads fetch.
+                warn!(
+                    %repo,
+                    missing_count = missing.len(),
+                    "direct git batched fetch did not cover all wants; retrying as exact-SHA fetch"
+                );
+                if let Err(err) = upstream_git
+                    .fetch_objects(
+                        &repo_dir,
+                        &upstream_url,
+                        &missing,
+                        fetch_options.git_options(),
+                    )
+                    .await
+                {
+                    if fetched_all_heads {
+                        return Err(GitCacheError::NotFound(format!(
+                            "objects could not be fetched from upstream: {err}"
+                        )));
+                    }
+                    warn!(
+                        %repo,
+                        missing_count = missing.len(),
+                        %err,
+                        "direct git exact-SHA retry fetch failed; falling back to all-heads fetch"
+                    );
+                    upstream_git
+                        .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
+                        .await?;
+                }
+                for object_id in &missing {
+                    match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
+                        Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
+                        Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
+                        Err(err) => {
+                            return Err(GitCacheError::NotFound(format!(
+                                "object `{object_id}` could not be fetched from upstream: {err}"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // One repo-wide fsck covers every commit fetched by this request.
+            if fetched_commits > 0 || fetched_non_commit_wants > 0 {
+                if let Some(first) = pending.first() {
+                    self.enqueue_direct_fsck(repo.clone(), repo_dir.to_path_buf(), first.clone());
+                }
             }
         }
 
@@ -367,7 +411,6 @@ impl Materializer {
 
     async fn prepare_fetched_direct_want(
         &self,
-        repo: &RepoKey,
         repo_dir: &FsPath,
         object_id: &CommitSha,
     ) -> CoreResult<DirectFetchedWantKind> {
@@ -402,7 +445,6 @@ impl Materializer {
             .update_ref(repo_dir, &cache_ref, object_id.as_str())
             .await?;
 
-        self.enqueue_direct_fsck(repo.clone(), repo_dir.to_path_buf(), object_id.clone());
         Ok(DirectFetchedWantKind::Commit)
     }
 
