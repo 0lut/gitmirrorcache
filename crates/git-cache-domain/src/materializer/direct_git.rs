@@ -482,6 +482,99 @@ impl Materializer {
         Ok(())
     }
 
+    /// Prepare direct Git wants from the cache without contacting upstream.
+    ///
+    /// Proxy-on-miss uses this before falling through to the upstream proxy:
+    /// EBS-local objects and complete object-store commit manifests both count
+    /// as warm. If this returns `false`, the existing read-through path still
+    /// remains the authoritative warmer/import path.
+    pub async fn prepare_upload_pack_from_cache(
+        &self,
+        repo: &RepoKey,
+        body: &Bytes,
+    ) -> CoreResult<bool> {
+        let started = Instant::now();
+        let intent = parse_upload_pack_intent(body)?;
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+
+        if intent.wants.is_empty() {
+            return Ok(true);
+        }
+
+        let _repo_lock = self.lock_repo(repo).await?;
+        let object_types = self
+            .state
+            .git
+            .cat_file_batch_types_no_lazy(&repo_dir, &intent.wants)
+            .await?;
+        let wants_count = intent.wants.len();
+        let mut served_commits = 0usize;
+        let mut served_non_commit_wants = 0usize;
+        for object_id in &intent.wants {
+            if let Some(object_type) = object_types.get(object_id).map(String::as_str) {
+                if object_type != "commit" {
+                    served_non_commit_wants += 1;
+                    continue;
+                }
+                if self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
+                    self.expose_served_commit(&repo_dir, object_id).await?;
+                    served_commits += 1;
+                    continue;
+                }
+            }
+
+            // This readiness check is intentionally EBS-local. Pulling a
+            // generation bundle from object storage can require importing a
+            // multi-GB pack before serving a tiny shallow/blobless clone; with
+            // proxy-on-miss requested, an EBS miss should proxy immediately and
+            // let the background warm path fill the local repo.
+            info!(
+                %repo,
+                commit = %object_id,
+                wants_count,
+                served_commits,
+                served_non_commit_wants,
+                elapsed_ms = elapsed_ms(started),
+                "direct git cache prepare missed local object"
+            );
+            return Ok(false);
+        }
+
+        info!(
+            %repo,
+            wants_count,
+            served_commits,
+            served_non_commit_wants,
+            elapsed_ms = elapsed_ms(started),
+            "direct git cache prepare satisfied upload-pack wants"
+        );
+        Ok(true)
+    }
+
+    pub async fn warm_upload_pack(
+        &self,
+        repo: &RepoKey,
+        body: &Bytes,
+        comparison: Option<&UpstreamRefComparison>,
+    ) -> CoreResult<()> {
+        let intent = parse_upload_pack_intent(body)?;
+        if intent.wants.is_empty() {
+            return Ok(());
+        }
+
+        match comparison {
+            Some(comparison) => {
+                Box::pin(
+                    self.ensure_upload_pack_intent_available_from_comparison(
+                        repo, &intent, comparison,
+                    ),
+                )
+                .await
+            }
+            None => Box::pin(self.ensure_upload_pack_intent_available(repo, &intent)).await,
+        }
+    }
+
     /// Handle a direct Git remote upload-pack request end-to-end:
     /// parse want lines, ensure objects are available, configure the repo,
     /// and spawn the upload-pack process for streaming.
