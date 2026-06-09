@@ -28,6 +28,11 @@ use tracing::info;
 
 const OBJECT_STORE_SCHEMA_SUFFIX: &str = "v2";
 
+#[cfg(feature = "gcs")]
+const ENV_GCS_ANONYMOUS: &str = "GIT_CACHE_GCS_ANONYMOUS";
+#[cfg(feature = "gcs")]
+const TRUTHY_ENV_VALUES: [&str; 4] = ["1", "true", "yes", "on"];
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -232,11 +237,10 @@ fn gcs_store_sync(
     endpoint: Option<&str>,
 ) -> CoreResult<GcsObjectStore> {
     if !gcs_anonymous_from_env() {
-        return Err(GitCacheError::NotImplemented(
+        return Err(GitCacheError::NotImplemented(format!(
             "authenticated GCS object store requires async initialization; \
-             use try_new_async or set GIT_CACHE_GCS_ANONYMOUS=1 for emulators"
-                .into(),
-        ));
+             use try_new_async or set {ENV_GCS_ANONYMOUS}=1 for emulators"
+        )));
     }
     let config = apply_gcs_endpoint(GcsClientConfig::default().anonymous(), endpoint);
     GcsObjectStore::new(GcsClient::new(config), bucket, prefix)
@@ -275,13 +279,10 @@ fn apply_gcs_endpoint(mut config: GcsClientConfig, endpoint: Option<&str>) -> Gc
 
 #[cfg(feature = "gcs")]
 fn gcs_anonymous_from_env() -> bool {
-    matches!(
-        env::var("GIT_CACHE_GCS_ANONYMOUS")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    let value = env::var(ENV_GCS_ANONYMOUS)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    TRUTHY_ENV_VALUES.contains(&value.as_str())
 }
 
 #[cfg(feature = "s3")]

@@ -116,95 +116,139 @@ impl AppConfig {
     }
 }
 
-fn object_store_from_env() -> crate::Result<ObjectStoreConfig> {
-    let kind = env::var("GIT_CACHE_OBJECT_STORE_KIND")
-        .unwrap_or_else(|_| "local".into())
-        .to_ascii_lowercase();
+pub const ENV_OBJECT_STORE_KIND: &str = "GIT_CACHE_OBJECT_STORE_KIND";
+pub const ENV_OBJECT_STORE_ROOT: &str = "GIT_CACHE_OBJECT_STORE_ROOT";
+pub const ENV_OBJECT_STORE_BUCKET: &str = "GIT_CACHE_OBJECT_STORE_BUCKET";
+pub const ENV_OBJECT_STORE_PREFIX: &str = "GIT_CACHE_OBJECT_STORE_PREFIX";
+pub const ENV_OBJECT_STORE_ENDPOINT: &str = "GIT_CACHE_OBJECT_STORE_ENDPOINT";
+pub const ENV_S3_BUCKET: &str = "GIT_CACHE_S3_BUCKET";
+pub const ENV_S3_PREFIX: &str = "GIT_CACHE_S3_PREFIX";
+pub const ENV_S3_ENDPOINT: &str = "GIT_CACHE_S3_ENDPOINT";
+pub const ENV_GCS_BUCKET: &str = "GIT_CACHE_GCS_BUCKET";
+pub const ENV_GCS_PREFIX: &str = "GIT_CACHE_GCS_PREFIX";
+pub const ENV_GCS_ENDPOINT: &str = "GIT_CACHE_GCS_ENDPOINT";
 
-    let s3_configured = env_present("GIT_CACHE_S3_BUCKET");
-    let gcs_configured = env_present("GIT_CACHE_GCS_BUCKET");
-    if s3_configured && gcs_configured {
-        return Err(crate::GitCacheError::Validation(
-            "a deployment uses exactly one durable object-store backend: \
-             both GIT_CACHE_S3_BUCKET and GIT_CACHE_GCS_BUCKET are set"
-                .into(),
-        ));
-    }
-    match (kind.as_str(), s3_configured, gcs_configured) {
-        ("s3", _, true) => {
-            return Err(crate::GitCacheError::Validation(
-                "GIT_CACHE_OBJECT_STORE_KIND=s3 conflicts with GIT_CACHE_GCS_BUCKET".into(),
-            ));
+const DEFAULT_OBJECT_STORE_PREFIX: &str = "repos";
+const DEFAULT_LOCAL_OBJECT_STORE_ROOT: &str = "./tmp/object-store";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectStoreKind {
+    Local,
+    S3,
+    Gcs,
+}
+
+impl ObjectStoreKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::S3 => "s3",
+            Self::Gcs => "gcs",
         }
-        ("gcs", true, _) => {
-            return Err(crate::GitCacheError::Validation(
-                "GIT_CACHE_OBJECT_STORE_KIND=gcs conflicts with GIT_CACHE_S3_BUCKET".into(),
-            ));
+    }
+
+    fn from_env() -> crate::Result<Self> {
+        let raw = env::var(ENV_OBJECT_STORE_KIND)
+            .unwrap_or_else(|_| Self::Local.as_str().into())
+            .to_ascii_lowercase();
+        match raw.as_str() {
+            "local" => Ok(Self::Local),
+            "s3" => Ok(Self::S3),
+            "gcs" => Ok(Self::Gcs),
+            other => Err(crate::GitCacheError::Validation(format!(
+                "unsupported {ENV_OBJECT_STORE_KIND} `{other}`"
+            ))),
+        }
+    }
+}
+
+fn object_store_from_env() -> crate::Result<ObjectStoreConfig> {
+    let kind = ObjectStoreKind::from_env()?;
+
+    let s3_configured = env_present(ENV_S3_BUCKET);
+    let gcs_configured = env_present(ENV_GCS_BUCKET);
+    if s3_configured && gcs_configured {
+        return Err(crate::GitCacheError::Validation(format!(
+            "a deployment uses exactly one durable object-store backend: \
+             both {ENV_S3_BUCKET} and {ENV_GCS_BUCKET} are set"
+        )));
+    }
+    match (kind, s3_configured, gcs_configured) {
+        (ObjectStoreKind::S3, _, true) => {
+            return Err(kind_conflict_error(kind, ENV_GCS_BUCKET));
+        }
+        (ObjectStoreKind::Gcs, true, _) => {
+            return Err(kind_conflict_error(kind, ENV_S3_BUCKET));
         }
         _ => {}
     }
 
-    match kind.as_str() {
-        "local" => Ok(ObjectStoreConfig::Local {
+    match kind {
+        ObjectStoreKind::Local => Ok(ObjectStoreConfig::Local {
             root: PathBuf::from(
-                env::var("GIT_CACHE_OBJECT_STORE_ROOT")
-                    .unwrap_or_else(|_| "./tmp/object-store".into()),
+                env::var(ENV_OBJECT_STORE_ROOT)
+                    .unwrap_or_else(|_| DEFAULT_LOCAL_OBJECT_STORE_ROOT.into()),
             ),
         }),
-        "s3" => {
-            let bucket = env::var("GIT_CACHE_S3_BUCKET")
-                .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_BUCKET"))
-                .map_err(|_| {
-                    crate::GitCacheError::Validation(
-                        "GIT_CACHE_OBJECT_STORE_KIND=s3 requires GIT_CACHE_S3_BUCKET".into(),
-                    )
-                })?;
-            if bucket.trim().is_empty() {
-                return Err(crate::GitCacheError::Validation(
-                    "GIT_CACHE_S3_BUCKET must not be empty".into(),
-                ));
-            }
-
+        ObjectStoreKind::S3 => {
+            let (bucket, prefix, endpoint) =
+                durable_backend_from_env(kind, ENV_S3_BUCKET, ENV_S3_PREFIX, ENV_S3_ENDPOINT)?;
             Ok(ObjectStoreConfig::S3 {
                 bucket,
-                prefix: env::var("GIT_CACHE_S3_PREFIX")
-                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_PREFIX"))
-                    .unwrap_or_else(|_| "repos".into()),
-                endpoint: env::var("GIT_CACHE_S3_ENDPOINT")
-                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_ENDPOINT"))
-                    .ok()
-                    .filter(|value| !value.trim().is_empty()),
+                prefix,
+                endpoint,
             })
         }
-        "gcs" => {
-            let bucket = env::var("GIT_CACHE_GCS_BUCKET")
-                .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_BUCKET"))
-                .map_err(|_| {
-                    crate::GitCacheError::Validation(
-                        "GIT_CACHE_OBJECT_STORE_KIND=gcs requires GIT_CACHE_GCS_BUCKET".into(),
-                    )
-                })?;
-            if bucket.trim().is_empty() {
-                return Err(crate::GitCacheError::Validation(
-                    "GIT_CACHE_GCS_BUCKET must not be empty".into(),
-                ));
-            }
-
+        ObjectStoreKind::Gcs => {
+            let (bucket, prefix, endpoint) =
+                durable_backend_from_env(kind, ENV_GCS_BUCKET, ENV_GCS_PREFIX, ENV_GCS_ENDPOINT)?;
             Ok(ObjectStoreConfig::Gcs {
                 bucket,
-                prefix: env::var("GIT_CACHE_GCS_PREFIX")
-                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_PREFIX"))
-                    .unwrap_or_else(|_| "repos".into()),
-                endpoint: env::var("GIT_CACHE_GCS_ENDPOINT")
-                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_ENDPOINT"))
-                    .ok()
-                    .filter(|value| !value.trim().is_empty()),
+                prefix,
+                endpoint,
             })
         }
-        other => Err(crate::GitCacheError::Validation(format!(
-            "unsupported GIT_CACHE_OBJECT_STORE_KIND `{other}`"
-        ))),
     }
+}
+
+fn kind_conflict_error(
+    kind: ObjectStoreKind,
+    conflicting_bucket_env: &str,
+) -> crate::GitCacheError {
+    crate::GitCacheError::Validation(format!(
+        "{ENV_OBJECT_STORE_KIND}={} conflicts with {conflicting_bucket_env}",
+        kind.as_str()
+    ))
+}
+
+fn durable_backend_from_env(
+    kind: ObjectStoreKind,
+    bucket_env: &str,
+    prefix_env: &str,
+    endpoint_env: &str,
+) -> crate::Result<(String, String, Option<String>)> {
+    let bucket = env::var(bucket_env)
+        .or_else(|_| env::var(ENV_OBJECT_STORE_BUCKET))
+        .map_err(|_| {
+            crate::GitCacheError::Validation(format!(
+                "{ENV_OBJECT_STORE_KIND}={} requires {bucket_env}",
+                kind.as_str()
+            ))
+        })?;
+    if bucket.trim().is_empty() {
+        return Err(crate::GitCacheError::Validation(format!(
+            "{bucket_env} must not be empty"
+        )));
+    }
+
+    let prefix = env::var(prefix_env)
+        .or_else(|_| env::var(ENV_OBJECT_STORE_PREFIX))
+        .unwrap_or_else(|_| DEFAULT_OBJECT_STORE_PREFIX.into());
+    let endpoint = env::var(endpoint_env)
+        .or_else(|_| env::var(ENV_OBJECT_STORE_ENDPOINT))
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    Ok((bucket, prefix, endpoint))
 }
 
 fn env_present(key: &str) -> bool {
