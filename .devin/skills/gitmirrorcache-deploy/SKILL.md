@@ -58,12 +58,33 @@ VERSION_ID=<12-char-commit> scripts/aws/destroy-preview.sh   # teardown
   `gmc-p-<VERSION_ID>` and served at the shared preview ALB under
   `/v/<VERSION_ID>` (e.g. `http://gitmirrorcache-arm-preview-alb-<id>.us-west-2.elb.amazonaws.com/v/<VERSION_ID>/healthz`).
 - Set `ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true` to skip the local Docker
-  build when the ECR tag already exists (e.g. after a buildbox build).
+  build when the ECR tag already exists (e.g. after `build-image-cross.sh`).
 - API logs: `aws logs tail /ecs/gmc-p-<VERSION_ID>/ec2-api --region us-west-2 --since 15m --format short`
 
-## Native arm64 image build on a buildbox
+## arm64 image build WITHOUT a buildbox (preferred)
 
-Local arm64 builds run under QEMU and are very slow. Build natively instead
+Building the full Dockerfile under QEMU is very slow because `cargo build`
+emulates arm64. On a Linux x86 host, use the checked-in wrapper instead
+(~2.5 min total): it cross-compiles the binaries natively, assembles a
+runtime-only image from `Dockerfile.cross` via buildx, and pushes to ECR.
+
+```sh
+AWS_REGION=us-west-2 scripts/aws/build-image-cross.sh
+# then deploy reusing the pushed tag:
+ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true IMAGE_TAG=<tag> \
+  AWS_REGION=us-west-2 scripts/aws/deploy-and-smoke.sh
+```
+
+Prereqs (baked into the Devin VM snapshot): `gcc-aarch64-linux-gnu`, the
+`aarch64-unknown-linux-gnu` rustup target, AWS CLI v2. The script registers
+the qemu binfmt handler itself if missing. `PUSH=false` does a local-only
+`--load` build (no AWS access needed). The script is Linux-only; on macOS
+(Apple Silicon) build the full Dockerfile natively:
+`docker buildx build --platform linux/arm64 -f Dockerfile .`
+
+## Native arm64 image build on a buildbox (fallback)
+
+Only if the cross-build path is unavailable. Build natively
 (~6 min on c8g.2xlarge), and ALWAYS terminate the buildbox afterwards:
 
 ```sh
