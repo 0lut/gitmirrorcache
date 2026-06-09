@@ -750,6 +750,13 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
                     }
                     Err(ProxyFallback::Error(error)) => return error.into_response(),
                 }
+            } else {
+                info!(
+                    request_id,
+                    repo = %repo,
+                    auth = auth_label(&auth),
+                    "direct git proxy-on-miss cache hit; serving local upload-pack"
+                );
             }
         }
 
