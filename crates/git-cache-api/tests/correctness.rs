@@ -309,6 +309,96 @@ mod tests {
         );
     }
 
+    // ── Async materialize ───────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_materialize_cold_miss_returns_accepted_and_completes() {
+        let server = TestServer::start().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{}?async=true", server.materialize_url()))
+            .json(&serde_json::json!({
+                "repo": "github.com/org/repo",
+                "selector": {"branch": "main"}
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 202);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["repo"], "github.com/org/repo");
+        assert_eq!(body["cache_available"], false);
+        let commit = body["commit"].as_str().unwrap().to_string();
+        assert_eq!(commit.len(), 40);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let resp = client
+                .post(server.resolve_url())
+                .json(&serde_json::json!({
+                    "repo": "github.com/org/repo",
+                    "selector": {"branch": "main"}
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().await.unwrap();
+            if body["cache_available"] == true {
+                assert_eq!(body["commit"].as_str().unwrap(), commit);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background materialize did not complete in time"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_materialize_cached_commit_returns_ok_immediately() {
+        let server = TestServer::start().await;
+        server.warm_local_branch_cache();
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{}?async=true", server.materialize_url()))
+            .json(&serde_json::json!({
+                "repo": "github.com/org/repo",
+                "selector": {"branch": "main"}
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["cache_available"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_materialize_invalid_repo_key_returns_error() {
+        let server = TestServer::start().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}?async=true", server.materialize_url()))
+            .json(&serde_json::json!({
+                "repo": "invalid-repo",
+                "selector": {"branch": "main"}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "expected 4xx, got {}",
+            resp.status()
+        );
+    }
+
     // ── Resolve endpoint ────────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
