@@ -5,9 +5,12 @@ description: Test the read-through Git remote feature end-to-end. Use when verif
 
 # Testing the Read-Through Git Remote
 
-This Codex runbook covers local and public-GitHub validation for the read-through
-Git remote. Follow the shared repository rules in [AGENTS.md](../../../AGENTS.md);
-deployment and AWS operations live in
+Requirements: local Rust/Git toolchain; optional public GitHub network access
+for live validation; no secrets; no live-infrastructure access.
+
+This local-only runbook covers validation for the read-through Git remote.
+Follow the shared repository rules in [AGENTS.md](../../../AGENTS.md);
+privileged AWS deployment and recovery operations live in
 [gitmirrorcache-deploy](../../../.devin/skills/gitmirrorcache-deploy/SKILL.md).
 
 ## Quick Checks

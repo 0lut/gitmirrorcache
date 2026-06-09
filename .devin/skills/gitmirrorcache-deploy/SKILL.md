@@ -9,9 +9,13 @@ triggers:
 Use this skill when asked to deploy gitmirrorcache, check a deployment, or
 recover a stuck ECS rollout.
 
-This Devin runbook owns AWS deployment and recovery procedures. Follow the
-shared repository rules in [AGENTS.md](../../../AGENTS.md); Codex-focused local
-testing runbooks live under [`.agents/skills`](../../../.agents/skills/).
+Requirements: persistent VM, `AWS_Access_Key`, AWS CLI v2, network access to
+AWS us-west-2, and authorization to mutate live AWS infrastructure.
+
+This privileged operations runbook owns AWS deployment and recovery procedures.
+Follow the shared repository rules in [AGENTS.md](../../../AGENTS.md);
+local-only testing runbooks live under
+[`.agents/skills`](../../../.agents/skills/).
 
 ## AWS credentials
 
@@ -37,9 +41,9 @@ directory first on `PATH` (e.g. `/usr/local/bin` on the Devin VM,
 
 ## Standard deployment
 
-1. Confirm the working tree is clean and based on latest `origin/main` (`main`
-   on the Devin VM; detached worktrees are fine for Codex if they point at
-   `origin/main`).
+1. Confirm the working tree is clean and based on latest `origin/main`; a
+   tracking `main` branch is not required if the checkout is otherwise clean and
+   at `origin/main`.
 2. Use the checked-in deployment wrapper, not one-off AWS/Docker commands:
 
    ```sh

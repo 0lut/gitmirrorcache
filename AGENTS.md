@@ -7,14 +7,14 @@ and tests over ad-hoc operational steps.
 
 - This file is shared guidance for any agent working in this repository. Keep
   repo-wide safety rules and current architecture contracts here.
-- Codex task runbooks live under [`.agents/skills/`](.agents/skills/). They
-  should cover focused implementation or testing workflows and refer back here
-  for shared rules.
-- Devin task runbooks live under [`.devin/skills/`](.devin/skills/). They should
-  cover Devin-specific environment details and operational workflows, such as
-  AWS deployment, and refer back here for shared rules.
-- When a workflow applies to multiple agents, keep the policy here and link to
-  the agent-specific runbook that owns the step-by-step procedure.
+- Local-only runbooks live under [`.agents/skills/`](.agents/skills/). They
+  require no secrets or live-infrastructure access and should be runnable by any
+  agent with the local repo, Rust toolchain, and Git.
+- Privileged operational runbooks live under [`.devin/skills/`](.devin/skills/).
+  They require a suitable VM, explicit credentials, network access to AWS, and
+  authorization to mutate live infrastructure.
+- When a workflow applies to multiple environments, keep the policy here and
+  link to the capability-specific runbook that owns the step-by-step procedure.
 
 ## Git Boundaries
 

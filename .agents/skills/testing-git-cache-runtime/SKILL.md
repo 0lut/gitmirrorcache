@@ -5,9 +5,12 @@ description: Test gitmirrorcache runtime cache flows end-to-end. Use when verify
 
 # Git Cache Runtime Testing
 
-This Codex runbook covers local runtime and cache-flow testing. Follow the
-shared repository rules in [AGENTS.md](../../../AGENTS.md); deployment and AWS
-operations live in
+Requirements: local Rust/Git toolchain only; no secrets; no live-infrastructure
+access.
+
+This local-only runbook covers runtime and cache-flow testing. Follow the shared
+repository rules in [AGENTS.md](../../../AGENTS.md); privileged AWS deployment
+and recovery operations live in
 [gitmirrorcache-deploy](../../../.devin/skills/gitmirrorcache-deploy/SKILL.md).
 
 ## Secrets Needed
