@@ -5,7 +5,8 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult, UpstreamAuth,
+    AppConfig, CommitSha, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult,
+    UpstreamAuth,
 };
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
@@ -15,9 +16,9 @@ use git_cache_domain::{
 };
 use git_cache_git::UploadPackProcess;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +74,7 @@ struct ApiState {
     domain: Arc<AppState>,
     direct_git_proofs: Arc<DirectGitProofCache>,
     direct_git_background_imports: Arc<Semaphore>,
+    async_materialize_jobs: Arc<AsyncMaterializeJobs>,
     upstream_http: reqwest::Client,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
@@ -103,10 +105,14 @@ impl ApiState {
             .git_remote
             .background_import_concurrency
             .max(1);
+        let async_materialize_concurrency = domain.config.async_materialize_concurrency.max(1);
         Ok(Self {
             domain,
             direct_git_proofs: Arc::new(DirectGitProofCache::new(DIRECT_GIT_PROOF_TTL)),
             direct_git_background_imports: Arc::new(Semaphore::new(background_import_concurrency)),
+            async_materialize_jobs: Arc::new(AsyncMaterializeJobs::new(
+                async_materialize_concurrency,
+            )),
             upstream_http,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
@@ -267,12 +273,23 @@ async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
 
 async fn materialize(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<MaterializeQuery>,
     headers: HeaderMap,
     Json(request): Json<MaterializeRequest>,
 ) -> Result<Response, ApiError> {
     let auth = upstream_api_auth(&headers)?;
-    handle_checked_materialize_request(&state, MaterializeEndpoint::Materialize, request, auth)
-        .await
+    let endpoint = if query.r#async {
+        MaterializeEndpoint::MaterializeAsync
+    } else {
+        MaterializeEndpoint::Materialize
+    };
+    handle_checked_materialize_request(&state, endpoint, request, auth).await
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MaterializeQuery {
+    #[serde(default, rename = "async")]
+    r#async: bool,
 }
 
 async fn resolve(
@@ -287,6 +304,7 @@ async fn resolve(
 #[derive(Debug, Clone, Copy)]
 enum MaterializeEndpoint {
     Materialize,
+    MaterializeAsync,
     Resolve,
 }
 
@@ -294,6 +312,7 @@ impl MaterializeEndpoint {
     fn name(self) -> &'static str {
         match self {
             Self::Materialize => "materialize",
+            Self::MaterializeAsync => "materialize_async",
             Self::Resolve => "resolve",
         }
     }
@@ -388,11 +407,11 @@ async fn handle_checked_materialize_request_inner(
 
     let result = run_domain_request(state, endpoint, request, auth).await;
     match &result {
-        Ok(_) => info!(
+        Ok(response) => info!(
             request_id,
             endpoint = endpoint.name(),
             elapsed_ms = elapsed_ms(started),
-            status = %StatusCode::OK,
+            status = %response.status(),
             "api request finished"
         ),
         Err(error) => info!(
@@ -425,6 +444,33 @@ async fn run_domain_request(
                     "domain materialize finished"
                 );
                 Json(response).into_response()
+            })
+        }
+        MaterializeEndpoint::MaterializeAsync => {
+            materializer.resolve(request.clone()).await.map(|response| {
+                if response.cache_available {
+                    info!(
+                        repo = %response.repo,
+                        commit = %response.commit,
+                        elapsed_ms = elapsed_ms(domain_started),
+                        "async materialize already cached"
+                    );
+                    Json(response).into_response()
+                } else {
+                    let queued = state.async_materialize_jobs.spawn(
+                        materializer.clone(),
+                        request,
+                        response.commit.clone(),
+                    );
+                    info!(
+                        repo = %response.repo,
+                        commit = %response.commit,
+                        queued,
+                        elapsed_ms = elapsed_ms(domain_started),
+                        "async materialize accepted"
+                    );
+                    (StatusCode::ACCEPTED, Json(response)).into_response()
+                }
             })
         }
         MaterializeEndpoint::Resolve => materializer.resolve(request).await.map(|response| {
@@ -976,6 +1022,75 @@ impl DirectGitWarmTask {
     }
 }
 
+/// Bounded background runner for `/v1/materialize?async=true`. Jobs are
+/// deduplicated per repo+commit; callers poll `/v1/resolve` for completion.
+struct AsyncMaterializeJobs {
+    permits: Arc<Semaphore>,
+    inflight: Mutex<HashSet<(RepoKey, CommitSha)>>,
+}
+
+impl AsyncMaterializeJobs {
+    fn new(concurrency: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(concurrency)),
+            inflight: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Queues a background materialize for the resolved commit. Returns false
+    /// when an equivalent job is already in flight.
+    fn spawn(
+        self: &Arc<Self>,
+        materializer: Materializer,
+        request: MaterializeRequest,
+        commit: CommitSha,
+    ) -> bool {
+        let key = (request.repo.clone(), commit);
+        {
+            let Ok(mut inflight) = self.inflight.lock() else {
+                warn!(
+                    repo = %key.0,
+                    commit = %key.1,
+                    "async materialize in-flight lock poisoned"
+                );
+                return false;
+            };
+            if !inflight.insert(key.clone()) {
+                return false;
+            }
+        }
+        let jobs = Arc::clone(self);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let result = match jobs.permits.acquire().await {
+                Ok(_permit) => materializer.materialize(request).await.map(|_| ()),
+                Err(_) => Err(GitCacheError::Internal(
+                    "async materialize semaphore closed".into(),
+                )),
+            };
+            match result {
+                Ok(()) => info!(
+                    repo = %key.0,
+                    commit = %key.1,
+                    elapsed_ms = elapsed_ms(started),
+                    "async materialize finished"
+                ),
+                Err(error) => warn!(
+                    repo = %key.0,
+                    commit = %key.1,
+                    %error,
+                    elapsed_ms = elapsed_ms(started),
+                    "async materialize failed"
+                ),
+            }
+            if let Ok(mut inflight) = jobs.inflight.lock() {
+                inflight.remove(&key);
+            }
+        });
+        true
+    }
+}
+
 type ReqwestBytesStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 
@@ -1369,6 +1484,7 @@ mod tests {
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             max_concurrent_generation_verifications: 1,
+            async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
         };
         let state = Arc::new(ApiState::try_new(config).unwrap());
         assert!(state.rate_limiter.check(), "first request consumes quota");

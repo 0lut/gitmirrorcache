@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub use auth::{SecretString, UpstreamAuth, UpstreamAuthorizationMode};
 pub use config::{
-    default_max_concurrent_git_processes, AppConfig, CompactionConfig, DiskConfig, GitRemoteConfig,
-    ObjectStoreConfig,
+    default_async_materialize_concurrency, default_max_concurrent_git_processes, AppConfig,
+    CompactionConfig, DiskConfig, GitRemoteConfig, ObjectStoreConfig,
 };
 pub use error::{GitCacheError, Result};
 pub use manifest::{
