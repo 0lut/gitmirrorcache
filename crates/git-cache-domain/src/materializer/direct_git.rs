@@ -28,10 +28,21 @@ pub(super) struct UploadPackIntent {
     pub(super) shallow: Vec<CommitSha>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct DirectFetchOptions {
     filter: Option<&'static str>,
     depth: Option<u32>,
+    hydrate_manifests: bool,
+}
+
+impl Default for DirectFetchOptions {
+    fn default() -> Self {
+        Self {
+            filter: None,
+            depth: None,
+            hydrate_manifests: true,
+        }
+    }
 }
 
 impl DirectFetchOptions {
@@ -42,6 +53,7 @@ impl DirectFetchOptions {
                 None => None,
             },
             depth: intent.depth,
+            hydrate_manifests: true,
         }
     }
 
@@ -50,11 +62,17 @@ impl DirectFetchOptions {
         Self {
             filter: blobless_fetch.then_some(BLOBLESS_FETCH_FILTER),
             depth: None,
+            hydrate_manifests: true,
         }
     }
 
     fn blobless_fetch(self) -> bool {
         self.filter == Some(BLOBLESS_FETCH_FILTER)
+    }
+
+    fn without_manifest_hydration(mut self) -> Self {
+        self.hydrate_manifests = false;
+        self
     }
 }
 
@@ -194,12 +212,14 @@ impl Materializer {
                 }
             }
 
-            if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
-                if manifest.complete {
-                    Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await?;
-                    self.expose_served_commit(&repo_dir, object_id).await?;
-                    hydrated_commits += 1;
-                    continue;
+            if fetch_options.hydrate_manifests {
+                if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
+                    if manifest.complete {
+                        Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await?;
+                        self.expose_served_commit(&repo_dir, object_id).await?;
+                        hydrated_commits += 1;
+                        continue;
+                    }
                 }
             }
 
@@ -340,6 +360,7 @@ impl Materializer {
             fetched_non_commit_wants,
             blobless_fetch = fetch_options.blobless_fetch(),
             depth = fetch_options.depth,
+            hydrate_manifests = fetch_options.hydrate_manifests,
             elapsed_ms = elapsed_ms(started),
             "ensured direct git wants via read-through"
         );
@@ -562,16 +583,26 @@ impl Materializer {
             return Ok(());
         }
 
+        // Proxy background warming is best-effort and should mirror the
+        // client's shallow/filter request. Avoid object-store generation
+        // hydration here: a manifest hit can point at a multi-GB bundle, while
+        // the upstream upload-pack request that just succeeded can usually
+        // fetch the wanted commit as a tiny filtered pack.
+        let fetch_options = DirectFetchOptions::from_intent(&intent).without_manifest_hydration();
         match comparison {
             Some(comparison) => {
-                Box::pin(
-                    self.ensure_upload_pack_intent_available_from_comparison(
-                        repo, &intent, comparison,
-                    ),
-                )
+                Box::pin(self.ensure_wants_read_through(
+                    repo,
+                    &intent.wants,
+                    Some(comparison),
+                    fetch_options,
+                ))
                 .await
             }
-            None => Box::pin(self.ensure_upload_pack_intent_available(repo, &intent)).await,
+            None => {
+                Box::pin(self.ensure_wants_read_through(repo, &intent.wants, None, fetch_options))
+                    .await
+            }
         }
     }
 
