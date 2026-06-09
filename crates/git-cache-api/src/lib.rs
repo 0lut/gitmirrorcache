@@ -657,6 +657,12 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
             Ok(auth) => auth,
             Err(error) => return error.into_response(),
         };
+        let body =
+            match decode_git_request_body(&headers, body, state.domain.config.max_git_output_bytes)
+            {
+                Ok(body) => body,
+                Err(error) => return error.into_response(),
+            };
         info!(
             request_id,
             repo = %repo,
@@ -947,6 +953,51 @@ fn upload_pack_endpoint(upstream_url: &str) -> Option<String> {
 
 fn proxy_on_miss_requested(headers: &HeaderMap) -> bool {
     headers.contains_key(PROXY_ON_MISS_HEADER)
+}
+
+/// Decode a Git smart HTTP request body according to its `Content-Encoding`.
+///
+/// Git clients gzip upload-pack request bodies above a small threshold
+/// (`Content-Encoding: gzip`), so the body must be inflated before pkt-line
+/// parsing. Decompression is bounded by `max_bytes` to keep allocations
+/// bounded; unknown encodings are rejected.
+fn decode_git_request_body(
+    headers: &HeaderMap,
+    body: Bytes,
+    max_bytes: usize,
+) -> Result<Bytes, ApiError> {
+    let encoding = match headers.get(header::CONTENT_ENCODING) {
+        Some(value) => value,
+        None => return Ok(body),
+    };
+    let encoding = encoding.to_str().map_err(|_| {
+        ApiError::from(GitCacheError::Validation(
+            "invalid content-encoding header".into(),
+        ))
+    })?;
+    match encoding.trim().to_ascii_lowercase().as_str() {
+        "" | "identity" => Ok(body),
+        "gzip" | "x-gzip" => {
+            use std::io::Read;
+            let limit = max_bytes as u64;
+            let mut decoder = flate2::bufread::GzDecoder::new(body.as_ref()).take(limit + 1);
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).map_err(|error| {
+                ApiError::from(GitCacheError::Validation(format!(
+                    "invalid gzip request body: {error}"
+                )))
+            })?;
+            if decoded.len() as u64 > limit {
+                return Err(ApiError::from(GitCacheError::Validation(format!(
+                    "gzip request body exceeded {max_bytes} byte limit"
+                ))));
+            }
+            Ok(Bytes::from(decoded))
+        }
+        other => Err(ApiError::from(GitCacheError::Unsupported(format!(
+            "unsupported content-encoding: {other}"
+        )))),
+    }
 }
 
 struct DirectGitWarmTask {
@@ -1278,6 +1329,56 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::duplex;
     use tokio::process::Command;
+
+    fn gzip_compress(data: &[u8]) -> Bytes {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        Bytes::from(encoder.finish().unwrap())
+    }
+
+    #[test]
+    fn decode_git_request_body_passes_through_without_encoding() {
+        let body = Bytes::from_static(b"0032want abc\n00000009done\n");
+        let decoded = decode_git_request_body(&HeaderMap::new(), body.clone(), 1024).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn decode_git_request_body_inflates_gzip() {
+        let plain = b"0032want abcdef0123456789\n00000009done\n";
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let decoded = decode_git_request_body(&headers, gzip_compress(plain), 1024).unwrap();
+        assert_eq!(decoded.as_ref(), plain);
+    }
+
+    #[test]
+    fn decode_git_request_body_bounds_inflated_size() {
+        let plain = vec![b'a'; 4096];
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let error = decode_git_request_body(&headers, gzip_compress(&plain), 1024).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_git_request_body_rejects_invalid_gzip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let error =
+            decode_git_request_body(&headers, Bytes::from_static(b"not gzip"), 1024).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_git_request_body_rejects_unknown_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "br".parse().unwrap());
+        let error =
+            decode_git_request_body(&headers, Bytes::from_static(b"data"), 1024).unwrap_err();
+        assert_eq!(error.status, StatusCode::METHOD_NOT_ALLOWED);
+    }
 
     #[test]
     fn rate_limiter_blocks_after_limit() {
