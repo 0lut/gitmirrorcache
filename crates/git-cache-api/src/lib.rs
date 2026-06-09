@@ -726,17 +726,17 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
             );
 
             if !can_serve_locally {
-                match proxy_upload_pack_to_upstream(
-                    &state,
-                    &materializer,
-                    &repo,
-                    &auth,
-                    &headers,
-                    body.clone(),
-                    comparison.clone(),
+                match proxy_upload_pack_to_upstream(UploadPackProxyRequest {
+                    state: &state,
+                    materializer: &materializer,
+                    repo: &repo,
+                    auth: &auth,
+                    headers: &headers,
+                    body: body.clone(),
+                    comparison: comparison.clone(),
                     request_id,
-                    started,
-                )
+                    request_started: started,
+                })
                 .await
                 {
                     Ok(response) => return response,
@@ -819,17 +819,32 @@ enum ProxyFallback {
     Error(ApiError),
 }
 
-async fn proxy_upload_pack_to_upstream(
-    state: &Arc<ApiState>,
-    materializer: &Materializer,
-    repo: &RepoKey,
-    auth: &UpstreamAuth,
-    headers: &HeaderMap,
+struct UploadPackProxyRequest<'a> {
+    state: &'a Arc<ApiState>,
+    materializer: &'a Materializer,
+    repo: &'a RepoKey,
+    auth: &'a UpstreamAuth,
+    headers: &'a HeaderMap,
     body: Bytes,
     comparison: Option<UpstreamRefComparison>,
     request_id: u64,
     request_started: Instant,
+}
+
+async fn proxy_upload_pack_to_upstream(
+    request: UploadPackProxyRequest<'_>,
 ) -> Result<Response, ProxyFallback> {
+    let UploadPackProxyRequest {
+        state,
+        materializer,
+        repo,
+        auth,
+        headers,
+        body,
+        comparison,
+        request_id,
+        request_started,
+    } = request;
     let upstream_url = materializer
         .upstream_url(repo)
         .map_err(|error| ProxyFallback::Error(error.into()))?;
