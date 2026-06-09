@@ -1103,6 +1103,13 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
                     }
                     Err(ProxyFallback::Error(error)) => return error.into_response(),
                 }
+            } else {
+                info!(
+                    request_id,
+                    repo = %repo,
+                    auth = auth_label(&auth),
+                    "direct git proxy-on-miss cache hit; serving local upload-pack"
+                );
             }
         }
 
@@ -1332,22 +1339,28 @@ struct DirectGitWarmTask {
 impl DirectGitWarmTask {
     fn spawn(self) {
         tokio::spawn(async move {
+            let task_started = Instant::now();
+            let body_bytes = self.body.len();
+            let cached_ref_proof = self.comparison.is_some();
             let permit = match self.imports.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
                     warn!(
                         request_id = self.request_id,
                         repo = %self.repo,
-                        "direct git background import semaphore closed"
+                        "direct git proxy-on-miss cache warm semaphore closed"
                     );
                     return;
                 }
             };
-            let started = Instant::now();
+            let warm_started = Instant::now();
             info!(
                 request_id = self.request_id,
                 repo = %self.repo,
-                "direct git background import started"
+                body_bytes,
+                cached_ref_proof,
+                queue_elapsed_ms = elapsed_ms(task_started),
+                "direct git proxy-on-miss cache warm started"
             );
             let result = Box::pin(self.materializer.warm_upload_pack(
                 &self.repo,
@@ -1360,15 +1373,21 @@ impl DirectGitWarmTask {
                 Ok(()) => info!(
                     request_id = self.request_id,
                     repo = %self.repo,
-                    elapsed_ms = elapsed_ms(started),
-                    "direct git background import finished"
+                    body_bytes,
+                    cached_ref_proof,
+                    warm_elapsed_ms = elapsed_ms(warm_started),
+                    total_async_elapsed_ms = elapsed_ms(task_started),
+                    "direct git proxy-on-miss cache warm finished"
                 ),
                 Err(error) => warn!(
                     request_id = self.request_id,
                     repo = %self.repo,
                     %error,
-                    elapsed_ms = elapsed_ms(started),
-                    "direct git background import failed"
+                    body_bytes,
+                    cached_ref_proof,
+                    warm_elapsed_ms = elapsed_ms(warm_started),
+                    total_async_elapsed_ms = elapsed_ms(task_started),
+                    "direct git proxy-on-miss cache warm failed"
                 ),
             }
         });

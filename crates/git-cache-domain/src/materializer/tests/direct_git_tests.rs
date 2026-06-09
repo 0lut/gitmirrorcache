@@ -505,6 +505,66 @@ async fn upload_pack_cache_prepare_is_true_for_hot_commit() {
 }
 
 #[tokio::test]
+async fn warm_upload_pack_fetches_upstream_when_manifest_bundle_is_unavailable() {
+    let fixture = GitFixture::new();
+    let state = Arc::new(fixture.state());
+    let materializer = Materializer::new(Arc::clone(&state));
+    let parent = fixture.head_commit();
+    let commit = fixture.commit_and_push("second");
+
+    let cached = materializer
+        .materialize(MaterializeRequest {
+            repo: fixture.repo.clone(),
+            selector: Selector::Branch(BranchName::parse("main").unwrap()),
+            upstream_authorization: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cached.commit, commit);
+    let manifest = wait_for_commit_manifest(&state, &fixture.repo, &cached.commit).await;
+    wait_for_verified_generation(&state, &fixture.repo, manifest.generation).await;
+
+    state
+        .store
+        .delete(&bundle_key(&fixture.repo, manifest.generation))
+        .await
+        .unwrap();
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    stdfs::remove_dir_all(&repo_dir).unwrap();
+
+    let comparison = UpstreamRefComparison {
+        default_branch: Some("main".to_string()),
+        all_upstream: HashMap::from([("main".to_string(), cached.commit.to_string())]),
+    };
+    let mut body =
+        make_upload_pack_pkt_line(&format!("want {} multi_ack thin-pack\n", cached.commit));
+    body.extend_from_slice(b"0000");
+    body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+    body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+    body.extend(make_upload_pack_pkt_line("done\n"));
+
+    let result = materializer
+        .warm_upload_pack(&fixture.repo, &Bytes::from(body), Some(&comparison))
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "background warm should fetch from upstream instead of depending on generation hydrate: {result:?}"
+    );
+    let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+    assert!(
+        materializer
+            .commit_ready_for_serving(&repo_dir, &cached.commit)
+            .await,
+        "background warm should make the wanted commit ready"
+    );
+    assert!(
+        !materializer.commit_exists(&repo_dir, &parent).await,
+        "background warm should preserve the client's shallow depth"
+    );
+}
+
+#[tokio::test]
 async fn authenticated_direct_want_for_advertised_uncached_commit_reads_through() {
     let fixture = GitFixture::new();
     let state = Arc::new(fixture.state());
