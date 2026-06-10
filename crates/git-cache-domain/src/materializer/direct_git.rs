@@ -248,86 +248,17 @@ impl Materializer {
             let upstream_url = self.upstream_url(repo)?;
             let upstream_git = self.upstream_git(&upstream_url)?;
 
-            let mut refspecs: Vec<String> = Vec::new();
-            let mut raw_objects: Vec<CommitSha> = Vec::new();
-            for object_id in &pending {
-                match comparison
-                    .and_then(|comparison| comparison.branch_for_commit(object_id))
-                    .map(git_cache_git::branch_cache_refspec)
-                {
-                    Some(Ok(refspec)) => refspecs.push(refspec),
-                    Some(Err(err)) => {
-                        warn!(
-                            %repo,
-                            %object_id,
-                            %err,
-                            "advertised branch name failed refspec validation; fetching as raw object"
-                        );
-                        raw_objects.push(object_id.clone());
-                    }
-                    None => raw_objects.push(object_id.clone()),
-                }
-            }
-            refspecs.sort();
-            refspecs.dedup();
-
-            info!(
-                %repo,
-                pending_wants = pending.len(),
-                refspec_count = refspecs.len(),
-                raw_object_count = raw_objects.len(),
-                depth = fetch_options.depth,
-                blobless_fetch = fetch_options.blobless_fetch(),
-                "direct git batched read-through fetch for wanted commits"
-            );
-
-            let mut fetched_all_heads = false;
-            if !refspecs.is_empty() {
-                if let Err(err) = upstream_git
-                    .fetch_refspecs(
-                        &repo_dir,
-                        &upstream_url,
-                        &refspecs,
-                        fetch_options.git_options(),
-                    )
-                    .await
-                {
-                    warn!(
-                        %repo,
-                        refspec_count = refspecs.len(),
-                        %err,
-                        "direct git batched advertised-ref fetch failed; falling back to all-heads fetch"
-                    );
-                    upstream_git
-                        .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
-                        .await?;
-                    fetched_all_heads = true;
-                }
-            }
-            if !raw_objects.is_empty() {
-                if let Err(err) = upstream_git
-                    .fetch_objects(
-                        &repo_dir,
-                        &upstream_url,
-                        &raw_objects,
-                        fetch_options.git_options(),
-                    )
-                    .await
-                {
-                    warn!(
-                        %repo,
-                        raw_object_count = raw_objects.len(),
-                        %err,
-                        "direct git batched raw-object fetch failed; falling back to all-heads fetch"
-                    );
-                    if !fetched_all_heads {
-                        upstream_git
-                            .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
-                            .await?;
-                        fetched_all_heads = true;
-                    }
-                }
-            }
+            let fetched_all_heads = self
+                .batched_read_through_fetch(
+                    repo,
+                    &repo_dir,
+                    &upstream_url,
+                    &upstream_git,
+                    &pending,
+                    comparison,
+                    fetch_options,
+                )
+                .await?;
 
             let mut missing: Vec<CommitSha> = Vec::new();
             for object_id in &pending {
@@ -407,6 +338,110 @@ impl Materializer {
             "ensured direct git wants via read-through"
         );
         Ok(())
+    }
+
+    /// Shared batched read-through fetch core: classify pending wants into
+    /// advertised-branch refspecs (when an upstream ref comparison is
+    /// available) and raw exact-SHA objects, then hydrate them with at most
+    /// two upstream fetches, falling back to a single all-heads fetch on
+    /// failure. Returns whether the all-heads fallback ran.
+    ///
+    /// Direct Git read-through and the proxy-on-miss background warm both
+    /// flow through this core; `/materialize` branch hydration shares the
+    /// same `branch_cache_refspec` construction so upstream fetch behavior
+    /// stays aligned across paths.
+    #[allow(clippy::too_many_arguments)]
+    async fn batched_read_through_fetch(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &FsPath,
+        upstream_url: &str,
+        upstream_git: &git_cache_git::Git,
+        pending: &[CommitSha],
+        comparison: Option<&UpstreamRefComparison>,
+        fetch_options: DirectFetchOptions,
+    ) -> CoreResult<bool> {
+        let mut refspecs: Vec<String> = Vec::new();
+        let mut raw_objects: Vec<CommitSha> = Vec::new();
+        for object_id in pending {
+            match comparison
+                .and_then(|comparison| comparison.branch_for_commit(object_id))
+                .map(git_cache_git::branch_cache_refspec)
+            {
+                Some(Ok(refspec)) => refspecs.push(refspec),
+                Some(Err(err)) => {
+                    warn!(
+                        %repo,
+                        %object_id,
+                        %err,
+                        "advertised branch name failed refspec validation; fetching as raw object"
+                    );
+                    raw_objects.push(object_id.clone());
+                }
+                None => raw_objects.push(object_id.clone()),
+            }
+        }
+        refspecs.sort();
+        refspecs.dedup();
+
+        info!(
+            %repo,
+            pending_wants = pending.len(),
+            refspec_count = refspecs.len(),
+            raw_object_count = raw_objects.len(),
+            depth = fetch_options.depth,
+            blobless_fetch = fetch_options.blobless_fetch(),
+            "direct git batched read-through fetch for wanted commits"
+        );
+
+        let mut fetched_all_heads = false;
+        if !refspecs.is_empty() {
+            if let Err(err) = upstream_git
+                .fetch_refspecs(
+                    repo_dir,
+                    upstream_url,
+                    &refspecs,
+                    fetch_options.git_options(),
+                )
+                .await
+            {
+                warn!(
+                    %repo,
+                    refspec_count = refspecs.len(),
+                    %err,
+                    "direct git batched advertised-ref fetch failed; falling back to all-heads fetch"
+                );
+                upstream_git
+                    .fetch_all_heads(repo_dir, upstream_url, fetch_options.git_options())
+                    .await?;
+                fetched_all_heads = true;
+            }
+        }
+        if !raw_objects.is_empty() {
+            if let Err(err) = upstream_git
+                .fetch_objects(
+                    repo_dir,
+                    upstream_url,
+                    &raw_objects,
+                    fetch_options.git_options(),
+                )
+                .await
+            {
+                warn!(
+                    %repo,
+                    raw_object_count = raw_objects.len(),
+                    %err,
+                    "direct git batched raw-object fetch failed; falling back to all-heads fetch"
+                );
+                if !fetched_all_heads {
+                    upstream_git
+                        .fetch_all_heads(repo_dir, upstream_url, fetch_options.git_options())
+                        .await?;
+                    fetched_all_heads = true;
+                }
+            }
+        }
+        Ok(fetched_all_heads)
     }
 
     async fn prepare_fetched_direct_want(
