@@ -25,6 +25,18 @@ mod tests {
 
     impl TestServer {
         async fn start() -> Self {
+            Self::start_inner(false).await
+        }
+
+        /// Like `start`, but the server reaches the upstream via a `file://`
+        /// URL instead of a bare path. Git only registers promisor/partial
+        /// clone state for URL-shaped remotes ("promisor remote name cannot
+        /// begin with '/'"), so filtered-fetch tests need this variant.
+        async fn start_with_file_url_upstream() -> Self {
+            Self::start_inner(true).await
+        }
+
+        async fn start_inner(file_url_upstream: bool) -> Self {
             let tmp = TempDir::new().unwrap();
             let upstream_bare = tmp.path().join("upstreams/github.com/org/repo.git");
             let upstream_work = tmp.path().join("work");
@@ -56,7 +68,15 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let config = support::test_config(addr, tmp.path());
+            let config = if file_url_upstream {
+                support::test_config_with_upstream(
+                    addr,
+                    tmp.path(),
+                    format!("file://{}", tmp.path().join("upstreams").display()),
+                )
+            } else {
+                support::test_config(addr, tmp.path())
+            };
 
             let router = app(config);
 
@@ -310,6 +330,84 @@ mod tests {
         let is_shallow =
             git_stdout_async(&clone_dir, &["rev-parse", "--is-shallow-repository"]).await;
         assert_eq!(is_shallow, "true");
+    }
+
+    // ── full clone after blobless hydration ─────────────────────────────────
+
+    /// Regression test: a blobless (`--filter=blob:none`) read-through fetch
+    /// persists `remote.<url>.partialclonefilter` in the cache repo config.
+    /// Git silently re-applies that saved filter to the later forced
+    /// `--refetch` that is supposed to convert the partially hydrated repo
+    /// into a full one, so blobs stayed missing and full clones died with
+    /// `could not fetch <blob> from promisor remote`. Requires the upstream
+    /// to support filters (`uploadpack.allowFilter`), like real upstreams do;
+    /// without it the filter is silently ignored and the bug cannot trigger.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_clone_succeeds_after_blobless_shallow_hydration() {
+        let server = TestServer::start_with_file_url_upstream().await;
+        run_git(
+            &server.upstream_bare,
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+
+        // Push new history WITHOUT warming the cache, so the blobless clone
+        // below is what hydrates it via a filtered read-through fetch.
+        std::fs::write(server.upstream_work.join("data.txt"), "blob payload\n").unwrap();
+        run_git(&server.upstream_work, &["add", "data.txt"]);
+        run_git(&server.upstream_work, &["commit", "-m", "add data"]);
+        std::fs::write(server.upstream_work.join("data.txt"), "blob payload v2\n").unwrap();
+        run_git(&server.upstream_work, &["add", "data.txt"]);
+        run_git(&server.upstream_work, &["commit", "-m", "update data"]);
+        run_git(&server.upstream_work, &["push", "origin", "main"]);
+
+        let url = server.git_url("github.com/org/repo");
+
+        let blobless_dir = server.tmp.path().join("blobless_shallow_clone");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--depth=1",
+                "--branch",
+                "main",
+                &url,
+                blobless_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        let full_dir = server.tmp.path().join("full_clone_after_blobless");
+        run_git_async(
+            server.tmp.path(),
+            &["clone", &url, full_dir.to_str().unwrap()],
+        )
+        .await;
+
+        let count = git_stdout_async(&full_dir, &["rev-list", "--count", "HEAD"]).await;
+        assert_eq!(count, "3", "full clone should have the entire history");
+        let contents = git_stdout_async(&full_dir, &["show", "HEAD~1:data.txt"]).await;
+        assert_eq!(contents, "blob payload");
+
+        // The cache repo itself must hold every object reachable from its
+        // refs; a silently re-filtered refetch leaves blobs missing.
+        let cache_repo = server
+            .tmp
+            .path()
+            .join("cache/repos/github.com/org/repo.git");
+        let missing = git_stdout_async(
+            &cache_repo,
+            &["rev-list", "--objects", "--missing=print", "--all"],
+        )
+        .await;
+        let missing: Vec<&str> = missing
+            .lines()
+            .filter(|line| line.starts_with('?'))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "cache repo is missing objects after full refetch: {missing:?}"
+        );
     }
 
     // ── fetch --deepen=1 after shallow clone ────────────────────────────────

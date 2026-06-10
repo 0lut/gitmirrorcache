@@ -767,7 +767,7 @@ impl Git {
             stdin.extend_from_slice(object_id.as_str().as_bytes());
             stdin.push(b'\n');
         }
-        let mut args = fetch_args_with_options(options)?;
+        let mut args = fetch_args_with_options(options, remote_url)?;
         // Mirror git's own promisor lazy fetch: raw object ids (blobs/trees)
         // are not revisions, so writing FETCH_HEAD would fail with
         // "bad revision"; negotiation tips are pointless for exact-oid wants.
@@ -793,7 +793,7 @@ impl Git {
         for refspec in refspecs {
             reject_refspec(refspec)?;
         }
-        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir))?;
+        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir), remote_url)?;
         args.push(OsString::from("--"));
         args.push(OsString::from(remote_url));
         args.extend(refspecs.iter().map(OsString::from));
@@ -807,7 +807,7 @@ impl Git {
         options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir))?;
+        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir), remote_url)?;
         args.push(OsString::from("--prune"));
         args.extend([
             OsString::from("--"),
@@ -833,7 +833,7 @@ impl Git {
 
         let refspec = format!("+{upstream_ref}:{local_ref}");
         reject_refspec(&refspec)?;
-        let mut args = fetch_args_with_options(options)?;
+        let mut args = fetch_args_with_options(options, remote_url)?;
         args.extend([
             OsString::from("--"),
             OsString::from(remote_url),
@@ -1200,8 +1200,22 @@ fn reject_fetch_depth(depth: u32) -> Result<()> {
     Ok(())
 }
 
-fn fetch_args_with_options(options: FetchOptions<'_>) -> Result<Vec<OsString>> {
-    let mut args = vec![OsString::from("fetch"), OsString::from("--no-tags")];
+fn fetch_args_with_options(options: FetchOptions<'_>, remote_url: &str) -> Result<Vec<OsString>> {
+    let mut args = Vec::new();
+    if options.filter.is_none() {
+        // A filtered (`--filter=blob:none`) fetch persists
+        // `remote.<url>.partialclonefilter` in the repo config, and git
+        // silently re-applies that saved filter to later unfiltered fetches
+        // from the same URL — including `--refetch`, which then still omits
+        // blobs. Clear it per-invocation so the explicit `filter` option is
+        // the sole source of truth for what each fetch downloads.
+        let key = format!("remote.{remote_url}.partialclonefilter");
+        reject_config_key(&key)?;
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(format!("{key}=")));
+    }
+    args.push(OsString::from("fetch"));
+    args.push(OsString::from("--no-tags"));
     if let Some(depth) = options.depth {
         reject_fetch_depth(depth)?;
         args.push(OsString::from(format!("--depth={depth}")));
@@ -1760,6 +1774,83 @@ printf '\n' >> "$FAKE_ARGS_OUT"
                 == "[fetch][--no-tags][--depth=1][--filter=blob:none][--][https://github.com/org/repo.git][+refs/heads/main:refs/cache/upstream/heads/main]"),
             "{args}"
         );
+    }
+
+    #[tokio::test]
+    async fn unfiltered_fetch_clears_persisted_partial_clone_filter() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "git-cache-fetch-nofilter-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-git");
+        let args_out = root.join("args.txt");
+        let repo_dir = root.join("repo.git");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+for arg in "$@"; do
+  printf '[%s]' "$arg" >> "$FAKE_ARGS_OUT"
+done
+printf '\n' >> "$FAKE_ARGS_OUT"
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let git = Git::new(&script, Duration::from_secs(5))
+            .with_env("FAKE_ARGS_OUT", args_out.as_os_str().to_os_string());
+        git.fetch_ref(
+            &repo_dir,
+            "https://github.com/org/repo.git",
+            "refs/heads/main",
+            "refs/cache/upstream/heads/main",
+            FetchOptions {
+                filter: None,
+                depth: None,
+                refetch: true,
+                unshallow: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let args = std::fs::read_to_string(&args_out).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            args.lines().any(|line| line
+                == "[-c][remote.https://github.com/org/repo.git.partialclonefilter=][fetch][--no-tags][--refetch][--][https://github.com/org/repo.git][+refs/heads/main:refs/cache/upstream/heads/main]"),
+            "{args}"
+        );
+    }
+
+    #[test]
+    fn filtered_fetch_args_do_not_clear_partial_clone_filter() {
+        let args = fetch_args_with_options(
+            FetchOptions {
+                filter: Some("blob:none"),
+                depth: Some(1),
+                refetch: false,
+                unshallow: false,
+            },
+            "https://github.com/org/repo.git",
+        )
+        .unwrap();
+        assert_eq!(args[0], OsString::from("fetch"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("partialclonefilter")));
     }
 
     // ── Public method rejection of dash-prefixed arguments ──────────
