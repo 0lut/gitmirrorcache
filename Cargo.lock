@@ -1395,6 +1395,7 @@ dependencies = [
 name = "git-cache-git"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "git-cache-core",
  "gix",
