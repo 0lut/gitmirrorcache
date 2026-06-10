@@ -663,6 +663,13 @@ impl Git {
             stdin.push(b'\n');
         }
         let mut args = fetch_args_with_options(options)?;
+        // Mirror git's own promisor lazy fetch: raw object ids (blobs/trees)
+        // are not revisions, so writing FETCH_HEAD would fail with
+        // "bad revision"; negotiation tips are pointless for exact-oid wants.
+        args.insert(0, OsString::from("-c"));
+        args.insert(1, OsString::from("fetch.negotiationAlgorithm=noop"));
+        args.push(OsString::from("--no-write-fetch-head"));
+        args.push(OsString::from("--recurse-submodules=no"));
         args.push(OsString::from("--stdin"));
         args.push(OsString::from("--"));
         args.push(OsString::from(remote_url));
