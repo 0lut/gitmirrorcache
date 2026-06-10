@@ -422,6 +422,9 @@ impl Materializer {
             }
         }
 
+        // Exact-commit hydration deliberately fetches all heads (not just the
+        // wanted SHA) so descendant exact-commit requests become cache hits
+        // that reuse the same full generation bundle.
         self.fetch_all_refs(repo, &repo_dir).await?;
 
         if !self.commit_exists(&repo_dir, commit).await {
@@ -744,8 +747,14 @@ impl Materializer {
         let _repo_lock = self.lock_repo(repo).await?;
         let upstream_url = self.upstream_url(repo)?;
         let fetch_started = Instant::now();
+        let refspec = git_cache_git::branch_cache_refspec(branch.as_str())?;
         self.upstream_git(&upstream_url)?
-            .fetch_branch(&repo_dir, &upstream_url, branch.as_str(), &local_ref)
+            .fetch_refspecs(
+                &repo_dir,
+                &upstream_url,
+                std::slice::from_ref(&refspec),
+                git_cache_git::FetchOptions::default(),
+            )
             .await?;
         info!(
             %repo,

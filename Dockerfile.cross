@@ -1,15 +1,7 @@
 # syntax=docker/dockerfile:1.7
-
-FROM rust:1.94-bookworm AS builder
-
-WORKDIR /src
-COPY . .
-RUN --mount=type=cache,id=git-cache-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=git-cache-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=git-cache-target,target=/src/target \
-    cargo build --release --features s3 -p git-cache-api -p git-cache-cli \
-    && mkdir -p /out \
-    && cp target/release/git-cache-api target/release/git-cache /out/
+# Runtime-only image for prebuilt (cross-compiled) binaries.
+# Build context must contain `git-cache-api` and `git-cache` binaries for the
+# target platform; see scripts/aws/build-image-cross.sh.
 
 # Runtime needs git >= 2.45: serving and want-classification rely on
 # GIT_NO_LAZY_FETCH printing `missing` for absent promisor objects (older
@@ -24,8 +16,8 @@ RUN useradd --system --create-home --home-dir /home/git-cache git-cache \
     && mkdir -p /cache \
     && chown -R git-cache:git-cache /cache
 
-COPY --from=builder /out/git-cache-api /usr/local/bin/git-cache-api
-COPY --from=builder /out/git-cache /usr/local/bin/git-cache
+COPY git-cache-api /usr/local/bin/git-cache-api
+COPY git-cache /usr/local/bin/git-cache
 
 ENV GIT_CACHE_BIND_ADDR=0.0.0.0:8080
 ENV GIT_CACHE_ROOT=/cache

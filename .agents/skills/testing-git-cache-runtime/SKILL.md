@@ -5,7 +5,15 @@ description: Test gitmirrorcache runtime cache flows end-to-end. Use when verify
 
 # Git Cache Runtime Testing
 
-## Devin Secrets Needed
+Requirements: local Rust/Git toolchain only; no secrets; no live-infrastructure
+access.
+
+This local-only runbook covers runtime and cache-flow testing. Follow the shared
+repository rules in [AGENTS.md](../../../AGENTS.md); privileged AWS deployment
+and recovery operations live in
+[gitmirrorcache-deploy](../../../.devin/skills/gitmirrorcache-deploy/SKILL.md).
+
+## Secrets Needed
 
 None for local runtime testing. The flow uses a local bare upstream repository, a local object store, and local cache directories.
 

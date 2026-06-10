@@ -19,9 +19,9 @@ traffic.
   `git ls-remote` before serving.
 - Optional read-through Git remote at `/git/{host}/{owner}/{repo}.git` for
   `info/refs` and `git-upload-pack`, including shallow and blobless fetches.
-- Direct Git cold misses can proxy upstream upload-pack responses immediately
-  when clients send the `git-cache-use-proxy-on-miss` header, then warm the
-  cache in the background.
+- Direct Git cold misses proxy upstream upload-pack responses immediately by
+  default, then warm the cache in the background; clients can opt out per
+  request with the `git-cache-use-proxy-on-miss` header.
 - `git-receive-pack` is rejected and never advertised.
 - Local object-store adapter and feature-gated S3-compatible adapter.
 - Disk reservations, LRU eviction, repo locks, protected repos, stale temp
@@ -100,10 +100,14 @@ git -c http.extraHeader='Authorization: Basic <base64-user-colon-token>' \
   fetch http://127.0.0.1:8080/git/github.com/org/private.git refs/heads/main
 ```
 
-To prioritize client latency on a cold direct-Git miss, opt into proxy-on-miss:
+On a cold direct-Git miss, the server proxies upload-pack to the upstream by
+default (then warms the cache in the background) so client latency stays close
+to a direct clone. Set `GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT=false`
+(config: `git_remote.proxy_on_miss_by_default`) to disable, or override per
+request with the `git-cache-use-proxy-on-miss` header:
 
 ```sh
-git -c http.extraHeader='git-cache-use-proxy-on-miss: true' \
+git -c http.extraHeader='git-cache-use-proxy-on-miss: false' \
   clone http://127.0.0.1:8080/git/github.com/org/repo.git
 ```
 

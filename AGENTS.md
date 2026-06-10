@@ -3,6 +3,19 @@
 Keep this file short and current. Prefer the repo's checked-in docs, scripts,
 and tests over ad-hoc operational steps.
 
+## Agent Docs Layout
+
+- This file is shared guidance for any agent working in this repository. Keep
+  repo-wide safety rules and current architecture contracts here.
+- Local-only runbooks live under [`.agents/skills/`](.agents/skills/). They
+  require no secrets or live-infrastructure access and should be runnable by any
+  agent with the local repo, Rust toolchain, and Git.
+- Privileged operational runbooks live under [`.devin/skills/`](.devin/skills/).
+  They require a suitable VM, explicit credentials, network access to AWS, and
+  authorization to mutate live infrastructure.
+- When a workflow applies to multiple environments, keep the policy here and
+  link to the capability-specific runbook that owns the step-by-step procedure.
+
 ## Git Boundaries
 
 - Unvalidated git arguments are production-safety bugs: option-looking values
@@ -43,15 +56,31 @@ and tests over ad-hoc operational steps.
 - Exact commit materialization should use complete cached generation metadata
   before contacting upstream. Branch and default-branch materialization must
   verify upstream refs.
+- Upstream want hydration flows through the shared batched read-through fetch
+  core (direct Git read-through and the proxy-on-miss warm); branch
+  materialization shares the same `branch_cache_refspec` construction. Exact
+  commit cold misses deliberately fetch all heads so descendant exact-commit
+  requests reuse the full generation bundle.
 - Direct Git uses `/git/{host}/{owner}/{repo}.git`, rejects receive-pack, and
   serves from the shared bare repo under `cache_root/repos/...`.
 - Direct Git GET proves repo access via `ls-remote` only. POST read-through uses
   the same request-scoped auth and must preserve shallow/blobless intent
   (`depth`, `blob:none`) when fetching wants.
-- `git-cache-use-proxy-on-miss` is the only cold-miss proxy opt-in. Proxy only
+- Cold-miss proxying defaults to `git_remote.proxy_on_miss_by_default` (on);
+  the `git-cache-use-proxy-on-miss` header is the only per-request override
+  (falsey values opt out). Proxy only
   HTTP(S) upstreams, enforce streamed byte limits, forward auth only to upstream,
   then queue a bounded background warm. The proxy readiness/background warm
   paths should not hydrate generation manifests.
+- IMPORTANT testing caveat: because proxying is on by default, any test or
+  benchmark that means to exercise the local read-through (cache-fill) path
+  against an HTTP(S) upstream MUST opt out explicitly — set
+  `git_remote.proxy_on_miss_by_default = false` in test configs (the shared
+  API test support config does this), or send
+  `git -c http.extraHeader='git-cache-use-proxy-on-miss: false'` per request.
+  Otherwise cold-miss measurements measure the upstream proxy, not the cache.
+  Tests using local filesystem upstreams are unaffected (the proxy only
+  engages for HTTP(S) upstream URLs).
 
 ## Runtime Safety
 
@@ -103,16 +132,6 @@ let Ok(mut state) = self.state.lock() else {
 ## Deployments
 
 - Use checked-in AWS scripts instead of raw AWS/SSM/Docker command sequences.
-  The maintained path is ECS on Graviton EC2 with host-mounted EBS and S3:
-
-```sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm scripts/aws/deploy-and-smoke.sh
-```
-
-- Preview stacks go through `scripts/aws/deploy-preview.sh <ref>` and
-  `scripts/aws/destroy-preview.sh <ref>`; they use isolated S3 prefixes and
-  shared preview ALB routes.
-- If a rollout is stuck because an old task still owns host port `8080`, inspect
-  with `scripts/aws/ecs-host-diagnostics.sh`, then use
-  `scripts/aws/stop-stale-ecs-container.sh` with `ECS_STALE_CONTAINER_ID` and
-  `CONFIRM_STOP=true`.
+  The Devin deployment runbook owns exact commands, credentials, preview-stack
+  steps, image build options, and stale ECS container recovery:
+  [gitmirrorcache-deploy](.devin/skills/gitmirrorcache-deploy/SKILL.md).

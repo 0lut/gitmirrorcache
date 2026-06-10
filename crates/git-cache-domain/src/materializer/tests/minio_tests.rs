@@ -73,6 +73,9 @@ mod tests {
             git,
             disk: AsyncDiskManager::new(disk),
             generation_verification_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         });
         let materializer = Materializer::new(Arc::clone(&state));
 

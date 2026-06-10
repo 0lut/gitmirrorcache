@@ -1,12 +1,41 @@
 use super::*;
 
-const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
+const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v2";
+/// Marker recording that the bare repo was hydrated with a filtered
+/// (blobless) fetch and therefore cannot serve full-object clone shapes
+/// until an unfiltered `--refetch` completes.
+const PARTIAL_HYDRATION_MARKER: &str = "git-cache-partial-hydration";
 const BLOBLESS_FETCH_FILTER: &str = "blob:none";
+
+/// Local git config applied to every served bare repo. Marker-gated by
+/// `SERVED_REPO_CONFIG_MARKER`; bump the marker version when changing this
+/// set so existing repos pick up the new configuration.
+const SERVED_REPO_CONFIG: &[(&str, &str)] = &[
+    ("uploadpack.allowAnySHA1InWant", "true"),
+    ("uploadpack.allowFilter", "true"),
+    ("uploadpack.allowReachableSHA1InWant", "true"),
+    ("uploadpack.hideRefs", "refs/cache"),
+    ("transfer.hideRefs", "refs/cache"),
+    ("pack.useBitmaps", "true"),
+    ("repack.writeBitmaps", "true"),
+    ("pack.writeReverseIndex", "true"),
+    ("pack.threads", "0"),
+    ("pack.deltaCacheSize", "256m"),
+    ("core.deltaBaseCacheLimit", "512m"),
+    ("fetch.unpackLimit", "1"),
+    ("pack.compression", "1"),
+    ("core.compression", "1"),
+];
 
 #[cfg(test)]
 const DIRECT_FSCK_DELAY: StdDuration = StdDuration::from_millis(20);
 #[cfg(not(test))]
 const DIRECT_FSCK_DELAY: StdDuration = StdDuration::from_secs(30);
+
+#[cfg(test)]
+const SERVING_MAINTENANCE_DELAY: StdDuration = StdDuration::from_millis(20);
+#[cfg(not(test))]
+const SERVING_MAINTENANCE_DELAY: StdDuration = StdDuration::from_secs(60);
 
 enum DirectFetchedWantKind {
     Commit,
@@ -33,6 +62,8 @@ struct DirectFetchOptions {
     filter: Option<&'static str>,
     depth: Option<u32>,
     hydrate_manifests: bool,
+    refetch: bool,
+    unshallow: bool,
 }
 
 impl Default for DirectFetchOptions {
@@ -41,6 +72,8 @@ impl Default for DirectFetchOptions {
             filter: None,
             depth: None,
             hydrate_manifests: true,
+            refetch: false,
+            unshallow: false,
         }
     }
 }
@@ -53,7 +86,13 @@ impl DirectFetchOptions {
                 None => None,
             },
             depth: intent.depth,
-            hydrate_manifests: true,
+            // Filtered (blobless) intents skip per-want manifest hydration:
+            // their wants are commits the batched fetch hydrates directly, or
+            // lazy-fetched blobs (tens of thousands per checkout) for which a
+            // serial object-store lookup per want would stall the request.
+            hydrate_manifests: intent.filter.is_none(),
+            refetch: false,
+            unshallow: false,
         }
     }
 
@@ -62,7 +101,9 @@ impl DirectFetchOptions {
         Self {
             filter: blobless_fetch.then_some(BLOBLESS_FETCH_FILTER),
             depth: None,
-            hydrate_manifests: true,
+            hydrate_manifests: !blobless_fetch,
+            refetch: false,
+            unshallow: false,
         }
     }
 
@@ -75,10 +116,22 @@ impl DirectFetchOptions {
         self
     }
 
+    fn with_refetch(mut self) -> Self {
+        self.refetch = true;
+        self
+    }
+
+    fn with_unshallow(mut self) -> Self {
+        self.unshallow = true;
+        self
+    }
+
     fn git_options(self) -> git_cache_git::FetchOptions<'static> {
         git_cache_git::FetchOptions {
             filter: self.filter,
             depth: self.depth,
+            refetch: self.refetch,
+            unshallow: self.unshallow,
         }
     }
 }
@@ -193,17 +246,59 @@ impl Materializer {
         let started = Instant::now();
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
+        // A repo hydrated only by filtered (blobless) fetches has commits and
+        // trees but no blobs. Readiness checks cannot see blob completeness,
+        // so full-object requests against such a repo would die in server
+        // pack-objects mid-stream. Force a `--refetch` covering every want so
+        // git re-downloads full objects despite the local (partial) haves.
+        let partial_marker = repo_dir.join(PARTIAL_HYDRATION_MARKER);
+        let force_refetch =
+            !fetch_options.blobless_fetch() && fs::try_exists(&partial_marker).await?;
+        let fetch_options = if force_refetch {
+            fetch_options.with_refetch()
+        } else {
+            fetch_options
+        };
+        if force_refetch {
+            info!(
+                %repo,
+                depth = fetch_options.depth,
+                "repo partially hydrated (blobless); forcing full refetch of wants"
+            );
+        }
+        // A repo hydrated only by depth-limited fetches is shallow: serving a
+        // full-history intent from it would stream a pack whose commit
+        // parents stop at the shallow boundary while the client repo is not
+        // marked shallow — a silently corrupt clone. Force the batched fetch
+        // to unshallow the cache repo before serving such intents. Lazy
+        // exact-oid fetches are unaffected (`fetch_objects` never
+        // unshallows), so blobless checkout blob storms stay cheap.
+        let needs_unshallow =
+            fetch_options.depth.is_none() && fs::try_exists(repo_dir.join("shallow")).await?;
+        let fetch_options = if needs_unshallow {
+            info!(
+                %repo,
+                "cache repo is shallow; forcing unshallow fetch for full-history wants"
+            );
+            fetch_options.with_unshallow()
+        } else {
+            fetch_options
+        };
         let object_count = object_ids.len();
+        // Classification must never trigger promisor lazy fetches: in a
+        // partially hydrated repo each missing object would otherwise spawn
+        // a serial upstream fetch.
         let object_types = self
             .state
             .git
-            .cat_file_batch_types(&repo_dir, object_ids)
+            .cat_file_batch_types_no_lazy(&repo_dir, object_ids)
             .await?;
         let mut non_commit_wants = 0usize;
         let mut served_commits = 0usize;
         let mut hydrated_commits = 0usize;
         let mut fetched_commits = 0usize;
         let mut fetched_non_commit_wants = 0usize;
+        let mut pending: Vec<CommitSha> = Vec::new();
 
         for object_id in object_ids {
             if let Some(object_type) = object_types.get(object_id) {
@@ -212,14 +307,17 @@ impl Materializer {
                     continue;
                 }
 
-                if self.commit_tree_exists(&repo_dir, object_id).await {
+                if !force_refetch
+                    && !needs_unshallow
+                    && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
+                {
                     self.expose_served_commit(&repo_dir, object_id).await?;
                     served_commits += 1;
                     continue;
                 }
             }
 
-            if fetch_options.hydrate_manifests {
+            if !force_refetch && !needs_unshallow && fetch_options.hydrate_manifests {
                 if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
                     if manifest.complete {
                         Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await?;
@@ -236,115 +334,100 @@ impl Materializer {
                 )));
             }
 
-            let advertised_branch = comparison
-                .and_then(|comparison| comparison.branch_for_commit(object_id).map(str::to_string));
-            let advertised_ref = advertised_branch
-                .as_ref()
-                .map(|branch| format!("refs/heads/{branch}"))
-                .unwrap_or_else(|| "<none>".to_string());
-            info!(
-                %repo,
-                commit = %object_id,
-                advertised_ref = %advertised_ref,
-                depth = fetch_options.depth,
-                blobless_fetch = fetch_options.blobless_fetch(),
-                "direct git read-through fetch for wanted commit"
-            );
+            pending.push(object_id.clone());
+        }
+
+        if !pending.is_empty() {
+            // A fresh clone wants the tip of every advertised ref, so missing
+            // wants must be fetched in batched upstream invocations: one fetch
+            // for all advertised refspecs plus one for raw SHAs, instead of one
+            // subprocess per want.
             let upstream_url = self.upstream_url(repo)?;
             let upstream_git = self.upstream_git(&upstream_url)?;
-            let fetched_via_advertised_ref = advertised_branch.is_some();
-            let fetch_result = if let Some(branch) = advertised_branch {
-                let upstream_ref = format!("refs/heads/{branch}");
-                let local_ref = format!("refs/cache/upstream/heads/{branch}");
-                let ref_fetch_result = upstream_git
-                    .fetch_ref(
-                        &repo_dir,
-                        &upstream_url,
-                        &upstream_ref,
-                        &local_ref,
-                        fetch_options.git_options(),
-                    )
-                    .await;
-                match ref_fetch_result {
-                    Ok(output) => Ok(output),
-                    Err(err) => {
-                        warn!(
-                            %repo,
-                            commit = %object_id,
-                            upstream_ref,
-                            local_ref,
-                            %err,
-                            "direct git advertised-ref fetch failed; falling back to raw object fetch"
-                        );
-                        upstream_git
-                            .fetch_object(
-                                &repo_dir,
-                                &upstream_url,
-                                object_id,
-                                fetch_options.git_options(),
-                            )
-                            .await
-                    }
-                }
-            } else {
-                upstream_git
-                    .fetch_object(
-                        &repo_dir,
-                        &upstream_url,
-                        object_id,
-                        fetch_options.git_options(),
-                    )
-                    .await
-            };
 
-            if let Err(fetch_err) = fetch_result {
-                upstream_git
-                    .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
-                    .await?;
-                match self
-                    .prepare_fetched_direct_want(repo, &repo_dir, object_id)
-                    .await
-                {
+            let fetched_all_heads = self
+                .batched_read_through_fetch(
+                    repo,
+                    &repo_dir,
+                    &upstream_url,
+                    &upstream_git,
+                    &pending,
+                    comparison,
+                    fetch_options,
+                )
+                .await?;
+
+            let mut missing: Vec<CommitSha> = Vec::new();
+            for object_id in &pending {
+                match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
                     Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
                     Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
-                    Err(_) => {
-                        return Err(GitCacheError::NotFound(format!(
-                            "object `{object_id}` could not be fetched from upstream: {fetch_err}"
-                        )));
-                    }
+                    Err(_) => missing.push(object_id.clone()),
                 }
-                continue;
             }
 
-            let prepared = self
-                .prepare_fetched_direct_want(repo, &repo_dir, object_id)
-                .await;
-            let prepared = match prepared {
-                Ok(kind) => kind,
-                Err(err) if fetched_via_advertised_ref => {
+            if !missing.is_empty() {
+                // Wants the batched fetch did not cover (e.g. an advertised
+                // branch moved between the GET advertisement and this POST)
+                // are retried as exact-SHA fetches, then as an all-heads fetch.
+                warn!(
+                    %repo,
+                    missing_count = missing.len(),
+                    "direct git batched fetch did not cover all wants; retrying as exact-SHA fetch"
+                );
+                if let Err(err) = upstream_git
+                    .fetch_objects(
+                        &repo_dir,
+                        &upstream_url,
+                        &missing,
+                        fetch_options.git_options(),
+                    )
+                    .await
+                {
+                    if fetched_all_heads {
+                        return Err(GitCacheError::NotFound(format!(
+                            "objects could not be fetched from upstream: {err}"
+                        )));
+                    }
                     warn!(
                         %repo,
-                        commit = %object_id,
+                        missing_count = missing.len(),
                         %err,
-                        "direct git advertised-ref fetch did not include wanted object; falling back to raw object fetch"
+                        "direct git exact-SHA retry fetch failed; falling back to all-heads fetch"
                     );
                     upstream_git
-                        .fetch_object(
-                            &repo_dir,
-                            &upstream_url,
-                            object_id,
-                            fetch_options.git_options(),
-                        )
+                        .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
                         .await?;
-                    self.prepare_fetched_direct_want(repo, &repo_dir, object_id)
-                        .await?
                 }
-                Err(err) => return Err(err),
-            };
+                for object_id in &missing {
+                    match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
+                        Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
+                        Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
+                        Err(err) => {
+                            return Err(GitCacheError::NotFound(format!(
+                                "object `{object_id}` could not be fetched from upstream: {err}"
+                            )));
+                        }
+                    }
+                }
+            }
 
-            match prepared {
-                DirectFetchedWantKind::Commit => fetched_commits += 1,
-                DirectFetchedWantKind::NonCommit => fetched_non_commit_wants += 1,
+            if fetch_options.blobless_fetch() {
+                fs::write(&partial_marker, b"blobless\n").await?;
+            } else if force_refetch && fetch_options.depth.is_none() {
+                // An unfiltered, undepthed refetch re-downloads full objects
+                // for every requested want; the repo can serve full-object
+                // shapes again.
+                fs::remove_file(&partial_marker).await.ok();
+                info!(%repo, "cleared partial hydration marker after full refetch");
+            }
+
+            // One repo-wide fsck covers every commit fetched by this request.
+            if fetched_commits > 0 || fetched_non_commit_wants > 0 {
+                if let Some(first) = pending.first() {
+                    self.enqueue_direct_fsck(repo.clone(), repo_dir.to_path_buf(), first.clone());
+                }
+                self.enqueue_serving_maintenance(repo.clone(), repo_dir.to_path_buf());
             }
         }
 
@@ -365,16 +448,119 @@ impl Materializer {
         Ok(())
     }
 
-    async fn prepare_fetched_direct_want(
+    /// Shared batched read-through fetch core: classify pending wants into
+    /// advertised-branch refspecs (when an upstream ref comparison is
+    /// available) and raw exact-SHA objects, then hydrate them with at most
+    /// two upstream fetches, falling back to a single all-heads fetch on
+    /// failure. Returns whether the all-heads fallback ran.
+    ///
+    /// Direct Git read-through and the proxy-on-miss background warm both
+    /// flow through this core; `/materialize` branch hydration shares the
+    /// same `branch_cache_refspec` construction so upstream fetch behavior
+    /// stays aligned across paths.
+    #[allow(clippy::too_many_arguments)]
+    async fn batched_read_through_fetch(
         &self,
         repo: &RepoKey,
+        repo_dir: &FsPath,
+        upstream_url: &str,
+        upstream_git: &git_cache_git::Git,
+        pending: &[CommitSha],
+        comparison: Option<&UpstreamRefComparison>,
+        fetch_options: DirectFetchOptions,
+    ) -> CoreResult<bool> {
+        let mut refspecs: Vec<String> = Vec::new();
+        let mut raw_objects: Vec<CommitSha> = Vec::new();
+        for object_id in pending {
+            match comparison
+                .and_then(|comparison| comparison.branch_for_commit(object_id))
+                .map(git_cache_git::branch_cache_refspec)
+            {
+                Some(Ok(refspec)) => refspecs.push(refspec),
+                Some(Err(err)) => {
+                    warn!(
+                        %repo,
+                        %object_id,
+                        %err,
+                        "advertised branch name failed refspec validation; fetching as raw object"
+                    );
+                    raw_objects.push(object_id.clone());
+                }
+                None => raw_objects.push(object_id.clone()),
+            }
+        }
+        refspecs.sort();
+        refspecs.dedup();
+
+        info!(
+            %repo,
+            pending_wants = pending.len(),
+            refspec_count = refspecs.len(),
+            raw_object_count = raw_objects.len(),
+            depth = fetch_options.depth,
+            blobless_fetch = fetch_options.blobless_fetch(),
+            "direct git batched read-through fetch for wanted commits"
+        );
+
+        let mut fetched_all_heads = false;
+        if !refspecs.is_empty() {
+            if let Err(err) = upstream_git
+                .fetch_refspecs(
+                    repo_dir,
+                    upstream_url,
+                    &refspecs,
+                    fetch_options.git_options(),
+                )
+                .await
+            {
+                warn!(
+                    %repo,
+                    refspec_count = refspecs.len(),
+                    %err,
+                    "direct git batched advertised-ref fetch failed; falling back to all-heads fetch"
+                );
+                upstream_git
+                    .fetch_all_heads(repo_dir, upstream_url, fetch_options.git_options())
+                    .await?;
+                fetched_all_heads = true;
+            }
+        }
+        if !raw_objects.is_empty() {
+            if let Err(err) = upstream_git
+                .fetch_objects(
+                    repo_dir,
+                    upstream_url,
+                    &raw_objects,
+                    fetch_options.git_options(),
+                )
+                .await
+            {
+                warn!(
+                    %repo,
+                    raw_object_count = raw_objects.len(),
+                    %err,
+                    "direct git batched raw-object fetch failed; falling back to all-heads fetch"
+                );
+                if !fetched_all_heads {
+                    upstream_git
+                        .fetch_all_heads(repo_dir, upstream_url, fetch_options.git_options())
+                        .await?;
+                    fetched_all_heads = true;
+                }
+            }
+        }
+        Ok(fetched_all_heads)
+    }
+
+    async fn prepare_fetched_direct_want(
+        &self,
         repo_dir: &FsPath,
         object_id: &CommitSha,
     ) -> CoreResult<DirectFetchedWantKind> {
         let object_types = self
             .state
             .git
-            .cat_file_batch_types(repo_dir, std::slice::from_ref(object_id))
+            .cat_file_batch_types_no_lazy(repo_dir, std::slice::from_ref(object_id))
             .await?;
         let Some(object_type) = object_types.get(object_id).map(String::as_str) else {
             return Err(GitCacheError::NotFound(format!(
@@ -386,7 +572,10 @@ impl Materializer {
             return Ok(DirectFetchedWantKind::NonCommit);
         }
 
-        if !self.commit_ready_for_serving(repo_dir, object_id).await {
+        if !self
+            .commit_ready_for_serving_no_lazy(repo_dir, object_id)
+            .await
+        {
             return Err(GitCacheError::NotFound(format!(
                 "commit `{object_id}` not found or incomplete after upstream fetch"
             )));
@@ -402,7 +591,6 @@ impl Materializer {
             .update_ref(repo_dir, &cache_ref, object_id.as_str())
             .await?;
 
-        self.enqueue_direct_fsck(repo.clone(), repo_dir.to_path_buf(), object_id.clone());
         Ok(DirectFetchedWantKind::Commit)
     }
 
@@ -435,6 +623,55 @@ impl Materializer {
         });
     }
 
+    /// Debounced background maintenance that keeps served repos fast: a full
+    /// `git repack -a -d --write-bitmap-index` plus a commit-graph rewrite
+    /// after hydration, so server-side pack-objects can reuse pack bytes and
+    /// bitmaps instead of recomputing deltas over millions of objects. At
+    /// most one maintenance run per repo is queued or running at a time.
+    fn enqueue_serving_maintenance(&self, repo: RepoKey, repo_dir: PathBuf) {
+        {
+            let Ok(mut inflight) = self.state.serving_maintenance_inflight.lock() else {
+                warn!(%repo, "serving maintenance in-flight lock poisoned; skipping");
+                return;
+            };
+            if !inflight.insert(repo_dir.clone()) {
+                return;
+            }
+        }
+        info!(
+            %repo,
+            delay_ms = SERVING_MAINTENANCE_DELAY.as_millis(),
+            "queued direct git serving maintenance (repack + commit-graph)"
+        );
+        let materializer = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SERVING_MAINTENANCE_DELAY).await;
+            let started = Instant::now();
+            let result = async {
+                materializer.state.git.repack_for_serving(&repo_dir).await?;
+                materializer.state.git.commit_graph_write(&repo_dir).await?;
+                CoreResult::Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => info!(
+                    %repo,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git serving maintenance finished"
+                ),
+                Err(err) => warn!(
+                    %repo,
+                    %err,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git serving maintenance failed"
+                ),
+            }
+            if let Ok(mut inflight) = materializer.state.serving_maintenance_inflight.lock() {
+                inflight.remove(&repo_dir);
+            }
+        });
+    }
+
     fn direct_git_repo_cache_miss(repo: &RepoKey) -> GitCacheError {
         GitCacheError::UpstreamUnavailable(format!(
             "repo `{repo}` is not available in the local cache"
@@ -453,42 +690,9 @@ impl Materializer {
             return Ok(());
         }
 
-        self.state
-            .git
-            .set_config(repo_dir, "uploadpack.allowAnySHA1InWant", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "uploadpack.allowFilter", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "uploadpack.allowReachableSHA1InWant", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "uploadpack.hideRefs", "refs/cache")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "transfer.hideRefs", "refs/cache")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "pack.useBitmap", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "repack.writeBitmaps", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "pack.compression", "1")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "core.compression", "1")
-            .await?;
+        for (key, value) in SERVED_REPO_CONFIG {
+            self.state.git.set_config(repo_dir, key, value).await?;
+        }
         fs::write(marker, b"configured\n").await?;
         Ok(())
     }
@@ -520,6 +724,27 @@ impl Materializer {
             return Ok(true);
         }
 
+        // A blobless-hydrated repo cannot serve full-object shapes; decline
+        // so proxy-on-miss streams from upstream while the background warm
+        // refetches full objects into the cache.
+        if intent.filter.is_none()
+            && fs::try_exists(repo_dir.join(PARTIAL_HYDRATION_MARKER)).await?
+        {
+            info!(
+                %repo,
+                wants_count = intent.wants.len(),
+                "direct git cache prepare declined: repo partially hydrated (blobless), request needs full objects"
+            );
+            return Ok(false);
+        }
+
+        // A shallow cache repo (depth-limited hydration) cannot serve
+        // full-history commit wants: the pack would stop at the shallow
+        // boundary while the client repo is not marked shallow — a silently
+        // corrupt clone. Lazy exact-oid (blob/tree) fetches are unaffected.
+        let full_history_on_shallow_repo =
+            intent.depth.is_none() && fs::try_exists(repo_dir.join("shallow")).await?;
+
         let _repo_lock = self.lock_repo(repo).await?;
         let object_types = self
             .state
@@ -534,6 +759,15 @@ impl Materializer {
                 if object_type != "commit" {
                     served_non_commit_wants += 1;
                     continue;
+                }
+                if full_history_on_shallow_repo {
+                    info!(
+                        %repo,
+                        commit = %object_id,
+                        wants_count,
+                        "direct git cache prepare declined: repo is shallow, commit want needs full history"
+                    );
+                    return Ok(false);
                 }
                 if self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
                     self.expose_served_commit(&repo_dir, object_id).await?;

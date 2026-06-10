@@ -68,6 +68,30 @@ impl Materializer {
             && self.commit_tree_exists(repo_dir, commit).await
     }
 
+    pub(super) async fn commit_exists_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> bool {
+        self.state
+            .git
+            .run_no_lazy(
+                Some(repo_dir),
+                ["cat-file", "-e", &format!("{}^{{commit}}", commit.as_str())],
+            )
+            .await
+            .is_ok()
+    }
+
+    pub(super) async fn commit_ready_for_serving_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> bool {
+        self.commit_exists_no_lazy(repo_dir, commit).await
+            && self.commit_tree_exists_no_lazy(repo_dir, commit).await
+    }
+
     #[cfg(test)]
     pub(super) async fn object_exists(&self, repo_dir: &FsPath, object_id: &CommitSha) -> bool {
         self.state
