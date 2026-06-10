@@ -63,6 +63,7 @@ struct DirectFetchOptions {
     depth: Option<u32>,
     hydrate_manifests: bool,
     refetch: bool,
+    unshallow: bool,
 }
 
 impl Default for DirectFetchOptions {
@@ -72,6 +73,7 @@ impl Default for DirectFetchOptions {
             depth: None,
             hydrate_manifests: true,
             refetch: false,
+            unshallow: false,
         }
     }
 }
@@ -90,6 +92,7 @@ impl DirectFetchOptions {
             // serial object-store lookup per want would stall the request.
             hydrate_manifests: intent.filter.is_none(),
             refetch: false,
+            unshallow: false,
         }
     }
 
@@ -100,6 +103,7 @@ impl DirectFetchOptions {
             depth: None,
             hydrate_manifests: !blobless_fetch,
             refetch: false,
+            unshallow: false,
         }
     }
 
@@ -117,11 +121,17 @@ impl DirectFetchOptions {
         self
     }
 
+    fn with_unshallow(mut self) -> Self {
+        self.unshallow = true;
+        self
+    }
+
     fn git_options(self) -> git_cache_git::FetchOptions<'static> {
         git_cache_git::FetchOptions {
             filter: self.filter,
             depth: self.depth,
             refetch: self.refetch,
+            unshallow: self.unshallow,
         }
     }
 }
@@ -256,6 +266,24 @@ impl Materializer {
                 "repo partially hydrated (blobless); forcing full refetch of wants"
             );
         }
+        // A repo hydrated only by depth-limited fetches is shallow: serving a
+        // full-history intent from it would stream a pack whose commit
+        // parents stop at the shallow boundary while the client repo is not
+        // marked shallow — a silently corrupt clone. Force the batched fetch
+        // to unshallow the cache repo before serving such intents. Lazy
+        // exact-oid fetches are unaffected (`fetch_objects` never
+        // unshallows), so blobless checkout blob storms stay cheap.
+        let needs_unshallow =
+            fetch_options.depth.is_none() && fs::try_exists(repo_dir.join("shallow")).await?;
+        let fetch_options = if needs_unshallow {
+            info!(
+                %repo,
+                "cache repo is shallow; forcing unshallow fetch for full-history wants"
+            );
+            fetch_options.with_unshallow()
+        } else {
+            fetch_options
+        };
         let object_count = object_ids.len();
         // Classification must never trigger promisor lazy fetches: in a
         // partially hydrated repo each missing object would otherwise spawn
@@ -279,14 +307,17 @@ impl Materializer {
                     continue;
                 }
 
-                if !force_refetch && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
+                if !force_refetch
+                    && !needs_unshallow
+                    && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
+                {
                     self.expose_served_commit(&repo_dir, object_id).await?;
                     served_commits += 1;
                     continue;
                 }
             }
 
-            if !force_refetch && fetch_options.hydrate_manifests {
+            if !force_refetch && !needs_unshallow && fetch_options.hydrate_manifests {
                 if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
                     if manifest.complete {
                         Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await?;
@@ -707,6 +738,13 @@ impl Materializer {
             return Ok(false);
         }
 
+        // A shallow cache repo (depth-limited hydration) cannot serve
+        // full-history commit wants: the pack would stop at the shallow
+        // boundary while the client repo is not marked shallow — a silently
+        // corrupt clone. Lazy exact-oid (blob/tree) fetches are unaffected.
+        let full_history_on_shallow_repo =
+            intent.depth.is_none() && fs::try_exists(repo_dir.join("shallow")).await?;
+
         let _repo_lock = self.lock_repo(repo).await?;
         let object_types = self
             .state
@@ -721,6 +759,15 @@ impl Materializer {
                 if object_type != "commit" {
                     served_non_commit_wants += 1;
                     continue;
+                }
+                if full_history_on_shallow_repo {
+                    info!(
+                        %repo,
+                        commit = %object_id,
+                        wants_count,
+                        "direct git cache prepare declined: repo is shallow, commit want needs full history"
+                    );
+                    return Ok(false);
                 }
                 if self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
                     self.expose_served_commit(&repo_dir, object_id).await?;

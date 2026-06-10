@@ -724,6 +724,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shallow_hydrated_repo_unshallows_for_full_history_wants() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let parent = fixture.head_commit();
+        let commit = fixture.commit_and_push("second");
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+
+        let mut shallow_body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        shallow_body.extend_from_slice(b"0000");
+        shallow_body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+        shallow_body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        shallow_body.extend(make_upload_pack_pkt_line("done\n"));
+        let shallow_intent =
+            super::super::direct_git::parse_upload_pack_intent(&shallow_body).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &shallow_intent,
+                &comparison,
+            )
+            .await
+            .expect("shallow blobless read-through should hydrate the repo");
+
+        let shallow_file = repo_dir.join("shallow");
+        assert!(
+            shallow_file.exists(),
+            "depth-limited hydration should leave the cache repo shallow"
+        );
+        assert!(
+            !materializer.commit_exists(&repo_dir, &parent).await,
+            "depth-limited hydration should not import the parent commit"
+        );
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(
+                    &fixture.repo,
+                    &Bytes::from(make_full_body(&commit))
+                )
+                .await
+                .unwrap(),
+            "shallow repos must decline full-history cache prepare"
+        );
+
+        let full_intent =
+            super::super::direct_git::parse_upload_pack_intent(&make_full_body(&commit)).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &full_intent,
+                &comparison,
+            )
+            .await
+            .expect("full-history read-through against a shallow repo should unshallow");
+
+        assert!(
+            !shallow_file.exists(),
+            "full-history read-through should remove the shallow boundary"
+        );
+        assert!(
+            materializer.commit_exists(&repo_dir, &parent).await,
+            "unshallowed repo should contain the full commit ancestry"
+        );
+    }
+
     fn make_full_body(commit: &CommitSha) -> Vec<u8> {
         let mut body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
         body.extend_from_slice(b"0000");

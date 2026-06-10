@@ -62,6 +62,26 @@ pub struct FetchOptions<'a> {
     /// serve full-object clone shapes; plain fetch negotiation would skip
     /// commits whose trees/blobs are absent.
     pub refetch: bool,
+    /// Pass `--unshallow` so git removes the repo's shallow boundary. Used
+    /// when a full-history intent hits a cache repo previously hydrated with
+    /// a depth limit; serving from a shallow repo would emit a pack whose
+    /// commit parents are unreadable. Mutually exclusive with `depth`, and
+    /// only applied when the repo actually has a `shallow` file (git rejects
+    /// `--unshallow` on a complete repository).
+    pub unshallow: bool,
+}
+
+impl FetchOptions<'_> {
+    /// Drop `--unshallow` when the repo at `repo_dir` is not shallow; git
+    /// fails with "--unshallow on a complete repository" otherwise. An
+    /// earlier fetch in the same request may already have removed the
+    /// shallow boundary, so this is re-checked per fetch invocation.
+    fn resolve_unshallow(mut self, repo_dir: &Path) -> Self {
+        if self.unshallow && !repo_dir.join("shallow").exists() {
+            self.unshallow = false;
+        }
+        self
+    }
 }
 
 impl Git {
@@ -650,9 +670,13 @@ impl Git {
         repo_dir: &Path,
         remote_url: &str,
         object_ids: &[CommitSha],
-        options: FetchOptions<'_>,
+        mut options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
+        // Raw exact-oid fetches never need to move the shallow boundary;
+        // unshallowing is reserved for ref/all-heads fetches that hydrate
+        // commit ancestry.
+        options.unshallow = false;
         // Lazy blob fetches can carry tens of thousands of wanted objects;
         // pass them via `--stdin` (like git's own promisor fetch) so the
         // argv stays bounded regardless of want count.
@@ -688,7 +712,7 @@ impl Git {
         for refspec in refspecs {
             reject_refspec(refspec)?;
         }
-        let mut args = fetch_args_with_options(options)?;
+        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir))?;
         args.push(OsString::from("--"));
         args.push(OsString::from(remote_url));
         args.extend(refspecs.iter().map(OsString::from));
@@ -702,7 +726,7 @@ impl Git {
         options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        let mut args = fetch_args_with_options(options)?;
+        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir))?;
         args.push(OsString::from("--prune"));
         args.extend([
             OsString::from("--"),
@@ -1107,6 +1131,14 @@ fn fetch_args_with_options(options: FetchOptions<'_>) -> Result<Vec<OsString>> {
     }
     if options.refetch {
         args.push(OsString::from("--refetch"));
+    }
+    if options.unshallow {
+        if options.depth.is_some() {
+            return Err(GitCacheError::Validation(
+                "fetch cannot combine --unshallow with --depth".into(),
+            ));
+        }
+        args.push(OsString::from("--unshallow"));
     }
     Ok(args)
 }
@@ -1634,6 +1666,7 @@ printf '\n' >> "$FAKE_ARGS_OUT"
                 filter: Some("blob:none"),
                 depth: Some(1),
                 refetch: false,
+                unshallow: false,
             },
         )
         .await
@@ -1840,6 +1873,7 @@ printf '\n' >> "$FAKE_ARGS_OUT"
                     filter: None,
                     depth: Some(0),
                     refetch: false,
+                    unshallow: false,
                 },
             )
             .await
