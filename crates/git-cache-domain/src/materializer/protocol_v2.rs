@@ -20,22 +20,28 @@ pub fn wants_protocol_v2(git_protocol_header: Option<&str>) -> bool {
 }
 
 /// The protocol-v2 command carried by a stateless-rpc upload-pack body, if
-/// the body is a v2 request (`command=<name>` first packet).
+/// the body is a v2 request. The `command=<name>` packet may appear anywhere
+/// in the capability section (before the `0001` delimiter), interleaved with
+/// capabilities such as `agent=...` and `object-format=...`.
 pub fn protocol_v2_command(body: &[u8]) -> Option<String> {
-    let first = first_pkt_line(body)?;
-    let rest = first.strip_prefix("command=")?;
-    Some(rest.trim_end_matches('\n').to_string())
-}
-
-fn first_pkt_line(body: &[u8]) -> Option<String> {
-    if body.len() < 4 {
-        return None;
+    let mut offset = 0;
+    while body.len() >= offset + 4 {
+        let pkt_len =
+            usize::from_str_radix(std::str::from_utf8(&body[offset..offset + 4]).ok()?, 16).ok()?;
+        if pkt_len < 4 {
+            // Flush (0000) or delimiter (0001) ends the capability section.
+            return None;
+        }
+        if offset + pkt_len > body.len() {
+            return None;
+        }
+        let line = std::str::from_utf8(&body[offset + 4..offset + pkt_len]).ok()?;
+        if let Some(rest) = line.strip_prefix("command=") {
+            return Some(rest.trim_end_matches('\n').to_string());
+        }
+        offset += pkt_len;
     }
-    let pkt_len = usize::from_str_radix(std::str::from_utf8(&body[..4]).ok()?, 16).ok()?;
-    if pkt_len < 4 || pkt_len > body.len() {
-        return None;
-    }
-    String::from_utf8(body[4..pkt_len].to_vec()).ok()
+    None
 }
 
 /// Synthesize the protocol-v2 capability advertisement, equivalent to
@@ -227,12 +233,26 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_command_reads_first_pkt() {
+    fn protocol_v2_command_reads_capability_section() {
         let mut body = pkt("command=ls-refs\n");
         body.extend_from_slice(b"0000");
         assert_eq!(protocol_v2_command(&body).as_deref(), Some("ls-refs"));
         assert_eq!(protocol_v2_command(b"0032want aaaa\n"), None);
         assert_eq!(protocol_v2_command(b""), None);
+
+        // git places `command=` among other capabilities, not necessarily first.
+        let mut body = pkt("agent=git/2.54.0\n");
+        body.extend_from_slice(&pkt("object-format=sha1\n"));
+        body.extend_from_slice(&pkt("command=bundle-uri\n"));
+        body.extend_from_slice(b"0001");
+        body.extend_from_slice(b"0000");
+        assert_eq!(protocol_v2_command(&body).as_deref(), Some("bundle-uri"));
+
+        // The capability section ends at the delimiter.
+        let mut body = pkt("agent=git/2.54.0\n");
+        body.extend_from_slice(b"0001");
+        body.extend_from_slice(&pkt("command=fetch\n"));
+        assert_eq!(protocol_v2_command(&body), None);
     }
 
     #[test]

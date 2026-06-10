@@ -65,8 +65,10 @@ mod tests {
             let mut config = support::test_config(addr, tmp.path());
             if bundle_uri {
                 config.git_remote.bundle_uri_enabled = true;
-                config.git_remote.bundle_uri_base_url =
-                    Some(format!("file://{}", tmp.path().join("objects").display()));
+                config.git_remote.bundle_uri_base_url = Some(format!(
+                    "file://{}",
+                    tmp.path().join("objects-v2").display()
+                ));
             }
 
             let router = app(config);
@@ -257,7 +259,6 @@ mod tests {
         server.materialize_main().await;
 
         let clone_dir = server.tmp.path().join("clone-bundle");
-        let trace_path = server.tmp.path().join("trace2.log");
         let (ok, output) = run_git_async_with_env(
             server.tmp.path(),
             &[
@@ -269,7 +270,7 @@ mod tests {
                 &server.git_url("github.com/org/repo"),
                 clone_dir.to_str().unwrap(),
             ],
-            &[("GIT_TRACE2_EVENT", trace_path.to_str().unwrap())],
+            &[("GIT_TRACE_PACKET", "2")],
         )
         .await;
         assert!(ok, "bundle-uri clone failed: {output}");
@@ -278,11 +279,20 @@ mod tests {
 
         // `transfer.bundleURI` client support landed in git 2.38; older
         // clients ignore the advertisement and fall back to a normal clone.
+        // The packet trace on stderr shows the bundle-uri command exchange,
+        // and a failed bundle download surfaces as a warning.
         if git_supports_bundle_uri() {
-            let trace = std::fs::read_to_string(&trace_path).unwrap_or_default();
             assert!(
-                trace.contains("bundle-uri"),
-                "client never used bundle-uri: {trace}"
+                output.contains("command=bundle-uri"),
+                "client never sent bundle-uri command: {output}"
+            );
+            assert!(
+                output.contains("bundle.version=1"),
+                "server never advertised bundles: {output}"
+            );
+            assert!(
+                !output.contains("failed to download bundle"),
+                "client failed to download advertised bundle: {output}"
             );
         }
     }
