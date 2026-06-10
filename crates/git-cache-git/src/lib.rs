@@ -14,6 +14,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, info};
 
+mod backend;
+mod gix_backend;
+
+use backend::{GitBackend, GixBackend, LocalGitBackend};
+
 pub const DEFAULT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -24,6 +29,7 @@ pub struct Git {
     extra_env: Vec<(OsString, OsString)>,
     upstream_auth_env: Option<GitAuthEnv>,
     process_semaphore: Arc<Semaphore>,
+    local_backend: Arc<dyn LocalGitBackend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +63,31 @@ impl GitOutput {
 pub struct FetchOptions<'a> {
     pub filter: Option<&'a str>,
     pub depth: Option<u32>,
+    /// Pass `--refetch` so git re-downloads objects it already has locally.
+    /// Used to convert a partially hydrated (filtered) repo into one that can
+    /// serve full-object clone shapes; plain fetch negotiation would skip
+    /// commits whose trees/blobs are absent.
+    pub refetch: bool,
+    /// Pass `--unshallow` so git removes the repo's shallow boundary. Used
+    /// when a full-history intent hits a cache repo previously hydrated with
+    /// a depth limit; serving from a shallow repo would emit a pack whose
+    /// commit parents are unreadable. Mutually exclusive with `depth`, and
+    /// only applied when the repo actually has a `shallow` file (git rejects
+    /// `--unshallow` on a complete repository).
+    pub unshallow: bool,
+}
+
+impl FetchOptions<'_> {
+    /// Drop `--unshallow` when the repo at `repo_dir` is not shallow; git
+    /// fails with "--unshallow on a complete repository" otherwise. An
+    /// earlier fetch in the same request may already have removed the
+    /// shallow boundary, so this is re-checked per fetch invocation.
+    fn resolve_unshallow(mut self, repo_dir: &Path) -> Self {
+        if self.unshallow && !repo_dir.join("shallow").exists() {
+            self.unshallow = false;
+        }
+        self
+    }
 }
 
 impl Git {
@@ -81,6 +112,7 @@ impl Git {
             extra_env: Vec::new(),
             upstream_auth_env: None,
             process_semaphore: Arc::new(Semaphore::new(effective)),
+            local_backend: Arc::new(GixBackend),
         }
     }
 
@@ -91,6 +123,36 @@ impl Git {
     pub fn with_output_limit(mut self, output_limit: usize) -> Self {
         self.output_limit = output_limit;
         self
+    }
+
+    /// Select the backend for local read-only operations. In-process
+    /// gitoxide is the default; disabling routes everything through the
+    /// `git` binary.
+    pub fn with_gitoxide(mut self, use_gitoxide: bool) -> Self {
+        self.local_backend = if use_gitoxide {
+            Arc::new(GixBackend) as Arc<dyn LocalGitBackend>
+        } else {
+            Arc::new(GitBackend)
+        };
+        self
+    }
+
+    /// Run a synchronous gitoxide operation on the blocking thread pool,
+    /// bounded by the same semaphore as git subprocesses.
+    async fn run_gix<T, F>(&self, func: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _permit = self
+            .process_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
+        tokio::task::spawn_blocking(func)
+            .await
+            .map_err(|err| GitCacheError::Internal(format!("gitoxide task failed: {err}")))?
     }
 
     pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
@@ -133,15 +195,10 @@ impl Git {
 
     pub async fn rev_parse(&self, repo_dir: &Path, rev: &str) -> Result<String> {
         reject_revision_arg(rev)?;
-        let output = self
-            .run(
-                Some(repo_dir),
-                ["rev-parse", "--verify", "--end-of-options", rev],
-            )
-            .await?;
-        output
-            .stdout_utf8("rev-parse")
-            .map(|value| value.trim().to_string())
+        self.local_backend
+            .clone()
+            .rev_parse(self, repo_dir, rev)
+            .await
     }
 
     pub async fn is_ancestor(
@@ -152,20 +209,10 @@ impl Git {
     ) -> Result<bool> {
         reject_revision_arg(ancestor.as_str())?;
         reject_revision_arg(descendant.as_str())?;
-        let output = self
-            .run(
-                Some(repo_dir),
-                [
-                    "rev-list",
-                    "--max-count=1",
-                    ancestor.as_str(),
-                    "--not",
-                    descendant.as_str(),
-                    "--",
-                ],
-            )
-            .await?;
-        Ok(output.stdout.iter().all(|byte| byte.is_ascii_whitespace()))
+        self.local_backend
+            .clone()
+            .is_ancestor(self, repo_dir, ancestor, descendant)
+            .await
     }
 
     pub async fn for_each_ref_commits(
@@ -174,17 +221,10 @@ impl Git {
         ref_prefix: &str,
     ) -> Result<Vec<CommitSha>> {
         reject_ref_arg(ref_prefix, "ref prefix")?;
-        let output = self
-            .run(
-                Some(repo_dir),
-                ["for-each-ref", "--format=%(objectname)", "--", ref_prefix],
-            )
-            .await?;
-        let text = output.stdout_utf8("for-each-ref")?;
-        text.lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| CommitSha::parse(line.trim()))
-            .collect()
+        self.local_backend
+            .clone()
+            .for_each_ref_commits(self, repo_dir, ref_prefix)
+            .await
     }
 
     pub async fn for_each_ref(
@@ -193,32 +233,10 @@ impl Git {
         ref_prefix: &str,
     ) -> Result<Vec<(String, CommitSha)>> {
         reject_ref_arg(ref_prefix, "ref prefix")?;
-        let output = self
-            .run(
-                Some(repo_dir),
-                [
-                    "for-each-ref",
-                    "--format=%(refname) %(objectname)",
-                    "--",
-                    ref_prefix,
-                ],
-            )
-            .await?;
-        let text = output.stdout_utf8("for-each-ref")?;
-        let mut refs = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some((ref_name, commit)) = line.split_once(' ') else {
-                return Err(GitCacheError::Validation(format!(
-                    "malformed git for-each-ref output line: {line:?}"
-                )));
-            };
-            refs.push((ref_name.to_string(), CommitSha::parse(commit)?));
-        }
-        Ok(refs)
+        self.local_backend
+            .clone()
+            .for_each_ref(self, repo_dir, ref_prefix)
+            .await
     }
 
     pub async fn for_each_ref_containing_commit(
@@ -287,37 +305,13 @@ impl Git {
         repo_dir: &Path,
         object_ids: &[CommitSha],
     ) -> Result<HashMap<CommitSha, String>> {
-        let mut stdin = Vec::with_capacity(object_ids.len() * 41);
         for object_id in object_ids {
             reject_revision_arg(object_id.as_str())?;
-            stdin.extend_from_slice(object_id.as_str().as_bytes());
-            stdin.push(b'\n');
         }
-
-        let output = self
-            .run_with_stdin_and_limits(
-                Some(repo_dir),
-                ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
-                Some(&stdin),
-                self.output_limit,
-                self.output_limit,
-            )
-            .await?;
-        let text = output.stdout_utf8("cat-file")?;
-
-        let mut types = HashMap::new();
-        for line in text.lines() {
-            let Some((object_id, object_type)) = line.split_once(' ') else {
-                return Err(GitCacheError::Validation(format!(
-                    "malformed git cat-file output line: {line:?}"
-                )));
-            };
-            if object_type == "missing" {
-                continue;
-            }
-            types.insert(CommitSha::parse(object_id)?, object_type.to_string());
-        }
-        Ok(types)
+        self.local_backend
+            .clone()
+            .cat_file_batch_types(self, repo_dir, object_ids)
+            .await
     }
 
     pub async fn cat_file_batch_types_no_lazy(
@@ -404,6 +398,14 @@ impl Git {
             ["repack", "-a", "-d", "--write-bitmap-index"],
         )
         .await
+    }
+
+    /// Write a commit-graph covering all reachable commits so server-side
+    /// `pack-objects` and reachability walks on large repos avoid parsing
+    /// every commit object.
+    pub async fn commit_graph_write(&self, repo_dir: &Path) -> Result<GitOutput> {
+        self.run(Some(repo_dir), ["commit-graph", "write", "--reachable"])
+            .await
     }
 
     /// Run `git ls-remote --symref <remote> HEAD refs/heads/*` and return a map of
@@ -536,6 +538,10 @@ impl Git {
         command
             .args(["upload-pack", "--stateless-rpc", "."])
             .env_clear()
+            // Serving must never trigger promisor lazy fetches: a single
+            // pack-objects run over a partial repo can otherwise storm
+            // upstream with one fetch per missing object.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -619,14 +625,66 @@ impl Git {
         object_id: &CommitSha,
         options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
+        self.fetch_objects(
+            repo_dir,
+            remote_url,
+            std::slice::from_ref(object_id),
+            options,
+        )
+        .await
+    }
+
+    pub async fn fetch_objects(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        object_ids: &[CommitSha],
+        mut options: FetchOptions<'_>,
+    ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        reject_revision_arg(object_id.as_str())?;
+        // Raw exact-oid fetches never need to move the shallow boundary;
+        // unshallowing is reserved for ref/all-heads fetches that hydrate
+        // commit ancestry.
+        options.unshallow = false;
+        // Lazy blob fetches can carry tens of thousands of wanted objects;
+        // pass them via `--stdin` (like git's own promisor fetch) so the
+        // argv stays bounded regardless of want count.
+        let mut stdin = Vec::with_capacity(object_ids.len() * 41);
+        for object_id in object_ids {
+            reject_revision_arg(object_id.as_str())?;
+            stdin.extend_from_slice(object_id.as_str().as_bytes());
+            stdin.push(b'\n');
+        }
         let mut args = fetch_args_with_options(options)?;
-        args.extend([
-            OsString::from("--"),
-            OsString::from(remote_url),
-            OsString::from(object_id.as_str()),
-        ]);
+        // Mirror git's own promisor lazy fetch: raw object ids (blobs/trees)
+        // are not revisions, so writing FETCH_HEAD would fail with
+        // "bad revision"; negotiation tips are pointless for exact-oid wants.
+        args.insert(0, OsString::from("-c"));
+        args.insert(1, OsString::from("fetch.negotiationAlgorithm=noop"));
+        args.push(OsString::from("--no-write-fetch-head"));
+        args.push(OsString::from("--recurse-submodules=no"));
+        args.push(OsString::from("--stdin"));
+        args.push(OsString::from("--"));
+        args.push(OsString::from(remote_url));
+        self.run_upstream_with_stdin(Some(repo_dir), args, &stdin)
+            .await
+    }
+
+    pub async fn fetch_refspecs(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        refspecs: &[String],
+        options: FetchOptions<'_>,
+    ) -> Result<GitOutput> {
+        reject_remote_url(remote_url)?;
+        for refspec in refspecs {
+            reject_refspec(refspec)?;
+        }
+        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir))?;
+        args.push(OsString::from("--"));
+        args.push(OsString::from(remote_url));
+        args.extend(refspecs.iter().map(OsString::from));
         self.run_upstream(Some(repo_dir), args).await
     }
 
@@ -637,7 +695,7 @@ impl Git {
         options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        let mut args = fetch_args_with_options(options)?;
+        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir))?;
         args.push(OsString::from("--prune"));
         args.extend([
             OsString::from("--"),
@@ -707,6 +765,28 @@ impl Git {
         self.run_with_stdin_limits(cwd, args, None, self.output_limit, self.output_limit, true)
             .await
             .map_err(|err| self.map_upstream_git_error(err))
+    }
+
+    async fn run_upstream_with_stdin<I, S>(
+        &self,
+        cwd: Option<&Path>,
+        args: I,
+        stdin: &[u8],
+    ) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_stdin_limits(
+            cwd,
+            args,
+            Some(stdin),
+            self.output_limit,
+            self.output_limit,
+            true,
+        )
+        .await
+        .map_err(|err| self.map_upstream_git_error(err))
     }
 
     async fn run_with_stdin_limits<I, S>(
@@ -937,8 +1017,52 @@ fn reject_remote_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Builds a force-fetch refspec that mirrors `refs/heads/{branch}` into
+/// `refs/cache/upstream/heads/{branch}`, validating the upstream-supplied
+/// branch name before it is interpolated into git arguments.
+pub fn branch_cache_refspec(branch: &str) -> Result<String> {
+    reject_branch_name(branch)?;
+    let upstream_ref = format!("refs/heads/{branch}");
+    let local_ref = format!("refs/cache/upstream/heads/{branch}");
+    reject_ref_arg(&upstream_ref, "upstream ref")?;
+    reject_ref_arg(&local_ref, "local ref")?;
+    let refspec = format!("+{upstream_ref}:{local_ref}");
+    reject_refspec(&refspec)?;
+    Ok(refspec)
+}
+
+/// Enforces `git check-ref-format` rules in-process so upstream-supplied
+/// branch names cannot smuggle glob patterns or malformed ref syntax into a
+/// refspec. Mirrors the documented rules: no control chars, space, `~`, `^`,
+/// `:`, `?`, `*`, `[`, or `\`; no `..`, `@{`, or bare `@`; components must be
+/// non-empty and must not start with `.`, end with `.`, or end with `.lock`;
+/// the name must not start or end with `/` or end with `.`.
+fn reject_branch_name(branch: &str) -> Result<()> {
+    let invalid = || GitCacheError::Validation(format!("invalid branch name argument: {branch:?}"));
+    if branch.is_empty() || branch == "@" {
+        return Err(invalid());
+    }
+    if branch.starts_with('/') || branch.ends_with('/') || branch.ends_with('.') {
+        return Err(invalid());
+    }
+    if branch.contains("..") || branch.contains("@{") {
+        return Err(invalid());
+    }
+    if branch.bytes().any(|b| {
+        b < 0x20 || b == 0x7f || matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+    }) {
+        return Err(invalid());
+    }
+    for component in branch.split('/') {
+        if component.is_empty() || component.starts_with('.') || component.ends_with(".lock") {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 fn reject_refspec(refspec: &str) -> Result<()> {
-    if refspec.is_empty() || refspec.contains('\0') {
+    if refspec.is_empty() || refspec.starts_with('-') || refspec.contains('\0') {
         return Err(GitCacheError::Validation(format!(
             "invalid refspec argument: {refspec:?}"
         )));
@@ -973,6 +1097,17 @@ fn fetch_args_with_options(options: FetchOptions<'_>) -> Result<Vec<OsString>> {
     if let Some(filter) = options.filter {
         reject_fetch_filter(filter)?;
         args.push(OsString::from("--filter=blob:none"));
+    }
+    if options.refetch {
+        args.push(OsString::from("--refetch"));
+    }
+    if options.unshallow {
+        if options.depth.is_some() {
+            return Err(GitCacheError::Validation(
+                "fetch cannot combine --unshallow with --depth".into(),
+            ));
+        }
+        args.push(OsString::from("--unshallow"));
     }
     Ok(args)
 }
@@ -1499,6 +1634,8 @@ printf '\n' >> "$FAKE_ARGS_OUT"
             FetchOptions {
                 filter: Some("blob:none"),
                 depth: Some(1),
+                refetch: false,
+                unshallow: false,
             },
         )
         .await
@@ -1704,6 +1841,8 @@ printf '\n' >> "$FAKE_ARGS_OUT"
                 FetchOptions {
                     filter: None,
                     depth: Some(0),
+                    refetch: false,
+                    unshallow: false,
                 },
             )
             .await

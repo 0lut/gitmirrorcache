@@ -134,6 +134,7 @@ impl GitFixture {
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             max_concurrent_generation_verifications: 1,
             async_materialize_concurrency: 2,
+            use_gitoxide: true,
         }
     }
 
@@ -161,6 +162,9 @@ impl GitFixture {
             git,
             disk: AsyncDiskManager::new(disk),
             generation_verification_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 

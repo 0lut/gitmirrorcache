@@ -14,10 +14,11 @@ use git_cache_git::Git;
 #[cfg(feature = "s3")]
 use git_cache_objectstore::S3ObjectStore;
 use git_cache_objectstore::{LocalObjectStore, ObjectStore};
+use std::collections::HashSet;
 #[cfg(feature = "s3")]
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::info;
@@ -31,6 +32,9 @@ pub struct AppState {
     pub git: Git,
     pub disk: AsyncDiskManager,
     pub generation_verification_semaphore: Arc<Semaphore>,
+    /// Repo dirs with a queued or running background serving-maintenance
+    /// task (repack + commit-graph), to dedupe bursts of hydrating requests.
+    pub serving_maintenance_inflight: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl AppState {
@@ -100,7 +104,8 @@ impl AppState {
             Duration::from_secs(config.git_timeout_seconds),
             config.max_concurrent_git_processes,
         )
-        .with_output_limit(config.max_git_output_bytes);
+        .with_output_limit(config.max_git_output_bytes)
+        .with_gitoxide(config.use_gitoxide);
         let git = with_optional_upstream_credentials(git, &config);
         let disk = DiskManager::new(
             &config.cache_root,
@@ -132,6 +137,7 @@ impl AppState {
             generation_verification_semaphore: Arc::new(Semaphore::new(
                 max_concurrent_generation_verifications,
             )),
+            serving_maintenance_inflight: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 }
@@ -398,6 +404,7 @@ mod tests {
             max_concurrent_git_processes: 1,
             max_concurrent_generation_verifications: 1,
             async_materialize_concurrency: 2,
+            use_gitoxide: true,
         }
     }
 }

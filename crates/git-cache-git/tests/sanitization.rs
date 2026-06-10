@@ -391,4 +391,124 @@ mod tests {
             .await
             .is_err());
     }
+
+    // ── fetch_refspecs sanitization ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_refspecs_rejects_dash_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_refspecs(Path::new("/unused"), "-evil", &[], Default::default())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refspecs_rejects_dash_refspec() {
+        let git = test_git();
+        assert!(git
+            .fetch_refspecs(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &["--upload-pack=evil".to_string()],
+                Default::default()
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refspecs_rejects_nul_in_refspec() {
+        let git = test_git();
+        assert!(git
+            .fetch_refspecs(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &["bad\0spec".to_string()],
+                Default::default()
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_refspecs_rejects_empty_refspec() {
+        let git = test_git();
+        assert!(git
+            .fetch_refspecs(
+                Path::new("/unused"),
+                "https://example.com/repo.git",
+                &["".to_string()],
+                Default::default()
+            )
+            .await
+            .is_err());
+    }
+
+    // ── branch_cache_refspec validation ─────────────────────────────────────
+
+    #[test]
+    fn branch_cache_refspec_accepts_normal_branch() {
+        assert_eq!(
+            git_cache_git::branch_cache_refspec("feature/foo-1.2").unwrap(),
+            "+refs/heads/feature/foo-1.2:refs/cache/upstream/heads/feature/foo-1.2"
+        );
+    }
+
+    #[test]
+    fn branch_cache_refspec_rejects_colon_in_branch() {
+        assert!(git_cache_git::branch_cache_refspec("evil:refs/heads/main").is_err());
+    }
+
+    #[test]
+    fn branch_cache_refspec_rejects_nul_in_branch() {
+        assert!(git_cache_git::branch_cache_refspec("bad\0branch").is_err());
+    }
+
+    #[test]
+    fn branch_cache_refspec_rejects_glob_characters() {
+        assert!(git_cache_git::branch_cache_refspec("*").is_err());
+        assert!(git_cache_git::branch_cache_refspec("feature/*").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a?b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a[b]").is_err());
+    }
+
+    #[test]
+    fn branch_cache_refspec_rejects_check_ref_format_violations() {
+        assert!(git_cache_git::branch_cache_refspec("a..b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a@{b}").is_err());
+        assert!(git_cache_git::branch_cache_refspec("@").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a~b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a^b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a\\b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a\x07b").is_err());
+        assert!(git_cache_git::branch_cache_refspec(".hidden").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a/.b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("branch.lock").is_err());
+        assert!(git_cache_git::branch_cache_refspec("a//b").is_err());
+        assert!(git_cache_git::branch_cache_refspec("/leading").is_err());
+        assert!(git_cache_git::branch_cache_refspec("trailing/").is_err());
+        assert!(git_cache_git::branch_cache_refspec("trailing.").is_err());
+    }
+
+    // ── fetch_objects sanitization ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_objects_rejects_dash_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_objects(Path::new("/unused"), "-evil", &[], Default::default())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_objects_rejects_nul_in_url() {
+        let git = test_git();
+        assert!(git
+            .fetch_objects(Path::new("/unused"), "url\0bad", &[], Default::default())
+            .await
+            .is_err());
+    }
 }
