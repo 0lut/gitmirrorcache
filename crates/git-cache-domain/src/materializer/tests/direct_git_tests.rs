@@ -620,6 +620,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blobless_hydrated_repo_serves_complete_depth1_snapshot_without_refetch() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let commit = fixture.head_commit();
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+
+        // Hydrate the tip's full snapshot via a depth-1 read-through, then
+        // mark the repo partially hydrated — the state a blobless hydration
+        // followed by client checkout blob storms leaves behind.
+        let mut depth1_body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        depth1_body.extend_from_slice(b"0000");
+        depth1_body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+        depth1_body.extend(make_upload_pack_pkt_line("done\n"));
+        let depth1_intent =
+            super::super::direct_git::parse_upload_pack_intent(&Bytes::from(depth1_body.clone()))
+                .unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &depth1_intent,
+                &comparison,
+            )
+            .await
+            .expect("depth-1 read-through should hydrate the tip snapshot");
+        let marker = repo_dir.join("git-cache-partial-hydration");
+        stdfs::write(&marker, b"blobless\n").unwrap();
+
+        // A new upstream head whose snapshot is absent locally must still
+        // decline cache prepare under the marker.
+        let new_head = fixture.commit_and_push("second");
+        let mut missing_body = make_upload_pack_pkt_line(&format!("want {new_head} multi_ack\n"));
+        missing_body.extend_from_slice(b"0000");
+        missing_body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+        missing_body.extend(make_upload_pack_pkt_line("done\n"));
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(missing_body))
+                .await
+                .unwrap(),
+            "depth-1 prepare must decline while the want's snapshot is missing"
+        );
+
+        // Break the upstream so any refetch attempt would fail: success below
+        // proves the complete depth-1 snapshot is served purely from cache.
+        stdfs::rename(
+            fixture.upstream_path(),
+            fixture.upstream_path().with_extension("moved"),
+        )
+        .unwrap();
+
+        assert!(
+            materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(depth1_body))
+                .await
+                .unwrap(),
+            "complete depth-1 snapshots should be served from cache despite the marker"
+        );
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &depth1_intent,
+                &comparison,
+            )
+            .await
+            .expect("complete depth-1 snapshot must not trigger an upstream refetch");
+        assert!(
+            marker.exists(),
+            "depth-1 service must not clear the partial hydration marker"
+        );
+    }
+
+    #[tokio::test]
     async fn shallow_hydrated_repo_unshallows_for_full_history_wants() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());

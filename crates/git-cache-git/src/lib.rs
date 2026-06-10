@@ -300,6 +300,41 @@ impl Git {
         Ok(text.lines().any(|line| line.trim() == object_id.as_str()))
     }
 
+    /// Check, without lazy promisor fetches, that the full snapshot of
+    /// `commit` — the commit object plus every tree and blob reachable from
+    /// its root tree — is present locally. `--max-count=1` restricts the
+    /// walk to that single commit, which is exactly the object set
+    /// upload-pack streams for a `--depth 1` clone of the tip.
+    pub async fn commit_snapshot_complete_no_lazy(
+        &self,
+        repo_dir: &Path,
+        commit: &CommitSha,
+    ) -> Result<bool> {
+        reject_revision_arg(commit.as_str())?;
+        let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
+        let output = match git
+            .run(
+                Some(repo_dir),
+                [
+                    "rev-list",
+                    "--objects",
+                    "--no-object-names",
+                    "--missing=print",
+                    "--max-count=1",
+                    commit.as_str(),
+                ],
+            )
+            .await
+        {
+            Ok(output) => output,
+            // A missing tip (or any other walk failure) means the snapshot
+            // is not locally complete; callers fall back to refetching.
+            Err(_) => return Ok(false),
+        };
+        let text = output.stdout_utf8("rev-list")?;
+        Ok(!text.lines().any(|line| line.starts_with('?')))
+    }
+
     pub async fn cat_file_batch_types(
         &self,
         repo_dir: &Path,
