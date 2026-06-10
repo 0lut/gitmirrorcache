@@ -34,6 +34,7 @@ mod executor;
 mod generations;
 mod manifests;
 mod planning;
+mod protocol_v2;
 mod repo;
 mod util;
 
@@ -42,6 +43,11 @@ pub use direct_git::{
 };
 pub use executor::MaterializerExecutor;
 pub use generations::{bundle_key, default_manifest_key, CompactionReport};
+pub use protocol_v2::{
+    parse_ls_refs_args, protocol_v2_command, synthesize_bundle_uri_response,
+    synthesize_capability_advertisement, synthesize_ls_refs_response, wants_protocol_v2,
+    LsRefsArgs,
+};
 pub use repo::repo_from_git_path;
 
 #[derive(Clone)]
