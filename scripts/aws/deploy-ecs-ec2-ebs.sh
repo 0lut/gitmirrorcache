@@ -129,8 +129,13 @@ if [[ "$ECS_SHARED_ALB" == "true" ]]; then
   ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-^$ECS_PUBLIC_PATH_PREFIX(/.*)$}"
 fi
 
-# Must match OBJECT_STORE_SCHEMA_SUFFIX in crates/git-cache-domain/src/state.rs.
-OBJECT_STORE_SCHEMA_SUFFIX="v3"
+# Single source of truth shared with OBJECT_STORE_SCHEMA_SUFFIX in
+# crates/git-cache-domain/src/state.rs (via include_str!).
+OBJECT_STORE_SCHEMA_SUFFIX="$(tr -d '[:space:]' < "$REPO_ROOT/crates/git-cache-domain/object-store-schema-suffix")"
+if [[ -z "$OBJECT_STORE_SCHEMA_SUFFIX" ]]; then
+  echo "object-store-schema-suffix file is empty" >&2
+  exit 1
+fi
 
 runtime_s3_prefix() {
   local prefix="$1"

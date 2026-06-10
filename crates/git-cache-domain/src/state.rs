@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::info;
 
-const OBJECT_STORE_SCHEMA_SUFFIX: &str = "v3";
+/// Shared with `scripts/aws/deploy-ecs-ec2-ebs.sh` via the sibling
+/// `object-store-schema-suffix` file so the deploy-time S3 prefix and the
+/// runtime schema suffix cannot drift.
+const OBJECT_STORE_SCHEMA_SUFFIX: &str = include_str!("../object-store-schema-suffix").trim_ascii();
 
 #[derive(Clone)]
 pub struct AppState {
