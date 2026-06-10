@@ -57,6 +57,31 @@ impl GitOutput {
 pub struct FetchOptions<'a> {
     pub filter: Option<&'a str>,
     pub depth: Option<u32>,
+    /// Pass `--refetch` so git re-downloads objects it already has locally.
+    /// Used to convert a partially hydrated (filtered) repo into one that can
+    /// serve full-object clone shapes; plain fetch negotiation would skip
+    /// commits whose trees/blobs are absent.
+    pub refetch: bool,
+    /// Pass `--unshallow` so git removes the repo's shallow boundary. Used
+    /// when a full-history intent hits a cache repo previously hydrated with
+    /// a depth limit; serving from a shallow repo would emit a pack whose
+    /// commit parents are unreadable. Mutually exclusive with `depth`, and
+    /// only applied when the repo actually has a `shallow` file (git rejects
+    /// `--unshallow` on a complete repository).
+    pub unshallow: bool,
+}
+
+impl FetchOptions<'_> {
+    /// Drop `--unshallow` when the repo at `repo_dir` is not shallow; git
+    /// fails with "--unshallow on a complete repository" otherwise. An
+    /// earlier fetch in the same request may already have removed the
+    /// shallow boundary, so this is re-checked per fetch invocation.
+    fn resolve_unshallow(mut self, repo_dir: &Path) -> Self {
+        if self.unshallow && !repo_dir.join("shallow").exists() {
+            self.unshallow = false;
+        }
+        self
+    }
 }
 
 impl Git {
@@ -406,6 +431,14 @@ impl Git {
         .await
     }
 
+    /// Write a commit-graph covering all reachable commits so server-side
+    /// `pack-objects` and reachability walks on large repos avoid parsing
+    /// every commit object.
+    pub async fn commit_graph_write(&self, repo_dir: &Path) -> Result<GitOutput> {
+        self.run(Some(repo_dir), ["commit-graph", "write", "--reachable"])
+            .await
+    }
+
     /// Run `git ls-remote --symref <remote> HEAD refs/heads/*` and return a map of
     /// `refs/heads/<branch>` → commit SHA, plus the optional default branch name.
     /// The explicit patterns include the HEAD symref without downloading tags.
@@ -536,6 +569,10 @@ impl Git {
         command
             .args(["upload-pack", "--stateless-rpc", "."])
             .env_clear()
+            // Serving must never trigger promisor lazy fetches: a single
+            // pack-objects run over a partial repo can otherwise storm
+            // upstream with one fetch per missing object.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -633,17 +670,35 @@ impl Git {
         repo_dir: &Path,
         remote_url: &str,
         object_ids: &[CommitSha],
-        options: FetchOptions<'_>,
+        mut options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
+        // Raw exact-oid fetches never need to move the shallow boundary;
+        // unshallowing is reserved for ref/all-heads fetches that hydrate
+        // commit ancestry.
+        options.unshallow = false;
+        // Lazy blob fetches can carry tens of thousands of wanted objects;
+        // pass them via `--stdin` (like git's own promisor fetch) so the
+        // argv stays bounded regardless of want count.
+        let mut stdin = Vec::with_capacity(object_ids.len() * 41);
         for object_id in object_ids {
             reject_revision_arg(object_id.as_str())?;
+            stdin.extend_from_slice(object_id.as_str().as_bytes());
+            stdin.push(b'\n');
         }
         let mut args = fetch_args_with_options(options)?;
+        // Mirror git's own promisor lazy fetch: raw object ids (blobs/trees)
+        // are not revisions, so writing FETCH_HEAD would fail with
+        // "bad revision"; negotiation tips are pointless for exact-oid wants.
+        args.insert(0, OsString::from("-c"));
+        args.insert(1, OsString::from("fetch.negotiationAlgorithm=noop"));
+        args.push(OsString::from("--no-write-fetch-head"));
+        args.push(OsString::from("--recurse-submodules=no"));
+        args.push(OsString::from("--stdin"));
         args.push(OsString::from("--"));
         args.push(OsString::from(remote_url));
-        args.extend(object_ids.iter().map(|id| OsString::from(id.as_str())));
-        self.run_upstream(Some(repo_dir), args).await
+        self.run_upstream_with_stdin(Some(repo_dir), args, &stdin)
+            .await
     }
 
     pub async fn fetch_refspecs(
@@ -657,7 +712,7 @@ impl Git {
         for refspec in refspecs {
             reject_refspec(refspec)?;
         }
-        let mut args = fetch_args_with_options(options)?;
+        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir))?;
         args.push(OsString::from("--"));
         args.push(OsString::from(remote_url));
         args.extend(refspecs.iter().map(OsString::from));
@@ -671,7 +726,7 @@ impl Git {
         options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        let mut args = fetch_args_with_options(options)?;
+        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir))?;
         args.push(OsString::from("--prune"));
         args.extend([
             OsString::from("--"),
@@ -741,6 +796,28 @@ impl Git {
         self.run_with_stdin_limits(cwd, args, None, self.output_limit, self.output_limit, true)
             .await
             .map_err(|err| self.map_upstream_git_error(err))
+    }
+
+    async fn run_upstream_with_stdin<I, S>(
+        &self,
+        cwd: Option<&Path>,
+        args: I,
+        stdin: &[u8],
+    ) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_stdin_limits(
+            cwd,
+            args,
+            Some(stdin),
+            self.output_limit,
+            self.output_limit,
+            true,
+        )
+        .await
+        .map_err(|err| self.map_upstream_git_error(err))
     }
 
     async fn run_with_stdin_limits<I, S>(
@@ -1051,6 +1128,17 @@ fn fetch_args_with_options(options: FetchOptions<'_>) -> Result<Vec<OsString>> {
     if let Some(filter) = options.filter {
         reject_fetch_filter(filter)?;
         args.push(OsString::from("--filter=blob:none"));
+    }
+    if options.refetch {
+        args.push(OsString::from("--refetch"));
+    }
+    if options.unshallow {
+        if options.depth.is_some() {
+            return Err(GitCacheError::Validation(
+                "fetch cannot combine --unshallow with --depth".into(),
+            ));
+        }
+        args.push(OsString::from("--unshallow"));
     }
     Ok(args)
 }
@@ -1577,6 +1665,8 @@ printf '\n' >> "$FAKE_ARGS_OUT"
             FetchOptions {
                 filter: Some("blob:none"),
                 depth: Some(1),
+                refetch: false,
+                unshallow: false,
             },
         )
         .await
@@ -1782,6 +1872,8 @@ printf '\n' >> "$FAKE_ARGS_OUT"
                 FetchOptions {
                     filter: None,
                     depth: Some(0),
+                    refetch: false,
+                    unshallow: false,
                 },
             )
             .await
