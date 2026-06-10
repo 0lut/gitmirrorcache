@@ -3,7 +3,10 @@
 # Build context must contain `git-cache-api` and `git-cache` binaries for the
 # target platform; see scripts/aws/build-image-cross.sh.
 
-FROM debian:bookworm-slim
+# Runtime needs git >= 2.45: serving and want-classification rely on
+# GIT_NO_LAZY_FETCH printing `missing` for absent promisor objects (older
+# gits die with `could not fetch ... from promisor remote` instead).
+FROM debian:trixie-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git util-linux \
