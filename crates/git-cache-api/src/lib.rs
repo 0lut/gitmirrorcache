@@ -11,8 +11,10 @@ use git_cache_core::{
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
-    UpstreamRefComparison,
+    frame_ref_advertisement, parse_ls_refs_args, protocol_v2_command,
+    synthesize_bundle_uri_response, synthesize_capability_advertisement,
+    synthesize_ls_refs_response, synthesize_ref_advertisement, wants_protocol_v2, AppState,
+    Materializer, UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -643,7 +645,11 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
             .direct_git_proofs
             .insert(&repo, &auth, comparison.clone());
 
-        let output = synthesize_ref_advertisement(&comparison);
+        let output = if request_wants_protocol_v2(&headers) {
+            synthesize_capability_advertisement(bundle_uri_advertisable(&state))
+        } else {
+            synthesize_ref_advertisement(&comparison)
+        };
         let response = git_response(
             "application/x-git-upload-pack-advertisement",
             frame_ref_advertisement(&output),
@@ -719,6 +725,40 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
         };
         let materializer = materializer.using_upstream_auth(&auth);
 
+        let v2_command = protocol_v2_command(&body);
+        match v2_command.as_deref() {
+            Some("ls-refs") => {
+                let empty_comparison = UpstreamRefComparison {
+                    default_branch: None,
+                    all_upstream: HashMap::new(),
+                };
+                let output = synthesize_ls_refs_response(
+                    comparison.as_ref().unwrap_or(&empty_comparison),
+                    &parse_ls_refs_args(&body),
+                );
+                info!(
+                    request_id,
+                    repo = %repo,
+                    auth = auth_label(&auth),
+                    elapsed_ms = elapsed_ms(started),
+                    status = %StatusCode::OK,
+                    "direct git protocol v2 ls-refs served"
+                );
+                return git_response("application/x-git-upload-pack-result", output);
+            }
+            Some("bundle-uri") => {
+                return serve_bundle_uri_command(&state, &materializer, &repo, request_id, started)
+                    .await;
+            }
+            Some("fetch") | None => {}
+            Some(other) => {
+                return ApiError::from(GitCacheError::Validation(format!(
+                    "unsupported git protocol v2 command `{other}`"
+                )))
+                .into_response();
+            }
+        }
+
         if !proxy_on_miss_disabled(
             &headers,
             state.domain.config.git_remote.proxy_on_miss_by_default,
@@ -775,8 +815,11 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
             }
         }
 
-        let result =
-            Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await;
+        let result = if v2_command.is_some() {
+            Box::pin(materializer.handle_upload_pack_v2(&repo, &body, comparison.as_ref())).await
+        } else {
+            Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await
+        };
 
         match result {
             Ok(process) => {
@@ -1242,6 +1285,62 @@ fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackPro
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(guarded))
         .expect("git upload-pack response")
+}
+
+fn request_wants_protocol_v2(headers: &HeaderMap) -> bool {
+    wants_protocol_v2(
+        headers
+            .get("Git-Protocol")
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn bundle_uri_advertisable(state: &ApiState) -> bool {
+    let git_remote = &state.domain.config.git_remote;
+    git_remote.bundle_uri_enabled && git_remote.bundle_uri_base_url.is_some()
+}
+
+/// Serve a protocol-v2 `bundle-uri` command: advertise the repo's generation
+/// bundle chain as URIs under the configured public base URL. Responds with
+/// an empty bundle list when advertisement is disabled or no generations
+/// exist, which clients treat as "no bundles offered".
+async fn serve_bundle_uri_command(
+    state: &ApiState,
+    materializer: &Materializer,
+    repo: &RepoKey,
+    request_id: u64,
+    started: Instant,
+) -> Response {
+    let git_remote = &state.domain.config.git_remote;
+    let chain = if bundle_uri_advertisable(state) {
+        match materializer.bundle_uri_generation_chain(repo).await {
+            Ok(chain) => chain,
+            Err(error) => return ApiError::from(error).into_response(),
+        }
+    } else {
+        Vec::new()
+    };
+    let base_url = git_remote.bundle_uri_base_url.as_deref().unwrap_or("");
+    let output = if chain.is_empty() {
+        match synthesize_bundle_uri_response("https://unused.invalid", &[]) {
+            Ok(output) => output,
+            Err(error) => return ApiError::from(error).into_response(),
+        }
+    } else {
+        match synthesize_bundle_uri_response(base_url, &chain) {
+            Ok(output) => output,
+            Err(error) => return ApiError::from(error).into_response(),
+        }
+    };
+    info!(
+        request_id,
+        repo = %repo,
+        bundles = chain.len(),
+        elapsed_ms = elapsed_ms(started),
+        status = %StatusCode::OK,
+        "direct git protocol v2 bundle-uri served"
+    );
+    git_response("application/x-git-upload-pack-result", output)
 }
 
 fn git_response(content_type: &'static str, output: Vec<u8>) -> Response {

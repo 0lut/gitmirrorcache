@@ -525,6 +525,28 @@ impl Git {
         repo_dir: &Path,
         request_body: Bytes,
     ) -> Result<UploadPackProcess> {
+        self.upload_pack_spawn_inner(repo_dir, request_body, false)
+            .await
+    }
+
+    /// Same as [`Self::upload_pack_spawn`] but with the Git wire protocol
+    /// pinned to version 2 (`GIT_PROTOCOL=version=2`), for stateless-rpc
+    /// bodies that carry protocol-v2 command requests.
+    pub async fn upload_pack_spawn_v2(
+        &self,
+        repo_dir: &Path,
+        request_body: Bytes,
+    ) -> Result<UploadPackProcess> {
+        self.upload_pack_spawn_inner(repo_dir, request_body, true)
+            .await
+    }
+
+    async fn upload_pack_spawn_inner(
+        &self,
+        repo_dir: &Path,
+        request_body: Bytes,
+        protocol_v2: bool,
+    ) -> Result<UploadPackProcess> {
         let permit = self
             .process_semaphore
             .clone()
@@ -547,6 +569,10 @@ impl Git {
             .stderr(Stdio::piped())
             .current_dir(repo_dir)
             .kill_on_drop(true);
+
+        if protocol_v2 {
+            command.env("GIT_PROTOCOL", "version=2");
+        }
 
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);

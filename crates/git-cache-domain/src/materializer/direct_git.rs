@@ -655,6 +655,30 @@ impl Materializer {
         body: &Bytes,
         comparison: Option<&UpstreamRefComparison>,
     ) -> CoreResult<UploadPackProcess> {
+        self.handle_upload_pack_inner(repo, body, comparison, false)
+            .await
+    }
+
+    /// Same as [`Self::handle_upload_pack`] but for protocol-v2 `fetch`
+    /// command bodies: the spawned `git upload-pack` is pinned to protocol
+    /// version 2 so it interprets the stateless-rpc body correctly.
+    pub async fn handle_upload_pack_v2(
+        &self,
+        repo: &RepoKey,
+        body: &Bytes,
+        comparison: Option<&UpstreamRefComparison>,
+    ) -> CoreResult<UploadPackProcess> {
+        self.handle_upload_pack_inner(repo, body, comparison, true)
+            .await
+    }
+
+    async fn handle_upload_pack_inner(
+        &self,
+        repo: &RepoKey,
+        body: &Bytes,
+        comparison: Option<&UpstreamRefComparison>,
+        protocol_v2: bool,
+    ) -> CoreResult<UploadPackProcess> {
         let started = Instant::now();
         let intent = parse_upload_pack_intent(body)?;
         info!(
@@ -702,11 +726,17 @@ impl Materializer {
             "direct git upload-pack repo configured"
         );
         let spawn_started = Instant::now();
-        let process = self
-            .state
-            .git
-            .upload_pack_spawn(&repo_dir, body.clone())
-            .await?;
+        let process = if protocol_v2 {
+            self.state
+                .git
+                .upload_pack_spawn_v2(&repo_dir, body.clone())
+                .await?
+        } else {
+            self.state
+                .git
+                .upload_pack_spawn(&repo_dir, body.clone())
+                .await?
+        };
         info!(
             %repo,
             spawn_elapsed_ms = elapsed_ms(spawn_started),
@@ -907,11 +937,14 @@ fn visit_upload_pack_lines(body: &[u8], mut visit: impl FnMut(&str)) {
             Err(_) => break,
         };
 
-        if pkt_len == 0 {
+        // Flush (0000), delim (0001), and response-end (0002) packets carry
+        // no payload; skip them so protocol-v2 bodies parse past section
+        // delimiters.
+        if pkt_len < 4 {
             offset += 4;
             continue;
         }
-        if pkt_len < 4 || offset + pkt_len > body.len() {
+        if offset + pkt_len > body.len() {
             break;
         }
 

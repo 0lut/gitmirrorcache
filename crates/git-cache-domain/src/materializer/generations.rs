@@ -1118,6 +1118,21 @@ impl Materializer {
         }))
     }
 
+    /// The repo's current generation bundle chain, oldest (root) first, for
+    /// protocol-v2 `bundle-uri` advertisement. Empty when the repo has no
+    /// published generations.
+    pub async fn bundle_uri_generation_chain(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<Vec<GenerationManifest>> {
+        let Some(head) = self.manifests().repo_head(repo).await? else {
+            return Ok(Vec::new());
+        };
+        let mut chain = self.generation_chain(repo, head.generation).await?;
+        chain.reverse();
+        Ok(chain)
+    }
+
     pub(super) async fn generation_chain(
         &self,
         repo: &RepoKey,
