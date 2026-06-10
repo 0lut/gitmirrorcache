@@ -16,6 +16,30 @@ use tracing::{debug, info};
 
 pub const DEFAULT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
+/// Minimum supported `(major, minor)` version of the `git` binary.
+/// `GIT_NO_LAZY_FETCH` landed in git 2.45; older binaries ignore it and die
+/// with `fatal: could not fetch ... from promisor remote` instead of
+/// reporting missing promisor objects as missing.
+pub const MIN_GIT_VERSION: (u32, u32) = (2, 45);
+
+/// Parse `git version` output (e.g. `"git version 2.47.3"`, possibly with a
+/// platform suffix) into `(major, minor, patch)`.
+pub fn parse_git_version(text: &str) -> Option<(u32, u32, u32)> {
+    let version = text.trim().strip_prefix("git version")?.trim();
+    let version = version.split_whitespace().next()?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts
+        .next()
+        .map(|part| {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().unwrap_or(0)
+        })
+        .unwrap_or(0);
+    Some((major, minor, patch))
+}
+
 #[derive(Debug, Clone)]
 pub struct Git {
     binary: PathBuf,
@@ -899,6 +923,34 @@ impl Git {
             .await
     }
 
+    /// Report the version of the configured `git` binary as
+    /// `(major, minor, patch)`.
+    pub async fn binary_version(&self) -> Result<(u32, u32, u32)> {
+        let output = self.run(None, ["version"]).await?;
+        let text = output.stdout_utf8("version")?;
+        parse_git_version(&text).ok_or_else(|| {
+            GitCacheError::Internal(format!("could not parse git version from {text:?}"))
+        })
+    }
+
+    /// Fail fast when the configured `git` binary is older than
+    /// [`MIN_GIT_VERSION`]. Older binaries silently ignore
+    /// `GIT_NO_LAZY_FETCH` and attempt lazy promisor fetches for missing
+    /// objects, which surface as fatal errors on blobless-clone read paths
+    /// instead of "missing" object reports.
+    pub async fn ensure_supported_binary_version(&self) -> Result<()> {
+        let (major, minor, patch) = self.binary_version().await?;
+        let (min_major, min_minor) = MIN_GIT_VERSION;
+        if (major, minor) < (min_major, min_minor) {
+            return Err(GitCacheError::Internal(format!(
+                "git binary {major}.{minor}.{patch} is too old: \
+                 {min_major}.{min_minor} or newer is required for reliable \
+                 GIT_NO_LAZY_FETCH support"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn run_no_lazy<I, S>(&self, cwd: Option<&Path>, args: I) -> Result<GitOutput>
     where
         I: IntoIterator<Item = S>,
@@ -1259,6 +1311,42 @@ where
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // ── parse_git_version tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_git_version_plain() {
+        assert_eq!(parse_git_version("git version 2.47.3\n"), Some((2, 47, 3)));
+        assert_eq!(parse_git_version("git version 2.39.5"), Some((2, 39, 5)));
+    }
+
+    #[test]
+    fn parse_git_version_with_platform_suffix() {
+        assert_eq!(
+            parse_git_version("git version 2.39.5 (Apple Git-154)\n"),
+            Some((2, 39, 5))
+        );
+        assert_eq!(
+            parse_git_version("git version 2.47.0.windows.1"),
+            Some((2, 47, 0))
+        );
+        assert_eq!(
+            parse_git_version("git version 2.46.0-rc1"),
+            Some((2, 46, 0))
+        );
+    }
+
+    #[test]
+    fn parse_git_version_missing_patch() {
+        assert_eq!(parse_git_version("git version 2.45"), Some((2, 45, 0)));
+    }
+
+    #[test]
+    fn parse_git_version_rejects_garbage() {
+        assert_eq!(parse_git_version(""), None);
+        assert_eq!(parse_git_version("not git"), None);
+        assert_eq!(parse_git_version("git version two.three"), None);
+    }
 
     // ── reject_ref_arg tests ────────────────────────────────────────
 

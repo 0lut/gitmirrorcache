@@ -48,6 +48,7 @@ pub fn app_result(config: AppConfig) -> CoreResult<Router> {
 pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
     let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
+    state.domain.git.ensure_supported_binary_version().await?;
     router(git_remote_enabled, state)
 }
 
