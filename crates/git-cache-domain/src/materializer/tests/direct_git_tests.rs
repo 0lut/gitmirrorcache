@@ -655,6 +655,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blobless_hydrated_repo_refetches_full_objects_for_unfiltered_wants() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let commit = fixture.head_commit();
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+
+        let mut blobless = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        blobless.extend_from_slice(b"0000");
+        blobless.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        blobless.extend(make_upload_pack_pkt_line("done\n"));
+        let blobless_intent = super::super::direct_git::parse_upload_pack_intent(&blobless).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &blobless_intent,
+                &comparison,
+            )
+            .await
+            .expect("blobless read-through should hydrate the repo");
+
+        let marker = repo_dir.join("git-cache-partial-hydration");
+        assert!(
+            marker.exists(),
+            "blobless hydration should mark the repo as partially hydrated"
+        );
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(make_full_body(
+                    &commit
+                )))
+                .await
+                .unwrap(),
+            "partially hydrated repos must decline full-object cache prepare"
+        );
+
+        let full_intent =
+            super::super::direct_git::parse_upload_pack_intent(&make_full_body(&commit)).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &full_intent,
+                &comparison,
+            )
+            .await
+            .expect("full read-through against a partially hydrated repo should refetch");
+
+        assert!(
+            !marker.exists(),
+            "full refetch should clear the partial hydration marker"
+        );
+        assert!(
+            materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(make_full_body(
+                    &commit
+                )))
+                .await
+                .unwrap(),
+            "fully refetched repos should serve full-object shapes from cache"
+        );
+    }
+
+    fn make_full_body(commit: &CommitSha) -> Vec<u8> {
+        let mut body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        body.extend_from_slice(b"0000");
+        body.extend(make_upload_pack_pkt_line("done\n"));
+        body
+    }
+
+    #[tokio::test]
     async fn direct_want_falls_back_to_exact_sha_when_advertised_branch_moves_before_post() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());

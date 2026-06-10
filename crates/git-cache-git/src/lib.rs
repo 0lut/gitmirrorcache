@@ -57,6 +57,11 @@ impl GitOutput {
 pub struct FetchOptions<'a> {
     pub filter: Option<&'a str>,
     pub depth: Option<u32>,
+    /// Pass `--refetch` so git re-downloads objects it already has locally.
+    /// Used to convert a partially hydrated (filtered) repo into one that can
+    /// serve full-object clone shapes; plain fetch negotiation would skip
+    /// commits whose trees/blobs are absent.
+    pub refetch: bool,
 }
 
 impl Git {
@@ -404,6 +409,14 @@ impl Git {
             ["repack", "-a", "-d", "--write-bitmap-index"],
         )
         .await
+    }
+
+    /// Write a commit-graph covering all reachable commits so server-side
+    /// `pack-objects` and reachability walks on large repos avoid parsing
+    /// every commit object.
+    pub async fn commit_graph_write(&self, repo_dir: &Path) -> Result<GitOutput> {
+        self.run(Some(repo_dir), ["commit-graph", "write", "--reachable"])
+            .await
     }
 
     /// Run `git ls-remote --symref <remote> HEAD refs/heads/*` and return a map of
@@ -1052,6 +1065,9 @@ fn fetch_args_with_options(options: FetchOptions<'_>) -> Result<Vec<OsString>> {
         reject_fetch_filter(filter)?;
         args.push(OsString::from("--filter=blob:none"));
     }
+    if options.refetch {
+        args.push(OsString::from("--refetch"));
+    }
     Ok(args)
 }
 
@@ -1577,6 +1593,7 @@ printf '\n' >> "$FAKE_ARGS_OUT"
             FetchOptions {
                 filter: Some("blob:none"),
                 depth: Some(1),
+                refetch: false,
             },
         )
         .await
@@ -1782,6 +1799,7 @@ printf '\n' >> "$FAKE_ARGS_OUT"
                 FetchOptions {
                     filter: None,
                     depth: Some(0),
+                    refetch: false,
                 },
             )
             .await

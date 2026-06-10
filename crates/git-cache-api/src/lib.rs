@@ -1423,6 +1423,20 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
                     Poll::Ready(Some(Ok(chunk)))
                 }
             }
+            Poll::Ready(None) => {
+                // upload-pack exiting nonzero after stdout closes (e.g.
+                // pack-objects dying on missing blobs in a partially hydrated
+                // repo) is invisible to the HTTP layer; surface it in logs.
+                match this.child.try_wait() {
+                    Ok(Some(status)) if !status.success() => warn!(
+                        exit_code = status.code(),
+                        bytes_sent = this.bytes_sent,
+                        "git upload-pack exited with failure status after streaming response"
+                    ),
+                    _ => {}
+                }
+                Poll::Ready(None)
+            }
             other => other,
         }
     }

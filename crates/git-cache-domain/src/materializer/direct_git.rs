@@ -1,12 +1,41 @@
 use super::*;
 
-const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v1";
+const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v2";
+/// Marker recording that the bare repo was hydrated with a filtered
+/// (blobless) fetch and therefore cannot serve full-object clone shapes
+/// until an unfiltered `--refetch` completes.
+const PARTIAL_HYDRATION_MARKER: &str = "git-cache-partial-hydration";
 const BLOBLESS_FETCH_FILTER: &str = "blob:none";
+
+/// Local git config applied to every served bare repo. Marker-gated by
+/// `SERVED_REPO_CONFIG_MARKER`; bump the marker version when changing this
+/// set so existing repos pick up the new configuration.
+const SERVED_REPO_CONFIG: &[(&str, &str)] = &[
+    ("uploadpack.allowAnySHA1InWant", "true"),
+    ("uploadpack.allowFilter", "true"),
+    ("uploadpack.allowReachableSHA1InWant", "true"),
+    ("uploadpack.hideRefs", "refs/cache"),
+    ("transfer.hideRefs", "refs/cache"),
+    ("pack.useBitmaps", "true"),
+    ("repack.writeBitmaps", "true"),
+    ("pack.writeReverseIndex", "true"),
+    ("pack.threads", "0"),
+    ("pack.deltaCacheSize", "256m"),
+    ("core.deltaBaseCacheLimit", "512m"),
+    ("fetch.unpackLimit", "1"),
+    ("pack.compression", "1"),
+    ("core.compression", "1"),
+];
 
 #[cfg(test)]
 const DIRECT_FSCK_DELAY: StdDuration = StdDuration::from_millis(20);
 #[cfg(not(test))]
 const DIRECT_FSCK_DELAY: StdDuration = StdDuration::from_secs(30);
+
+#[cfg(test)]
+const SERVING_MAINTENANCE_DELAY: StdDuration = StdDuration::from_millis(20);
+#[cfg(not(test))]
+const SERVING_MAINTENANCE_DELAY: StdDuration = StdDuration::from_secs(60);
 
 enum DirectFetchedWantKind {
     Commit,
@@ -33,6 +62,7 @@ struct DirectFetchOptions {
     filter: Option<&'static str>,
     depth: Option<u32>,
     hydrate_manifests: bool,
+    refetch: bool,
 }
 
 impl Default for DirectFetchOptions {
@@ -41,6 +71,7 @@ impl Default for DirectFetchOptions {
             filter: None,
             depth: None,
             hydrate_manifests: true,
+            refetch: false,
         }
     }
 }
@@ -54,6 +85,7 @@ impl DirectFetchOptions {
             },
             depth: intent.depth,
             hydrate_manifests: true,
+            refetch: false,
         }
     }
 
@@ -63,6 +95,7 @@ impl DirectFetchOptions {
             filter: blobless_fetch.then_some(BLOBLESS_FETCH_FILTER),
             depth: None,
             hydrate_manifests: true,
+            refetch: false,
         }
     }
 
@@ -75,10 +108,16 @@ impl DirectFetchOptions {
         self
     }
 
+    fn with_refetch(mut self) -> Self {
+        self.refetch = true;
+        self
+    }
+
     fn git_options(self) -> git_cache_git::FetchOptions<'static> {
         git_cache_git::FetchOptions {
             filter: self.filter,
             depth: self.depth,
+            refetch: self.refetch,
         }
     }
 }
@@ -193,6 +232,26 @@ impl Materializer {
         let started = Instant::now();
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
+        // A repo hydrated only by filtered (blobless) fetches has commits and
+        // trees but no blobs. Readiness checks cannot see blob completeness,
+        // so full-object requests against such a repo would die in server
+        // pack-objects mid-stream. Force a `--refetch` covering every want so
+        // git re-downloads full objects despite the local (partial) haves.
+        let partial_marker = repo_dir.join(PARTIAL_HYDRATION_MARKER);
+        let force_refetch =
+            !fetch_options.blobless_fetch() && fs::try_exists(&partial_marker).await?;
+        let fetch_options = if force_refetch {
+            fetch_options.with_refetch()
+        } else {
+            fetch_options
+        };
+        if force_refetch {
+            info!(
+                %repo,
+                depth = fetch_options.depth,
+                "repo partially hydrated (blobless); forcing full refetch of wants"
+            );
+        }
         let object_count = object_ids.len();
         let object_types = self
             .state
@@ -213,14 +272,14 @@ impl Materializer {
                     continue;
                 }
 
-                if self.commit_tree_exists(&repo_dir, object_id).await {
+                if !force_refetch && self.commit_tree_exists(&repo_dir, object_id).await {
                     self.expose_served_commit(&repo_dir, object_id).await?;
                     served_commits += 1;
                     continue;
                 }
             }
 
-            if fetch_options.hydrate_manifests {
+            if !force_refetch && fetch_options.hydrate_manifests {
                 if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
                     if manifest.complete {
                         Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await?;
@@ -315,11 +374,22 @@ impl Materializer {
                 }
             }
 
+            if fetch_options.blobless_fetch() {
+                fs::write(&partial_marker, b"blobless\n").await?;
+            } else if force_refetch && fetch_options.depth.is_none() {
+                // An unfiltered, undepthed refetch re-downloads full objects
+                // for every requested want; the repo can serve full-object
+                // shapes again.
+                fs::remove_file(&partial_marker).await.ok();
+                info!(%repo, "cleared partial hydration marker after full refetch");
+            }
+
             // One repo-wide fsck covers every commit fetched by this request.
             if fetched_commits > 0 || fetched_non_commit_wants > 0 {
                 if let Some(first) = pending.first() {
                     self.enqueue_direct_fsck(repo.clone(), repo_dir.to_path_buf(), first.clone());
                 }
+                self.enqueue_serving_maintenance(repo.clone(), repo_dir.to_path_buf());
             }
         }
 
@@ -512,6 +582,55 @@ impl Materializer {
         });
     }
 
+    /// Debounced background maintenance that keeps served repos fast: a full
+    /// `git repack -a -d --write-bitmap-index` plus a commit-graph rewrite
+    /// after hydration, so server-side pack-objects can reuse pack bytes and
+    /// bitmaps instead of recomputing deltas over millions of objects. At
+    /// most one maintenance run per repo is queued or running at a time.
+    fn enqueue_serving_maintenance(&self, repo: RepoKey, repo_dir: PathBuf) {
+        {
+            let Ok(mut inflight) = self.state.serving_maintenance_inflight.lock() else {
+                warn!(%repo, "serving maintenance in-flight lock poisoned; skipping");
+                return;
+            };
+            if !inflight.insert(repo_dir.clone()) {
+                return;
+            }
+        }
+        info!(
+            %repo,
+            delay_ms = SERVING_MAINTENANCE_DELAY.as_millis(),
+            "queued direct git serving maintenance (repack + commit-graph)"
+        );
+        let materializer = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SERVING_MAINTENANCE_DELAY).await;
+            let started = Instant::now();
+            let result = async {
+                materializer.state.git.repack_for_serving(&repo_dir).await?;
+                materializer.state.git.commit_graph_write(&repo_dir).await?;
+                CoreResult::Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => info!(
+                    %repo,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git serving maintenance finished"
+                ),
+                Err(err) => warn!(
+                    %repo,
+                    %err,
+                    elapsed_ms = elapsed_ms(started),
+                    "direct git serving maintenance failed"
+                ),
+            }
+            if let Ok(mut inflight) = materializer.state.serving_maintenance_inflight.lock() {
+                inflight.remove(&repo_dir);
+            }
+        });
+    }
+
     fn direct_git_repo_cache_miss(repo: &RepoKey) -> GitCacheError {
         GitCacheError::UpstreamUnavailable(format!(
             "repo `{repo}` is not available in the local cache"
@@ -530,42 +649,9 @@ impl Materializer {
             return Ok(());
         }
 
-        self.state
-            .git
-            .set_config(repo_dir, "uploadpack.allowAnySHA1InWant", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "uploadpack.allowFilter", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "uploadpack.allowReachableSHA1InWant", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "uploadpack.hideRefs", "refs/cache")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "transfer.hideRefs", "refs/cache")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "pack.useBitmap", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "repack.writeBitmaps", "true")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "pack.compression", "1")
-            .await?;
-        self.state
-            .git
-            .set_config(repo_dir, "core.compression", "1")
-            .await?;
+        for (key, value) in SERVED_REPO_CONFIG {
+            self.state.git.set_config(repo_dir, key, value).await?;
+        }
         fs::write(marker, b"configured\n").await?;
         Ok(())
     }
@@ -595,6 +681,20 @@ impl Materializer {
 
         if intent.wants.is_empty() {
             return Ok(true);
+        }
+
+        // A blobless-hydrated repo cannot serve full-object shapes; decline
+        // so proxy-on-miss streams from upstream while the background warm
+        // refetches full objects into the cache.
+        if intent.filter.is_none()
+            && fs::try_exists(repo_dir.join(PARTIAL_HYDRATION_MARKER)).await?
+        {
+            info!(
+                %repo,
+                wants_count = intent.wants.len(),
+                "direct git cache prepare declined: repo partially hydrated (blobless), request needs full objects"
+            );
+            return Ok(false);
         }
 
         let _repo_lock = self.lock_repo(repo).await?;

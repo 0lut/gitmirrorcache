@@ -14,10 +14,11 @@ use git_cache_git::Git;
 #[cfg(feature = "s3")]
 use git_cache_objectstore::S3ObjectStore;
 use git_cache_objectstore::{LocalObjectStore, ObjectStore};
+use std::collections::HashSet;
 #[cfg(feature = "s3")]
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::info;
@@ -31,6 +32,9 @@ pub struct AppState {
     pub git: Git,
     pub disk: AsyncDiskManager,
     pub generation_verification_semaphore: Arc<Semaphore>,
+    /// Repo dirs with a queued or running background serving-maintenance
+    /// task (repack + commit-graph), to dedupe bursts of hydrating requests.
+    pub serving_maintenance_inflight: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl AppState {
@@ -132,6 +136,7 @@ impl AppState {
             generation_verification_semaphore: Arc::new(Semaphore::new(
                 max_concurrent_generation_verifications,
             )),
+            serving_maintenance_inflight: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 }
