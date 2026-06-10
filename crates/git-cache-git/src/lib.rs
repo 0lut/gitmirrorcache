@@ -653,14 +653,21 @@ impl Git {
         options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
+        // Lazy blob fetches can carry tens of thousands of wanted objects;
+        // pass them via `--stdin` (like git's own promisor fetch) so the
+        // argv stays bounded regardless of want count.
+        let mut stdin = Vec::with_capacity(object_ids.len() * 41);
         for object_id in object_ids {
             reject_revision_arg(object_id.as_str())?;
+            stdin.extend_from_slice(object_id.as_str().as_bytes());
+            stdin.push(b'\n');
         }
         let mut args = fetch_args_with_options(options)?;
+        args.push(OsString::from("--stdin"));
         args.push(OsString::from("--"));
         args.push(OsString::from(remote_url));
-        args.extend(object_ids.iter().map(|id| OsString::from(id.as_str())));
-        self.run_upstream(Some(repo_dir), args).await
+        self.run_upstream_with_stdin(Some(repo_dir), args, &stdin)
+            .await
     }
 
     pub async fn fetch_refspecs(
@@ -758,6 +765,28 @@ impl Git {
         self.run_with_stdin_limits(cwd, args, None, self.output_limit, self.output_limit, true)
             .await
             .map_err(|err| self.map_upstream_git_error(err))
+    }
+
+    async fn run_upstream_with_stdin<I, S>(
+        &self,
+        cwd: Option<&Path>,
+        args: I,
+        stdin: &[u8],
+    ) -> Result<GitOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_with_stdin_limits(
+            cwd,
+            args,
+            Some(stdin),
+            self.output_limit,
+            self.output_limit,
+            true,
+        )
+        .await
+        .map_err(|err| self.map_upstream_git_error(err))
     }
 
     async fn run_with_stdin_limits<I, S>(

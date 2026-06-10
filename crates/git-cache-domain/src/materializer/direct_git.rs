@@ -84,7 +84,11 @@ impl DirectFetchOptions {
                 None => None,
             },
             depth: intent.depth,
-            hydrate_manifests: true,
+            // Filtered (blobless) intents skip per-want manifest hydration:
+            // their wants are commits the batched fetch hydrates directly, or
+            // lazy-fetched blobs (tens of thousands per checkout) for which a
+            // serial object-store lookup per want would stall the request.
+            hydrate_manifests: intent.filter.is_none(),
             refetch: false,
         }
     }
@@ -94,7 +98,7 @@ impl DirectFetchOptions {
         Self {
             filter: blobless_fetch.then_some(BLOBLESS_FETCH_FILTER),
             depth: None,
-            hydrate_manifests: true,
+            hydrate_manifests: !blobless_fetch,
             refetch: false,
         }
     }
