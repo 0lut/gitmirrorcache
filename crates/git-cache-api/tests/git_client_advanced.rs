@@ -25,18 +25,19 @@ mod tests {
 
     impl TestServer {
         async fn start() -> Self {
-            Self::start_inner(false).await
+            Self::start_inner(false, true).await
         }
 
         /// Like `start`, but the server reaches the upstream via a `file://`
         /// URL instead of a bare path. Git only registers promisor/partial
         /// clone state for URL-shaped remotes ("promisor remote name cannot
         /// begin with '/'"), so filtered-fetch tests need this variant.
-        async fn start_with_file_url_upstream() -> Self {
-            Self::start_inner(true).await
+        /// `use_gitoxide` selects the local backend (gix vs git subprocess).
+        async fn start_with_file_url_upstream(use_gitoxide: bool) -> Self {
+            Self::start_inner(true, use_gitoxide).await
         }
 
-        async fn start_inner(file_url_upstream: bool) -> Self {
+        async fn start_inner(file_url_upstream: bool, use_gitoxide: bool) -> Self {
             let tmp = TempDir::new().unwrap();
             let upstream_bare = tmp.path().join("upstreams/github.com/org/repo.git");
             let upstream_work = tmp.path().join("work");
@@ -68,7 +69,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let config = if file_url_upstream {
+            let mut config = if file_url_upstream {
                 support::test_config_with_upstream(
                     addr,
                     tmp.path(),
@@ -77,6 +78,7 @@ mod tests {
             } else {
                 support::test_config(addr, tmp.path())
             };
+            config.use_gitoxide = use_gitoxide;
 
             let router = app(config);
 
@@ -343,8 +345,17 @@ mod tests {
     /// to support filters (`uploadpack.allowFilter`), like real upstreams do;
     /// without it the filter is silently ignored and the bug cannot trigger.
     #[tokio::test(flavor = "multi_thread")]
-    async fn full_clone_succeeds_after_blobless_shallow_hydration() {
-        let server = TestServer::start_with_file_url_upstream().await;
+    async fn full_clone_succeeds_after_blobless_shallow_hydration_gix_backend() {
+        full_clone_after_blobless_shallow_hydration(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_clone_succeeds_after_blobless_shallow_hydration_git_backend() {
+        full_clone_after_blobless_shallow_hydration(false).await;
+    }
+
+    async fn full_clone_after_blobless_shallow_hydration(use_gitoxide: bool) {
+        let server = TestServer::start_with_file_url_upstream(use_gitoxide).await;
         run_git(
             &server.upstream_bare,
             &["config", "uploadpack.allowFilter", "true"],
