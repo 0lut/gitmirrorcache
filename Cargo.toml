@@ -26,6 +26,7 @@ chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.38", features = ["derive", "env"] }
 flate2 = "1.1"
 futures = "0.3"
+gix = { version = "0.84", default-features = false, features = ["revision", "sha1"] }
 http = "1.3.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0.219", features = ["derive"] }

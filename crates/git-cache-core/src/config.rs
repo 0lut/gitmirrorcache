@@ -34,6 +34,10 @@ pub struct AppConfig {
     pub max_concurrent_generation_verifications: usize,
     #[serde(default = "default_async_materialize_concurrency")]
     pub async_materialize_concurrency: usize,
+    /// Use in-process gitoxide for local read-only Git operations instead of
+    /// spawning the `git` binary. Acts as a kill switch when disabled.
+    #[serde(default = "default_use_gitoxide")]
+    pub use_gitoxide: bool,
 }
 
 impl AppConfig {
@@ -122,6 +126,7 @@ impl AppConfig {
                 "GIT_CACHE_ASYNC_MATERIALIZE_CONCURRENCY",
                 default_async_materialize_concurrency(),
             )?,
+            use_gitoxide: parse_bool_env("GIT_CACHE_USE_GITOXIDE", default_use_gitoxide())?,
         })
     }
 }
@@ -270,6 +275,10 @@ pub fn default_max_concurrent_generation_verifications() -> usize {
 
 pub fn default_async_materialize_concurrency() -> usize {
     2
+}
+
+pub fn default_use_gitoxide() -> bool {
+    true
 }
 
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> crate::Result<T>
