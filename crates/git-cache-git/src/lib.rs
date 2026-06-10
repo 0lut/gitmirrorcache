@@ -549,6 +549,10 @@ impl Git {
         command
             .args(["upload-pack", "--stateless-rpc", "."])
             .env_clear()
+            // Serving must never trigger promisor lazy fetches: a single
+            // pack-objects run over a partial repo can otherwise storm
+            // upstream with one fetch per missing object.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")

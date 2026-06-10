@@ -670,7 +670,8 @@ mod tests {
         blobless.extend_from_slice(b"0000");
         blobless.extend(make_upload_pack_pkt_line("filter blob:none\n"));
         blobless.extend(make_upload_pack_pkt_line("done\n"));
-        let blobless_intent = super::super::direct_git::parse_upload_pack_intent(&blobless).unwrap();
+        let blobless_intent =
+            super::super::direct_git::parse_upload_pack_intent(&blobless).unwrap();
         materializer
             .ensure_upload_pack_intent_available_from_comparison(
                 &fixture.repo,
@@ -687,9 +688,10 @@ mod tests {
         );
         assert!(
             !materializer
-                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(make_full_body(
-                    &commit
-                )))
+                .prepare_upload_pack_from_cache(
+                    &fixture.repo,
+                    &Bytes::from(make_full_body(&commit))
+                )
                 .await
                 .unwrap(),
             "partially hydrated repos must decline full-object cache prepare"
@@ -712,9 +714,10 @@ mod tests {
         );
         assert!(
             materializer
-                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(make_full_body(
-                    &commit
-                )))
+                .prepare_upload_pack_from_cache(
+                    &fixture.repo,
+                    &Bytes::from(make_full_body(&commit))
+                )
                 .await
                 .unwrap(),
             "fully refetched repos should serve full-object shapes from cache"

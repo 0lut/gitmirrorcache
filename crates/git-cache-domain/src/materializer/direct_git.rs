@@ -253,10 +253,13 @@ impl Materializer {
             );
         }
         let object_count = object_ids.len();
+        // Classification must never trigger promisor lazy fetches: in a
+        // partially hydrated repo each missing object would otherwise spawn
+        // a serial upstream fetch.
         let object_types = self
             .state
             .git
-            .cat_file_batch_types(&repo_dir, object_ids)
+            .cat_file_batch_types_no_lazy(&repo_dir, object_ids)
             .await?;
         let mut non_commit_wants = 0usize;
         let mut served_commits = 0usize;
@@ -272,7 +275,7 @@ impl Materializer {
                     continue;
                 }
 
-                if !force_refetch && self.commit_tree_exists(&repo_dir, object_id).await {
+                if !force_refetch && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
                     self.expose_served_commit(&repo_dir, object_id).await?;
                     served_commits += 1;
                     continue;
@@ -522,7 +525,7 @@ impl Materializer {
         let object_types = self
             .state
             .git
-            .cat_file_batch_types(repo_dir, std::slice::from_ref(object_id))
+            .cat_file_batch_types_no_lazy(repo_dir, std::slice::from_ref(object_id))
             .await?;
         let Some(object_type) = object_types.get(object_id).map(String::as_str) else {
             return Err(GitCacheError::NotFound(format!(
@@ -534,7 +537,10 @@ impl Materializer {
             return Ok(DirectFetchedWantKind::NonCommit);
         }
 
-        if !self.commit_ready_for_serving(repo_dir, object_id).await {
+        if !self
+            .commit_ready_for_serving_no_lazy(repo_dir, object_id)
+            .await
+        {
             return Err(GitCacheError::NotFound(format!(
                 "commit `{object_id}` not found or incomplete after upstream fetch"
             )));
