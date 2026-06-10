@@ -392,6 +392,118 @@ impl Git {
         .await
     }
 
+    /// Run `git pack-objects --revs` writing a pack containing the objects
+    /// reachable from `include` and not reachable from `exclude`. Returns the
+    /// path of the written pack file (`{prefix}-{hash}.pack`).
+    pub async fn pack_objects_revs(
+        &self,
+        repo_dir: &Path,
+        prefix_path: &Path,
+        include: &[CommitSha],
+        exclude: &[CommitSha],
+    ) -> Result<PathBuf> {
+        if include.is_empty() {
+            return Err(GitCacheError::Validation(
+                "pack-objects requires at least one included revision".into(),
+            ));
+        }
+        let mut stdin = Vec::with_capacity((include.len() + exclude.len()) * 42);
+        for commit in include {
+            reject_revision_arg(commit.as_str())?;
+            stdin.extend_from_slice(commit.as_str().as_bytes());
+            stdin.push(b'\n');
+        }
+        for commit in exclude {
+            reject_revision_arg(commit.as_str())?;
+            stdin.push(b'^');
+            stdin.extend_from_slice(commit.as_str().as_bytes());
+            stdin.push(b'\n');
+        }
+
+        let args: Vec<OsString> = vec![
+            OsString::from("pack-objects"),
+            OsString::from("--revs"),
+            OsString::from("-q"),
+            OsString::from(path_to_str(prefix_path)?),
+        ];
+        let output = self
+            .run_with_stdin_and_limits(
+                Some(repo_dir),
+                args,
+                Some(&stdin),
+                self.output_limit,
+                self.output_limit,
+            )
+            .await?;
+        let text = output.stdout_utf8("pack-objects")?;
+        let hash = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .ok_or_else(|| {
+                GitCacheError::Internal("pack-objects did not report a pack name".into())
+            })?;
+        if hash.is_empty() || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(GitCacheError::Internal(format!(
+                "pack-objects reported an invalid pack name `{hash}`"
+            )));
+        }
+        let mut file_name = prefix_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| GitCacheError::Validation("invalid pack prefix path".into()))?
+            .to_string();
+        file_name.push('-');
+        file_name.push_str(hash);
+        file_name.push_str(".pack");
+        Ok(prefix_path.with_file_name(file_name))
+    }
+
+    /// Run `git index-pack` on a pack file already placed in the repo,
+    /// generating the companion `.idx` so the objects become readable.
+    pub async fn index_pack(&self, repo_dir: &Path, pack_path: &Path) -> Result<GitOutput> {
+        self.run(Some(repo_dir), ["index-pack", path_to_str(pack_path)?])
+            .await
+    }
+
+    /// Apply many ref updates atomically via `git update-ref --stdin`.
+    pub async fn update_refs_batch(
+        &self,
+        repo_dir: &Path,
+        updates: &[(String, CommitSha)],
+    ) -> Result<GitOutput> {
+        if updates.is_empty() {
+            return self.run(Some(repo_dir), ["update-ref", "--stdin"]).await;
+        }
+        let mut stdin = Vec::new();
+        for (ref_name, sha) in updates {
+            reject_ref_arg(ref_name, "ref")?;
+            reject_revision_arg(sha.as_str())?;
+            stdin.extend_from_slice(b"update ");
+            stdin.extend_from_slice(ref_name.as_bytes());
+            stdin.push(b' ');
+            stdin.extend_from_slice(sha.as_str().as_bytes());
+            stdin.push(b'\n');
+        }
+        self.run_with_stdin_and_limits(
+            Some(repo_dir),
+            ["update-ref", "--stdin"],
+            Some(&stdin),
+            self.output_limit,
+            self.output_limit,
+        )
+        .await
+    }
+
+    /// Read a symbolic ref (e.g. `HEAD`) and return its target ref name.
+    pub async fn symbolic_ref_read(&self, repo_dir: &Path, name: &str) -> Result<String> {
+        reject_ref_arg(name, "symbolic-ref name")?;
+        let output = self
+            .run(Some(repo_dir), ["symbolic-ref", "--", name])
+            .await?;
+        Ok(output.stdout_utf8("symbolic-ref")?.trim().to_string())
+    }
+
     pub async fn repack_for_serving(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(
             Some(repo_dir),

@@ -89,7 +89,7 @@ mod tests {
         assert_eq!(url, "https://github.com/org/repo.git");
     }
 
-    // ── default_manifest_key and bundle_key tests ────────────────────
+    // ── default_manifest_key and pack_key tests ──────────────────────
 
     #[test]
     fn default_manifest_key_produces_expected_path() {
@@ -101,25 +101,14 @@ mod tests {
     }
 
     #[test]
-    fn bundle_key_produces_expected_path() {
+    fn pack_key_produces_expected_path() {
         let repo = RepoKey::parse("github.com/org/repo").unwrap();
-        let gen = GenerationId::new();
-        let key = bundle_key(&repo, gen);
-        assert!(key.starts_with("repos/github.com/org/repo/generations/"));
-        assert!(key.ends_with("/base.bundle"));
-    }
-
-    #[test]
-    fn pending_generation_from_key_parses_scan_key() {
-        let repo = RepoKey::parse("github.com/org/repo").unwrap();
-        let generation = GenerationId::new();
-        let key = pending_generation_publish_key(&repo, generation);
-
+        let sha = "4e03c5e500d33132d9bda1452f82e2258acfa7ff8e45146796010a89f34cd081";
         assert_eq!(
-            pending_generation_from_key(&key).unwrap(),
-            Some((repo, generation))
+            pack_key(&repo, sha).unwrap(),
+            format!("repos/github.com/org/repo/packs/pack-{sha}.pack")
         );
-        assert_eq!(pending_generation_from_key("other/key.json").unwrap(), None);
+        assert!(pack_key(&repo, "not-a-sha").is_err());
     }
 
     // ── synthesize_ref_advertisement tests ───────────────────────────

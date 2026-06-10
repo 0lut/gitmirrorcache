@@ -68,6 +68,11 @@ path for old clients.)
 
 ### d. Content-addressed pack storage instead of generation chains
 
+> **Status: implemented.** The durable layer now stores content-addressed packs
+> (`repos/{repo}/packs/pack-{sha256}.pack`) with self-contained generation
+> manifests, parallel pack-download hydration, checksum-is-name verification,
+> and repack-based compaction, per the design below.
+
 gitmirrorcache models durability as generation manifests + incremental bundle chains
 + hourly compaction. I'd instead store **content-addressed packs** with a tiny ref
 manifest. The chain shape is an artifact of building on `git bundle`; flat packs are

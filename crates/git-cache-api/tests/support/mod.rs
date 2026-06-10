@@ -37,7 +37,6 @@ pub fn test_config_with_upstream(
         },
         compaction: Default::default(),
         max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-        max_concurrent_generation_verifications: 1,
         async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
         use_gitoxide: true,
     }

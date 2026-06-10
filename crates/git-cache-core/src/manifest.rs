@@ -25,37 +25,36 @@ impl fmt::Display for GenerationId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PackKind {
+    Base,
+    Delta,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackInfo {
+    pub key: String,
+    pub len: u64,
+    pub sha256: String,
+    pub kind: PackKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationManifest {
     pub repo: RepoKey,
     pub generation: GenerationId,
-    pub bundle_key: String,
-    #[serde(default)]
-    pub parent_generation: Option<GenerationId>,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
-    pub commits: Vec<CommitSha>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifiedGenerationManifest {
-    pub schema_version: u32,
-    pub repo: RepoKey,
-    pub generation: GenerationId,
-    pub bundle_key: String,
-    pub bundle_len: u64,
-    pub bundle_sha256: String,
+    pub verified_at: Option<DateTime<Utc>>,
     #[serde(default)]
-    pub parent_generation: Option<GenerationId>,
-    pub created_at: DateTime<Utc>,
-    pub verified_at: DateTime<Utc>,
-    pub verifier_version: u32,
-    pub git_version: String,
-    pub fsck_mode: String,
+    pub packs: Vec<PackInfo>,
+    #[serde(default)]
+    pub refs: std::collections::BTreeMap<String, CommitSha>,
+    #[serde(default)]
+    pub head_ref: Option<String>,
     #[serde(default)]
     pub commits: Vec<CommitSha>,
-    #[serde(default)]
-    pub tip_commits: Vec<CommitSha>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

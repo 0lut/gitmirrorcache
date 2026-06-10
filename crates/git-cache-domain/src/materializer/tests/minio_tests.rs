@@ -21,12 +21,11 @@ mod tests {
             .await
             .unwrap();
         let manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
-        assert!(state
-            .store
-            .head(&bundle_key(&fixture.repo, manifest.generation))
-            .await
-            .unwrap()
-            .is_some());
+        let generation = generation_manifest_for(&state, &fixture.repo, manifest.generation).await;
+        assert!(!generation.packs.is_empty());
+        for pack in &generation.packs {
+            assert!(state.store.head(&pack.key).await.unwrap().is_some());
+        }
 
         let repo_dir = materializer.repo_dir(&fixture.repo);
         stdfs::remove_dir_all(&repo_dir).unwrap();
@@ -72,7 +71,6 @@ mod tests {
             store: Arc::clone(&minio.store),
             git,
             disk: AsyncDiskManager::new(disk),
-            generation_verification_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
@@ -117,7 +115,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(report.old_chain_depth, 3);
+        assert_eq!(report.old_pack_count, 3);
         for old_generation in &report.old_generations {
             assert!(
                 read_generation_manifest(&*state.store, &fixture.repo, *old_generation)
@@ -125,15 +123,9 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            assert!(state
-                .store
-                .head(&bundle_key(&fixture.repo, *old_generation))
-                .await
-                .unwrap()
-                .is_none());
         }
         let compacted = generation_manifest_for(&state, &fixture.repo, report.new_generation).await;
-        assert_eq!(compacted.parent_generation, None);
+        assert_eq!(compacted.packs.len(), 1);
 
         let repo_dir = materializer.repo_dir(&fixture.repo);
         stdfs::remove_dir_all(&repo_dir).unwrap();

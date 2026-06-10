@@ -16,8 +16,8 @@ pub use config::{
 };
 pub use error::{GitCacheError, Result};
 pub use manifest::{
-    CommitManifest, GenerationId, GenerationManifest, RefManifest, RepoGenerationHead,
-    VerifiedGenerationManifest,
+    CommitManifest, GenerationId, GenerationManifest, PackInfo, PackKind, RefManifest,
+    RepoGenerationHead,
 };
 pub use repo::{CommitSha, RepoKey, ShortCommitSha};
 pub use selector::{BranchName, Selector};

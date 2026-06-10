@@ -265,107 +265,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_direct_want_does_not_verify_pending_generation_on_post() {
-        let fixture = GitFixture::new();
-        let state = Arc::new(fixture.state());
-        let materializer = Materializer::new(Arc::clone(&state));
-        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
-        let commit = fixture.head_commit();
-
-        run_git(
-            &repo_dir,
-            [
-                "fetch",
-                "--no-tags",
-                fixture.upstream_path().to_str().unwrap(),
-                "+refs/heads/main:refs/cache/upstream/heads/main",
-            ],
-        );
-        let generation = GenerationId::new();
-        let reservation = state.disk.reserve(1024 * 1024 * 64).await.unwrap();
-        let temp_path = reservation.temp_path().unwrap();
-        fs::create_dir_all(&temp_path).await.unwrap();
-        let bundle_path = temp_path.join("pending.bundle");
-        state
-            .git
-            .bundle_create_all(&repo_dir, &bundle_path)
-            .await
-            .unwrap();
-
-        let now = Utc::now();
-        let generation_manifest = GenerationManifest {
-            repo: fixture.repo.clone(),
-            generation,
-            bundle_key: bundle_key(&fixture.repo, generation),
-            parent_generation: None,
-            created_at: now,
-            commits: vec![commit.clone()],
-        };
-        let publish_manifests = PublishManifests {
-            commits: vec![CommitManifest {
-                repo: fixture.repo.clone(),
-                commit: commit.clone(),
-                generation,
-                complete: true,
-                verified_at: now,
-            }],
-            refs: Vec::new(),
-        };
-        let head = RepoGenerationHead {
-            repo: fixture.repo.clone(),
-            generation,
-            tip_commits: vec![commit.clone()],
-            updated_at: now,
-        };
-        GenerationPublish::with_manifests(generation_manifest, publish_manifests)
-            .publish_pending_bundle_file(&*state.store, &bundle_path, head, None)
-            .await
-            .unwrap();
-        reservation.release().await.unwrap();
-
-        stdfs::remove_dir_all(&repo_dir).unwrap();
-        stdfs::rename(
-            fixture.upstream_path(),
-            fixture.tmp.path().join("offline.git"),
-        )
-        .unwrap();
-
-        let comparison = UpstreamRefComparison {
-            default_branch: Some("main".to_string()),
-            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
-        };
-        let result = materializer
-            .ensure_wants_available_from_comparison(
-                &fixture.repo,
-                &[commit.to_string()],
-                &comparison,
-                false,
-            )
-            .await;
-
-        assert!(
-            matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
-            "direct Git POST should fetch proved refs instead of verifying pending generations: {result:?}"
-        );
-
-        let repo_dir = materializer.repo_dir(&fixture.repo);
-        assert!(
-            !materializer
-                .commit_ready_for_serving(&repo_dir, &commit)
-                .await,
-            "direct Git POST must not hydrate pending generations"
-        );
-        assert!(
-            materializer
-                .get_commit_manifest(&fixture.repo, &commit)
-                .await
-                .unwrap()
-                .is_none(),
-            "direct Git POST must not verify and publish pending generations"
-        );
-    }
-
-    #[tokio::test]
     async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());
@@ -528,11 +427,7 @@ mod tests {
         let manifest = wait_for_commit_manifest(&state, &fixture.repo, &cached.commit).await;
         wait_for_verified_generation(&state, &fixture.repo, manifest.generation).await;
 
-        state
-            .store
-            .delete(&bundle_key(&fixture.repo, manifest.generation))
-            .await
-            .unwrap();
+        delete_generation_packs(&state, &fixture.repo, manifest.generation).await;
         let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
         stdfs::remove_dir_all(&repo_dir).unwrap();
 
@@ -942,11 +837,7 @@ mod tests {
                 .await
         );
 
-        state
-            .store
-            .delete(&bundle_key(&fixture.repo, manifest.generation))
-            .await
-            .unwrap();
+        delete_generation_packs(&state, &fixture.repo, manifest.generation).await;
         stdfs::rename(
             fixture.upstream_path(),
             fixture.tmp.path().join("offline.git"),

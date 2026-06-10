@@ -3,11 +3,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
     CommitManifest, GenerationId, GenerationManifest, GitCacheError, RefManifest,
-    RepoGenerationHead, RepoKey, Result, VerifiedGenerationManifest,
+    RepoGenerationHead, RepoKey, Result,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt::Debug;
-use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseManifest {
@@ -24,18 +23,9 @@ pub struct PublishManifests {
     pub refs: Vec<RefManifest>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingGenerationPublish {
-    pub generation: GenerationManifest,
-    pub manifests: PublishManifests,
-    pub head: RepoGenerationHead,
-    pub default_ref: Option<RefManifest>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationPublish {
     pub generation: GenerationManifest,
-    pub verification: Option<VerifiedGenerationManifest>,
     pub manifests: PublishManifests,
 }
 
@@ -43,7 +33,6 @@ impl GenerationPublish {
     pub fn new(generation: GenerationManifest) -> Self {
         Self {
             generation,
-            verification: None,
             manifests: PublishManifests::default(),
         }
     }
@@ -51,99 +40,34 @@ impl GenerationPublish {
     pub fn with_manifests(generation: GenerationManifest, manifests: PublishManifests) -> Self {
         Self {
             generation,
-            verification: None,
             manifests,
         }
     }
 
-    pub fn with_verification(mut self, verification: VerifiedGenerationManifest) -> Self {
-        self.verification = Some(verification);
-        self
-    }
-
-    pub async fn publish_bundle_bytes<S>(&self, store: &S, bundle: Bytes) -> Result<()>
-    where
-        S: ObjectStore + ?Sized,
-    {
-        validate_publish(self)?;
-        put_bytes_if_absent_or_matches(store, &self.generation.bundle_key, bundle).await?;
-        if let Some(verification) = &self.verification {
-            write_verified_generation_manifest_if_absent_or_matches(store, verification).await?;
-        }
-        write_generation_manifest_if_absent_or_matches(store, &self.generation).await?;
-        write_publish_manifests(store, &self.manifests).await
-    }
-
-    pub async fn publish_bundle_file<S>(&self, store: &S, path: impl AsRef<Path>) -> Result<()>
-    where
-        S: ObjectStore + ?Sized,
-    {
-        validate_publish(self)?;
-        if store.exists(&self.generation.bundle_key).await? {
-            return Err(GitCacheError::Conflict(format!(
-                "bundle `{}` already exists",
-                self.generation.bundle_key
-            )));
-        }
-        store
-            .put_file(&self.generation.bundle_key, path.as_ref())
-            .await?;
-        if let Some(verification) = &self.verification {
-            write_verified_generation_manifest_if_absent_or_matches(store, verification).await?;
-        }
-        write_generation_manifest_if_absent_or_matches(store, &self.generation).await?;
-        write_publish_manifests(store, &self.manifests).await
-    }
-
-    pub async fn publish_pending_bundle_file<S>(
+    /// Publish a generation whose packs are content-addressed objects. Each
+    /// entry in `local_packs` maps a pack key from the manifest to a local
+    /// file containing the pack bytes; packs already present in the store
+    /// are skipped (identical content shares an address).
+    pub async fn publish_pack_files<S>(
         &self,
         store: &S,
-        path: impl AsRef<Path>,
-        head: RepoGenerationHead,
-        default_ref: Option<RefManifest>,
+        local_packs: &[(String, std::path::PathBuf)],
     ) -> Result<()>
     where
         S: ObjectStore + ?Sized,
     {
         validate_publish(self)?;
-        let pending = PendingGenerationPublish {
-            generation: self.generation.clone(),
-            manifests: self.manifests.clone(),
-            head,
-            default_ref,
-        };
-        validate_pending_publish(&pending)?;
-        if store.exists(&self.generation.bundle_key).await? {
-            return Err(GitCacheError::Conflict(format!(
-                "bundle `{}` already exists",
-                self.generation.bundle_key
-            )));
+        for (key, path) in local_packs {
+            if !self.generation.packs.iter().any(|pack| pack.key == *key) {
+                return Err(GitCacheError::Validation(format!(
+                    "pack `{key}` is not referenced by generation `{}`",
+                    self.generation.generation
+                )));
+            }
+            if !store.exists(key).await? {
+                store.put_file(key, path.as_path()).await?;
+            }
         }
-        store
-            .put_file(&self.generation.bundle_key, path.as_ref())
-            .await?;
-        write_pending_generation_publish_if_absent_or_matches(store, &pending).await?;
-        Ok(())
-    }
-
-    pub async fn publish_verified_metadata<S>(&self, store: &S) -> Result<()>
-    where
-        S: ObjectStore + ?Sized,
-    {
-        validate_publish(self)?;
-        let verification = self.verification.as_ref().ok_or_else(|| {
-            GitCacheError::Validation(format!(
-                "generation `{}` is missing verified metadata",
-                self.generation.generation
-            ))
-        })?;
-        if !store.exists(&self.generation.bundle_key).await? {
-            return Err(GitCacheError::NotFound(format!(
-                "bundle `{}` not found",
-                self.generation.bundle_key
-            )));
-        }
-        write_verified_generation_manifest_if_absent_or_matches(store, verification).await?;
         write_generation_manifest_if_absent_or_matches(store, &self.generation).await?;
         write_publish_manifests(store, &self.manifests).await
     }
@@ -201,12 +125,13 @@ pub fn generation_manifest_key(repo: &RepoKey, generation: GenerationId) -> Stri
     format!("repos/{repo}/generations/{generation}/manifest.json")
 }
 
-pub fn verified_generation_manifest_key(repo: &RepoKey, generation: GenerationId) -> String {
-    format!("repos/{repo}/generations/{generation}/verified.json")
+pub fn generation_manifest_prefix(repo: &RepoKey) -> String {
+    format!("repos/{repo}/generations/")
 }
 
-pub fn pending_generation_publish_key(repo: &RepoKey, generation: GenerationId) -> String {
-    format!("pending-generations/{repo}/{generation}.json")
+pub fn pack_key(repo: &RepoKey, sha256: &str) -> Result<String> {
+    validate_sha256(sha256)?;
+    Ok(format!("repos/{repo}/packs/pack-{sha256}.pack"))
 }
 
 pub fn commit_manifest_key(repo: &RepoKey, commit: &git_cache_core::CommitSha) -> String {
@@ -320,60 +245,6 @@ where
         store,
         &generation_manifest_key(&manifest.repo, manifest.generation),
         manifest,
-    )
-    .await
-}
-
-pub async fn read_verified_generation_manifest<S>(
-    store: &S,
-    repo: &RepoKey,
-    generation: GenerationId,
-) -> Result<Option<VerifiedGenerationManifest>>
-where
-    S: ObjectStore + ?Sized,
-{
-    read_json(store, &verified_generation_manifest_key(repo, generation)).await
-}
-
-pub async fn write_verified_generation_manifest_if_absent_or_matches<S>(
-    store: &S,
-    manifest: &VerifiedGenerationManifest,
-) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    validate_verified_generation_manifest(manifest)?;
-    write_json_if_absent_or_matches(
-        store,
-        &verified_generation_manifest_key(&manifest.repo, manifest.generation),
-        manifest,
-    )
-    .await
-}
-
-pub async fn read_pending_generation_publish<S>(
-    store: &S,
-    repo: &RepoKey,
-    generation: GenerationId,
-) -> Result<Option<PendingGenerationPublish>>
-where
-    S: ObjectStore + ?Sized,
-{
-    read_json(store, &pending_generation_publish_key(repo, generation)).await
-}
-
-pub async fn write_pending_generation_publish_if_absent_or_matches<S>(
-    store: &S,
-    pending: &PendingGenerationPublish,
-) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    validate_pending_publish(pending)?;
-    write_json_if_absent_or_matches(
-        store,
-        &pending_generation_publish_key(&pending.generation.repo, pending.generation.generation),
-        pending,
     )
     .await
 }
@@ -531,27 +402,6 @@ where
     Ok(())
 }
 
-async fn put_bytes_if_absent_or_matches<S>(store: &S, key: &str, value: Bytes) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    if store.put_if_absent(key, value.clone()).await? {
-        return Ok(true);
-    }
-
-    let existing = store
-        .get(key)
-        .await?
-        .ok_or_else(|| GitCacheError::Conflict(format!("object `{key}` disappeared")))?;
-    if existing == value {
-        Ok(false)
-    } else {
-        Err(GitCacheError::Conflict(format!(
-            "object `{key}` already contains different bytes"
-        )))
-    }
-}
-
 fn json_bytes<T>(value: &T) -> Result<Bytes>
 where
     T: Serialize + ?Sized,
@@ -565,19 +415,6 @@ fn validate_publish(publish: &GenerationPublish) -> Result<()> {
     validate_generation_manifest(&publish.generation)?;
     let repo = &publish.generation.repo;
     let generation = publish.generation.generation;
-
-    if let Some(verification) = &publish.verification {
-        validate_verified_generation_manifest(verification)?;
-        if verification.repo != *repo
-            || verification.generation != generation
-            || verification.bundle_key != publish.generation.bundle_key
-            || verification.parent_generation != publish.generation.parent_generation
-        {
-            return Err(GitCacheError::Validation(format!(
-                "verified generation manifest does not match generation `{generation}`"
-            )));
-        }
-    }
 
     for manifest in &publish.manifests.commits {
         if manifest.repo != *repo || manifest.generation != generation {
@@ -601,55 +438,30 @@ fn validate_publish(publish: &GenerationPublish) -> Result<()> {
     Ok(())
 }
 
-fn validate_pending_publish(pending: &PendingGenerationPublish) -> Result<()> {
-    validate_generation_manifest(&pending.generation)?;
-    let repo = &pending.generation.repo;
-    let generation = pending.generation.generation;
-
-    if pending.head.repo != *repo || pending.head.generation != generation {
-        return Err(GitCacheError::Validation(format!(
-            "pending generation head does not match generation `{generation}`"
-        )));
-    }
-
-    let publish =
-        GenerationPublish::with_manifests(pending.generation.clone(), pending.manifests.clone());
-    validate_publish(&publish)?;
-
-    if let Some(default_ref) = &pending.default_ref {
-        if default_ref.repo != *repo
-            || default_ref.generation != generation
-            || default_ref.ref_name != "HEAD"
-        {
+fn validate_generation_manifest(manifest: &GenerationManifest) -> Result<()> {
+    for pack in &manifest.packs {
+        validate_key(&pack.key)?;
+        validate_sha256(&pack.sha256)?;
+        if pack.len == 0 {
             return Err(GitCacheError::Validation(format!(
-                "pending default ref does not match generation `{generation}`"
+                "generation `{}` references empty pack `{}`",
+                manifest.generation, pack.key
+            )));
+        }
+        let expected = pack_key(&manifest.repo, &pack.sha256)?;
+        if pack.key != expected {
+            return Err(GitCacheError::Validation(format!(
+                "pack key `{}` does not match content address `{expected}`",
+                pack.key
             )));
         }
     }
-
-    Ok(())
-}
-
-fn validate_generation_manifest(manifest: &GenerationManifest) -> Result<()> {
-    validate_key(&manifest.bundle_key)?;
-    Ok(())
-}
-
-fn validate_verified_generation_manifest(manifest: &VerifiedGenerationManifest) -> Result<()> {
-    if manifest.schema_version != 2 {
-        return Err(GitCacheError::Validation(format!(
-            "verified generation `{}` has unsupported schema version {}",
-            manifest.generation, manifest.schema_version
-        )));
+    for ref_name in manifest.refs.keys() {
+        validate_ref_name(ref_name)?;
     }
-    if manifest.bundle_len == 0 {
-        return Err(GitCacheError::Validation(format!(
-            "verified generation `{}` has empty bundle",
-            manifest.generation
-        )));
+    if let Some(head_ref) = &manifest.head_ref {
+        validate_ref_name(head_ref)?;
     }
-    validate_key(&manifest.bundle_key)?;
-    validate_sha256(&manifest.bundle_sha256)?;
     Ok(())
 }
 
