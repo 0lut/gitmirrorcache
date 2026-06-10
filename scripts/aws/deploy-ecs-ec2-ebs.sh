@@ -129,6 +129,9 @@ if [[ "$ECS_SHARED_ALB" == "true" ]]; then
   ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-^$ECS_PUBLIC_PATH_PREFIX(/.*)$}"
 fi
 
+# Must match OBJECT_STORE_SCHEMA_SUFFIX in crates/git-cache-domain/src/state.rs.
+OBJECT_STORE_SCHEMA_SUFFIX="v3"
+
 runtime_s3_prefix() {
   local prefix="$1"
   while [[ "$prefix" == /* ]]; do
@@ -138,16 +141,16 @@ runtime_s3_prefix() {
     prefix="${prefix%/}"
   done
   if [[ -z "$prefix" ]]; then
-    printf 'v2\n'
+    printf '%s\n' "$OBJECT_STORE_SCHEMA_SUFFIX"
     return
   fi
   local component="${prefix##*/}"
-  if [[ "$component" == "v2" || "$component" == *-v2 ]]; then
+  if [[ "$component" == "$OBJECT_STORE_SCHEMA_SUFFIX" || "$component" == *-"$OBJECT_STORE_SCHEMA_SUFFIX" ]]; then
     printf '%s\n' "$prefix"
   elif [[ "$prefix" == */* ]]; then
-    printf '%s/%s-v2\n' "${prefix%/*}" "$component"
+    printf '%s/%s-%s\n' "${prefix%/*}" "$component" "$OBJECT_STORE_SCHEMA_SUFFIX"
   else
-    printf '%s-v2\n' "$prefix"
+    printf '%s-%s\n' "$prefix" "$OBJECT_STORE_SCHEMA_SUFFIX"
   fi
 }
 
