@@ -309,6 +309,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gitoxide_backend_matches_subprocess_backend() {
+        let temp = TempTree::new("gitoxide-parity");
+        let (source_repo, first_sha) = create_source_repo(&temp.path);
+        let cache_repo = temp.path.join("cache.git");
+        let gix = test_git().with_gitoxide(true);
+        let subprocess = test_git().with_gitoxide(false);
+
+        let second_sha = commit_source(&source_repo, "second");
+        gix.init_bare(&cache_repo).await.expect("init cache repo");
+        gix.fetch_branch(
+            &cache_repo,
+            path_arg(&source_repo),
+            "main",
+            "refs/cache/upstream/heads/main",
+        )
+        .await
+        .expect("fetch cache ref");
+
+        for rev in ["refs/cache/upstream/heads/main", second_sha.as_str()] {
+            assert_eq!(
+                gix.rev_parse(&cache_repo, rev).await.expect("gix rev-parse"),
+                subprocess
+                    .rev_parse(&cache_repo, rev)
+                    .await
+                    .expect("subprocess rev-parse"),
+            );
+        }
+        assert!(gix.rev_parse(&cache_repo, "refs/missing").await.is_err());
+
+        assert_eq!(
+            gix.for_each_ref(&cache_repo, "refs/cache/upstream/heads")
+                .await
+                .expect("gix for-each-ref"),
+            subprocess
+                .for_each_ref(&cache_repo, "refs/cache/upstream/heads")
+                .await
+                .expect("subprocess for-each-ref"),
+        );
+
+        let first = CommitSha::parse(&first_sha).unwrap();
+        let second = CommitSha::parse(&second_sha).unwrap();
+        for (ancestor, descendant) in [(&first, &second), (&second, &first), (&first, &first)] {
+            assert_eq!(
+                gix.is_ancestor(&cache_repo, ancestor, descendant)
+                    .await
+                    .expect("gix is-ancestor"),
+                subprocess
+                    .is_ancestor(&cache_repo, ancestor, descendant)
+                    .await
+                    .expect("subprocess is-ancestor"),
+            );
+        }
+
+        let missing = CommitSha::parse("f".repeat(40)).unwrap();
+        let ids = vec![first, second, missing];
+        assert_eq!(
+            gix.cat_file_batch_types(&cache_repo, &ids)
+                .await
+                .expect("gix cat-file types"),
+            subprocess
+                .cat_file_batch_types(&cache_repo, &ids)
+                .await
+                .expect("subprocess cat-file types"),
+        );
+    }
+
+    #[tokio::test]
     async fn bundle_create_incremental_empty_excludes_creates_full_bundle() {
         let temp = TempTree::new("incremental-empty");
         let (source_repo, source_sha) = create_source_repo(&temp.path);

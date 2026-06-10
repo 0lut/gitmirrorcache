@@ -100,7 +100,8 @@ impl AppState {
             Duration::from_secs(config.git_timeout_seconds),
             config.max_concurrent_git_processes,
         )
-        .with_output_limit(config.max_git_output_bytes);
+        .with_output_limit(config.max_git_output_bytes)
+        .with_gitoxide(config.use_gitoxide);
         let git = with_optional_upstream_credentials(git, &config);
         let disk = DiskManager::new(
             &config.cache_root,
@@ -398,6 +399,7 @@ mod tests {
             max_concurrent_git_processes: 1,
             max_concurrent_generation_verifications: 1,
             async_materialize_concurrency: 2,
+            use_gitoxide: true,
         }
     }
 }

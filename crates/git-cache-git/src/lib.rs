@@ -14,6 +14,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, info};
 
+mod gix_backend;
+
 pub const DEFAULT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -24,6 +26,7 @@ pub struct Git {
     extra_env: Vec<(OsString, OsString)>,
     upstream_auth_env: Option<GitAuthEnv>,
     process_semaphore: Arc<Semaphore>,
+    use_gitoxide: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +84,7 @@ impl Git {
             extra_env: Vec::new(),
             upstream_auth_env: None,
             process_semaphore: Arc::new(Semaphore::new(effective)),
+            use_gitoxide: true,
         }
     }
 
@@ -91,6 +95,32 @@ impl Git {
     pub fn with_output_limit(mut self, output_limit: usize) -> Self {
         self.output_limit = output_limit;
         self
+    }
+
+    /// Toggle in-process gitoxide implementations for local read-only
+    /// operations. Enabled by default; disabling routes everything through
+    /// the `git` binary.
+    pub fn with_gitoxide(mut self, use_gitoxide: bool) -> Self {
+        self.use_gitoxide = use_gitoxide;
+        self
+    }
+
+    /// Run a synchronous gitoxide operation on the blocking thread pool,
+    /// bounded by the same semaphore as git subprocesses.
+    async fn run_gix<T, F>(&self, func: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let _permit = self
+            .process_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
+        tokio::task::spawn_blocking(func)
+            .await
+            .map_err(|err| GitCacheError::Internal(format!("gitoxide task failed: {err}")))?
     }
 
     pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
@@ -133,6 +163,13 @@ impl Git {
 
     pub async fn rev_parse(&self, repo_dir: &Path, rev: &str) -> Result<String> {
         reject_revision_arg(rev)?;
+        if self.use_gitoxide {
+            let repo_dir = repo_dir.to_path_buf();
+            let rev = rev.to_string();
+            return self
+                .run_gix(move || gix_backend::rev_parse(&repo_dir, &rev))
+                .await;
+        }
         let output = self
             .run(
                 Some(repo_dir),
@@ -152,6 +189,14 @@ impl Git {
     ) -> Result<bool> {
         reject_revision_arg(ancestor.as_str())?;
         reject_revision_arg(descendant.as_str())?;
+        if self.use_gitoxide {
+            let repo_dir = repo_dir.to_path_buf();
+            let ancestor = ancestor.clone();
+            let descendant = descendant.clone();
+            return self
+                .run_gix(move || gix_backend::is_ancestor(&repo_dir, &ancestor, &descendant))
+                .await;
+        }
         let output = self
             .run(
                 Some(repo_dir),
@@ -174,6 +219,13 @@ impl Git {
         ref_prefix: &str,
     ) -> Result<Vec<CommitSha>> {
         reject_ref_arg(ref_prefix, "ref prefix")?;
+        if self.use_gitoxide {
+            let repo_dir = repo_dir.to_path_buf();
+            let ref_prefix = ref_prefix.to_string();
+            return self
+                .run_gix(move || gix_backend::for_each_ref_commits(&repo_dir, &ref_prefix))
+                .await;
+        }
         let output = self
             .run(
                 Some(repo_dir),
@@ -193,6 +245,13 @@ impl Git {
         ref_prefix: &str,
     ) -> Result<Vec<(String, CommitSha)>> {
         reject_ref_arg(ref_prefix, "ref prefix")?;
+        if self.use_gitoxide {
+            let repo_dir = repo_dir.to_path_buf();
+            let ref_prefix = ref_prefix.to_string();
+            return self
+                .run_gix(move || gix_backend::for_each_ref(&repo_dir, &ref_prefix))
+                .await;
+        }
         let output = self
             .run(
                 Some(repo_dir),
@@ -287,6 +346,16 @@ impl Git {
         repo_dir: &Path,
         object_ids: &[CommitSha],
     ) -> Result<HashMap<CommitSha, String>> {
+        if self.use_gitoxide {
+            for object_id in object_ids {
+                reject_revision_arg(object_id.as_str())?;
+            }
+            let repo_dir = repo_dir.to_path_buf();
+            let object_ids = object_ids.to_vec();
+            return self
+                .run_gix(move || gix_backend::cat_file_batch_types(&repo_dir, &object_ids))
+                .await;
+        }
         let mut stdin = Vec::with_capacity(object_ids.len() * 41);
         for object_id in object_ids {
             reject_revision_arg(object_id.as_str())?;
