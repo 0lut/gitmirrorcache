@@ -329,7 +329,9 @@ mod tests {
 
         for rev in ["refs/cache/upstream/heads/main", second_sha.as_str()] {
             assert_eq!(
-                gix.rev_parse(&cache_repo, rev).await.expect("gix rev-parse"),
+                gix.rev_parse(&cache_repo, rev)
+                    .await
+                    .expect("gix rev-parse"),
                 subprocess
                     .rev_parse(&cache_repo, rev)
                     .await

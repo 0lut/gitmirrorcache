@@ -36,9 +36,9 @@ pub(crate) fn rev_parse(repo_dir: &Path, rev: &str) -> Result<String> {
 /// Equivalent of `git for-each-ref --format='%(refname) %(objectname)' -- {prefix}`.
 pub(crate) fn for_each_ref(repo_dir: &Path, ref_prefix: &str) -> Result<Vec<(String, CommitSha)>> {
     let repo = open(repo_dir)?;
-    let references = repo.references().map_err(|err| {
-        GitCacheError::Validation(format!("gitoxide failed to read refs: {err}"))
-    })?;
+    let references = repo
+        .references()
+        .map_err(|err| GitCacheError::Validation(format!("gitoxide failed to read refs: {err}")))?;
     let iter = references.prefixed(ref_prefix).map_err(|err| {
         GitCacheError::Validation(format!(
             "gitoxide failed to iterate refs with prefix {ref_prefix:?}: {err}"
