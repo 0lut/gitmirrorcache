@@ -68,35 +68,40 @@ Image reference.
 
 {{/*
 Shared GIT_CACHE_* environment variables used by both the server and the
-compaction CronJob. GIT_CACHE_CONFIG is deliberately not set here: when it is
-set the application reads the entire config from the TOML file and ignores
-env vars, so only the server (which mounts the ConfigMap) opts into it.
+compaction CronJob. Takes a dict: "ctx" (the root context) and an optional
+"cacheRoot" override so the CronJob can use a scratch directory. GIT_CACHE_CONFIG
+is deliberately not set here: when it is set the application reads the entire
+config from the TOML file and ignores env vars, so only the server (which
+mounts the ConfigMap) opts into it.
 */}}
 {{- define "gitmirrorcache.env" -}}
+{{- $ctx := .ctx -}}
+{{- $cacheRoot := default $ctx.Values.config.cacheRoot .cacheRoot -}}
+{{- with $ctx }}
 - name: GIT_CACHE_BIND_ADDR
   value: {{ .Values.config.bindAddr | quote }}
 - name: GIT_CACHE_ROOT
-  value: {{ .Values.config.cacheRoot | quote }}
+  value: {{ $cacheRoot | quote }}
 - name: GIT_CACHE_GIT_BINARY
   value: {{ .Values.config.gitBinary | quote }}
 - name: GIT_CACHE_GIT_TIMEOUT_SECONDS
-  value: {{ .Values.config.gitTimeoutSeconds | quote }}
+  value: {{ .Values.config.gitTimeoutSeconds | int64 | quote }}
 - name: GIT_CACHE_MAX_GIT_OUTPUT_BYTES
-  value: {{ .Values.config.maxGitOutputBytes | quote }}
+  value: {{ .Values.config.maxGitOutputBytes | int64 | quote }}
 - name: GIT_CACHE_RATE_LIMIT_PER_MINUTE
-  value: {{ .Values.config.rateLimitPerMinute | quote }}
+  value: {{ .Values.config.rateLimitPerMinute | int64 | quote }}
 - name: GIT_CACHE_ALLOWED_UPSTREAM_HOSTS
   value: {{ join "," .Values.config.allowedUpstreamHosts | quote }}
 - name: GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES
-  value: {{ .Values.config.maxConcurrentGitProcesses | quote }}
+  value: {{ .Values.config.maxConcurrentGitProcesses | int64 | quote }}
 - name: GIT_CACHE_DISK_QUOTA_BYTES
-  value: {{ .Values.config.disk.quotaBytes | quote }}
+  value: {{ .Values.config.disk.quotaBytes | int64 | quote }}
 - name: GIT_CACHE_DISK_MIN_FREE_BYTES
-  value: {{ .Values.config.disk.minFreeBytes | quote }}
+  value: {{ .Values.config.disk.minFreeBytes | int64 | quote }}
 - name: GIT_CACHE_GIT_REMOTE_ENABLED
   value: {{ .Values.config.gitRemote.enabled | quote }}
 - name: GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD
-  value: {{ .Values.config.compaction.chainDepthThreshold | quote }}
+  value: {{ .Values.config.compaction.chainDepthThreshold | int64 | quote }}
 - name: GIT_CACHE_COMPACTION_INLINE
   value: {{ .Values.config.compaction.inline | quote }}
 - name: RUST_LOG
@@ -145,5 +150,6 @@ env vars, so only the server (which mounts the ConfigMap) opts into it.
 {{- end }}
 {{- with .Values.config.extraEnv }}
 {{ toYaml . }}
+{{- end }}
 {{- end }}
 {{- end }}

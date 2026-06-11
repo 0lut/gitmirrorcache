@@ -36,12 +36,10 @@ spec:
               command: ["/usr/local/bin/git-cache", "compact", "--all"]
               # The CLI is configured purely via env vars (no GIT_CACHE_CONFIG
               # here: a TOML config would override the scratch cache root).
+              # Compaction works against the object store; use scratch disk
+              # so the job does not contend with the server's hot cache.
               env:
-                {{- include "gitmirrorcache.env" . | nindent 16 }}
-                # Compaction works against the object store; use scratch disk
-                # so the job does not contend with the server's hot cache.
-                - name: GIT_CACHE_ROOT
-                  value: /tmp/compaction-cache
+                {{- include "gitmirrorcache.env" (dict "ctx" . "cacheRoot" "/tmp/compaction-cache") | nindent 16 }}
               {{- with .Values.compaction.resources }}
               resources:
                 {{- toYaml . | nindent 16 }}

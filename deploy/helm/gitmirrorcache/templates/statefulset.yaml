@@ -43,7 +43,7 @@ spec:
               containerPort: {{ (split ":" .Values.config.bindAddr)._1 | int }}
               protocol: TCP
           env:
-            {{- include "gitmirrorcache.env" . | nindent 12 }}
+            {{- include "gitmirrorcache.env" (dict "ctx" .) | nindent 12 }}
             {{- if .Values.configFile }}
             - name: GIT_CACHE_CONFIG
               value: /etc/gitmirrorcache/config.toml
