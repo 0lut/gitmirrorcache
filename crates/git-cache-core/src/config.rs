@@ -30,8 +30,6 @@ pub struct AppConfig {
     pub compaction: CompactionConfig,
     #[serde(default = "default_max_concurrent_git_processes")]
     pub max_concurrent_git_processes: usize,
-    #[serde(default = "default_max_concurrent_generation_verifications")]
-    pub max_concurrent_generation_verifications: usize,
     #[serde(default = "default_async_materialize_concurrency")]
     pub async_materialize_concurrency: usize,
     /// Use in-process gitoxide for local read-only Git operations instead of
@@ -117,10 +115,6 @@ impl AppConfig {
             max_concurrent_git_processes: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
                 default_max_concurrent_git_processes(),
-            )?,
-            max_concurrent_generation_verifications: parse_env(
-                "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
-                default_max_concurrent_generation_verifications(),
             )?,
             async_materialize_concurrency: parse_env(
                 "GIT_CACHE_ASYNC_MATERIALIZE_CONCURRENCY",
@@ -269,10 +263,6 @@ pub fn default_max_concurrent_git_processes() -> usize {
     64
 }
 
-pub fn default_max_concurrent_generation_verifications() -> usize {
-    1
-}
-
 pub fn default_async_materialize_concurrency() -> usize {
     2
 }
@@ -358,7 +348,6 @@ mod tests {
         "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
         "GIT_CACHE_COMPACTION_INLINE",
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
-        "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS",
         "GIT_CACHE_ASYNC_MATERIALIZE_CONCURRENCY",
     ];
 
@@ -453,7 +442,6 @@ min_free_bytes = 100000
         assert_eq!(config.max_git_output_bytes, 16 * 1024 * 1024);
         assert_eq!(config.git_remote, GitRemoteConfig::default());
         assert_eq!(config.compaction, CompactionConfig::default());
-        assert_eq!(config.max_concurrent_generation_verifications, 1);
         assert_eq!(config.async_materialize_concurrency, 2);
     }
 
@@ -502,7 +490,6 @@ min_free_bytes = 100000
             ("GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT", "off"),
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
-            ("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "3"),
         ]);
 
         let config = AppConfig::from_env().unwrap();
@@ -518,7 +505,6 @@ min_free_bytes = 100000
         assert!(!config.git_remote.proxy_on_miss_by_default);
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
-        assert_eq!(config.max_concurrent_generation_verifications, 3);
 
         match config.object_store {
             ObjectStoreConfig::S3 {

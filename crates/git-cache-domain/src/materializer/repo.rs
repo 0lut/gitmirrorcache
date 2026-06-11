@@ -83,6 +83,28 @@ impl Materializer {
             .is_ok()
     }
 
+    /// Whether every want's own snapshot (commit + full tree + blobs) is
+    /// locally complete, i.e. a `--depth 1` pack for these tips can be
+    /// served without contacting upstream even from a partially hydrated
+    /// (blobless-marked) repo.
+    pub(super) async fn depth1_snapshots_complete_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        wants: &[CommitSha],
+    ) -> CoreResult<bool> {
+        for want in wants {
+            if !self
+                .state
+                .git
+                .commit_snapshot_complete_no_lazy(repo_dir, want)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) async fn commit_ready_for_serving_no_lazy(
         &self,
         repo_dir: &FsPath,

@@ -66,29 +66,6 @@ impl<'a> ManifestStore<'a> {
     pub(super) async fn write_repo_head(&self, head: &RepoGenerationHead) -> CoreResult<()> {
         write_repo_generation_head(&*self.state.store, head).await
     }
-
-    pub(super) async fn pending_generation(
-        &self,
-        repo: &RepoKey,
-        generation: GenerationId,
-    ) -> CoreResult<Option<git_cache_objectstore::PendingGenerationPublish>> {
-        read_pending_generation_publish(&*self.state.store, repo, generation).await
-    }
-
-    pub(super) async fn verified_generation(
-        &self,
-        repo: &RepoKey,
-        generation: GenerationId,
-    ) -> CoreResult<Option<VerifiedGenerationManifest>> {
-        read_verified_generation_manifest(&*self.state.store, repo, generation).await
-    }
-
-    pub(super) async fn write_verified_if_absent_or_matches(
-        &self,
-        manifest: &VerifiedGenerationManifest,
-    ) -> CoreResult<bool> {
-        write_verified_generation_manifest_if_absent_or_matches(&*self.state.store, manifest).await
-    }
 }
 
 impl Materializer {

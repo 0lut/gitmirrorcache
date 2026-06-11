@@ -88,7 +88,7 @@ mod tests {
         }
 
         fn object_store_root(&self) -> PathBuf {
-            self.tmp.path().join("objects-v2")
+            self.tmp.path().join("objects-v3")
         }
 
         fn head_commit(&self) -> String {
@@ -129,19 +129,13 @@ mod tests {
 
         let second = server.commit_and_push("second");
         let second_manifest = materialize_branch_and_wait(&server, &client, &second).await;
-        assert_generation_parent(
-            &server,
-            &second_manifest.generation,
-            Some(&first_manifest.generation),
-        );
+        assert!(second_manifest.generation != first_manifest.generation);
+        assert_generation_pack_count(&server, &second_manifest.generation, 2);
 
         let third = server.commit_and_push("third");
         let third_manifest = materialize_branch_and_wait(&server, &client, &third).await;
-        assert_generation_parent(
-            &server,
-            &third_manifest.generation,
-            Some(&second_manifest.generation),
-        );
+        assert!(third_manifest.generation != second_manifest.generation);
+        assert_generation_pack_count(&server, &third_manifest.generation, 3);
 
         fs::remove_dir_all(server.cache_repo_dir()).unwrap();
 
@@ -249,9 +243,13 @@ mod tests {
             if let Ok(raw) = fs::read_to_string(&path) {
                 let json: Value = serde_json::from_str(&raw).unwrap();
                 let generation = json["generation"].as_str().unwrap().to_string();
-                let verified = server.object_store_root().join(format!(
-                    "repos/{REPO}/generations/{generation}/verified.json"
+                let manifest_path = server.object_store_root().join(format!(
+                    "repos/{REPO}/generations/{generation}/manifest.json"
                 ));
+                let verified = fs::read_to_string(&manifest_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .is_some_and(|json| json["verified_at"].is_string());
                 let generation_head = server
                     .object_store_root()
                     .join(format!("repos/{REPO}/manifests/generation-head.json"));
@@ -261,7 +259,7 @@ mod tests {
                     .and_then(|json| json["generation"].as_str().map(str::to_string))
                     .as_deref()
                     == Some(generation.as_str());
-                if verified.exists() && head_matches {
+                if verified && head_matches {
                     return CommitManifest { generation };
                 }
             }
@@ -283,20 +281,16 @@ mod tests {
         ))
     }
 
-    fn assert_generation_parent(
-        server: &TestServer,
-        generation: &str,
-        expected_parent: Option<&str>,
-    ) {
+    fn assert_generation_pack_count(server: &TestServer, generation: &str, expected: usize) {
         let path = server.object_store_root().join(format!(
             "repos/{REPO}/generations/{generation}/manifest.json"
         ));
         let raw = fs::read_to_string(&path).unwrap();
         let json: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
-            json["parent_generation"].as_str(),
-            expected_parent,
-            "unexpected parent for generation {generation}"
+            json["packs"].as_array().map(Vec::len),
+            Some(expected),
+            "unexpected pack count for generation {generation}"
         );
     }
 

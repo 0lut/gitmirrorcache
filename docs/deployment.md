@@ -354,12 +354,14 @@ Git config environment variables:
   including active upload-pack streams.
 - `ECS_EBS_IOPS` and `ECS_EBS_THROUGHPUT` provision gp3 hot-cache performance.
 
-## Bundle Strategy And Compaction
+## Pack Strategy And Compaction
 
-The publish path writes a generation bundle and commit/ref manifests that prove
-which commits are complete. Hydration downloads bundles to disk before fetching
-them into the local bare repository, so large bundles are not loaded entirely
-into memory.
+The publish path writes content-addressed pack files
+(`repos/{repo}/packs/pack-{sha256}.pack`) plus a self-contained generation
+manifest listing the packs, refs, and commits that prove which commits are
+complete. Hydration downloads the manifest's packs in parallel to disk,
+indexes them with `git index-pack`, and writes refs in one batch, so large
+packs are not loaded entirely into memory.
 
 The ECS deployment registers an hourly EventBridge rule that runs
 `git-cache compact --all` as a separate one-off ECS task. The compaction task
@@ -368,11 +370,12 @@ service, but has no port mapping. It uses a host-volume `flock` at
 `/cache/git-cache-compaction.lock` so a later hourly tick exits successfully if a
 previous compaction is still running.
 
-Compaction walks each repo's current generation chain. If the chain exceeds
-`GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD` (default `10`), it hydrates the
-chain, publishes a new full generation, verifies it with `git fsck`, repoints
-commit/ref manifests to the compacted generation, and prunes old generation
-objects that are not still needed by pending verification.
+Compaction inspects each repo's head generation manifest. If it references
+more packs than `GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD` (default `10`),
+compaction hydrates the generation, repacks it into a single pack, publishes
+a new single-pack generation, repoints commit/ref manifests to it, deletes
+old generation manifests, and garbage-collects pack files no longer
+referenced by the new head.
 
 Useful overrides:
 
