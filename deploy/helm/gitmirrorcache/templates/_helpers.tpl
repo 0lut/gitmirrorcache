@@ -68,7 +68,9 @@ Image reference.
 
 {{/*
 Shared GIT_CACHE_* environment variables used by both the server and the
-compaction CronJob.
+compaction CronJob. GIT_CACHE_CONFIG is deliberately not set here: when it is
+set the application reads the entire config from the TOML file and ignores
+env vars, so only the server (which mounts the ConfigMap) opts into it.
 */}}
 {{- define "gitmirrorcache.env" -}}
 - name: GIT_CACHE_BIND_ADDR
@@ -140,10 +142,6 @@ compaction CronJob.
     secretKeyRef:
       name: {{ .Values.upstreamAuth.existingSecret }}
       key: {{ .Values.upstreamAuth.secretKey }}
-{{- end }}
-{{- if .Values.configFile }}
-- name: GIT_CACHE_CONFIG
-  value: /etc/gitmirrorcache/config.toml
 {{- end }}
 {{- with .Values.config.extraEnv }}
 {{ toYaml . }}

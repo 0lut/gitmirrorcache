@@ -34,6 +34,8 @@ spec:
               securityContext:
                 {{- toYaml .Values.securityContext | nindent 16 }}
               command: ["/usr/local/bin/git-cache", "compact", "--all"]
+              # The CLI is configured purely via env vars (no GIT_CACHE_CONFIG
+              # here: a TOML config would override the scratch cache root).
               env:
                 {{- include "gitmirrorcache.env" . | nindent 16 }}
                 # Compaction works against the object store; use scratch disk
@@ -45,19 +47,9 @@ spec:
                 {{- toYaml . | nindent 16 }}
               {{- end }}
               volumeMounts:
-                {{- if .Values.configFile }}
-                - name: config
-                  mountPath: /etc/gitmirrorcache
-                  readOnly: true
-                {{- end }}
                 - name: scratch
                   mountPath: /tmp/compaction-cache
           volumes:
             - name: scratch
               emptyDir: {}
-            {{- if .Values.configFile }}
-            - name: config
-              configMap:
-                name: {{ include "gitmirrorcache.fullname" . }}
-            {{- end }}
 {{- end }}

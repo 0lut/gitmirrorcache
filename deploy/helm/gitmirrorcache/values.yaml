@@ -108,9 +108,11 @@ config:
   #   - name: GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT
   #     value: "false"
 
-# Optional full TOML config mounted into the pod and pointed to by
-# GIT_CACHE_CONFIG. When set, file values take precedence over env defaults
-# for keys present in the file (see config/production.example.toml).
+# Optional full TOML config mounted into the server pod and pointed to by
+# GIT_CACHE_CONFIG. When set, the server reads its ENTIRE config from this
+# file and ignores GIT_CACHE_* env vars (see config/production.example.toml).
+# The compaction CronJob always uses env-var config so it can keep its
+# scratch cache root.
 configFile: ""
 
 # Token used to authenticate against upstream hosts when warming/serving

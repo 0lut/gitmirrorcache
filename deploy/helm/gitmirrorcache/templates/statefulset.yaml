@@ -44,6 +44,10 @@ spec:
               protocol: TCP
           env:
             {{- include "gitmirrorcache.env" . | nindent 12 }}
+            {{- if .Values.configFile }}
+            - name: GIT_CACHE_CONFIG
+              value: /etc/gitmirrorcache/config.toml
+            {{- end }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:
