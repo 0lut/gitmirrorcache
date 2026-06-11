@@ -1,9 +1,11 @@
-use crate::{validate_key, ObjectMeta, ObjectStore};
+use crate::{validate_key, ObjectMeta, ObjectStore, ObjectVersion};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use git_cache_core::{GitCacheError, Result};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -78,6 +80,32 @@ impl ObjectStore for LocalObjectStore {
                 Err(err.into())
             }
         }
+    }
+
+    async fn get_versioned(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>> {
+        let _guard = cas_lock().lock().await;
+        let Some(value) = self.get(key).await? else {
+            return Ok(None);
+        };
+        let version = content_version(&value);
+        Ok(Some((value, version)))
+    }
+
+    async fn put_if_version_matches(
+        &self,
+        key: &str,
+        value: Bytes,
+        version: &ObjectVersion,
+    ) -> Result<bool> {
+        let _guard = cas_lock().lock().await;
+        let Some(current) = self.get(key).await? else {
+            return Ok(false);
+        };
+        if content_version(&current) != *version {
+            return Ok(false);
+        }
+        self.put(key, value).await?;
+        Ok(true)
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
@@ -185,6 +213,20 @@ impl ObjectStore for LocalObjectStore {
             }
         }
     }
+}
+
+/// Serializes local read-compare-write sequences process-wide. The local
+/// store is single-node, so an in-process lock is sufficient to make
+/// `put_if_version_matches` atomic with respect to other CAS callers.
+fn cas_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn content_version(value: &Bytes) -> ObjectVersion {
+    let mut hasher = std::hash::DefaultHasher::new();
+    value.as_ref().hash(&mut hasher);
+    ObjectVersion::new(format!("{}-{:016x}", value.len(), hasher.finish()))
 }
 
 fn allocate_temp_path(parent: &Path, final_path: &Path) -> Result<PathBuf> {

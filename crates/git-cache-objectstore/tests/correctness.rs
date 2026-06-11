@@ -10,8 +10,7 @@ mod tests {
         commit_manifest_key, generation_manifest_key, read_commit_manifest,
         read_generation_manifest, read_ref_manifest, ref_manifest_key, repo_generation_head_key,
         write_commit_manifest, write_commit_manifest_if_absent_or_matches,
-        write_generation_manifest, write_ref_manifest, write_ref_manifest_if_absent_or_matches,
-        LocalObjectStore, ObjectStore,
+        write_generation_manifest, write_ref_manifest, LocalObjectStore, ObjectStore,
     };
     use tokio::fs;
 
@@ -292,8 +291,10 @@ mod tests {
         let manifest = GenerationManifest {
             repo: repo.clone(),
             generation: gen,
-            bundle_key: format!("repos/{repo}/generations/{gen}/base.bundle"),
-            parent_generation: None,
+            verified_at: None,
+            packs: Vec::new(),
+            refs: Default::default(),
+            head_ref: None,
             created_at: ts(1),
             commits: vec![commit('a')],
         };
@@ -430,53 +431,6 @@ mod tests {
                 .await
                 .is_err()
         );
-
-        let _ = fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn ref_manifest_if_absent_or_matches_first_succeeds() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-        let gen = GenerationId::new();
-
-        let manifest = RefManifest {
-            repo: repo.clone(),
-            ref_name: "refs/heads/develop".into(),
-            commit: commit('a'),
-            generation: gen,
-            verified_at: ts(1),
-        };
-
-        assert!(write_ref_manifest_if_absent_or_matches(&store, &manifest)
-            .await
-            .unwrap());
-
-        let _ = fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn ref_manifest_if_absent_or_matches_identical_returns_false() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-        let gen = GenerationId::new();
-
-        let manifest = RefManifest {
-            repo: repo.clone(),
-            ref_name: "refs/heads/develop".into(),
-            commit: commit('a'),
-            generation: gen,
-            verified_at: ts(1),
-        };
-
-        write_ref_manifest_if_absent_or_matches(&store, &manifest)
-            .await
-            .unwrap();
-        assert!(!write_ref_manifest_if_absent_or_matches(&store, &manifest)
-            .await
-            .unwrap());
 
         let _ = fs::remove_dir_all(&root).await;
     }

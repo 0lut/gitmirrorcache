@@ -39,7 +39,7 @@ Create a local config file with:
 - `allowed_upstream_hosts = ["github.com"]`
 - `[disk] min_free_bytes = 0` for small local test fixtures
 - `[git_remote] enabled = true` if testing HTTP git routes
-- `[compaction] chain_depth_threshold = 2` when you need a three-generation chain to compact quickly
+- `[compaction] chain_depth_threshold = 2` when you need a three-pack generation head to compact quickly (the threshold counts packs referenced by the head generation manifest)
 - `[compaction] inline = false` unless inline compaction itself is the feature under test
 
 Set `GIT_CACHE_CONFIG=/path/to/config.toml` for both CLI and API commands.
@@ -64,7 +64,7 @@ Set `GIT_CACHE_CONFIG=/path/to/config.toml` for both CLI and API commands.
 4. Inspect object-store JSON before compaction. For `github.com/acme/repo`, useful paths are:
 
    - `objects/repos/github.com/acme/repo/generations/<generation>/manifest.json`
-   - `objects/repos/github.com/acme/repo/generations/<generation>/base.bundle`
+   - `objects/repos/github.com/acme/repo/packs/pack-<sha256>.pack` (listed in each generation manifest's `packs` array)
    - `objects/repos/github.com/acme/repo/manifests/generation-head.json`
    - `objects/repos/github.com/acme/repo/manifests/refs/heads/main.json`
    - `objects/repos/github.com/acme/repo/manifests/refs/heads/default.json`
@@ -75,7 +75,7 @@ Set `GIT_CACHE_CONFIG=/path/to/config.toml` for both CLI and API commands.
    target/debug/git-cache compact --repo github.com/acme/repo --dry-run
    ```
 
-   Assert the report has `old_chain_depth: 3` and the generation head still points to the pre-compaction head.
+   Assert the report has `old_pack_count: 3` and the generation head still points to the pre-compaction head.
 
 6. Run real compaction:
 
@@ -83,11 +83,11 @@ Set `GIT_CACHE_CONFIG=/path/to/config.toml` for both CLI and API commands.
    target/debug/git-cache compact --repo github.com/acme/repo
    ```
 
-   Assert the report has `old_chain_depth: 3`, three `old_generations`, a non-empty `new_generation`, and `bytes_reclaimed > 0`.
+   Assert the report has `old_pack_count: 3`, three `old_generations`, a non-empty `new_generation`, and `bytes_reclaimed > 0`.
 
-7. Assert each old generation from the report no longer has either `manifest.json` or `base.bundle` in the object store.
+7. Assert each old generation from the report no longer has a `manifest.json`, and that pack keys referenced only by old generations were deleted from `packs/`.
 
-8. Assert the new generation manifest has `parent_generation: null` and contains exactly commits `[A, B, C]`.
+8. Assert the new generation manifest has a single entry in `packs`, a non-null `verified_at`, and contains exactly commits `[A, B, C]`.
 
 9. Assert branch ref manifests, including `refs/heads/default` when applicable, point to the new compacted generation.
 

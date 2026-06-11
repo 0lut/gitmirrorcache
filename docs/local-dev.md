@@ -23,7 +23,7 @@ git --git-dir ../upstreams/github.com/acme/widgets.git symbolic-ref HEAD refs/he
 ## 2. Start The API
 
 ```sh
-cd /Users/sahin/dev/gitcache
+cd /path/to/gitmirrorcache
 GIT_CACHE_CONFIG=config/local.example.toml cargo run -p git-cache-api
 ```
 
@@ -55,7 +55,8 @@ The response should report `cache_verified`.
 
 - Local hot repos: `cache/repos/`
 - Reservations: `cache/reservations/`
-- Object-store manifests and bundles: `tmp/object-store/repos/`
+- Object-store manifests and packs: `tmp/object-store-v3/repos/` (the runtime
+  appends the object-store schema suffix to the configured root)
 
 ```sh
 cargo run -p git-cache-cli -- disk-status

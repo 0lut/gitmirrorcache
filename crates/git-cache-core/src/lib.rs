@@ -12,12 +12,12 @@ use serde::{Deserialize, Serialize};
 pub use auth::{SecretString, UpstreamAuth, UpstreamAuthorizationMode};
 pub use config::{
     default_async_materialize_concurrency, default_max_concurrent_git_processes, AppConfig,
-    CompactionConfig, DiskConfig, GitRemoteConfig, ObjectStoreConfig,
+    CompactionConfig, DiskConfig, GitRemoteConfig, ObjectStoreConfig, ShutdownConfig,
 };
 pub use error::{GitCacheError, Result};
 pub use manifest::{
-    CommitManifest, GenerationId, GenerationManifest, RefManifest, RepoGenerationHead,
-    VerifiedGenerationManifest,
+    CommitManifest, GenerationId, GenerationManifest, PackInfo, PackKind, RefManifest,
+    RepoGenerationHead,
 };
 pub use repo::{CommitSha, RepoKey, ShortCommitSha};
 pub use selector::{BranchName, Selector};

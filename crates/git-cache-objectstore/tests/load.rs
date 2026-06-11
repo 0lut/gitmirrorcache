@@ -21,8 +21,10 @@ mod tests {
         GenerationManifest {
             repo: repo.clone(),
             generation: gen_id,
-            bundle_key: format!("bundles/{}/{}.bundle", repo.as_str(), gen_id),
-            parent_generation: None,
+            verified_at: None,
+            packs: Vec::new(),
+            refs: Default::default(),
+            head_ref: None,
             created_at: chrono::Utc::now(),
             commits: vec![],
         }
@@ -54,7 +56,7 @@ mod tests {
 
             assert_eq!(read_back.repo, expected.repo);
             assert_eq!(read_back.generation, expected.generation);
-            assert_eq!(read_back.bundle_key, expected.bundle_key);
+            assert_eq!(read_back.packs, expected.packs);
         }
     }
 

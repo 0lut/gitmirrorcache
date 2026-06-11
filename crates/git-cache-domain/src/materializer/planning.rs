@@ -389,8 +389,25 @@ impl Materializer {
     ) -> CoreResult<MaterializeSource> {
         if let Some(manifest) = self.get_commit_manifest(repo, commit).await? {
             if manifest.complete {
-                self.hydrate_commit(&manifest).await?;
-                return Ok(MaterializeSource::CacheVerified);
+                match self.hydrate_commit(&manifest).await {
+                    Ok(()) => return Ok(MaterializeSource::CacheVerified),
+                    // A commit manifest can point at a generation that no
+                    // longer exists (swept, or repointed by a concurrent
+                    // compaction on another node). Treat that as a cache miss
+                    // instead of failing the request; the paths below re-index
+                    // from the head generation or upstream and rewrite the
+                    // manifest.
+                    Err(err) if exact_hydrate_error_allows_upstream_fallback(&err) => {
+                        warn!(
+                            %repo,
+                            %commit,
+                            generation = %manifest.generation,
+                            %err,
+                            "commit manifest hydrate unavailable; falling back to head generation or upstream"
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -422,6 +439,9 @@ impl Materializer {
             }
         }
 
+        // Exact-commit hydration deliberately fetches all heads (not just the
+        // wanted SHA) so descendant exact-commit requests become cache hits
+        // that reuse the same full generation bundle.
         self.fetch_all_refs(repo, &repo_dir).await?;
 
         if !self.commit_exists(&repo_dir, commit).await {
@@ -744,8 +764,14 @@ impl Materializer {
         let _repo_lock = self.lock_repo(repo).await?;
         let upstream_url = self.upstream_url(repo)?;
         let fetch_started = Instant::now();
+        let refspec = git_cache_git::branch_cache_refspec(branch.as_str())?;
         self.upstream_git(&upstream_url)?
-            .fetch_branch(&repo_dir, &upstream_url, branch.as_str(), &local_ref)
+            .fetch_refspecs(
+                &repo_dir,
+                &upstream_url,
+                std::slice::from_ref(&refspec),
+                git_cache_git::FetchOptions::default(),
+            )
             .await?;
         info!(
             %repo,
@@ -898,7 +924,7 @@ impl Materializer {
     }
 }
 
-fn exact_hydrate_error_allows_upstream_fallback(err: &GitCacheError) -> bool {
+pub(super) fn exact_hydrate_error_allows_upstream_fallback(err: &GitCacheError) -> bool {
     matches!(
         err,
         GitCacheError::NotFound(_)

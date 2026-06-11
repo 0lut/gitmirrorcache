@@ -21,12 +21,11 @@ mod tests {
             .await
             .unwrap();
         let manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
-        assert!(state
-            .store
-            .head(&bundle_key(&fixture.repo, manifest.generation))
-            .await
-            .unwrap()
-            .is_some());
+        let generation = generation_manifest_for(&state, &fixture.repo, manifest.generation).await;
+        assert!(!generation.packs.is_empty());
+        for pack in &generation.packs {
+            assert!(state.store.head(&pack.key).await.unwrap().is_some());
+        }
 
         let repo_dir = materializer.repo_dir(&fixture.repo);
         stdfs::remove_dir_all(&repo_dir).unwrap();
@@ -55,6 +54,7 @@ mod tests {
         config.compaction = git_cache_core::CompactionConfig {
             chain_depth_threshold: 2,
             inline: false,
+            retention_secs: 0,
         };
         let git = Git::with_concurrency_limit(
             config.git_binary.clone(),
@@ -72,7 +72,9 @@ mod tests {
             store: Arc::clone(&minio.store),
             git,
             disk: AsyncDiskManager::new(disk),
-            generation_verification_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         });
         let materializer = Materializer::new(Arc::clone(&state));
 
@@ -114,7 +116,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(report.old_chain_depth, 3);
+        assert_eq!(report.old_pack_count, 3);
         for old_generation in &report.old_generations {
             assert!(
                 read_generation_manifest(&*state.store, &fixture.repo, *old_generation)
@@ -122,15 +124,9 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            assert!(state
-                .store
-                .head(&bundle_key(&fixture.repo, *old_generation))
-                .await
-                .unwrap()
-                .is_none());
         }
         let compacted = generation_manifest_for(&state, &fixture.repo, report.new_generation).await;
-        assert_eq!(compacted.parent_generation, None);
+        assert_eq!(compacted.packs.len(), 1);
 
         let repo_dir = materializer.repo_dir(&fixture.repo);
         stdfs::remove_dir_all(&repo_dir).unwrap();
@@ -151,6 +147,103 @@ mod tests {
                 .rev_parse(&repo_dir, &format!("{}^{{commit}}", commit.as_str()))
                 .await
                 .unwrap();
+        }
+    }
+
+    /// Two independent nodes (separate disk caches, shared bucket) racing
+    /// publishes against compaction+sweep must leave every published commit
+    /// servable by a third cold node.
+    #[cfg(feature = "s3-tests")]
+    #[tokio::test]
+    async fn minio_two_node_publish_compact_sweep_race_keeps_commits_servable() {
+        let Some(minio) = MinioFixture::new().await else {
+            eprintln!("skipping minio_two_node_publish_compact_sweep_race_keeps_commits_servable: set GIT_CACHE_S3_INTEGRATION=1");
+            return;
+        };
+        let fixture = GitFixture::new();
+        let make_state = |cache_dir: &str, retention_secs: u64| {
+            let mut config = fixture.state_config();
+            config.cache_root = fixture.tmp.path().join(cache_dir);
+            config.compaction = git_cache_core::CompactionConfig {
+                chain_depth_threshold: 2,
+                inline: false,
+                retention_secs,
+            };
+            let git = Git::with_concurrency_limit(
+                config.git_binary.clone(),
+                std::time::Duration::from_secs(config.git_timeout_seconds),
+                config.max_concurrent_git_processes,
+            )
+            .with_output_limit(config.max_git_output_bytes);
+            let disk = DiskManager::new(
+                &config.cache_root,
+                config.disk.quota_bytes,
+                config.disk.min_free_bytes,
+            );
+            Arc::new(AppState {
+                config,
+                store: Arc::clone(&minio.store),
+                git,
+                disk: AsyncDiskManager::new(disk),
+                serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
+            })
+        };
+        let node_a = make_state("cache-a", 3600);
+        let node_b = make_state("cache-b", 3600);
+
+        let mut commits = vec![fixture.head_commit()];
+        for round in 0..4 {
+            let publisher = Materializer::new(Arc::clone(&node_a));
+            let publish_repo = fixture.repo.clone();
+            let publish = tokio::spawn(async move {
+                publisher
+                    .materialize(MaterializeRequest {
+                        repo: publish_repo,
+                        selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                        upstream_authorization: Default::default(),
+                    })
+                    .await
+            });
+            let compactor = Materializer::new(Arc::clone(&node_b));
+            let compact_repo = fixture.repo.clone();
+            let compact =
+                tokio::spawn(
+                    async move { compactor.compact_generation_chain(&compact_repo).await },
+                );
+            let (publish, compact) = tokio::join!(publish, compact);
+            publish.unwrap().unwrap();
+            compact.unwrap().unwrap();
+            commits.push(fixture.commit_and_push(&format!("round-{round}")));
+        }
+        Materializer::new(Arc::clone(&node_a))
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        let sweeper = Materializer::new(make_state("cache-sweeper", 0));
+        let sweep = sweeper
+            .sweep_superseded_generations(&fixture.repo)
+            .await
+            .unwrap();
+        assert!(!sweep.swept_generations.is_empty());
+
+        let cold = Materializer::new(make_state("cache-cold", 3600));
+        for commit in &commits {
+            let response = cold
+                .materialize(MaterializeRequest {
+                    repo: fixture.repo.clone(),
+                    selector: Selector::Commit(commit.clone()),
+                    upstream_authorization: Default::default(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.commit, *commit);
         }
     }
 }

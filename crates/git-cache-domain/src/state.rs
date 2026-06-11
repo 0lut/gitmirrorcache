@@ -14,15 +14,18 @@ use git_cache_git::Git;
 #[cfg(feature = "s3")]
 use git_cache_objectstore::S3ObjectStore;
 use git_cache_objectstore::{LocalObjectStore, ObjectStore};
+use std::collections::HashSet;
 #[cfg(feature = "s3")]
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use tracing::info;
 
-const OBJECT_STORE_SCHEMA_SUFFIX: &str = "v2";
+/// Shared with `scripts/aws/deploy-ecs-ec2-ebs.sh` via the sibling
+/// `object-store-schema-suffix` file so the deploy-time S3 prefix and the
+/// runtime schema suffix cannot drift.
+const OBJECT_STORE_SCHEMA_SUFFIX: &str = include_str!("../object-store-schema-suffix").trim_ascii();
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,7 +33,9 @@ pub struct AppState {
     pub store: Arc<dyn ObjectStore>,
     pub git: Git,
     pub disk: AsyncDiskManager,
-    pub generation_verification_semaphore: Arc<Semaphore>,
+    /// Repo dirs with a queued or running background serving-maintenance
+    /// task (repack + commit-graph), to dedupe bursts of hydrating requests.
+    pub serving_maintenance_inflight: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl AppState {
@@ -100,7 +105,8 @@ impl AppState {
             Duration::from_secs(config.git_timeout_seconds),
             config.max_concurrent_git_processes,
         )
-        .with_output_limit(config.max_git_output_bytes);
+        .with_output_limit(config.max_git_output_bytes)
+        .with_gitoxide(config.use_gitoxide);
         let git = with_optional_upstream_credentials(git, &config);
         let disk = DiskManager::new(
             &config.cache_root,
@@ -121,17 +127,12 @@ impl AppState {
                 "cleaned stale disk reservations on startup"
             );
         }
-        let max_concurrent_generation_verifications =
-            config.max_concurrent_generation_verifications.max(1);
-
         Ok(Self {
             config,
             store,
             git,
             disk: AsyncDiskManager::new(disk),
-            generation_verification_semaphore: Arc::new(Semaphore::new(
-                max_concurrent_generation_verifications,
-            )),
+            serving_maintenance_inflight: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 }
@@ -336,26 +337,26 @@ mod tests {
     fn local_store_root_gets_v2_suffix() {
         assert_eq!(
             v2_local_store_root(Path::new("/tmp/object-store")),
-            PathBuf::from("/tmp/object-store-v2")
+            PathBuf::from("/tmp/object-store-v3")
         );
         assert_eq!(
-            v2_local_store_root(Path::new("/tmp/object-store-v2")),
-            PathBuf::from("/tmp/object-store-v2")
+            v2_local_store_root(Path::new("/tmp/object-store-v3")),
+            PathBuf::from("/tmp/object-store-v3")
         );
         assert_eq!(
             v2_local_store_root(Path::new("/")),
-            PathBuf::from("/").join("v2")
+            PathBuf::from("/").join("v3")
         );
     }
 
     #[test]
     fn s3_prefix_gets_v2_suffix() {
-        assert_eq!(v2_s3_prefix("repos"), "repos-v2");
-        assert_eq!(v2_s3_prefix("prod/repos"), "prod/repos-v2");
-        assert_eq!(v2_s3_prefix("/prod/repos/"), "prod/repos-v2");
-        assert_eq!(v2_s3_prefix("repos-v2"), "repos-v2");
-        assert_eq!(v2_s3_prefix("prod/v2"), "prod/v2");
-        assert_eq!(v2_s3_prefix(""), "v2");
+        assert_eq!(v2_s3_prefix("repos"), "repos-v3");
+        assert_eq!(v2_s3_prefix("prod/repos"), "prod/repos-v3");
+        assert_eq!(v2_s3_prefix("/prod/repos/"), "prod/repos-v3");
+        assert_eq!(v2_s3_prefix("repos-v3"), "repos-v3");
+        assert_eq!(v2_s3_prefix("prod/v3"), "prod/v3");
+        assert_eq!(v2_s3_prefix(""), "v3");
     }
 
     #[test]
@@ -392,12 +393,14 @@ mod tests {
             disk: git_cache_core::DiskConfig {
                 quota_bytes: 10_000,
                 min_free_bytes: 0,
+                access_flush_interval_secs: 60,
             },
             git_remote: Default::default(),
             compaction: Default::default(),
+            shutdown: Default::default(),
             max_concurrent_git_processes: 1,
-            max_concurrent_generation_verifications: 1,
             async_materialize_concurrency: 2,
+            use_gitoxide: true,
         }
     }
 }

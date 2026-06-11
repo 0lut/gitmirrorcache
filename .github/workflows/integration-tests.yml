@@ -28,6 +28,8 @@ jobs:
             packages: -p git-cache-objectstore
           - group: api
             packages: -p git-cache-api
+          - group: fuzz
+            packages: -p git-cache-fuzz
     steps:
       - uses: actions/checkout@v4
 
@@ -35,17 +37,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-integration-${{ matrix.group }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-integration-${{ matrix.group }}-
-            ${{ runner.os }}-cargo-integration-
-            ${{ runner.os }}-cargo-
+          shared-key: integration-${{ matrix.group }}
 
       - name: Run integration tests
         env:
@@ -93,17 +87,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-minio-rust-${{ matrix.group }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-minio-rust-
-            ${{ runner.os }}-cargo-minio-
-            ${{ runner.os }}-cargo-
+          shared-key: minio-rust-${{ matrix.group }}
 
       - name: Start MinIO
         run: |
@@ -134,17 +120,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-minio-python-api-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-minio-python-api-
-            ${{ runner.os }}-cargo-minio-
-            ${{ runner.os }}-cargo-
+          shared-key: minio-python-api
 
       - name: Build git-cache-api with S3 backend
         run: cargo build -p git-cache-api --features s3
@@ -217,3 +195,40 @@ jobs:
           GIT_CACHE_TEST_BRANCH: main
           GIT_CACHE_API_BIN: target/debug/git-cache-api
         run: python3 -m unittest -v ${{ matrix.test_target }}
+
+  cleanup-minio-python-api-artifact:
+    name: Delete MinIO API Artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    needs:
+      - minio-python-api-build
+      - minio-python-integration-tests
+    if: always()
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete git-cache-api-s3 artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          if ! artifact_ids="$(gh api "/repos/${GH_REPO}/actions/runs/${GH_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "git-cache-api-s3") | .id')"; then
+            echo "::warning::Could not list artifacts for this run; continuing."
+            exit 0
+          fi
+
+          if [ -z "${artifact_ids}" ]; then
+            echo "No git-cache-api-s3 artifact found for this run."
+            exit 0
+          fi
+
+          while IFS= read -r artifact_id; do
+            [ -n "${artifact_id}" ] || continue
+            echo "Deleting artifact ${artifact_id} (git-cache-api-s3)"
+            if ! gh api --method DELETE "/repos/${GH_REPO}/actions/artifacts/${artifact_id}" >/dev/null; then
+              echo "::warning::Could not delete artifact ${artifact_id}; continuing."
+            fi
+          done <<< "${artifact_ids}"

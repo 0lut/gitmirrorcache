@@ -265,107 +265,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_direct_want_does_not_verify_pending_generation_on_post() {
-        let fixture = GitFixture::new();
-        let state = Arc::new(fixture.state());
-        let materializer = Materializer::new(Arc::clone(&state));
-        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
-        let commit = fixture.head_commit();
-
-        run_git(
-            &repo_dir,
-            [
-                "fetch",
-                "--no-tags",
-                fixture.upstream_path().to_str().unwrap(),
-                "+refs/heads/main:refs/cache/upstream/heads/main",
-            ],
-        );
-        let generation = GenerationId::new();
-        let reservation = state.disk.reserve(1024 * 1024 * 64).await.unwrap();
-        let temp_path = reservation.temp_path().unwrap();
-        fs::create_dir_all(&temp_path).await.unwrap();
-        let bundle_path = temp_path.join("pending.bundle");
-        state
-            .git
-            .bundle_create_all(&repo_dir, &bundle_path)
-            .await
-            .unwrap();
-
-        let now = Utc::now();
-        let generation_manifest = GenerationManifest {
-            repo: fixture.repo.clone(),
-            generation,
-            bundle_key: bundle_key(&fixture.repo, generation),
-            parent_generation: None,
-            created_at: now,
-            commits: vec![commit.clone()],
-        };
-        let publish_manifests = PublishManifests {
-            commits: vec![CommitManifest {
-                repo: fixture.repo.clone(),
-                commit: commit.clone(),
-                generation,
-                complete: true,
-                verified_at: now,
-            }],
-            refs: Vec::new(),
-        };
-        let head = RepoGenerationHead {
-            repo: fixture.repo.clone(),
-            generation,
-            tip_commits: vec![commit.clone()],
-            updated_at: now,
-        };
-        GenerationPublish::with_manifests(generation_manifest, publish_manifests)
-            .publish_pending_bundle_file(&*state.store, &bundle_path, head, None)
-            .await
-            .unwrap();
-        reservation.release().await.unwrap();
-
-        stdfs::remove_dir_all(&repo_dir).unwrap();
-        stdfs::rename(
-            fixture.upstream_path(),
-            fixture.tmp.path().join("offline.git"),
-        )
-        .unwrap();
-
-        let comparison = UpstreamRefComparison {
-            default_branch: Some("main".to_string()),
-            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
-        };
-        let result = materializer
-            .ensure_wants_available_from_comparison(
-                &fixture.repo,
-                &[commit.to_string()],
-                &comparison,
-                false,
-            )
-            .await;
-
-        assert!(
-            matches!(result, Err(GitCacheError::UpstreamUnavailable(_))),
-            "direct Git POST should fetch proved refs instead of verifying pending generations: {result:?}"
-        );
-
-        let repo_dir = materializer.repo_dir(&fixture.repo);
-        assert!(
-            !materializer
-                .commit_ready_for_serving(&repo_dir, &commit)
-                .await,
-            "direct Git POST must not hydrate pending generations"
-        );
-        assert!(
-            materializer
-                .get_commit_manifest(&fixture.repo, &commit)
-                .await
-                .unwrap()
-                .is_none(),
-            "direct Git POST must not verify and publish pending generations"
-        );
-    }
-
-    #[tokio::test]
     async fn anonymous_direct_want_for_advertised_uncached_commit_reads_through() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());
@@ -528,11 +427,7 @@ mod tests {
         let manifest = wait_for_commit_manifest(&state, &fixture.repo, &cached.commit).await;
         wait_for_verified_generation(&state, &fixture.repo, manifest.generation).await;
 
-        state
-            .store
-            .delete(&bundle_key(&fixture.repo, manifest.generation))
-            .await
-            .unwrap();
+        delete_generation_packs(&state, &fixture.repo, manifest.generation).await;
         let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
         stdfs::remove_dir_all(&repo_dir).unwrap();
 
@@ -652,6 +547,230 @@ mod tests {
             !materializer.commit_exists(&repo_dir, &parent).await,
             "deepen 1 should avoid importing the parent commit on a cold read-through"
         );
+    }
+
+    #[tokio::test]
+    async fn blobless_hydrated_repo_refetches_full_objects_for_unfiltered_wants() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let commit = fixture.head_commit();
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+
+        let mut blobless = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        blobless.extend_from_slice(b"0000");
+        blobless.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        blobless.extend(make_upload_pack_pkt_line("done\n"));
+        let blobless_intent =
+            super::super::direct_git::parse_upload_pack_intent(&blobless).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &blobless_intent,
+                &comparison,
+            )
+            .await
+            .expect("blobless read-through should hydrate the repo");
+
+        let marker = repo_dir.join("git-cache-partial-hydration");
+        assert!(
+            marker.exists(),
+            "blobless hydration should mark the repo as partially hydrated"
+        );
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(
+                    &fixture.repo,
+                    &Bytes::from(make_full_body(&commit))
+                )
+                .await
+                .unwrap(),
+            "partially hydrated repos must decline full-object cache prepare"
+        );
+
+        let full_intent =
+            super::super::direct_git::parse_upload_pack_intent(&make_full_body(&commit)).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &full_intent,
+                &comparison,
+            )
+            .await
+            .expect("full read-through against a partially hydrated repo should refetch");
+
+        assert!(
+            !marker.exists(),
+            "full refetch should clear the partial hydration marker"
+        );
+        assert!(
+            materializer
+                .prepare_upload_pack_from_cache(
+                    &fixture.repo,
+                    &Bytes::from(make_full_body(&commit))
+                )
+                .await
+                .unwrap(),
+            "fully refetched repos should serve full-object shapes from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn blobless_hydrated_repo_serves_complete_depth1_snapshot_without_refetch() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let commit = fixture.head_commit();
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+
+        // Hydrate the tip's full snapshot via a depth-1 read-through, then
+        // mark the repo partially hydrated — the state a blobless hydration
+        // followed by client checkout blob storms leaves behind.
+        let mut depth1_body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        depth1_body.extend_from_slice(b"0000");
+        depth1_body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+        depth1_body.extend(make_upload_pack_pkt_line("done\n"));
+        let depth1_intent =
+            super::super::direct_git::parse_upload_pack_intent(&Bytes::from(depth1_body.clone()))
+                .unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &depth1_intent,
+                &comparison,
+            )
+            .await
+            .expect("depth-1 read-through should hydrate the tip snapshot");
+        let marker = repo_dir.join("git-cache-partial-hydration");
+        stdfs::write(&marker, b"blobless\n").unwrap();
+
+        // A new upstream head whose snapshot is absent locally must still
+        // decline cache prepare under the marker.
+        let new_head = fixture.commit_and_push("second");
+        let mut missing_body = make_upload_pack_pkt_line(&format!("want {new_head} multi_ack\n"));
+        missing_body.extend_from_slice(b"0000");
+        missing_body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+        missing_body.extend(make_upload_pack_pkt_line("done\n"));
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(missing_body))
+                .await
+                .unwrap(),
+            "depth-1 prepare must decline while the want's snapshot is missing"
+        );
+
+        // Break the upstream so any refetch attempt would fail: success below
+        // proves the complete depth-1 snapshot is served purely from cache.
+        stdfs::rename(
+            fixture.upstream_path(),
+            fixture.upstream_path().with_extension("moved"),
+        )
+        .unwrap();
+
+        assert!(
+            materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(depth1_body))
+                .await
+                .unwrap(),
+            "complete depth-1 snapshots should be served from cache despite the marker"
+        );
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &depth1_intent,
+                &comparison,
+            )
+            .await
+            .expect("complete depth-1 snapshot must not trigger an upstream refetch");
+        assert!(
+            marker.exists(),
+            "depth-1 service must not clear the partial hydration marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn shallow_hydrated_repo_unshallows_for_full_history_wants() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let parent = fixture.head_commit();
+        let commit = fixture.commit_and_push("second");
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+
+        let mut shallow_body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        shallow_body.extend_from_slice(b"0000");
+        shallow_body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+        shallow_body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        shallow_body.extend(make_upload_pack_pkt_line("done\n"));
+        let shallow_intent =
+            super::super::direct_git::parse_upload_pack_intent(&shallow_body).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &shallow_intent,
+                &comparison,
+            )
+            .await
+            .expect("shallow blobless read-through should hydrate the repo");
+
+        let shallow_file = repo_dir.join("shallow");
+        assert!(
+            shallow_file.exists(),
+            "depth-limited hydration should leave the cache repo shallow"
+        );
+        assert!(
+            !materializer.commit_exists(&repo_dir, &parent).await,
+            "depth-limited hydration should not import the parent commit"
+        );
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(
+                    &fixture.repo,
+                    &Bytes::from(make_full_body(&commit))
+                )
+                .await
+                .unwrap(),
+            "shallow repos must decline full-history cache prepare"
+        );
+
+        let full_intent =
+            super::super::direct_git::parse_upload_pack_intent(&make_full_body(&commit)).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &full_intent,
+                &comparison,
+            )
+            .await
+            .expect("full-history read-through against a shallow repo should unshallow");
+
+        assert!(
+            !shallow_file.exists(),
+            "full-history read-through should remove the shallow boundary"
+        );
+        assert!(
+            materializer.commit_exists(&repo_dir, &parent).await,
+            "unshallowed repo should contain the full commit ancestry"
+        );
+    }
+
+    fn make_full_body(commit: &CommitSha) -> Vec<u8> {
+        let mut body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        body.extend_from_slice(b"0000");
+        body.extend(make_upload_pack_pkt_line("done\n"));
+        body
     }
 
     #[tokio::test]
@@ -795,11 +914,7 @@ mod tests {
                 .await
         );
 
-        state
-            .store
-            .delete(&bundle_key(&fixture.repo, manifest.generation))
-            .await
-            .unwrap();
+        delete_generation_packs(&state, &fixture.repo, manifest.generation).await;
         stdfs::rename(
             fixture.upstream_path(),
             fixture.tmp.path().join("offline.git"),

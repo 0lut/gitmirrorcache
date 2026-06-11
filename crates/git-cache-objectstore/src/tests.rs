@@ -1,20 +1,17 @@
 mod tests {
     use crate::{
-        acquire_lease, commit_manifest_key, generation_manifest_key, lease_key,
-        pending_generation_publish_key, read_commit_manifest, read_generation_manifest, read_lease,
-        read_pending_generation_publish, read_ref_manifest, read_repo_generation_head,
-        read_verified_generation_manifest, ref_manifest_key, repo_generation_head_key,
-        validate_key, verified_generation_manifest_key, write_generation_manifest,
-        write_generation_manifest_if_absent_or_matches, write_ref_manifest_if_absent_or_matches,
-        write_repo_generation_head, write_verified_generation_manifest_if_absent_or_matches,
-        GenerationPublish, LeaseManifest, LocalObjectStore, ObjectStore, PendingGenerationPublish,
-        PublishManifests,
+        commit_manifest_key, generation_manifest_key, pack_key, read_commit_manifest,
+        read_generation_manifest, read_ref_manifest, read_repo_generation_head, ref_manifest_key,
+        repo_generation_head_key, validate_key, write_generation_manifest,
+        write_generation_manifest_if_absent_or_matches, write_json_if_absent_or_matches,
+        write_repo_generation_head, write_repo_generation_head_if_version_matches,
+        GenerationPublish, LocalObjectStore, ObjectStore, PublishManifests,
     };
     use bytes::Bytes;
-    use chrono::{DateTime, Duration, Utc};
+    use chrono::{DateTime, Utc};
     use git_cache_core::{
-        CommitManifest, CommitSha, GenerationId, GenerationManifest, RefManifest,
-        RepoGenerationHead, RepoKey, VerifiedGenerationManifest,
+        CommitManifest, CommitSha, GenerationId, GenerationManifest, PackInfo, PackKind,
+        RefManifest, RepoGenerationHead, RepoKey,
     };
     use std::path::Path;
     use tokio::fs;
@@ -57,35 +54,25 @@ mod tests {
         GenerationId::new()
     }
 
+    const PACK_BYTES: &[u8] = b"pack-bytes";
+    const PACK_SHA256: &str = "4e03c5e500d33132d9bda1452f82e2258acfa7ff8e45146796010a89f34cd081";
+
     fn generation_manifest(repo: &RepoKey) -> GenerationManifest {
         let gen = test_generation_id();
         GenerationManifest {
             repo: repo.clone(),
             generation: gen,
-            bundle_key: format!("repos/{repo}/generations/{gen}/base.bundle"),
-            parent_generation: None,
             created_at: ts(1),
+            verified_at: Some(ts(1)),
+            packs: vec![PackInfo {
+                key: pack_key(repo, PACK_SHA256).unwrap(),
+                len: PACK_BYTES.len() as u64,
+                sha256: PACK_SHA256.into(),
+                kind: PackKind::Base,
+            }],
+            refs: Default::default(),
+            head_ref: None,
             commits: vec![commit('a')],
-        }
-    }
-
-    fn verified_generation_manifest(manifest: &GenerationManifest) -> VerifiedGenerationManifest {
-        VerifiedGenerationManifest {
-            schema_version: 2,
-            repo: manifest.repo.clone(),
-            generation: manifest.generation,
-            bundle_key: manifest.bundle_key.clone(),
-            bundle_len: 12,
-            bundle_sha256: "eb333942340dfa7da54597d78b894f35310289e75ec3a84137a197a37ab1d164"
-                .into(),
-            parent_generation: manifest.parent_generation,
-            created_at: manifest.created_at,
-            verified_at: ts(6),
-            verifier_version: 1,
-            git_version: "git version test".into(),
-            fsck_mode: "connectivity-only".into(),
-            commits: manifest.commits.clone(),
-            tip_commits: manifest.commits.clone(),
         }
     }
 
@@ -107,6 +94,125 @@ mod tests {
             generation: gen,
             verified_at: ts(3),
         }
+    }
+
+    #[tokio::test]
+    async fn put_if_version_matches_swaps_when_version_is_current() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+
+        store.put("cas/item.json", Bytes::from("v1")).await.unwrap();
+        let (value, version) = store.get_versioned("cas/item.json").await.unwrap().unwrap();
+        assert_eq!(value, Bytes::from("v1"));
+
+        assert!(store
+            .put_if_version_matches("cas/item.json", Bytes::from("v2"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get("cas/item.json").await.unwrap().unwrap(),
+            Bytes::from("v2")
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn put_if_version_matches_rejects_stale_version() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+
+        store.put("cas/item.json", Bytes::from("v1")).await.unwrap();
+        let (_, stale) = store.get_versioned("cas/item.json").await.unwrap().unwrap();
+        store
+            .put("cas/item.json", Bytes::from("concurrent"))
+            .await
+            .unwrap();
+
+        assert!(!store
+            .put_if_version_matches("cas/item.json", Bytes::from("v2"), &stale)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get("cas/item.json").await.unwrap().unwrap(),
+            Bytes::from("concurrent")
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn put_if_version_matches_missing_object_returns_false() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+
+        store.put("cas/item.json", Bytes::from("v1")).await.unwrap();
+        let (_, version) = store.get_versioned("cas/item.json").await.unwrap().unwrap();
+        store.delete("cas/item.json").await.unwrap();
+
+        assert!(!store
+            .put_if_version_matches("cas/item.json", Bytes::from("v2"), &version)
+            .await
+            .unwrap());
+        assert!(store.get("cas/item.json").await.unwrap().is_none());
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn repo_head_cas_first_write_then_stale_version_rejected() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+        let repo = repo();
+
+        let first = RepoGenerationHead {
+            repo: repo.clone(),
+            generation: test_generation_id(),
+            tip_commits: vec![commit('a')],
+            updated_at: ts(1),
+        };
+        assert!(
+            write_repo_generation_head_if_version_matches(&store, &first, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !write_repo_generation_head_if_version_matches(&store, &first, None)
+                .await
+                .unwrap()
+        );
+
+        let (read_back, version) = crate::read_repo_generation_head_versioned(&store, &repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_back, first);
+
+        let second = RepoGenerationHead {
+            repo: repo.clone(),
+            generation: test_generation_id(),
+            tip_commits: vec![commit('b')],
+            updated_at: ts(2),
+        };
+        assert!(
+            write_repo_generation_head_if_version_matches(&store, &second, Some(&version))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !write_repo_generation_head_if_version_matches(&store, &first, Some(&version))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            read_repo_generation_head(&store, &repo)
+                .await
+                .unwrap()
+                .unwrap(),
+            second
+        );
+
+        let _ = fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]
@@ -132,42 +238,6 @@ mod tests {
         let store = LocalObjectStore::new(&root);
 
         store.delete("does/not/exist.json").await.unwrap();
-
-        let _ = fs::remove_dir_all(root).await;
-    }
-
-    #[tokio::test]
-    async fn verified_generation_manifest_round_trips() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-        let generation = generation_manifest(&repo);
-        let verification = verified_generation_manifest(&generation);
-
-        assert!(
-            write_verified_generation_manifest_if_absent_or_matches(&store, &verification)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !write_verified_generation_manifest_if_absent_or_matches(&store, &verification)
-                .await
-                .unwrap()
-        );
-
-        assert_eq!(
-            read_verified_generation_manifest(&store, &repo, generation.generation)
-                .await
-                .unwrap(),
-            Some(verification)
-        );
-        assert_eq!(
-            verified_generation_manifest_key(&repo, generation.generation),
-            format!(
-                "repos/{repo}/generations/{}/verified.json",
-                generation.generation
-            )
-        );
 
         let _ = fs::remove_dir_all(root).await;
     }
@@ -230,10 +300,7 @@ mod tests {
         );
 
         let mut conflicting = generation.clone();
-        conflicting.bundle_key = format!(
-            "repos/{repo}/generations/{}/other.bundle",
-            generation.generation
-        );
+        conflicting.commits = vec![commit('b')];
         assert!(
             write_generation_manifest_if_absent_or_matches(&store, &conflicting)
                 .await
@@ -298,61 +365,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_acquisition_uses_create_once_semantics() {
+    async fn publish_writes_packs_generation_then_manifests() {
         let root = temp_root();
         let store = LocalObjectStore::new(&root);
         let repo = repo();
-
-        let acquired = acquire_lease(
-            &store,
-            &repo,
-            "update",
-            "worker-a",
-            ts(10),
-            Duration::minutes(15),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            acquired,
-            LeaseManifest {
-                repo: repo.clone(),
-                name: "update".into(),
-                holder: "worker-a".into(),
-                acquired_at: ts(10),
-                expires_at: ts(10) + Duration::minutes(15),
-            }
-        );
-
-        assert!(acquire_lease(
-            &store,
-            &repo,
-            "update",
-            "worker-b",
-            ts(11),
-            Duration::minutes(15),
-        )
-        .await
-        .unwrap()
-        .is_none());
-
-        assert_eq!(
-            read_lease(&store, &repo, "update").await.unwrap(),
-            Some(acquired)
-        );
-
-        let _ = fs::remove_dir_all(root).await;
-    }
-
-    #[tokio::test]
-    async fn publish_writes_bundle_generation_then_manifests() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
+        fs::create_dir_all(&root).await.unwrap();
 
         let generation = generation_manifest(&repo);
-        let verification = verified_generation_manifest(&generation);
+        let pack_store_key = generation.packs[0].key.clone();
         let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
         let reference = ref_manifest_with_gen(&repo, generation.generation);
         let publish = GenerationPublish::with_manifests(
@@ -361,11 +381,13 @@ mod tests {
                 commits: vec![commit_manifest.clone()],
                 refs: vec![reference.clone()],
             },
-        )
-        .with_verification(verification.clone());
+        );
 
         assert!(publish
-            .publish_bundle_file(&store, root.join("missing.bundle"))
+            .publish_pack_files(
+                &store,
+                &[(pack_store_key.clone(), root.join("missing.pack"))]
+            )
             .await
             .is_err());
         assert!(!store
@@ -373,25 +395,21 @@ mod tests {
             .await
             .unwrap());
 
+        let pack_path = root.join("local.pack");
+        fs::write(&pack_path, PACK_BYTES).await.unwrap();
         publish
-            .publish_bundle_bytes(&store, Bytes::from_static(b"bundle-bytes"))
+            .publish_pack_files(&store, &[(pack_store_key.clone(), pack_path.clone())])
             .await
             .unwrap();
         assert_eq!(
-            store.get(&generation.bundle_key).await.unwrap().unwrap(),
-            Bytes::from_static(b"bundle-bytes")
+            store.get(&pack_store_key).await.unwrap().unwrap(),
+            Bytes::from_static(PACK_BYTES)
         );
         assert_eq!(
             read_generation_manifest(&store, &repo, generation.generation)
                 .await
                 .unwrap(),
             Some(generation.clone())
-        );
-        assert_eq!(
-            read_verified_generation_manifest(&store, &repo, generation.generation)
-                .await
-                .unwrap(),
-            Some(verification)
         );
         assert_eq!(
             read_commit_manifest(&store, &repo, &commit_manifest.commit)
@@ -407,101 +425,18 @@ mod tests {
         );
 
         publish
-            .publish_bundle_bytes(&store, Bytes::from_static(b"bundle-bytes"))
+            .publish_pack_files(&store, &[(pack_store_key.clone(), pack_path)])
             .await
             .unwrap();
 
         let mut changed_ref = reference;
         changed_ref.commit = commit('b');
+        let changed_key = ref_manifest_key(&changed_ref.repo, &changed_ref.ref_name).unwrap();
         assert!(
-            write_ref_manifest_if_absent_or_matches(&store, &changed_ref)
+            write_json_if_absent_or_matches(&store, &changed_key, &changed_ref)
                 .await
                 .is_err()
         );
-
-        let _ = fs::remove_dir_all(root).await;
-    }
-
-    #[tokio::test]
-    async fn pending_publish_writes_only_bundle_and_pending_metadata() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-        fs::create_dir_all(&root).await.unwrap();
-
-        let generation = generation_manifest(&repo);
-        let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
-        let reference = ref_manifest_with_gen(&repo, generation.generation);
-        let head = RepoGenerationHead {
-            repo: repo.clone(),
-            generation: generation.generation,
-            tip_commits: generation.commits.clone(),
-            updated_at: ts(7),
-        };
-        let default_ref = RefManifest {
-            repo: repo.clone(),
-            ref_name: "HEAD".into(),
-            commit: commit_manifest.commit.clone(),
-            generation: generation.generation,
-            verified_at: ts(8),
-        };
-        let publish = GenerationPublish::with_manifests(
-            generation.clone(),
-            PublishManifests {
-                commits: vec![commit_manifest.clone()],
-                refs: vec![reference.clone()],
-            },
-        );
-        let bundle_path = root.join("pending.bundle");
-        fs::write(&bundle_path, b"bundle-bytes").await.unwrap();
-
-        publish
-            .publish_pending_bundle_file(
-                &store,
-                &bundle_path,
-                head.clone(),
-                Some(default_ref.clone()),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store.get(&generation.bundle_key).await.unwrap().unwrap(),
-            Bytes::from_static(b"bundle-bytes")
-        );
-        assert_eq!(
-            read_pending_generation_publish(&store, &repo, generation.generation)
-                .await
-                .unwrap(),
-            Some(PendingGenerationPublish {
-                generation: generation.clone(),
-                manifests: publish.manifests.clone(),
-                head,
-                default_ref: Some(default_ref)
-            })
-        );
-        assert_eq!(
-            pending_generation_publish_key(&repo, generation.generation),
-            format!("pending-generations/{repo}/{}.json", generation.generation)
-        );
-        assert!(
-            read_generation_manifest(&store, &repo, generation.generation)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(read_commit_manifest(&store, &repo, &commit_manifest.commit)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(read_ref_manifest(&store, &repo, &reference.ref_name)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(read_repo_generation_head(&store, &repo)
-            .await
-            .unwrap()
-            .is_none());
 
         let _ = fs::remove_dir_all(root).await;
     }
@@ -526,7 +461,6 @@ mod tests {
 
         assert!(ref_manifest_key(&repo, "refs/heads/../main").is_err());
         assert!(ref_manifest_key(&repo, "/refs/heads/main").is_err());
-        assert!(lease_key(&repo, "../update").is_err());
 
         assert_eq!(
             ref_manifest_key(&repo, "refs/heads/feature/cache").unwrap(),
@@ -624,48 +558,6 @@ mod tests {
 
         let data = store.get("dup/key.json").await.unwrap().unwrap();
         assert_eq!(data, Bytes::from("first"));
-
-        let _ = fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn ref_manifest_absent_or_matches_matching_content() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-        let gen_id = test_generation_id();
-        let reference = ref_manifest_with_gen(&repo, gen_id);
-
-        assert!(write_ref_manifest_if_absent_or_matches(&store, &reference)
-            .await
-            .unwrap());
-        // Same content → not an error, returns false (already exists)
-        assert!(!write_ref_manifest_if_absent_or_matches(&store, &reference)
-            .await
-            .unwrap());
-
-        let _ = fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn ref_manifest_absent_or_matches_conflicting_content() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-        let gen_id = test_generation_id();
-        let reference = ref_manifest_with_gen(&repo, gen_id);
-
-        write_ref_manifest_if_absent_or_matches(&store, &reference)
-            .await
-            .unwrap();
-
-        let mut conflicting = reference;
-        conflicting.commit = commit('b');
-        assert!(
-            write_ref_manifest_if_absent_or_matches(&store, &conflicting)
-                .await
-                .is_err()
-        );
 
         let _ = fs::remove_dir_all(&root).await;
     }
@@ -931,6 +823,44 @@ mod tests {
 
     #[cfg(feature = "s3")]
     #[tokio::test]
+    async fn minio_put_if_version_matches_detects_concurrent_update() {
+        let Some(fixture) = MinioFixture::new("cas").await else {
+            eprintln!(
+                "skipping minio_put_if_version_matches_detects_concurrent_update: set GIT_CACHE_S3_INTEGRATION=1"
+            );
+            return;
+        };
+        let store = fixture.store;
+
+        let key = "cas/item.json";
+        store.put(key, Bytes::from_static(b"v1")).await.unwrap();
+        let (value, version) = store.get_versioned(key).await.unwrap().unwrap();
+        assert_eq!(value, Bytes::from_static(b"v1"));
+
+        assert!(store
+            .put_if_version_matches(key, Bytes::from_static(b"v2"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"v2")
+        );
+
+        // The token from v1 is now stale; the swap must be refused.
+        assert!(!store
+            .put_if_version_matches(key, Bytes::from_static(b"v3"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"v2")
+        );
+
+        store.delete(key).await.unwrap();
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
     async fn minio_manifest_publish_and_listing_uses_prefix() {
         let Some(fixture) = MinioFixture::new("manifest").await else {
             eprintln!(
@@ -944,6 +874,8 @@ mod tests {
         let commit_manifest = commit_manifest_with_gen(&repo, generation.generation);
         let reference = ref_manifest_with_gen(&repo, generation.generation);
 
+        let pack_path = std::env::temp_dir().join(format!("minio-pack-{}", uuid::Uuid::now_v7()));
+        fs::write(&pack_path, PACK_BYTES).await.unwrap();
         GenerationPublish::with_manifests(
             generation.clone(),
             PublishManifests {
@@ -951,13 +883,13 @@ mod tests {
                 refs: vec![reference.clone()],
             },
         )
-        .publish_bundle_bytes(&store, Bytes::from_static(b"bundle-bytes"))
+        .publish_pack_files(&store, &[(generation.packs[0].key.clone(), pack_path)])
         .await
         .unwrap();
 
         assert_eq!(
-            store.get(&generation.bundle_key).await.unwrap().unwrap(),
-            Bytes::from_static(b"bundle-bytes")
+            store.get(&generation.packs[0].key).await.unwrap().unwrap(),
+            Bytes::from_static(PACK_BYTES)
         );
         assert_eq!(
             read_generation_manifest(&store, &repo, generation.generation)

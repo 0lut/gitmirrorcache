@@ -27,6 +27,7 @@ pub fn test_config_with_upstream(
         disk: git_cache_core::DiskConfig {
             quota_bytes: 1024 * 1024 * 1024,
             min_free_bytes: 0,
+            access_flush_interval_secs: 60,
         },
         git_remote: GitRemoteConfig {
             enabled: true,
@@ -36,8 +37,9 @@ pub fn test_config_with_upstream(
             ..Default::default()
         },
         compaction: Default::default(),
+        shutdown: Default::default(),
         max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-        max_concurrent_generation_verifications: 1,
         async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
+        use_gitoxide: true,
     }
 }

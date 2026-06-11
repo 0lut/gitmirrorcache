@@ -1,21 +1,28 @@
 use super::util::hex_lower;
 use super::*;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
-const VERIFIED_GENERATION_SCHEMA_VERSION: u32 = 2;
-const VERIFIED_GENERATION_VERIFIER_VERSION: u32 = 1;
-const VERIFIED_GENERATION_FSCK_MODE: &str = "connectivity-only";
-const PENDING_GENERATION_PREFIX: &str = "pending-generations/";
-const MAX_PENDING_GENERATION_SCAN_KEYS: usize = 10_000;
-const GENERATION_VERIFICATION_MAX_ATTEMPTS: usize = 3;
-const GENERATION_VERIFICATION_RETRY_DELAY: StdDuration = StdDuration::from_secs(30);
+const MAX_GENERATION_MANIFEST_SCAN_KEYS: usize = 10_000;
+const HYDRATE_PACK_DOWNLOAD_CONCURRENCY: usize = 4;
+const HEAD_CAS_MAX_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompactionReport {
     pub repo: RepoKey,
-    pub old_chain_depth: usize,
+    pub old_pack_count: usize,
     pub old_generations: Vec<GenerationId>,
     pub new_generation: GenerationId,
+    pub bytes_reclaimed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GenerationSweepReport {
+    pub repo: RepoKey,
+    pub swept_generations: Vec<GenerationId>,
+    pub deleted_packs: usize,
     pub bytes_reclaimed: u64,
 }
 
@@ -66,6 +73,10 @@ impl Materializer {
         Ok(())
     }
 
+    /// Hydrate a generation snapshot into the local repo: download each
+    /// content-addressed pack the manifest references (in parallel, skipping
+    /// packs already indexed locally), index them, then apply the manifest's
+    /// full ref snapshot.
     pub(super) async fn hydrate_generation(
         &self,
         repo: &RepoKey,
@@ -73,129 +84,149 @@ impl Materializer {
         generation: GenerationId,
     ) -> CoreResult<()> {
         let started = Instant::now();
-        let chain = self.generation_chain(repo, generation).await?;
+        let manifest = self
+            .get_generation_manifest(repo, generation)
+            .await?
+            .ok_or_else(|| {
+                GitCacheError::NotFound(format!("generation manifest `{generation}` not found"))
+            })?;
         info!(
             %repo,
             %generation,
-            chain_len = chain.len(),
+            pack_count = manifest.packs.len(),
+            ref_count = manifest.refs.len(),
             "hydrate generation started"
         );
 
-        for generation_manifest in chain.iter().rev() {
-            let bundle_started = Instant::now();
-            let manifest_started = Instant::now();
-            let verification = self
-                .manifests()
-                .verified_generation(repo, generation_manifest.generation)
-                .await?
-                .ok_or_else(|| {
-                    GitCacheError::NotFound(format!(
-                        "verified generation manifest `{}` not found",
-                        generation_manifest.generation
-                    ))
-                })?;
-            info!(
-                %repo,
-                generation = %generation_manifest.generation,
-                elapsed_ms = elapsed_ms(manifest_started),
-                "loaded verified generation manifest"
-            );
-            let head_started = Instant::now();
-            let bundle_meta = self
-                .state
-                .store
-                .head(&generation_manifest.bundle_key)
-                .await?
-                .ok_or_else(|| {
-                    GitCacheError::NotFound(format!(
-                        "bundle `{}` not found",
-                        generation_manifest.bundle_key
-                    ))
-                })?;
-            info!(
-                %repo,
-                generation = %generation_manifest.generation,
-                bundle_key = %generation_manifest.bundle_key,
-                bundle_len = bundle_meta.len,
-                elapsed_ms = elapsed_ms(head_started),
-                "loaded generation bundle metadata"
-            );
+        let pack_dir = repo_dir.join("objects").join("pack");
+        fs::create_dir_all(&pack_dir).await?;
+        let mut missing: Vec<PackInfo> = Vec::new();
+        for pack in &manifest.packs {
+            let idx_path = pack_dir.join(format!("pack-{}.idx", pack.sha256));
+            if !idx_path.exists() {
+                missing.push(pack.clone());
+            }
+        }
 
-            validate_verified_generation(generation_manifest, &verification, bundle_meta.len)?;
-
-            let reserve_started = Instant::now();
-            let reservation = self.state.disk.reserve(verification.bundle_len).await?;
+        if !missing.is_empty() {
+            let total_len: u64 = missing.iter().map(|pack| pack.len).sum();
+            let reservation = self.state.disk.reserve(total_len).await?;
             let temp_path = reservation.temp_path()?;
             fs::create_dir_all(&temp_path).await?;
-            let bundle_path = temp_path.join("hydrate.bundle");
-            info!(
-                %repo,
-                generation = %generation_manifest.generation,
-                bundle_len = verification.bundle_len,
-                elapsed_ms = elapsed_ms(reserve_started),
-                "reserved disk for generation hydrate"
-            );
+
             let download_started = Instant::now();
-            if !self
-                .state
-                .store
-                .get_file(&generation_manifest.bundle_key, &bundle_path)
-                .await?
-            {
-                return Err(GitCacheError::NotFound(format!(
-                    "bundle `{}` not found",
-                    generation_manifest.bundle_key
-                )));
+            let semaphore = Arc::new(Semaphore::new(HYDRATE_PACK_DOWNLOAD_CONCURRENCY));
+            let mut join_set: JoinSet<CoreResult<(PackInfo, PathBuf)>> = JoinSet::new();
+            for pack in missing.iter().cloned() {
+                let store = Arc::clone(&self.state.store);
+                let semaphore = Arc::clone(&semaphore);
+                let download_path = temp_path.join(format!("pack-{}.pack", pack.sha256));
+                join_set.spawn(async move {
+                    let _permit = semaphore.acquire_owned().await.map_err(|_| {
+                        GitCacheError::Internal("pack download semaphore closed".into())
+                    })?;
+                    if !store.get_file(&pack.key, &download_path).await? {
+                        return Err(GitCacheError::NotFound(format!(
+                            "pack `{}` not found",
+                            pack.key
+                        )));
+                    }
+                    let (len, sha256) = file_len_and_sha256(&download_path).await?;
+                    if len != pack.len {
+                        return Err(GitCacheError::Validation(format!(
+                            "pack `{}` length mismatch: expected {}, got {len}",
+                            pack.key, pack.len
+                        )));
+                    }
+                    if !sha256.eq_ignore_ascii_case(&pack.sha256) {
+                        return Err(GitCacheError::Validation(format!(
+                            "pack `{}` sha256 mismatch",
+                            pack.key
+                        )));
+                    }
+                    Ok((pack, download_path))
+                });
+            }
+
+            let mut downloaded = Vec::with_capacity(missing.len());
+            let mut first_error = None;
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok(Ok(entry)) => downloaded.push(entry),
+                    Ok(Err(err)) => {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                        join_set.abort_all();
+                    }
+                    Err(err) => {
+                        if first_error.is_none() {
+                            first_error = Some(GitCacheError::Internal(format!(
+                                "pack download task failed: {err}"
+                            )));
+                        }
+                        join_set.abort_all();
+                    }
+                }
+            }
+            if let Some(err) = first_error {
+                reservation.release().await?;
+                return Err(err);
             }
             info!(
                 %repo,
-                generation = %generation_manifest.generation,
-                bundle_key = %generation_manifest.bundle_key,
-                bundle_len = verification.bundle_len,
+                %generation,
+                pack_count = downloaded.len(),
+                total_len,
                 elapsed_ms = elapsed_ms(download_started),
-                "downloaded generation bundle"
+                "downloaded generation packs"
             );
-            let checksum_started = Instant::now();
-            let (bundle_len, bundle_sha256) = file_len_and_sha256(&bundle_path).await?;
-            if bundle_len != verification.bundle_len {
-                return Err(GitCacheError::Validation(format!(
-                    "bundle `{}` length mismatch: expected {}, got {}",
-                    generation_manifest.bundle_key, verification.bundle_len, bundle_len
-                )));
-            }
-            if !bundle_sha256.eq_ignore_ascii_case(&verification.bundle_sha256) {
-                return Err(GitCacheError::Validation(format!(
-                    "bundle `{}` sha256 mismatch",
-                    generation_manifest.bundle_key
-                )));
+
+            let index_started = Instant::now();
+            for (pack, download_path) in downloaded {
+                let final_path = pack_dir.join(format!("pack-{}.pack", pack.sha256));
+                if fs::rename(&download_path, &final_path).await.is_err() {
+                    fs::copy(&download_path, &final_path).await?;
+                    let _ = fs::remove_file(&download_path).await;
+                }
+                self.state.git.index_pack(repo_dir, &final_path).await?;
             }
             info!(
                 %repo,
-                generation = %generation_manifest.generation,
-                bundle_len,
-                elapsed_ms = elapsed_ms(checksum_started),
-                "verified generation bundle checksum"
-            );
-            let fetch_started = Instant::now();
-            self.state.git.fetch_bundle(repo_dir, &bundle_path).await?;
-            info!(
-                %repo,
-                generation = %generation_manifest.generation,
-                elapsed_ms = elapsed_ms(fetch_started),
-                "fetched generation bundle into local repo"
+                %generation,
+                elapsed_ms = elapsed_ms(index_started),
+                "indexed generation packs"
             );
             reservation.release().await?;
-            info!(
-                %repo,
-                generation = %generation_manifest.generation,
-                elapsed_ms = elapsed_ms(bundle_started),
-                "hydrated generation bundle"
-            );
+        }
+
+        let refs_started = Instant::now();
+        let updates: Vec<(String, CommitSha)> = manifest
+            .refs
+            .iter()
+            .map(|(ref_name, commit)| (ref_name.clone(), commit.clone()))
+            .collect();
+        if !updates.is_empty() {
+            self.state.git.update_refs_batch(repo_dir, &updates).await?;
+        }
+        if let Some(head_ref) = &manifest.head_ref {
+            self.state
+                .git
+                .symbolic_ref(repo_dir, "HEAD", head_ref)
+                .await?;
         }
         info!(
             %repo,
             %generation,
-            chain_len = chain.len(),
+            ref_count = updates.len(),
+            elapsed_ms = elapsed_ms(refs_started),
+            "applied generation ref snapshot"
+        );
+
+        info!(
+            %repo,
+            %generation,
+            pack_count = manifest.packs.len(),
             elapsed_ms = elapsed_ms(started),
             "hydrate generation finished"
         );
@@ -306,73 +337,129 @@ impl Materializer {
             );
             None
         };
-        let previous_generation = previous_head.as_ref().map(|head| head.generation);
+        let previous_manifest = match previous_head.as_ref() {
+            Some(head) => self.get_generation_manifest(repo, head.generation).await?,
+            None => None,
+        };
         let previous_tips = previous_head
             .as_ref()
             .map(|head| head.tip_commits.as_slice())
             .unwrap_or(&[]);
         let generation = GenerationId::new();
-        let bundle_key = bundle_key(repo, generation);
 
         let reservation = self.state.disk.reserve(1024 * 1024 * 64).await?;
         let temp_path = reservation.temp_path()?;
         fs::create_dir_all(&temp_path).await?;
-        let bundle_path = temp_path.join("generation.bundle");
+        let pack_prefix = temp_path.join("generation");
         let now = Utc::now();
-        let mut parent_generation = previous_generation;
         let mut tip_commits = previous_head
             .as_ref()
             .map(|head| head.tip_commits.clone())
             .unwrap_or_default();
 
-        let bundle_started = Instant::now();
-        if previous_tips.is_empty() {
-            self.state
-                .git
-                .bundle_create_all(repo_dir, &bundle_path)
-                .await?;
-            info!(
-                %repo,
-                %generation,
-                elapsed_ms = elapsed_ms(bundle_started),
-                "created full generation bundle"
-            );
-        } else if let Err(err) = self
+        let include = self
             .state
             .git
-            .bundle_create_incremental(repo_dir, &bundle_path, previous_tips)
-            .await
-        {
-            warn!(
-                %repo,
-                %err,
-                elapsed_ms = elapsed_ms(bundle_started),
-                "delta bundle failed, falling back to full bundle"
-            );
-            let _ = fs::remove_file(&bundle_path).await;
-            let fallback_started = Instant::now();
-            self.state
+            .for_each_ref_commits(repo_dir, "refs")
+            .await?;
+        let pack_started = Instant::now();
+        let mut incremental = previous_manifest.is_some() && !previous_tips.is_empty();
+        let pack_path = if incremental {
+            match self
+                .state
                 .git
-                .bundle_create_all(repo_dir, &bundle_path)
+                .pack_objects_revs(repo_dir, &pack_prefix, &include, previous_tips)
+                .await
+            {
+                Ok(path) => {
+                    info!(
+                        %repo,
+                        %generation,
+                        previous_tip_count = previous_tips.len(),
+                        elapsed_ms = elapsed_ms(pack_started),
+                        "created incremental generation pack"
+                    );
+                    path
+                }
+                Err(err) => {
+                    warn!(
+                        %repo,
+                        %err,
+                        elapsed_ms = elapsed_ms(pack_started),
+                        "incremental pack failed, falling back to full pack"
+                    );
+                    incremental = false;
+                    tip_commits.clear();
+                    let fallback_started = Instant::now();
+                    let path = self
+                        .state
+                        .git
+                        .pack_objects_revs(repo_dir, &pack_prefix, &include, &[])
+                        .await?;
+                    info!(
+                        %repo,
+                        %generation,
+                        elapsed_ms = elapsed_ms(fallback_started),
+                        "created fallback full generation pack"
+                    );
+                    path
+                }
+            }
+        } else {
+            incremental = false;
+            tip_commits.clear();
+            let path = self
+                .state
+                .git
+                .pack_objects_revs(repo_dir, &pack_prefix, &include, &[])
                 .await?;
             info!(
                 %repo,
                 %generation,
-                elapsed_ms = elapsed_ms(fallback_started),
-                "created fallback full generation bundle"
+                elapsed_ms = elapsed_ms(pack_started),
+                "created full generation pack"
             );
-            parent_generation = None;
-            tip_commits.clear();
-        } else {
-            info!(
-                %repo,
-                %generation,
-                previous_tip_count = previous_tips.len(),
-                elapsed_ms = elapsed_ms(bundle_started),
-                "created incremental generation bundle"
-            );
-        }
+            path
+        };
         push_unique_commit(&mut tip_commits, commit.clone());
+
+        let (pack_len, pack_sha256) = file_len_and_sha256(&pack_path).await?;
+        let new_pack = PackInfo {
+            key: pack_key(repo, &pack_sha256)?,
+            len: pack_len,
+            sha256: pack_sha256,
+            kind: if incremental {
+                PackKind::Delta
+            } else {
+                PackKind::Base
+            },
+        };
+        let mut packs = if incremental {
+            previous_manifest
+                .as_ref()
+                .map(|manifest| manifest.packs.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !packs.iter().any(|pack| pack.key == new_pack.key) {
+            packs.push(new_pack.clone());
+        }
+
+        let refs: BTreeMap<String, CommitSha> = self
+            .state
+            .git
+            .for_each_ref(repo_dir, "refs")
+            .await?
+            .into_iter()
+            .collect();
+        let head_ref = self
+            .state
+            .git
+            .symbolic_ref_read(repo_dir, "HEAD")
+            .await
+            .ok()
+            .filter(|target| refs.contains_key(target));
 
         let mut manifest_commits = vec![commit.clone()];
         let manifest_scan_started = Instant::now();
@@ -399,9 +486,11 @@ impl Materializer {
         let generation_manifest = GenerationManifest {
             repo: repo.clone(),
             generation,
-            bundle_key,
-            parent_generation,
             created_at: now,
+            verified_at: Some(now),
+            packs,
+            refs,
+            head_ref,
             commits: manifest_commits.clone(),
         };
         let mut manifests = PublishManifests {
@@ -447,48 +536,27 @@ impl Materializer {
         };
 
         let publish_started = Instant::now();
-        let verification = Box::pin(self.verify_local_generation_bundle(
-            repo,
-            repo_dir,
-            generation,
-            &generation_manifest,
-            &bundle_path,
-            &head.tip_commits,
-        ))
-        .await?;
-        let published_verified = verification.is_some();
-        let default_ref_for_verified = default_ref.clone();
-        if let Some(verification) = verification {
-            GenerationPublish::with_manifests(generation_manifest.clone(), manifests)
-                .with_verification(verification)
-                .publish_bundle_file(&*self.state.store, &bundle_path)
-                .await?;
-            self.finish_verified_generation_publish(repo, &head, default_ref_for_verified)
-                .await?;
-            info!(
-                %repo,
-                %generation,
-                elapsed_ms = elapsed_ms(publish_started),
-                "published verified generation bundle"
-            );
-        } else {
-            GenerationPublish::with_manifests(generation_manifest, manifests)
-                .publish_pending_bundle_file(&*self.state.store, &bundle_path, head, default_ref)
-                .await?;
-            info!(
-                %repo,
-                %generation,
-                elapsed_ms = elapsed_ms(publish_started),
-                "published pending generation bundle"
-            );
-        }
+        let pack_count = generation_manifest.packs.len();
+        GenerationPublish::with_manifests(generation_manifest, manifests)
+            .publish_pack_files(
+                &*self.state.store,
+                &[(new_pack.key.clone(), pack_path.clone())],
+            )
+            .await?;
+        self.finish_generation_publish(repo, &head, default_ref)
+            .await?;
+        info!(
+            %repo,
+            %generation,
+            pack_len,
+            elapsed_ms = elapsed_ms(publish_started),
+            "published generation pack"
+        );
 
         reservation.release().await?;
 
-        if published_verified {
+        if pack_count > self.state.config.compaction.chain_depth_threshold as usize {
             self.enqueue_inline_compaction(repo.clone(), generation);
-        } else {
-            self.enqueue_generation_verification(repo.clone(), generation);
         }
 
         info!(
@@ -499,29 +567,6 @@ impl Materializer {
             "publish generation finished"
         );
         Ok(generation)
-    }
-
-    pub(super) fn enqueue_generation_verification(&self, repo: RepoKey, generation: GenerationId) {
-        let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
-            for attempt in 1..=GENERATION_VERIFICATION_MAX_ATTEMPTS {
-                let materializer = Materializer::new(Arc::clone(&state));
-                let result = materializer
-                    .verify_generation_with_semaphore_mode(repo.clone(), generation, true, false)
-                    .await;
-                match result {
-                    Ok(()) => return,
-                    Err(err) if attempt < GENERATION_VERIFICATION_MAX_ATTEMPTS => {
-                        warn!(%repo, %generation, attempt, %err, "generation verification failed; retrying");
-                        tokio::time::sleep(GENERATION_VERIFICATION_RETRY_DELAY).await;
-                    }
-                    Err(err) => {
-                        warn!(%repo, %generation, attempt, %err, "generation verification failed");
-                        return;
-                    }
-                }
-            }
-        });
     }
 
     fn enqueue_inline_compaction(&self, repo: RepoKey, generation: GenerationId) {
@@ -538,376 +583,7 @@ impl Materializer {
         });
     }
 
-    pub fn enqueue_pending_generation_scan(&self) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            warn!("skipping pending generation scan: no active tokio runtime");
-            return;
-        };
-        let materializer = self.clone();
-        handle.spawn(async move {
-            match materializer
-                .enqueue_pending_generation_verifications()
-                .await
-            {
-                Ok(count) => {
-                    if count > 0 {
-                        info!(count, "enqueued pending generation verifications");
-                    }
-                }
-                Err(err) => warn!(%err, "pending generation scan failed"),
-            }
-        });
-    }
-
-    pub async fn enqueue_pending_generation_verifications(&self) -> CoreResult<usize> {
-        let keys = self
-            .state
-            .store
-            .list_prefix(
-                PENDING_GENERATION_PREFIX,
-                Some(MAX_PENDING_GENERATION_SCAN_KEYS),
-            )
-            .await?;
-        let mut queued = 0usize;
-        for key in keys {
-            match pending_generation_from_key(&key) {
-                Ok(Some((repo, generation))) => {
-                    self.enqueue_generation_verification(repo, generation);
-                    queued += 1;
-                }
-                Ok(None) => {}
-                Err(err) => warn!(key, %err, "skipping malformed pending generation key"),
-            }
-        }
-        Ok(queued)
-    }
-
-    pub(super) async fn verify_generation_with_semaphore(
-        &self,
-        repo: RepoKey,
-        generation: GenerationId,
-        inline_compaction: bool,
-    ) -> CoreResult<()> {
-        self.verify_generation_with_semaphore_mode(repo, generation, inline_compaction, true)
-            .await
-    }
-
-    async fn verify_generation_with_semaphore_mode(
-        &self,
-        repo: RepoKey,
-        generation: GenerationId,
-        inline_compaction: bool,
-        allow_full_chain: bool,
-    ) -> CoreResult<()> {
-        let permit = self
-            .state
-            .generation_verification_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                GitCacheError::Internal("generation verification semaphore closed".into())
-            })?;
-        Box::pin(self.verify_generation_inner(repo.clone(), generation, allow_full_chain)).await?;
-        drop(permit);
-
-        if inline_compaction && self.state.config.compaction.inline {
-            if let Err(err) = Box::pin(self.compact_generation_chain(&repo)).await {
-                warn!(%repo, %generation, %err, "inline generation compaction failed");
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) async fn verify_generation_inner(
-        &self,
-        repo: RepoKey,
-        generation: GenerationId,
-        allow_full_chain: bool,
-    ) -> CoreResult<()> {
-        let Some(pending) = self
-            .manifests()
-            .pending_generation(&repo, generation)
-            .await?
-        else {
-            return Ok(());
-        };
-
-        if let Some(verification) =
-            Box::pin(self.verify_generation_from_local_repo(&repo, generation, &pending)).await?
-        {
-            Box::pin(self.publish_verified_pending_generation(
-                &repo,
-                generation,
-                pending,
-                verification,
-            ))
-            .await?;
-            return Ok(());
-        }
-
-        if !allow_full_chain {
-            info!(
-                %repo,
-                %generation,
-                "generation verification left pending: local fast path was unavailable"
-            );
-            return Ok(());
-        }
-
-        let chain = self
-            .generation_chain_for_verification(&repo, generation)
-            .await?;
-        let mut bundle_metas = Vec::with_capacity(chain.len());
-        let mut total_len = 0_u64;
-        for manifest in chain.iter().rev() {
-            let meta = self
-                .state
-                .store
-                .head(&manifest.bundle_key)
-                .await?
-                .ok_or_else(|| {
-                    GitCacheError::NotFound(format!("bundle `{}` not found", manifest.bundle_key))
-                })?;
-            total_len = total_len.saturating_add(meta.len);
-            bundle_metas.push((manifest, meta.len));
-        }
-
-        let reservation = self.state.disk.reserve(total_len).await?;
-        let temp_path = reservation.temp_path()?;
-        fs::create_dir_all(&temp_path).await?;
-        let verify_repo = temp_path.join("verify.git");
-        self.state.git.init_bare(&verify_repo).await?;
-
-        let mut verifications = Vec::with_capacity(bundle_metas.len());
-        let now = Utc::now();
-        let tip_commits = pending.head.tip_commits.clone();
-
-        for (manifest, object_len) in bundle_metas {
-            let bundle_path = temp_path.join(format!("{}.bundle", manifest.generation));
-            if !self
-                .state
-                .store
-                .get_file(&manifest.bundle_key, &bundle_path)
-                .await?
-            {
-                return Err(GitCacheError::NotFound(format!(
-                    "bundle `{}` not found",
-                    manifest.bundle_key
-                )));
-            }
-            let (bundle_len, bundle_sha256) = file_len_and_sha256(&bundle_path).await?;
-            if bundle_len != object_len {
-                return Err(GitCacheError::Validation(format!(
-                    "bundle `{}` length changed during verification: expected {}, got {}",
-                    manifest.bundle_key, object_len, bundle_len
-                )));
-            }
-            self.state
-                .git
-                .fetch_bundle(&verify_repo, &bundle_path)
-                .await?;
-            let manifest_tip_commits = if manifest.generation == generation {
-                tip_commits.clone()
-            } else {
-                Vec::new()
-            };
-            verifications.push(verified_generation_manifest(
-                manifest,
-                bundle_len,
-                bundle_sha256,
-                now,
-                manifest_tip_commits,
-            ));
-        }
-
-        self.state.git.fsck(&verify_repo).await?;
-        let mut pending_verification = None;
-        for verification in verifications {
-            if verification.generation == generation {
-                pending_verification = Some(verification);
-            } else if self
-                .manifests()
-                .verified_generation(&verification.repo, verification.generation)
-                .await?
-                .is_none()
-            {
-                self.manifests()
-                    .write_verified_if_absent_or_matches(&verification)
-                    .await?;
-            }
-        }
-        let verification = pending_verification.ok_or_else(|| {
-            GitCacheError::Internal(format!(
-                "verification for generation `{generation}` was not produced"
-            ))
-        })?;
-        Box::pin(self.publish_verified_pending_generation(
-            &repo,
-            generation,
-            pending,
-            verification,
-        ))
-        .await?;
-        reservation.release().await?;
-        info!(%repo, %generation, "generation verified");
-        Ok(())
-    }
-
-    async fn verify_generation_from_local_repo(
-        &self,
-        repo: &RepoKey,
-        generation: GenerationId,
-        pending: &PendingGenerationPublish,
-    ) -> CoreResult<Option<VerifiedGenerationManifest>> {
-        let repo_dir = self.repo_dir(repo);
-        if !repo_dir.join("config").exists() {
-            return Ok(None);
-        }
-
-        let bundle_meta = self
-            .state
-            .store
-            .head(&pending.generation.bundle_key)
-            .await?
-            .ok_or_else(|| {
-                GitCacheError::NotFound(format!(
-                    "bundle `{}` not found",
-                    pending.generation.bundle_key
-                ))
-            })?;
-        let reservation = self.state.disk.reserve(bundle_meta.len).await?;
-        let temp_path = reservation.temp_path()?;
-        fs::create_dir_all(&temp_path).await?;
-        let bundle_path = temp_path.join("verify-local.bundle");
-        if !self
-            .state
-            .store
-            .get_file(&pending.generation.bundle_key, &bundle_path)
-            .await?
-        {
-            reservation.release().await?;
-            return Err(GitCacheError::NotFound(format!(
-                "bundle `{}` not found",
-                pending.generation.bundle_key
-            )));
-        }
-
-        let verification = Box::pin(self.verify_local_generation_bundle(
-            repo,
-            &repo_dir,
-            generation,
-            &pending.generation,
-            &bundle_path,
-            &pending.head.tip_commits,
-        ))
-        .await?;
-        let Some(verification) = verification else {
-            reservation.release().await?;
-            return Ok(None);
-        };
-
-        if verification.bundle_len != bundle_meta.len {
-            reservation.release().await?;
-            return Err(GitCacheError::Validation(format!(
-                "bundle `{}` length changed during verification: expected {}, got {}",
-                pending.generation.bundle_key, bundle_meta.len, verification.bundle_len
-            )));
-        }
-        reservation.release().await?;
-        Ok(Some(verification))
-    }
-
-    async fn verify_local_generation_bundle(
-        &self,
-        repo: &RepoKey,
-        repo_dir: &FsPath,
-        generation: GenerationId,
-        generation_manifest: &GenerationManifest,
-        bundle_path: &FsPath,
-        tip_commits: &[CommitSha],
-    ) -> CoreResult<Option<VerifiedGenerationManifest>> {
-        let started = Instant::now();
-        for tip in tip_commits {
-            if !self.commit_ready_for_serving(repo_dir, tip).await {
-                info!(
-                    %repo,
-                    %generation,
-                    tip = %tip,
-                    elapsed_ms = elapsed_ms(started),
-                    "local generation verification skipped: tip not locally ready"
-                );
-                return Ok(None);
-            }
-        }
-
-        // For HTTP-published incremental generations, the local repo already
-        // has the parent history and the new objects that produced the bundle.
-        // Re-fetching the whole verified parent chain into a temporary repo is
-        // catastrophically expensive for repos like llvm-project and can starve
-        // hot materialize/direct-git requests. When every ancestor is already
-        // verified, `git bundle verify` against the local repo is enough to
-        // prove the pending bundle's prerequisites without running index-pack
-        // over gigabytes of parent history again.
-        let mut next = generation_manifest.parent_generation;
-        while let Some(parent) = next {
-            if self
-                .manifests()
-                .verified_generation(repo, parent)
-                .await?
-                .is_none()
-            {
-                info!(
-                    %repo,
-                    %generation,
-                    parent_generation = %parent,
-                    elapsed_ms = elapsed_ms(started),
-                    "local generation verification skipped: parent is not verified"
-                );
-                return Ok(None);
-            }
-            let Some(parent_manifest) = self.get_generation_manifest(repo, parent).await? else {
-                info!(
-                    %repo,
-                    %generation,
-                    parent_generation = %parent,
-                    elapsed_ms = elapsed_ms(started),
-                    "local generation verification skipped: parent manifest missing"
-                );
-                return Ok(None);
-            };
-            next = parent_manifest.parent_generation;
-        }
-
-        if let Err(err) = self.state.git.bundle_verify(repo_dir, bundle_path).await {
-            info!(
-                %repo,
-                %generation,
-                %err,
-                elapsed_ms = elapsed_ms(started),
-                "local generation verification skipped: bundle verify failed"
-            );
-            return Ok(None);
-        }
-
-        let (bundle_len, bundle_sha256) = file_len_and_sha256(bundle_path).await?;
-        info!(
-            %repo,
-            %generation,
-            bundle_len,
-            elapsed_ms = elapsed_ms(started),
-            "verified generation from local repo"
-        );
-        Ok(Some(verified_generation_manifest(
-            generation_manifest,
-            bundle_len,
-            bundle_sha256,
-            Utc::now(),
-            tip_commits.to_vec(),
-        )))
-    }
-
-    async fn finish_verified_generation_publish(
+    async fn finish_generation_publish(
         &self,
         repo: &RepoKey,
         head: &RepoGenerationHead,
@@ -919,81 +595,32 @@ impl Materializer {
                 .await?;
         }
 
-        let current_head = self.manifests().repo_head(repo).await?;
-        if current_head
-            .as_ref()
-            .map(|current| current.updated_at <= head.updated_at)
-            .unwrap_or(true)
-        {
-            self.manifests().write_repo_head(head).await?;
-        }
-        Ok(())
-    }
-
-    async fn publish_verified_pending_generation(
-        &self,
-        repo: &RepoKey,
-        generation: GenerationId,
-        pending: PendingGenerationPublish,
-        verification: VerifiedGenerationManifest,
-    ) -> CoreResult<()> {
-        GenerationPublish::with_manifests(pending.generation.clone(), pending.manifests.clone())
-            .with_verification(verification)
-            .publish_verified_metadata(&*self.state.store)
-            .await?;
-
-        self.finish_verified_generation_publish(repo, &pending.head, pending.default_ref)
-            .await?;
-        if let Err(err) = self
-            .state
-            .store
-            .delete(&pending_generation_publish_key(repo, generation))
-            .await
-        {
-            warn!(%repo, %generation, %err, "failed to delete pending generation publish");
-        }
-        Ok(())
-    }
-
-    pub(super) async fn generation_chain_for_verification(
-        &self,
-        repo: &RepoKey,
-        generation: GenerationId,
-    ) -> CoreResult<Vec<GenerationManifest>> {
-        let mut chain = Vec::new();
-        let mut seen = HashSet::new();
-        let mut next = Some(generation);
-        while let Some(current) = next {
-            if !seen.insert(current) {
-                return Err(GitCacheError::Conflict(format!(
-                    "generation chain for `{repo}` contains a cycle at `{current}`"
-                )));
-            }
-            let manifest = if current == generation {
-                if let Some(pending) = self.manifests().pending_generation(repo, current).await? {
-                    pending.generation
-                } else {
-                    self.get_generation_manifest(repo, current)
-                        .await?
-                        .ok_or_else(|| {
-                            GitCacheError::NotFound(format!(
-                                "generation manifest `{current}` not found"
-                            ))
-                        })?
-                }
-            } else {
-                self.get_generation_manifest(repo, current)
-                    .await?
-                    .ok_or_else(|| {
-                        GitCacheError::NotFound(format!(
-                            "generation manifest `{current}` not found"
-                        ))
-                    })?
+        for _ in 0..HEAD_CAS_MAX_ATTEMPTS {
+            let current = self.manifests().repo_head_versioned(repo).await?;
+            let (current_head, version) = match &current {
+                Some((head, version)) => (Some(head), Some(version)),
+                None => (None, None),
             };
-            next = manifest.parent_generation;
-            chain.push(manifest);
+            if current_head
+                .map(|current| current.updated_at > head.updated_at)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            if self
+                .manifests()
+                .write_repo_head_if_version_matches(head, version)
+                .await?
+            {
+                return Ok(());
+            }
         }
-        Ok(chain)
+        warn!(
+            %repo,
+            generation = %head.generation,
+            "generation head moved repeatedly during publish; leaving newer head in place"
+        );
+        Ok(())
     }
 
     pub async fn compact_generation_chain(
@@ -1001,7 +628,147 @@ impl Materializer {
         repo: &RepoKey,
     ) -> CoreResult<Option<CompactionReport>> {
         let threshold = self.state.config.compaction.chain_depth_threshold as usize;
-        Box::pin(self.compact_generation_chain_inner(repo, threshold, false)).await
+        let report = Box::pin(self.compact_generation_chain_inner(repo, threshold, false)).await?;
+        let sweep = self.sweep_superseded_generations(repo).await?;
+        Ok(report.map(|mut report| {
+            report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(sweep.bytes_reclaimed);
+            report
+        }))
+    }
+
+    /// Delete generation manifests (and the packs only they reference) that
+    /// have been superseded for longer than the configured retention window.
+    ///
+    /// Eligibility is derived purely from durable manifest data: a generation
+    /// is swept only when another generation with a strictly newer
+    /// `created_at` has existed for longer than the retention window. The
+    /// generation the head pointer references is always kept. Packs not
+    /// referenced by any manifest are deleted once their store timestamp is
+    /// older than the window, which retroactively collects packs leaked by
+    /// crashes between publish and cleanup.
+    pub async fn sweep_superseded_generations(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<GenerationSweepReport> {
+        let mut report = GenerationSweepReport {
+            repo: repo.clone(),
+            swept_generations: Vec::new(),
+            deleted_packs: 0,
+            bytes_reclaimed: 0,
+        };
+        let _repo_lock = self.lock_repo(repo).await?;
+        let Some(head) = self.manifests().repo_head(repo).await? else {
+            return Ok(report);
+        };
+
+        let mut manifests = Vec::new();
+        for generation in self.list_generation_ids(repo).await? {
+            if let Some(manifest) = self.get_generation_manifest(repo, generation).await? {
+                manifests.push(manifest);
+            }
+        }
+
+        let retention_secs = self
+            .state
+            .config
+            .compaction
+            .retention_secs
+            .min(i64::MAX as u64) as i64;
+        let cutoff = Utc::now() - chrono::Duration::seconds(retention_secs);
+
+        let mut created_at_sorted: Vec<(DateTime<Utc>, GenerationId)> = manifests
+            .iter()
+            .map(|manifest| (manifest.created_at, manifest.generation))
+            .collect();
+        created_at_sorted.sort();
+
+        let mut swept: HashSet<GenerationId> = HashSet::new();
+        for manifest in &manifests {
+            if manifest.generation == head.generation {
+                continue;
+            }
+            let successor_created_at = created_at_sorted
+                .iter()
+                .find(|(created_at, generation)| {
+                    *generation != manifest.generation && *created_at > manifest.created_at
+                })
+                .map(|(created_at, _)| *created_at);
+            if let Some(successor_created_at) = successor_created_at {
+                if successor_created_at < cutoff {
+                    swept.insert(manifest.generation);
+                }
+            }
+        }
+
+        // Commit/ref manifests may still reference a generation being swept
+        // (publish never rewrites an existing commit manifest). Repoint them
+        // to the head generation before its predecessors' manifests are
+        // deleted, so cold-cache hydration never chases a swept generation.
+        if !swept.is_empty() {
+            self.repoint_manifests_after_compaction(repo, &swept, head.generation)
+                .await?;
+        }
+
+        let kept_packs: HashSet<&str> = manifests
+            .iter()
+            .filter(|manifest| !swept.contains(&manifest.generation))
+            .flat_map(|manifest| manifest.packs.iter().map(|pack| pack.key.as_str()))
+            .collect();
+
+        let mut deleted_pack_keys: HashSet<&str> = HashSet::new();
+        for manifest in &manifests {
+            if !swept.contains(&manifest.generation) {
+                continue;
+            }
+            for pack in &manifest.packs {
+                if kept_packs.contains(pack.key.as_str()) {
+                    continue;
+                }
+                if deleted_pack_keys.insert(pack.key.as_str()) {
+                    self.state.store.delete(&pack.key).await?;
+                    report.deleted_packs += 1;
+                    report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(pack.len);
+                }
+            }
+            self.state
+                .store
+                .delete(&generation_manifest_key(repo, manifest.generation))
+                .await?;
+            report.swept_generations.push(manifest.generation);
+        }
+
+        let pack_keys = self
+            .state
+            .store
+            .list_prefix(&pack_prefix(repo), Some(MAX_GENERATION_MANIFEST_SCAN_KEYS))
+            .await?;
+        for key in pack_keys {
+            if kept_packs.contains(key.as_str()) || deleted_pack_keys.contains(key.as_str()) {
+                continue;
+            }
+            let Some(meta) = self.state.store.head(&key).await? else {
+                continue;
+            };
+            let Some(updated_at) = meta.updated_at else {
+                continue;
+            };
+            if updated_at < cutoff {
+                self.state.store.delete(&key).await?;
+                report.deleted_packs += 1;
+                report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(meta.len);
+            }
+        }
+
+        if !report.swept_generations.is_empty() || report.deleted_packs > 0 {
+            info!(
+                %repo,
+                swept_generations = report.swept_generations.len(),
+                deleted_packs = report.deleted_packs,
+                bytes_reclaimed = report.bytes_reclaimed,
+                "retention sweep removed superseded generations"
+            );
+        }
+        Ok(report)
     }
 
     pub async fn compact_generation_chain_dry_run(
@@ -1012,61 +779,117 @@ impl Materializer {
         Box::pin(self.compact_generation_chain_inner(repo, threshold, true)).await
     }
 
+    /// Compact a repo whose head generation references too many packs:
+    /// hydrate the head snapshot, repack the local repo into a single pack,
+    /// then publish it as a fresh self-contained generation. Superseded
+    /// generations are not deleted here; the retention sweep removes them
+    /// once their successor is older than the configured window.
     pub(super) async fn compact_generation_chain_inner(
         &self,
         repo: &RepoKey,
         threshold: usize,
         dry_run: bool,
     ) -> CoreResult<Option<CompactionReport>> {
-        let Some(head) = self.manifests().repo_head(repo).await? else {
+        let outer_repo_lock = if dry_run {
+            None
+        } else {
+            Some(self.lock_repo(repo).await?)
+        };
+        let Some((head, head_version)) = self.manifests().repo_head_versioned(repo).await? else {
             return Ok(None);
         };
-        let chain = self.generation_chain(repo, head.generation).await?;
-        if chain.len() <= threshold {
+        let Some(head_manifest) = self.get_generation_manifest(repo, head.generation).await? else {
+            return Ok(None);
+        };
+        if head_manifest.packs.len() <= threshold {
             return Ok(None);
         }
 
-        let old_generations: Vec<GenerationId> =
-            chain.iter().map(|manifest| manifest.generation).collect();
+        let old_generations = self.list_generation_ids(repo).await?;
+        let mut old_packs: BTreeMap<String, u64> = BTreeMap::new();
+        let mut old_commits = Vec::new();
+        for generation in &old_generations {
+            let Some(manifest) = self.get_generation_manifest(repo, *generation).await? else {
+                continue;
+            };
+            for pack in &manifest.packs {
+                old_packs.insert(pack.key.clone(), pack.len);
+            }
+            for commit in &manifest.commits {
+                push_unique_commit(&mut old_commits, commit.clone());
+            }
+        }
         let old_generation_set: HashSet<GenerationId> = old_generations.iter().copied().collect();
-        let all_old_generation_bytes = self
-            .bundle_bytes_for_generations(repo, &old_generations)
-            .await?;
         let new_generation = GenerationId::new();
         if dry_run {
+            let bytes_reclaimed = old_packs.values().sum();
             return Ok(Some(CompactionReport {
                 repo: repo.clone(),
-                old_chain_depth: chain.len(),
+                old_pack_count: head_manifest.packs.len(),
                 old_generations,
                 new_generation,
-                bytes_reclaimed: all_old_generation_bytes,
+                bytes_reclaimed,
             }));
         }
 
+        let _repo_lock = outer_repo_lock;
         let repo_dir = self.ensure_repo_dir(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
-        Box::pin(self.verify_generation_with_semaphore(repo.clone(), head.generation, false))
-            .await?;
         Box::pin(self.hydrate_generation(repo, &repo_dir, head.generation)).await?;
-        let reservation = self.state.disk.reserve(1024 * 1024 * 64).await?;
-        let temp_path = reservation.temp_path()?;
-        fs::create_dir_all(&temp_path).await?;
-        let bundle_path = temp_path.join("compacted.bundle");
-        self.state
+        self.state.git.repack_for_serving(&repo_dir).await?;
+
+        let pack_dir = repo_dir.join("objects").join("pack");
+        let mut local_packs: Vec<(String, PathBuf)> = Vec::new();
+        let mut packs: Vec<PackInfo> = Vec::new();
+        let mut entries = fs::read_dir(&pack_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("pack") {
+                continue;
+            }
+            let (len, sha256) = file_len_and_sha256(&path).await?;
+            let key = pack_key(repo, &sha256)?;
+            if packs.iter().any(|pack| pack.key == key) {
+                continue;
+            }
+            packs.push(PackInfo {
+                key: key.clone(),
+                len,
+                sha256,
+                kind: PackKind::Base,
+            });
+            local_packs.push((key, path));
+        }
+        if packs.is_empty() {
+            return Err(GitCacheError::Internal(format!(
+                "compaction repack for `{repo}` produced no pack files"
+            )));
+        }
+
+        let refs: BTreeMap<String, CommitSha> = self
+            .state
             .git
-            .bundle_create_all(&repo_dir, &bundle_path)
-            .await?;
+            .for_each_ref(&repo_dir, "refs")
+            .await?
+            .into_iter()
+            .collect();
+        let head_ref = self
+            .state
+            .git
+            .symbolic_ref_read(&repo_dir, "HEAD")
+            .await
+            .ok()
+            .filter(|target| refs.contains_key(target));
 
         let now = Utc::now();
-        let bundle_key = bundle_key(repo, new_generation);
-        let commits = commits_from_chain(chain.iter().rev());
         let generation_manifest = GenerationManifest {
             repo: repo.clone(),
             generation: new_generation,
-            bundle_key,
-            parent_generation: None,
             created_at: now,
-            commits: commits.clone(),
+            verified_at: Some(now),
+            packs: packs.clone(),
+            refs,
+            head_ref,
+            commits: old_commits.clone(),
         };
         let new_head = RepoGenerationHead {
             repo: repo.clone(),
@@ -1074,15 +897,26 @@ impl Materializer {
             tip_commits: head.tip_commits.clone(),
             updated_at: now,
         };
-        GenerationPublish::new(generation_manifest.clone())
-            .publish_pending_bundle_file(&*self.state.store, &bundle_path, new_head.clone(), None)
+        GenerationPublish::new(generation_manifest)
+            .publish_pack_files(&*self.state.store, &local_packs)
             .await?;
-        Box::pin(self.verify_generation_with_semaphore(repo.clone(), new_generation, false))
-            .await?;
+
+        if !self
+            .manifests()
+            .write_repo_head_if_version_matches(&new_head, Some(&head_version))
+            .await?
+        {
+            warn!(
+                %repo,
+                %new_generation,
+                "generation head changed during compaction; superseded generations left for the retention sweep"
+            );
+            return Ok(None);
+        }
 
         self.repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)
             .await?;
-        for commit in commits {
+        for commit in old_commits {
             let manifest = CommitManifest {
                 repo: repo.clone(),
                 commit,
@@ -1092,130 +926,47 @@ impl Materializer {
             };
             self.manifests().write_commit(&manifest).await?;
         }
-        self.manifests().write_repo_head(&new_head).await?;
-        let retained_generations = self
-            .old_generations_needed_by_pending_publishes(repo, &old_generation_set)
-            .await?;
-        let delete_generations = old_generations
-            .iter()
-            .copied()
-            .filter(|generation| !retained_generations.contains(generation))
-            .collect::<Vec<_>>();
-        let bytes_reclaimed = self
-            .bundle_bytes_for_generations(repo, &delete_generations)
-            .await?;
-        self.delete_old_generations(repo, &delete_generations)
-            .await?;
-
-        reservation.release().await?;
 
         Ok(Some(CompactionReport {
             repo: repo.clone(),
-            old_chain_depth: old_generations.len(),
+            old_pack_count: head_manifest.packs.len(),
             old_generations,
             new_generation,
-            bytes_reclaimed,
+            bytes_reclaimed: 0,
         }))
     }
 
-    pub(super) async fn generation_chain(
+    /// List the generation ids that currently have a manifest in the store.
+    pub(super) async fn list_generation_ids(
         &self,
         repo: &RepoKey,
-        generation: GenerationId,
-    ) -> CoreResult<Vec<GenerationManifest>> {
-        let mut chain = Vec::new();
-        let mut seen = HashSet::new();
-        let mut next = Some(generation);
-        while let Some(current) = next {
-            if !seen.insert(current) {
-                return Err(GitCacheError::Conflict(format!(
-                    "generation chain for `{repo}` contains a cycle at `{current}`"
-                )));
-            }
-            let manifest = self
-                .get_generation_manifest(repo, current)
-                .await?
-                .ok_or_else(|| {
-                    GitCacheError::NotFound(format!("generation manifest `{current}` not found"))
-                })?;
-            next = manifest.parent_generation;
-            chain.push(manifest);
-        }
-        Ok(chain)
-    }
-
-    pub(super) async fn old_generations_needed_by_pending_publishes(
-        &self,
-        repo: &RepoKey,
-        old_generations: &HashSet<GenerationId>,
-    ) -> CoreResult<HashSet<GenerationId>> {
+    ) -> CoreResult<Vec<GenerationId>> {
+        let prefix = generation_manifest_prefix(repo);
         let keys = self
             .state
             .store
-            .list_prefix(
-                &format!("{PENDING_GENERATION_PREFIX}{repo}/"),
-                Some(MAX_PENDING_GENERATION_SCAN_KEYS),
-            )
+            .list_prefix(&prefix, Some(MAX_GENERATION_MANIFEST_SCAN_KEYS))
             .await?;
-        if keys.len() >= MAX_PENDING_GENERATION_SCAN_KEYS {
+        if keys.len() >= MAX_GENERATION_MANIFEST_SCAN_KEYS {
             return Err(GitCacheError::Conflict(format!(
-                "too many pending generations for `{repo}` to compact safely"
+                "too many generation manifests for `{repo}` to compact safely"
             )));
         }
-
-        let mut needed = HashSet::new();
+        let mut generations = Vec::new();
         for key in keys {
-            let Some((pending_repo, generation)) = pending_generation_from_key(&key)? else {
+            let Some(rest) = key.strip_prefix(&prefix) else {
                 continue;
             };
-            if pending_repo != *repo {
-                continue;
-            }
-            let Some(pending) = self
-                .manifests()
-                .pending_generation(repo, generation)
-                .await?
-            else {
+            let Some(generation) = rest.strip_suffix("/manifest.json") else {
                 continue;
             };
-
-            let mut seen = HashSet::new();
-            let mut next = pending.generation.parent_generation;
-            while let Some(current) = next {
-                if !seen.insert(current) {
-                    return Err(GitCacheError::Conflict(format!(
-                        "pending generation chain for `{repo}` contains a cycle at `{current}`"
-                    )));
-                }
-                if old_generations.contains(&current) {
-                    needed.insert(current);
-                }
-                let Some(manifest) = self.get_generation_manifest(repo, current).await? else {
-                    if old_generations.contains(&current) {
-                        warn!(%repo, generation = %current, pending_generation = %generation, "pending generation references missing old generation manifest");
-                    }
-                    break;
-                };
-                next = manifest.parent_generation;
-            }
+            let Ok(uuid) = uuid::Uuid::parse_str(generation) else {
+                warn!(key, "skipping malformed generation manifest key");
+                continue;
+            };
+            generations.push(GenerationId(uuid));
         }
-
-        Ok(needed)
-    }
-
-    pub(super) async fn bundle_bytes_for_generations(
-        &self,
-        repo: &RepoKey,
-        generations: &[GenerationId],
-    ) -> CoreResult<u64> {
-        let mut total = 0_u64;
-        for generation in generations {
-            let key = bundle_key(repo, *generation);
-            if let Some(meta) = self.state.store.head(&key).await? {
-                total = total.saturating_add(meta.len);
-            }
-        }
-        Ok(total)
+        Ok(generations)
     }
 
     pub(super) async fn repoint_manifests_after_compaction(
@@ -1255,28 +1006,6 @@ impl Materializer {
             }
         }
 
-        Ok(())
-    }
-
-    pub(super) async fn delete_old_generations(
-        &self,
-        repo: &RepoKey,
-        generations: &[GenerationId],
-    ) -> CoreResult<()> {
-        for generation in generations {
-            self.state
-                .store
-                .delete(&bundle_key(repo, *generation))
-                .await?;
-            self.state
-                .store
-                .delete(&generation_manifest_key(repo, *generation))
-                .await?;
-            self.state
-                .store
-                .delete(&verified_generation_manifest_key(repo, *generation))
-                .await?;
-        }
         Ok(())
     }
 
@@ -1322,97 +1051,6 @@ pub fn default_manifest_key(repo: &RepoKey) -> String {
     format!("repos/{}/manifests/refs/default.json", repo.as_str())
 }
 
-pub fn bundle_key(repo: &RepoKey, generation: GenerationId) -> String {
-    format!(
-        "repos/{}/generations/{}/base.bundle",
-        repo.as_str(),
-        generation
-    )
-}
-
-pub(super) fn pending_generation_from_key(
-    key: &str,
-) -> CoreResult<Option<(RepoKey, GenerationId)>> {
-    let Some(rest) = key.strip_prefix(PENDING_GENERATION_PREFIX) else {
-        return Ok(None);
-    };
-    let Some((repo_part, generation_file)) = rest.rsplit_once('/') else {
-        return Ok(None);
-    };
-    let Some(generation) = generation_file.strip_suffix(".json") else {
-        return Ok(None);
-    };
-    let repo = RepoKey::parse(repo_part)?;
-    let generation = GenerationId(uuid::Uuid::parse_str(generation).map_err(|err| {
-        GitCacheError::Validation(format!(
-            "invalid pending generation id `{generation}`: {err}"
-        ))
-    })?);
-    Ok(Some((repo, generation)))
-}
-
-pub(super) fn verified_generation_manifest(
-    generation: &GenerationManifest,
-    bundle_len: u64,
-    bundle_sha256: String,
-    verified_at: chrono::DateTime<Utc>,
-    tip_commits: Vec<CommitSha>,
-) -> VerifiedGenerationManifest {
-    VerifiedGenerationManifest {
-        schema_version: VERIFIED_GENERATION_SCHEMA_VERSION,
-        repo: generation.repo.clone(),
-        generation: generation.generation,
-        bundle_key: generation.bundle_key.clone(),
-        bundle_len,
-        bundle_sha256,
-        parent_generation: generation.parent_generation,
-        created_at: generation.created_at,
-        verified_at,
-        verifier_version: VERIFIED_GENERATION_VERIFIER_VERSION,
-        git_version: "unknown".to_string(),
-        fsck_mode: VERIFIED_GENERATION_FSCK_MODE.to_string(),
-        commits: generation.commits.clone(),
-        tip_commits,
-    }
-}
-
-pub(super) fn validate_verified_generation(
-    generation: &GenerationManifest,
-    verification: &VerifiedGenerationManifest,
-    object_len: u64,
-) -> CoreResult<()> {
-    if verification.schema_version != VERIFIED_GENERATION_SCHEMA_VERSION {
-        return Err(GitCacheError::Validation(format!(
-            "verified generation `{}` has unsupported schema version {}",
-            generation.generation, verification.schema_version
-        )));
-    }
-    if verification.repo != generation.repo
-        || verification.generation != generation.generation
-        || verification.bundle_key != generation.bundle_key
-        || verification.parent_generation != generation.parent_generation
-    {
-        return Err(GitCacheError::Validation(format!(
-            "verified generation manifest does not match generation `{}`",
-            generation.generation
-        )));
-    }
-    if verification.bundle_len == 0 {
-        return Err(GitCacheError::Validation(format!(
-            "verified generation `{}` has empty bundle",
-            generation.generation
-        )));
-    }
-    if object_len != verification.bundle_len {
-        return Err(GitCacheError::Validation(format!(
-            "bundle `{}` length mismatch: expected {}, got {}",
-            generation.bundle_key, verification.bundle_len, object_len
-        )));
-    }
-    validate_sha256_hex(&verification.bundle_sha256)?;
-    Ok(())
-}
-
 pub(super) async fn file_len_and_sha256(path: &FsPath) -> CoreResult<(u64, String)> {
     let mut file = fs::File::open(path).await?;
     let mut hasher = Sha256::new();
@@ -1431,29 +1069,8 @@ pub(super) async fn file_len_and_sha256(path: &FsPath) -> CoreResult<(u64, Strin
     Ok((len, hex_lower(&hasher.finalize())))
 }
 
-pub(super) fn validate_sha256_hex(value: &str) -> CoreResult<()> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(GitCacheError::Validation(format!(
-            "invalid sha256 digest `{value}`"
-        )));
-    }
-    Ok(())
-}
-
 pub(super) fn push_unique_commit(commits: &mut Vec<CommitSha>, commit: CommitSha) {
     if !commits.iter().any(|existing| existing == &commit) {
         commits.push(commit);
     }
-}
-
-pub(super) fn commits_from_chain<'a>(
-    chain: impl IntoIterator<Item = &'a GenerationManifest>,
-) -> Vec<CommitSha> {
-    let mut commits = Vec::new();
-    for manifest in chain {
-        for commit in &manifest.commits {
-            push_unique_commit(&mut commits, commit.clone());
-        }
-    }
-    commits
 }

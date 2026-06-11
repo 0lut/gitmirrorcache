@@ -10,7 +10,13 @@ impl Materializer {
     pub async fn ensure_repo_dir(&self, repo: &RepoKey) -> CoreResult<PathBuf> {
         let repo_dir = self.repo_dir(repo);
         if !repo_dir.join("config").exists() {
-            self.reset_invalid_repo_cache(repo).await?;
+            // Only a leftover partial directory needs invalidation; a wholly
+            // absent repo dir must not go through invalidate_repo, which
+            // conflicts with a repo lock the caller may already hold (e.g.
+            // compaction on a cold cache).
+            if repo_dir.exists() {
+                self.reset_invalid_repo_cache(repo).await?;
+            }
             if let Some(parent) = repo_dir.parent() {
                 fs::create_dir_all(parent).await?;
             }
@@ -66,6 +72,52 @@ impl Materializer {
     ) -> bool {
         self.commit_exists(repo_dir, commit).await
             && self.commit_tree_exists(repo_dir, commit).await
+    }
+
+    pub(super) async fn commit_exists_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> bool {
+        self.state
+            .git
+            .run_no_lazy(
+                Some(repo_dir),
+                ["cat-file", "-e", &format!("{}^{{commit}}", commit.as_str())],
+            )
+            .await
+            .is_ok()
+    }
+
+    /// Whether every want's own snapshot (commit + full tree + blobs) is
+    /// locally complete, i.e. a `--depth 1` pack for these tips can be
+    /// served without contacting upstream even from a partially hydrated
+    /// (blobless-marked) repo.
+    pub(super) async fn depth1_snapshots_complete_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        wants: &[CommitSha],
+    ) -> CoreResult<bool> {
+        for want in wants {
+            if !self
+                .state
+                .git
+                .commit_snapshot_complete_no_lazy(repo_dir, want)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) async fn commit_ready_for_serving_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> bool {
+        self.commit_exists_no_lazy(repo_dir, commit).await
+            && self.commit_tree_exists_no_lazy(repo_dir, commit).await
     }
 
     #[cfg(test)]
@@ -359,11 +411,7 @@ impl Materializer {
     }
 
     pub(super) async fn touch_repo_access(&self, repo: &RepoKey) -> CoreResult<()> {
-        self.state
-            .disk
-            .touch_repo_access(self.repo_disk_path(repo))
-            .await?;
-        Ok(())
+        self.state.disk.note_repo_access(self.repo_disk_path(repo))
     }
 
     pub(super) async fn lock_repo(&self, repo: &RepoKey) -> CoreResult<RepoLock> {

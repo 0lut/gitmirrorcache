@@ -129,6 +129,14 @@ if [[ "$ECS_SHARED_ALB" == "true" ]]; then
   ECS_ALB_RULE_REWRITE_REGEX="${ECS_ALB_RULE_REWRITE_REGEX:-^$ECS_PUBLIC_PATH_PREFIX(/.*)$}"
 fi
 
+# Single source of truth shared with OBJECT_STORE_SCHEMA_SUFFIX in
+# crates/git-cache-domain/src/state.rs (via include_str!).
+OBJECT_STORE_SCHEMA_SUFFIX="$(tr -d '[:space:]' < "$REPO_ROOT/crates/git-cache-domain/object-store-schema-suffix")"
+if [[ -z "$OBJECT_STORE_SCHEMA_SUFFIX" ]]; then
+  echo "object-store-schema-suffix file is empty" >&2
+  exit 1
+fi
+
 runtime_s3_prefix() {
   local prefix="$1"
   while [[ "$prefix" == /* ]]; do
@@ -138,16 +146,16 @@ runtime_s3_prefix() {
     prefix="${prefix%/}"
   done
   if [[ -z "$prefix" ]]; then
-    printf 'v2\n'
+    printf '%s\n' "$OBJECT_STORE_SCHEMA_SUFFIX"
     return
   fi
   local component="${prefix##*/}"
-  if [[ "$component" == "v2" || "$component" == *-v2 ]]; then
+  if [[ "$component" == "$OBJECT_STORE_SCHEMA_SUFFIX" || "$component" == *-"$OBJECT_STORE_SCHEMA_SUFFIX" ]]; then
     printf '%s\n' "$prefix"
   elif [[ "$prefix" == */* ]]; then
-    printf '%s/%s-v2\n' "${prefix%/*}" "$component"
+    printf '%s/%s-%s\n' "${prefix%/*}" "$component" "$OBJECT_STORE_SCHEMA_SUFFIX"
   else
-    printf '%s-v2\n' "$prefix"
+    printf '%s-%s\n' "$prefix" "$OBJECT_STORE_SCHEMA_SUFFIX"
   fi
 }
 
@@ -988,8 +996,6 @@ env = [
     {"name": "GIT_CACHE_DISK_QUOTA_BYTES", "value": os.environ["GIT_CACHE_DISK_QUOTA_BYTES"]},
     {"name": "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "value": os.environ.get("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "10")},
     {"name": "GIT_CACHE_COMPACTION_INLINE", "value": os.environ.get("GIT_CACHE_COMPACTION_INLINE", "false")},
-    {"name": "GIT_CACHE_GIT_REMOTE_ENABLED", "value": os.environ.get("GIT_REMOTE_ENABLED", "true")},
-    {"name": "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "value": os.environ.get("GIT_REMOTE_COMMIT_READ_THROUGH", "true")},
     {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
     {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
     {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
@@ -1084,8 +1090,6 @@ env = [
     {"name": "GIT_CACHE_DISK_QUOTA_BYTES", "value": os.environ["GIT_CACHE_DISK_QUOTA_BYTES"]},
     {"name": "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "value": os.environ.get("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "10")},
     {"name": "GIT_CACHE_COMPACTION_INLINE", "value": os.environ.get("GIT_CACHE_COMPACTION_INLINE", "false")},
-    {"name": "GIT_CACHE_GIT_REMOTE_ENABLED", "value": os.environ.get("GIT_REMOTE_ENABLED", "true")},
-    {"name": "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "value": os.environ.get("GIT_REMOTE_COMMIT_READ_THROUGH", "true")},
     {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
     {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
     {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},

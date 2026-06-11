@@ -63,31 +63,19 @@ impl<'a> ManifestStore<'a> {
         read_repo_generation_head(&*self.state.store, repo).await
     }
 
-    pub(super) async fn write_repo_head(&self, head: &RepoGenerationHead) -> CoreResult<()> {
-        write_repo_generation_head(&*self.state.store, head).await
-    }
-
-    pub(super) async fn pending_generation(
+    pub(super) async fn repo_head_versioned(
         &self,
         repo: &RepoKey,
-        generation: GenerationId,
-    ) -> CoreResult<Option<git_cache_objectstore::PendingGenerationPublish>> {
-        read_pending_generation_publish(&*self.state.store, repo, generation).await
+    ) -> CoreResult<Option<(RepoGenerationHead, ObjectVersion)>> {
+        read_repo_generation_head_versioned(&*self.state.store, repo).await
     }
 
-    pub(super) async fn verified_generation(
+    pub(super) async fn write_repo_head_if_version_matches(
         &self,
-        repo: &RepoKey,
-        generation: GenerationId,
-    ) -> CoreResult<Option<VerifiedGenerationManifest>> {
-        read_verified_generation_manifest(&*self.state.store, repo, generation).await
-    }
-
-    pub(super) async fn write_verified_if_absent_or_matches(
-        &self,
-        manifest: &VerifiedGenerationManifest,
+        head: &RepoGenerationHead,
+        version: Option<&ObjectVersion>,
     ) -> CoreResult<bool> {
-        write_verified_generation_manifest_if_absent_or_matches(&*self.state.store, manifest).await
+        write_repo_generation_head_if_version_matches(&*self.state.store, head, version).await
     }
 }
 

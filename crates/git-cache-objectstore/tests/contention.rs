@@ -5,12 +5,11 @@
 
 mod tests {
     use bytes::Bytes;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use chrono::Utc;
     use futures::future::join_all;
     use git_cache_core::{GenerationId, GenerationManifest, RepoKey};
     use git_cache_objectstore::{
-        acquire_lease, write_generation_manifest_if_absent_or_matches, LocalObjectStore,
-        ObjectStore,
+        write_generation_manifest_if_absent_or_matches, LocalObjectStore, ObjectStore,
     };
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -253,8 +252,10 @@ mod tests {
         let manifest = GenerationManifest {
             repo: repo.clone(),
             generation: gen_id,
-            bundle_key: format!("repos/{repo}/generations/{gen_id}/base.bundle"),
-            parent_generation: None,
+            verified_at: None,
+            packs: Vec::new(),
+            refs: Default::default(),
+            head_ref: None,
             created_at: Utc::now(),
             commits: vec![commit_sha('a')],
         };
@@ -282,49 +283,5 @@ mod tests {
 
         assert_eq!(first_writes.len(), 1, "exactly one first-write");
         assert_eq!(idempotent.len(), 9, "remaining should be idempotent");
-    }
-
-    // ── 7. Lease acquisition contention ──────────────────────────────────────
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn lease_acquisition_contention_exactly_one_acquires() {
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(make_store(&tmp));
-        let barrier = Arc::new(Barrier::new(20));
-
-        let handles: Vec<_> = (0..20)
-            .map(|i| {
-                let s = Arc::clone(&store);
-                let bar = Arc::clone(&barrier);
-                tokio::spawn(async move {
-                    bar.wait().await;
-                    acquire_lease(
-                        &*s,
-                        &repo(),
-                        "update",
-                        format!("holder-{i}"),
-                        Utc::now(),
-                        ChronoDuration::minutes(5),
-                    )
-                    .await
-                })
-            })
-            .collect();
-
-        let results: Vec<_> = join_all(handles)
-            .await
-            .into_iter()
-            .map(|r| r.unwrap().unwrap())
-            .collect();
-
-        let acquired: Vec<_> = results.iter().filter(|r| r.is_some()).collect();
-        assert_eq!(
-            acquired.len(),
-            1,
-            "exactly one task should acquire the lease"
-        );
-
-        let not_acquired: Vec<_> = results.iter().filter(|r| r.is_none()).collect();
-        assert_eq!(not_acquired.len(), 19);
     }
 }
