@@ -187,9 +187,11 @@ ALB with `scripts/aws/deploy-preview.sh`. See
 
 ### Docker
 
-A multi-stage [`Dockerfile`](Dockerfile) builds the server and CLI; configure
-it with the environment variables above. For local S3 testing there is a MinIO
-compose file:
+Prebuilt multi-arch images are published to `ghcr.io/0lut/gitmirrorcache` on
+`v*` release tags (pin a version like `v1.2.3`, or `latest` for the most
+recent release). A multi-stage [`Dockerfile`](Dockerfile) builds the server
+and CLI from source; configure either with the environment variables above.
+For local S3 testing there is a MinIO compose file:
 
 ```sh
 docker compose -f docker-compose.minio.yml up -d
