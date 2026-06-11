@@ -160,22 +160,34 @@ from the file.
 ### Helm (Kubernetes)
 
 The project ships as a Helm chart that lives in this repository at
-[`deploy/helm/gitmirrorcache`](deploy/helm/gitmirrorcache) (it is not
-published to a chart registry yet, so install it from a checkout). It runs the
-server as a StatefulSet with a persistent volume for the hot cache and an
+[`deploy/helm/gitmirrorcache`](deploy/helm/gitmirrorcache). Release charts are
+published to GHCR as OCI artifacts alongside the container image. The chart runs
+the server as a StatefulSet with a persistent volume for the hot cache and an
 hourly CronJob for compaction:
 
+Helm install commands take both a release name and a chart reference. From the
+repository root, use the chart directory as the chart reference:
+
 ```sh
-git clone https://github.com/0lut/gitmirrorcache.git
-helm install git-cache gitmirrorcache/deploy/helm/gitmirrorcache \
+helm install git-cache deploy/helm/gitmirrorcache \
   --set config.objectStore.s3.bucket=my-git-cache-bucket
 ```
 
 The AWS region is picked up from the environment (IRSA injects `AWS_REGION`
 automatically on EKS); set `aws.region` only when nothing else provides one.
 
-See the [chart README](deploy/helm/gitmirrorcache/README.md) for credentials,
-sizing, and scaling guidance.
+For a published chart, set `CHART_REF` to the OCI chart reference and
+`CHART_VERSION` to the release version:
+
+```sh
+helm install git-cache "${CHART_REF}" \
+  --version "${CHART_VERSION}" \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket
+```
+
+For release tag `vX.Y.Z`, use chart version `X.Y.Z`. See the
+[chart README](deploy/helm/gitmirrorcache/README.md) for credentials, local
+checkout installs, sizing, and scaling guidance.
 
 ### AWS (ECS on EC2)
 
