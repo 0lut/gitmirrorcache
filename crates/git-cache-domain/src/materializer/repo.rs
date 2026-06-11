@@ -10,7 +10,13 @@ impl Materializer {
     pub async fn ensure_repo_dir(&self, repo: &RepoKey) -> CoreResult<PathBuf> {
         let repo_dir = self.repo_dir(repo);
         if !repo_dir.join("config").exists() {
-            self.reset_invalid_repo_cache(repo).await?;
+            // Only a leftover partial directory needs invalidation; a wholly
+            // absent repo dir must not go through invalidate_repo, which
+            // conflicts with a repo lock the caller may already hold (e.g.
+            // compaction on a cold cache).
+            if repo_dir.exists() {
+                self.reset_invalid_repo_cache(repo).await?;
+            }
             if let Some(parent) = repo_dir.parent() {
                 fs::create_dir_all(parent).await?;
             }

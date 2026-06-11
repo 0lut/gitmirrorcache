@@ -700,6 +700,15 @@ impl Materializer {
             }
         }
 
+        // Commit/ref manifests may still reference a generation being swept
+        // (publish never rewrites an existing commit manifest). Repoint them
+        // to the head generation before its predecessors' manifests are
+        // deleted, so cold-cache hydration never chases a swept generation.
+        if !swept.is_empty() {
+            self.repoint_manifests_after_compaction(repo, &swept, head.generation)
+                .await?;
+        }
+
         let kept_packs: HashSet<&str> = manifests
             .iter()
             .filter(|manifest| !swept.contains(&manifest.generation))
