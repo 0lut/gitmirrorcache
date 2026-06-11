@@ -28,6 +28,8 @@ mod tests {
     use aws_sdk_s3::Client;
     #[cfg(feature = "s3")]
     use aws_types::region::Region;
+    #[cfg(feature = "s3")]
+    use git_cache_core::GitCacheError;
 
     fn temp_root() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -726,20 +728,17 @@ mod tests {
 
     #[cfg(feature = "s3")]
     impl MinioFixture {
-        async fn new(label: &str) -> Option<Self> {
+        fn client() -> Option<Client> {
             if std::env::var("GIT_CACHE_S3_INTEGRATION").ok().as_deref() != Some("1") {
                 return None;
             }
 
             let endpoint = std::env::var("GIT_CACHE_S3_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:9000".into());
-            let bucket = std::env::var("GIT_CACHE_S3_BUCKET")
-                .unwrap_or_else(|_| "gitmirrorcache-test".into());
             let access_key =
                 std::env::var("GIT_CACHE_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
             let secret_key =
                 std::env::var("GIT_CACHE_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
-            let prefix = format!("tests/{label}/{}", uuid::Uuid::now_v7());
             let config = aws_sdk_s3::Config::builder()
                 .behavior_version(BehaviorVersion::latest())
                 .region(Region::new("us-east-1"))
@@ -754,11 +753,45 @@ mod tests {
                     "minio-integration",
                 ))
                 .build();
-            let client = Client::from_conf(config);
+            Some(Client::from_conf(config))
+        }
+
+        async fn new(label: &str) -> Option<Self> {
+            let client = Self::client()?;
+            let bucket = std::env::var("GIT_CACHE_S3_BUCKET")
+                .unwrap_or_else(|_| "gitmirrorcache-test".into());
+            let prefix = format!("tests/{label}/{}", uuid::Uuid::now_v7());
             client.create_bucket().bucket(&bucket).send().await.ok();
             let store = S3ObjectStore::new(client, bucket, &prefix).unwrap();
             Some(Self { store, prefix })
         }
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn minio_verify_bucket_access_round_trips() {
+        let Some(client) = MinioFixture::client() else {
+            eprintln!(
+                "skipping minio_verify_bucket_access_round_trips: set GIT_CACHE_S3_INTEGRATION=1"
+            );
+            return;
+        };
+
+        let missing_bucket = format!("gitmirrorcache-missing-{}", uuid::Uuid::now_v7());
+        let store = S3ObjectStore::new(client, &missing_bucket, "tests").unwrap();
+        let err = store.verify_bucket_access().await.unwrap_err();
+        assert!(
+            matches!(err, GitCacheError::Validation(_)),
+            "expected Validation error for missing bucket, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&missing_bucket) && message.contains("does not exist"),
+            "error should name the missing bucket: {message}"
+        );
+
+        let fixture = MinioFixture::new("verify-bucket").await.unwrap();
+        fixture.store.verify_bucket_access().await.unwrap();
     }
 
     #[cfg(feature = "s3")]
@@ -989,6 +1022,33 @@ mod tests {
             let store = crate::GcsObjectStore::new(client, bucket, prefix).unwrap();
             Some(Self { store })
         }
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    async fn fake_gcs_verify_bucket_access_round_trips() {
+        let Some(fixture) = FakeGcsFixture::new("verify-bucket").await else {
+            eprintln!(
+                "skipping fake_gcs_verify_bucket_access_round_trips: set GIT_CACHE_GCS_INTEGRATION=1"
+            );
+            return;
+        };
+        fixture.store.verify_bucket_access().await.unwrap();
+
+        let missing_bucket = format!("gitmirrorcache-missing-{}", uuid::Uuid::now_v7());
+        let store =
+            crate::GcsObjectStore::new(fixture.store.client().clone(), &missing_bucket, "tests")
+                .unwrap();
+        let err = store.verify_bucket_access().await.unwrap_err();
+        assert!(
+            matches!(err, git_cache_core::GitCacheError::Validation(_)),
+            "expected Validation error for missing bucket, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&missing_bucket) && message.contains("does not exist"),
+            "error should name the missing bucket: {message}"
+        );
     }
 
     #[cfg(feature = "gcs")]

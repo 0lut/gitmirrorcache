@@ -1,10 +1,13 @@
 # gitmirrorcache
 
+[![Latest release](https://img.shields.io/github/v/tag/0lut/gitmirrorcache?sort=semver&label=release)](https://github.com/0lut/gitmirrorcache/tags)
+[![Container image](https://img.shields.io/badge/ghcr.io-0lut%2Fgitmirrorcache-blue?logo=docker)](https://github.com/0lut/gitmirrorcache/pkgs/container/gitmirrorcache)
+
 A read-only Git fetch cache that sits between clone-heavy automation — CI
-runners, coding agents, sandboxes, build farms — and your Git upstreams
-(GitHub, GitLab, Bitbucket, or any Smart HTTP Git server). Instead of
-hammering the upstream with thousands of identical clones, clients fetch from
-the cache: an S3-compatible object store is the durable source of truth, and
+runners, coding agents, sandboxes, build farms — and allowlisted HTTPS
+upstreams addressable as `host/owner/repo` (GitHub-style remotes, including
+top-level GitLab and Bitbucket repos). Instead of hammering the upstream with
+thousands of identical clones, clients fetch from the cache: an S3-compatible object store is the durable source of truth, and
 local disk is just a disposable hot layer that can be rebuilt at any time. The
 result is faster clones, fewer upstream rate-limit headaches, and a cache you
 can throw away without losing anything.
@@ -19,7 +22,9 @@ It exposes two interfaces:
 
 On a cold miss, the server proxies upstream's response straight to the client
 (so first-clone latency stays close to a direct clone) while warming the cache
-in the background. Everything after that is served locally.
+in the background. Once the cache is warm, pack data is served from the local
+bare repo; ref advertisements and branch/default-branch selectors still verify
+refs against upstream so clients never see stale tips.
 
 ## Quick Start
 
@@ -171,9 +176,11 @@ hourly CronJob for compaction:
 ```sh
 git clone https://github.com/0lut/gitmirrorcache.git
 helm install git-cache gitmirrorcache/deploy/helm/gitmirrorcache \
-  --set config.objectStore.s3.bucket=my-git-cache-bucket \
-  --set aws.region=us-west-2
+  --set config.objectStore.s3.bucket=my-git-cache-bucket
 ```
+
+The AWS region is picked up from the environment (IRSA injects `AWS_REGION`
+automatically on EKS); set `aws.region` only when nothing else provides one.
 
 See the [chart README](deploy/helm/gitmirrorcache/README.md) for credentials,
 sizing, and scaling guidance.
@@ -195,9 +202,18 @@ ALB with `scripts/aws/deploy-preview.sh`. See
 
 ### Docker
 
-A multi-stage [`Dockerfile`](Dockerfile) builds the server and CLI; configure
-it with the environment variables above. For local S3 testing there is a MinIO
-compose file:
+Prebuilt multi-arch images are published to `ghcr.io/0lut/gitmirrorcache` on
+`v*` release tags — the badge at the top of this README always shows the
+newest release:
+
+```sh
+docker pull ghcr.io/0lut/gitmirrorcache:latest   # most recent release
+docker pull ghcr.io/0lut/gitmirrorcache:1.2.3    # pin an exact version
+```
+
+A multi-stage [`Dockerfile`](Dockerfile) builds the server and CLI from
+source; configure either with the environment variables above. For local S3
+testing there is a MinIO compose file:
 
 ```sh
 docker compose -f docker-compose.minio.yml up -d

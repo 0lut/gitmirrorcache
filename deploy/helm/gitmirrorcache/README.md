@@ -12,9 +12,14 @@ compaction rule from the AWS deployment.
 
 ```sh
 helm install git-cache deploy/helm/gitmirrorcache \
-  --set config.objectStore.s3.bucket=my-git-cache-bucket \
-  --set aws.region=us-west-2
+  --set config.objectStore.s3.bucket=my-git-cache-bucket
 ```
+
+The server resolves the S3 region from `GIT_CACHE_S3_REGION`, `AWS_REGION`,
+`AWS_DEFAULT_REGION`, or the AWS SDK default chain. On EKS with IRSA,
+`AWS_REGION` is injected into the pod automatically, so no region value is
+needed. Set `aws.region` (rendered as `AWS_REGION`) only when nothing else
+provides one — e.g. static credentials on a non-AWS cluster.
 
 ## S3 credentials
 

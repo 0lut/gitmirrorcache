@@ -4,6 +4,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use gcloud_storage::client::Client;
+use gcloud_storage::http::buckets::get::GetBucketRequest;
 use gcloud_storage::http::objects::delete::DeleteObjectRequest;
 use gcloud_storage::http::objects::download::Range;
 use gcloud_storage::http::objects::get::GetObjectRequest;
@@ -53,6 +54,31 @@ impl GcsObjectStore {
             bucket,
             prefix,
         })
+    }
+
+    /// Startup probe: confirms the configured bucket exists and is reachable
+    /// with the current credentials, so misconfiguration fails fast with a
+    /// clear error instead of surfacing as a not-found error on the first
+    /// cache operation.
+    pub async fn verify_bucket_access(&self) -> Result<()> {
+        match self
+            .client
+            .get_bucket(&GetBucketRequest {
+                bucket: self.bucket.clone(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Err(GitCacheError::Validation(format!(
+                "gcs bucket `{}` does not exist; create it (the server never creates buckets) or fix GIT_CACHE_GCS_BUCKET",
+                self.bucket
+            ))),
+            Err(err) => Err(GitCacheError::UpstreamUnavailable(format!(
+                "gcs bucket `{}` is not accessible with the current credentials/endpoint: {err:?}",
+                self.bucket
+            ))),
+        }
     }
 
     pub fn client(&self) -> &Client {
