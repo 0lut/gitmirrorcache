@@ -1,6 +1,14 @@
+#[cfg(all(feature = "s3", feature = "gcs"))]
+compile_error!(
+    "features `s3` and `gcs` are mutually exclusive: a deployment uses exactly one \
+     durable object-store backend"
+);
+
 mod local;
 mod manifests;
 
+#[cfg(feature = "gcs")]
+mod gcs;
 #[cfg(feature = "s3")]
 mod s3;
 
@@ -22,6 +30,8 @@ pub use manifests::{
     PublishManifests,
 };
 
+#[cfg(feature = "gcs")]
+pub use gcs::GcsObjectStore;
 #[cfg(feature = "s3")]
 pub use s3::S3ObjectStore;
 
@@ -37,7 +47,7 @@ impl ObjectVersion {
         Self(token.into())
     }
 
-    #[cfg(feature = "s3")]
+    #[cfg(any(feature = "s3", feature = "gcs"))]
     pub(crate) fn token(&self) -> &str {
         &self.0
     }

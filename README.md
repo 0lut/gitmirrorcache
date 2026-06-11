@@ -106,7 +106,7 @@ from the file.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `GIT_CACHE_OBJECT_STORE_KIND` | `local` | `local` (filesystem) or `s3`. S3 requires building with the `s3` feature. |
+| `GIT_CACHE_OBJECT_STORE_KIND` | `local` | `local` (filesystem), `s3`, or `gcs`. S3 requires building with the `s3` feature, GCS the `gcs` feature. |
 | `GIT_CACHE_OBJECT_STORE_ROOT` | `./tmp/object-store` | Root directory for the `local` object store. |
 | `GIT_CACHE_S3_BUCKET` | – | S3 bucket name. Required when kind is `s3`. |
 | `GIT_CACHE_S3_PREFIX` | `repos` | Key prefix inside the bucket. A schema-version suffix is appended automatically (e.g. `repos` stores under `repos-v3`). |
@@ -114,6 +114,14 @@ from the file.
 | `GIT_CACHE_S3_REGION` | falls back to `AWS_REGION` / `AWS_DEFAULT_REGION` | AWS region for the bucket. |
 | `GIT_CACHE_S3_ACCESS_KEY` / `GIT_CACHE_S3_SECRET_KEY` | – | Static S3 credentials. If unset, the standard AWS credential chain is used (env vars, profiles, IAM roles, workload identity). |
 | `GIT_CACHE_S3_SESSION_TOKEN` | falls back to `AWS_SESSION_TOKEN` | Session token for temporary credentials. |
+| `GIT_CACHE_GCS_BUCKET` | – | GCS bucket name. Required when kind is `gcs`. |
+| `GIT_CACHE_GCS_PREFIX` | `repos` | Key prefix inside the bucket. A schema-version suffix is appended automatically. |
+| `GIT_CACHE_GCS_ENDPOINT` | – | Custom GCS endpoint for emulators such as fake-gcs-server. |
+| `GIT_CACHE_GCS_ANONYMOUS` | `false` | Skip credential resolution (for emulators). Otherwise Application Default Credentials are used (`GOOGLE_APPLICATION_CREDENTIALS` or the GCE metadata server). |
+
+A deployment uses exactly one durable backend: the `s3` and `gcs` features are
+mutually exclusive (enforced at compile time), and configuration rejects mixed
+`GIT_CACHE_S3_*` / `GIT_CACHE_GCS_*` bucket settings at startup.
 
 ### Git remote
 

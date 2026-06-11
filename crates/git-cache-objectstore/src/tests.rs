@@ -981,4 +981,227 @@ mod tests {
 
         let _ = fs::remove_dir_all(root).await;
     }
+
+    #[cfg(feature = "gcs")]
+    struct FakeGcsFixture {
+        store: crate::GcsObjectStore,
+    }
+
+    #[cfg(feature = "gcs")]
+    impl FakeGcsFixture {
+        async fn new(label: &str) -> Option<Self> {
+            use gcloud_storage::client::{Client as GcsClient, ClientConfig as GcsClientConfig};
+            use gcloud_storage::http::buckets::insert::{
+                BucketCreationConfig, InsertBucketParam, InsertBucketRequest,
+            };
+
+            if std::env::var("GIT_CACHE_GCS_INTEGRATION").ok().as_deref() != Some("1") {
+                return None;
+            }
+
+            let endpoint = std::env::var("GIT_CACHE_GCS_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:4443".into());
+            let bucket = std::env::var("GIT_CACHE_GCS_BUCKET")
+                .unwrap_or_else(|_| "gitmirrorcache-test".into());
+            let prefix = format!("tests/{label}/{}", uuid::Uuid::now_v7());
+
+            let mut config = GcsClientConfig::default().anonymous();
+            config.storage_endpoint = endpoint;
+            let client = GcsClient::new(config);
+            client
+                .insert_bucket(&InsertBucketRequest {
+                    name: bucket.clone(),
+                    param: InsertBucketParam {
+                        project: "test-project".to_string(),
+                        ..Default::default()
+                    },
+                    bucket: BucketCreationConfig::default(),
+                })
+                .await
+                .ok();
+            let store = crate::GcsObjectStore::new(client, bucket, prefix).unwrap();
+            Some(Self { store })
+        }
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    async fn fake_gcs_verify_bucket_access_round_trips() {
+        let Some(fixture) = FakeGcsFixture::new("verify-bucket").await else {
+            eprintln!(
+                "skipping fake_gcs_verify_bucket_access_round_trips: set GIT_CACHE_GCS_INTEGRATION=1"
+            );
+            return;
+        };
+        fixture.store.verify_bucket_access().await.unwrap();
+
+        let missing_bucket = format!("gitmirrorcache-missing-{}", uuid::Uuid::now_v7());
+        let store =
+            crate::GcsObjectStore::new(fixture.store.client().clone(), &missing_bucket, "tests")
+                .unwrap();
+        let err = store.verify_bucket_access().await.unwrap_err();
+        assert!(
+            matches!(err, git_cache_core::GitCacheError::Validation(_)),
+            "expected Validation error for missing bucket, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&missing_bucket) && message.contains("does not exist"),
+            "error should name the missing bucket: {message}"
+        );
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    async fn fake_gcs_store_round_trips_objects_and_metadata() {
+        let Some(fixture) = FakeGcsFixture::new("round-trip").await else {
+            eprintln!(
+                "skipping fake_gcs_store_round_trips_objects_and_metadata: set GIT_CACHE_GCS_INTEGRATION=1"
+            );
+            return;
+        };
+        let store = fixture.store;
+
+        let key = "objects/round-trip/blob.bin";
+        store
+            .put(key, Bytes::from_static(b"hello-gcs"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"hello-gcs")
+        );
+
+        let meta = store.head(key).await.unwrap().unwrap();
+        assert_eq!(meta.key, key);
+        assert_eq!(meta.len, b"hello-gcs".len() as u64);
+        assert!(store.exists(key).await.unwrap());
+
+        store.delete(key).await.unwrap();
+        assert!(store.get(key).await.unwrap().is_none());
+        store.delete(key).await.unwrap();
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    async fn fake_gcs_put_if_absent_preserves_first_writer() {
+        let Some(fixture) = FakeGcsFixture::new("conditional").await else {
+            eprintln!(
+                "skipping fake_gcs_put_if_absent_preserves_first_writer: set GIT_CACHE_GCS_INTEGRATION=1"
+            );
+            return;
+        };
+        let store = fixture.store;
+
+        assert!(store.get("conditional/item.json").await.unwrap().is_none());
+        assert!(store
+            .put_if_absent("conditional/item.json", Bytes::from_static(b"first"))
+            .await
+            .unwrap());
+        assert!(!store
+            .put_if_absent("conditional/item.json", Bytes::from_static(b"second"))
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get("conditional/item.json").await.unwrap().unwrap(),
+            Bytes::from_static(b"first")
+        );
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    async fn fake_gcs_put_if_version_matches_detects_concurrent_update() {
+        let Some(fixture) = FakeGcsFixture::new("cas").await else {
+            eprintln!(
+                "skipping fake_gcs_put_if_version_matches_detects_concurrent_update: set GIT_CACHE_GCS_INTEGRATION=1"
+            );
+            return;
+        };
+        let store = fixture.store;
+
+        let key = "cas/item.json";
+        store.put(key, Bytes::from_static(b"v1")).await.unwrap();
+        let (value, version) = store.get_versioned(key).await.unwrap().unwrap();
+        assert_eq!(value, Bytes::from_static(b"v1"));
+
+        assert!(store
+            .put_if_version_matches(key, Bytes::from_static(b"v2"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"v2")
+        );
+
+        // The token from v1 is now stale; the swap must be refused.
+        assert!(!store
+            .put_if_version_matches(key, Bytes::from_static(b"v3"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"v2")
+        );
+
+        store.delete(key).await.unwrap();
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    async fn fake_gcs_list_prefix_honors_max_keys_and_strips_prefix() {
+        let Some(fixture) = FakeGcsFixture::new("listing").await else {
+            eprintln!(
+                "skipping fake_gcs_list_prefix_honors_max_keys_and_strips_prefix: set GIT_CACHE_GCS_INTEGRATION=1"
+            );
+            return;
+        };
+        let store = fixture.store;
+
+        for index in 0..5 {
+            store
+                .put(
+                    &format!("listing/item-{index}.json"),
+                    Bytes::from_static(b"{}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let all = store.list_prefix("listing/", None).await.unwrap();
+        assert_eq!(all.len(), 5);
+        assert!(all.iter().all(|key| key.starts_with("listing/item-")));
+
+        let limited = store.list_prefix("listing/", Some(2)).await.unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
+    async fn fake_gcs_file_round_trip_streams_through_disk() {
+        let Some(fixture) = FakeGcsFixture::new("files").await else {
+            eprintln!(
+                "skipping fake_gcs_file_round_trip_streams_through_disk: set GIT_CACHE_GCS_INTEGRATION=1"
+            );
+            return;
+        };
+        let store = fixture.store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("bundle-src.dat");
+        let payload = vec![7u8; 256 * 1024];
+        fs::write(&src, &payload).await.unwrap();
+
+        store.put_file("files/bundle.dat", &src).await.unwrap();
+
+        let dst = dir.path().join("nested/bundle-dst.dat");
+        assert!(store.get_file("files/bundle.dat", &dst).await.unwrap());
+        assert_eq!(fs::read(&dst).await.unwrap(), payload);
+
+        let missing = dir.path().join("missing.dat");
+        assert!(!store
+            .get_file("files/does-not-exist.dat", &missing)
+            .await
+            .unwrap());
+        assert!(!missing.exists());
+    }
 }
