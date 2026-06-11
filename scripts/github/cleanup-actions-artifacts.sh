@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}"
+
 usage() {
   cat <<'USAGE'
 Usage: cleanup-actions-artifacts.sh [--repo OWNER/REPO] [--older-than-days DAYS] [--all] [--dry-run] [--include-active-runs]
@@ -99,15 +102,7 @@ if [[ ! -s "$artifact_list" ]]; then
 fi
 
 is_older_than() {
-  python3 - "$1" "$2" <<'PY'
-from datetime import datetime, timedelta, timezone
-import sys
-
-created_at = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
-older_than_days = int(sys.argv[2])
-cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
-sys.exit(0 if created_at < cutoff else 1)
-PY
+  python3 "$REPO_ROOT/python/github/artifact_is_older_than.py" "$1" "$2"
 }
 
 run_status() {

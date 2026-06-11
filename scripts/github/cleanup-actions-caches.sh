@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}"
+
 usage() {
   cat <<'USAGE'
 Usage: cleanup-actions-caches.sh [--repo OWNER/REPO] [--older-than-days DAYS] [--all] [--dry-run]
@@ -99,15 +102,7 @@ while IFS=$'\t' read -r cache_id cache_key last_accessed_at size_in_bytes; do
   should_delete="false"
   if [[ "$delete_all" == "true" ]]; then
     should_delete="true"
-  elif python3 - "$last_accessed_at" "$older_than_days" <<'PY'
-from datetime import datetime, timedelta, timezone
-import sys
-
-last_accessed_at = datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
-older_than_days = int(sys.argv[2])
-cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
-sys.exit(0 if last_accessed_at < cutoff else 1)
-PY
+  elif python3 "$REPO_ROOT/python/github/cache_is_older_than.py" "$last_accessed_at" "$older_than_days"
   then
     should_delete="true"
   fi

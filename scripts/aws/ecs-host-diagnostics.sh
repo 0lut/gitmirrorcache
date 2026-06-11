@@ -32,27 +32,7 @@ cleanup() {
 trap cleanup EXIT
 
 export ECS_HOST_PORT
-python3 >"$tmpdir/ssm-parameters.json" <<'PY'
-import json
-import os
-import shlex
-
-host_port = shlex.quote(os.environ["ECS_HOST_PORT"])
-script = f"""set -euo pipefail
-host_port={host_port}
-
-echo '--- docker containers ---'
-docker ps -a --format '{{{{.ID}}}} {{{{.Image}}}} {{{{.Names}}}} {{{{.Status}}}} {{{{.Ports}}}}'
-echo
-echo "--- listeners on :$host_port ---"
-sudo ss -ltnp | grep ":$host_port" || true
-echo
-echo '--- ecs agent recent logs ---'
-sudo journalctl -u ecs --no-pager -n 80
-"""
-
-json.dump({"commands": [script]}, open("/dev/stdout", "w"))
-PY
+python3 "$REPO_ROOT/python/aws/ecs_host_diagnostics_ssm_command.py" >"$tmpdir/ssm-parameters.json"
 
 command_id="$(aws_cli ssm send-command \
   --instance-ids "$ECS_INSTANCE_ID" \
