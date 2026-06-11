@@ -20,6 +20,7 @@ pub struct DiskManager {
     quota_bytes: u64,
     min_free_bytes: u64,
     state: Arc<Mutex<DiskState>>,
+    pending_accesses: Arc<Mutex<HashMap<PathBuf, u64>>>,
 }
 
 #[derive(Debug, Default)]
@@ -27,7 +28,6 @@ struct DiskState {
     active_reservations: HashMap<Uuid, ReservationMarker>,
     repo_locks: HashMap<PathBuf, usize>,
     invalidating_repos: HashSet<PathBuf>,
-    pending_accesses: HashMap<PathBuf, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,6 +102,7 @@ impl DiskManager {
             quota_bytes,
             min_free_bytes,
             state: Arc::new(Mutex::new(DiskState::default())),
+            pending_accesses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -226,47 +227,74 @@ impl DiskManager {
     /// are not selected as LRU victims before a flush happens.
     pub fn note_repo_access(&self, repo_path: impl AsRef<Path>) -> Result<()> {
         let repo_path = normalize_repo_path(&self.repos_dir(), repo_path.as_ref())?;
-        let mut state = self
-            .state
+        let mut pending = self
+            .pending_accesses
             .lock()
-            .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
-        state.pending_accesses.insert(repo_path, now_unix_millis());
+            .map_err(|_| GitCacheError::Internal("pending accesses mutex poisoned".into()))?;
+        pending.insert(repo_path, now_unix_millis());
         Ok(())
     }
 
     /// Apply buffered in-memory access timestamps to the persistent repo
     /// index in a single write. Returns the number of entries applied.
+    ///
+    /// The pending-accesses mutex is held only to take the buffered map, and
+    /// the buffer lives behind its own lock, so concurrent
+    /// [`DiskManager::note_repo_access`] calls never contend with index I/O.
+    /// On I/O failure the taken entries are merged back into the pending map
+    /// so the next flush retries them.
     pub fn flush_repo_accesses(&self) -> Result<usize> {
         self.ensure_layout()?;
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
-        let pending = std::mem::take(&mut state.pending_accesses);
+        let pending = {
+            let mut pending = self
+                .pending_accesses
+                .lock()
+                .map_err(|_| GitCacheError::Internal("pending accesses mutex poisoned".into()))?;
+            std::mem::take(&mut *pending)
+        };
         if pending.is_empty() {
             return Ok(0);
         }
 
+        let result = self.apply_pending_accesses(&pending);
+        if result.is_err() {
+            if let Ok(mut current) = self.pending_accesses.lock() {
+                for (repo_path, accessed_at) in pending {
+                    let entry = current.entry(repo_path).or_insert(0);
+                    *entry = (*entry).max(accessed_at);
+                }
+            }
+        }
+        result
+    }
+
+    /// Index reads/writes elsewhere are serialized under the state mutex, so
+    /// hold it here too while rewriting the index.
+    fn apply_pending_accesses(&self, pending: &HashMap<PathBuf, u64>) -> Result<usize> {
+        let _state = self
+            .state
+            .lock()
+            .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
         let mut index = self.load_index()?;
         let mut applied = 0usize;
         for (repo_path, accessed_at) in pending {
-            if let Some(entry) = index.repos.get_mut(&repo_path) {
-                entry.last_accessed_unix_millis = entry.last_accessed_unix_millis.max(accessed_at);
+            if let Some(entry) = index.repos.get_mut(repo_path) {
+                entry.last_accessed_unix_millis = entry.last_accessed_unix_millis.max(*accessed_at);
                 applied += 1;
                 continue;
             }
-            let repo_dir = self.repo_dir(&repo_path);
+            let repo_dir = self.repo_dir(repo_path);
             if !repo_dir.exists() {
                 continue;
             }
             let entry = RepoIndexEntry {
                 path: repo_path.clone(),
                 size_bytes: directory_size(&repo_dir)?,
-                last_accessed_unix_millis: accessed_at,
+                last_accessed_unix_millis: *accessed_at,
                 protected: false,
             };
-            index.repos.insert(repo_path, entry);
+            index.repos.insert(repo_path.clone(), entry);
             applied += 1;
         }
         self.write_index(&index)?;
@@ -374,7 +402,9 @@ impl DiskManager {
                 } else {
                     Ok(())
                 };
-                state.pending_accesses.remove(&repo_path);
+                if let Ok(mut pending) = self.pending_accesses.lock() {
+                    pending.remove(&repo_path);
+                }
                 state.invalidating_repos.remove(&repo_path);
                 index_result
             });
@@ -577,9 +607,16 @@ impl DiskManager {
 
     fn evict_until_available_locked(&self, bytes: u64, state: &DiskState) -> Result<()> {
         let mut index = self.sync_repo_index_locked()?;
-        for (repo_path, accessed_at) in &state.pending_accesses {
-            if let Some(entry) = index.repos.get_mut(repo_path) {
-                entry.last_accessed_unix_millis = entry.last_accessed_unix_millis.max(*accessed_at);
+        {
+            let pending = self
+                .pending_accesses
+                .lock()
+                .map_err(|_| GitCacheError::Internal("pending accesses mutex poisoned".into()))?;
+            for (repo_path, accessed_at) in pending.iter() {
+                if let Some(entry) = index.repos.get_mut(repo_path) {
+                    entry.last_accessed_unix_millis =
+                        entry.last_accessed_unix_millis.max(*accessed_at);
+                }
             }
         }
 
