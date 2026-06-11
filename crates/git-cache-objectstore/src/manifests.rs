@@ -1,4 +1,4 @@
-use crate::{validate_key, ObjectStore};
+use crate::{validate_key, ObjectStore, ObjectVersion};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
@@ -202,6 +202,42 @@ where
     S: ObjectStore + ?Sized,
 {
     write_json(store, &repo_generation_head_key(&head.repo), head).await
+}
+
+pub async fn read_repo_generation_head_versioned<S>(
+    store: &S,
+    repo: &RepoKey,
+) -> Result<Option<(RepoGenerationHead, ObjectVersion)>>
+where
+    S: ObjectStore + ?Sized,
+{
+    let Some((value, version)) = store
+        .get_versioned(&repo_generation_head_key(repo))
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((serde_json::from_slice(&value)?, version)))
+}
+
+/// Compare-and-swap write of the generation head pointer. `version` is the
+/// token from `read_repo_generation_head_versioned`; `None` means the head
+/// is expected to be absent (first write). Returns `Ok(false)` when the
+/// stored head no longer matches the expectation.
+pub async fn write_repo_generation_head_if_version_matches<S>(
+    store: &S,
+    head: &RepoGenerationHead,
+    version: Option<&ObjectVersion>,
+) -> Result<bool>
+where
+    S: ObjectStore + ?Sized,
+{
+    let key = repo_generation_head_key(&head.repo);
+    let bytes = json_bytes(head)?;
+    match version {
+        Some(version) => store.put_if_version_matches(&key, bytes, version).await,
+        None => store.put_if_absent(&key, bytes).await,
+    }
 }
 
 pub async fn write_generation_manifest<S>(store: &S, manifest: &GenerationManifest) -> Result<()>

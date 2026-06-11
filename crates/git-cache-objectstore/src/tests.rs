@@ -4,8 +4,9 @@ mod tests {
         read_commit_manifest, read_generation_manifest, read_lease, read_ref_manifest,
         read_repo_generation_head, ref_manifest_key, repo_generation_head_key, validate_key,
         write_generation_manifest, write_generation_manifest_if_absent_or_matches,
-        write_ref_manifest_if_absent_or_matches, write_repo_generation_head, GenerationPublish,
-        LeaseManifest, LocalObjectStore, ObjectStore, PublishManifests,
+        write_ref_manifest_if_absent_or_matches, write_repo_generation_head,
+        write_repo_generation_head_if_version_matches, GenerationPublish, LeaseManifest,
+        LocalObjectStore, ObjectStore, PublishManifests,
     };
     use bytes::Bytes;
     use chrono::{DateTime, Duration, Utc};
@@ -94,6 +95,125 @@ mod tests {
             generation: gen,
             verified_at: ts(3),
         }
+    }
+
+    #[tokio::test]
+    async fn put_if_version_matches_swaps_when_version_is_current() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+
+        store.put("cas/item.json", Bytes::from("v1")).await.unwrap();
+        let (value, version) = store.get_versioned("cas/item.json").await.unwrap().unwrap();
+        assert_eq!(value, Bytes::from("v1"));
+
+        assert!(store
+            .put_if_version_matches("cas/item.json", Bytes::from("v2"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get("cas/item.json").await.unwrap().unwrap(),
+            Bytes::from("v2")
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn put_if_version_matches_rejects_stale_version() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+
+        store.put("cas/item.json", Bytes::from("v1")).await.unwrap();
+        let (_, stale) = store.get_versioned("cas/item.json").await.unwrap().unwrap();
+        store
+            .put("cas/item.json", Bytes::from("concurrent"))
+            .await
+            .unwrap();
+
+        assert!(!store
+            .put_if_version_matches("cas/item.json", Bytes::from("v2"), &stale)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get("cas/item.json").await.unwrap().unwrap(),
+            Bytes::from("concurrent")
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn put_if_version_matches_missing_object_returns_false() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+
+        store.put("cas/item.json", Bytes::from("v1")).await.unwrap();
+        let (_, version) = store.get_versioned("cas/item.json").await.unwrap().unwrap();
+        store.delete("cas/item.json").await.unwrap();
+
+        assert!(!store
+            .put_if_version_matches("cas/item.json", Bytes::from("v2"), &version)
+            .await
+            .unwrap());
+        assert!(store.get("cas/item.json").await.unwrap().is_none());
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn repo_head_cas_first_write_then_stale_version_rejected() {
+        let root = temp_root();
+        let store = LocalObjectStore::new(&root);
+        let repo = repo();
+
+        let first = RepoGenerationHead {
+            repo: repo.clone(),
+            generation: test_generation_id(),
+            tip_commits: vec![commit('a')],
+            updated_at: ts(1),
+        };
+        assert!(
+            write_repo_generation_head_if_version_matches(&store, &first, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !write_repo_generation_head_if_version_matches(&store, &first, None)
+                .await
+                .unwrap()
+        );
+
+        let (read_back, version) = crate::read_repo_generation_head_versioned(&store, &repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_back, first);
+
+        let second = RepoGenerationHead {
+            repo: repo.clone(),
+            generation: test_generation_id(),
+            tip_commits: vec![commit('b')],
+            updated_at: ts(2),
+        };
+        assert!(
+            write_repo_generation_head_if_version_matches(&store, &second, Some(&version))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !write_repo_generation_head_if_version_matches(&store, &first, Some(&version))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            read_repo_generation_head(&store, &repo)
+                .await
+                .unwrap()
+                .unwrap(),
+            second
+        );
+
+        let _ = fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]
@@ -790,6 +910,44 @@ mod tests {
             store.get("conditional/item.json").await.unwrap().unwrap(),
             Bytes::from_static(b"first")
         );
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn minio_put_if_version_matches_detects_concurrent_update() {
+        let Some(fixture) = MinioFixture::new("cas").await else {
+            eprintln!(
+                "skipping minio_put_if_version_matches_detects_concurrent_update: set GIT_CACHE_S3_INTEGRATION=1"
+            );
+            return;
+        };
+        let store = fixture.store;
+
+        let key = "cas/item.json";
+        store.put(key, Bytes::from_static(b"v1")).await.unwrap();
+        let (value, version) = store.get_versioned(key).await.unwrap().unwrap();
+        assert_eq!(value, Bytes::from_static(b"v1"));
+
+        assert!(store
+            .put_if_version_matches(key, Bytes::from_static(b"v2"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"v2")
+        );
+
+        // The token from v1 is now stale; the swap must be refused.
+        assert!(!store
+            .put_if_version_matches(key, Bytes::from_static(b"v3"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"v2")
+        );
+
+        store.delete(key).await.unwrap();
     }
 
     #[cfg(feature = "s3")]

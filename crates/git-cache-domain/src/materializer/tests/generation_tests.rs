@@ -1,5 +1,6 @@
 mod tests {
     use super::super::*;
+    use git_cache_objectstore::write_repo_generation_head;
 
     #[tokio::test]
     async fn publish_generation_links_delta_to_previous_generation() {

@@ -13,9 +13,10 @@ use git_cache_disk::RepoLock;
 pub use git_cache_git::UploadPackProcess;
 use git_cache_objectstore::{
     generation_manifest_key, generation_manifest_prefix, pack_key, read_commit_manifest,
-    read_generation_manifest, read_json, read_repo_generation_head, write_commit_manifest,
-    write_json, write_ref_manifest, write_repo_generation_head, GenerationPublish,
-    PublishManifests,
+    read_generation_manifest, read_json, read_repo_generation_head,
+    read_repo_generation_head_versioned, write_commit_manifest, write_json, write_ref_manifest,
+    write_repo_generation_head_if_version_matches, GenerationPublish,
+    ObjectVersion, PublishManifests,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};

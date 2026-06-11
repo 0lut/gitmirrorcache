@@ -1,4 +1,4 @@
-use crate::{validate_key, ObjectMeta, ObjectStore};
+use crate::{validate_key, ObjectMeta, ObjectStore, ObjectVersion};
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
@@ -244,6 +244,60 @@ impl ObjectStore for S3ObjectStore {
             Ok(_) => Ok(true),
             Err(err) if is_precondition_failed(&err) => Ok(false),
             Err(err) => Err(s3_error("put_if_absent", &s3_key, err)),
+        }
+    }
+
+    async fn get_versioned(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>> {
+        let s3_key = self.s3_key(key)?;
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(s3_error("get_versioned", &s3_key, err)),
+        };
+
+        let e_tag = output
+            .e_tag()
+            .ok_or_else(|| {
+                GitCacheError::UpstreamUnavailable(format!(
+                    "s3 get `{s3_key}` returned no etag"
+                ))
+            })?
+            .to_string();
+        let body = output
+            .body
+            .collect()
+            .await
+            .map_err(|err| s3_error("read body", &s3_key, err))?;
+        Ok(Some((body.into_bytes(), ObjectVersion::new(e_tag))))
+    }
+
+    async fn put_if_version_matches(
+        &self,
+        key: &str,
+        value: Bytes,
+        version: &ObjectVersion,
+    ) -> Result<bool> {
+        let s3_key = self.s3_key(key)?;
+        match self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .if_match(version.token())
+            .body(ByteStream::new(value.into()))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) if is_precondition_failed(&err) || is_not_found(&err) => Ok(false),
+            Err(err) => Err(s3_error("put_if_version_matches", &s3_key, err)),
         }
     }
 

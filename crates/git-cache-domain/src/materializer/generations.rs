@@ -7,6 +7,7 @@ use tokio::task::JoinSet;
 
 const MAX_GENERATION_MANIFEST_SCAN_KEYS: usize = 10_000;
 const HYDRATE_PACK_DOWNLOAD_CONCURRENCY: usize = 4;
+const HEAD_CAS_MAX_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompactionReport {
@@ -586,14 +587,31 @@ impl Materializer {
                 .await?;
         }
 
-        let current_head = self.manifests().repo_head(repo).await?;
-        if current_head
-            .as_ref()
-            .map(|current| current.updated_at <= head.updated_at)
-            .unwrap_or(true)
-        {
-            self.manifests().write_repo_head(head).await?;
+        for _ in 0..HEAD_CAS_MAX_ATTEMPTS {
+            let current = self.manifests().repo_head_versioned(repo).await?;
+            let (current_head, version) = match &current {
+                Some((head, version)) => (Some(head), Some(version)),
+                None => (None, None),
+            };
+            if current_head
+                .map(|current| current.updated_at > head.updated_at)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            if self
+                .manifests()
+                .write_repo_head_if_version_matches(head, version)
+                .await?
+            {
+                return Ok(());
+            }
         }
+        warn!(
+            %repo,
+            generation = %head.generation,
+            "generation head moved repeatedly during publish; leaving newer head in place"
+        );
         Ok(())
     }
 
@@ -623,7 +641,12 @@ impl Materializer {
         threshold: usize,
         dry_run: bool,
     ) -> CoreResult<Option<CompactionReport>> {
-        let Some(head) = self.manifests().repo_head(repo).await? else {
+        let outer_repo_lock = if dry_run {
+            None
+        } else {
+            Some(self.lock_repo(repo).await?)
+        };
+        let Some((head, head_version)) = self.manifests().repo_head_versioned(repo).await? else {
             return Ok(None);
         };
         let Some(head_manifest) = self.get_generation_manifest(repo, head.generation).await? else {
@@ -660,8 +683,8 @@ impl Materializer {
             }));
         }
 
+        let _repo_lock = outer_repo_lock;
         let repo_dir = self.ensure_repo_dir(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
         Box::pin(self.hydrate_generation(repo, &repo_dir, head.generation)).await?;
         self.state.git.repack_for_serving(&repo_dir).await?;
 
@@ -741,7 +764,18 @@ impl Materializer {
             };
             self.manifests().write_commit(&manifest).await?;
         }
-        self.manifests().write_repo_head(&new_head).await?;
+        if !self
+            .manifests()
+            .write_repo_head_if_version_matches(&new_head, Some(&head_version))
+            .await?
+        {
+            warn!(
+                %repo,
+                %new_generation,
+                "generation head changed during compaction; skipping cleanup of old packs"
+            );
+            return Ok(None);
+        }
 
         let retained_keys: HashSet<&str> = packs.iter().map(|pack| pack.key.as_str()).collect();
         let mut bytes_reclaimed = 0_u64;
