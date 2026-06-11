@@ -149,6 +149,14 @@ packs not referenced by any snapshot newer than a retention horizon, plus snapsh
 older than the horizon — safe because snapshots are immutable and HEAD only moves
 forward.
 
+TODO (multi-node): add a compaction lease — a `put_if_absent` claim marker with a
+TTL on a per-repo key, taken before starting the repack. The conditional-PUT CAS
+on the head pointer (PR #81) already guarantees correctness when two nodes compact
+concurrently (one wins, the loser aborts cleanup and nothing is orphaned), but the
+loser still burns a full `git repack` whose output is discarded. A lease turns
+"both repack, one discarded" into "one repacks, the other skips". Not needed while
+deployments are single-node — the in-process repo lock already serializes writers.
+
 #### What gets deleted from the current codebase
 
 - `bundle_create_all` / `bundle_create_incremental` + tips/prerequisite tracking
