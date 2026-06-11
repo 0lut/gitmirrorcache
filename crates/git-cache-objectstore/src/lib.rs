@@ -40,6 +40,7 @@ impl ObjectVersion {
         Self(token.into())
     }
 
+    #[cfg(feature = "s3")]
     pub(crate) fn token(&self) -> &str {
         &self.0
     }
