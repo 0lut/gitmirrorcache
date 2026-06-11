@@ -168,9 +168,11 @@ hourly CronJob for compaction:
 ```sh
 git clone https://github.com/0lut/gitmirrorcache.git
 helm install git-cache gitmirrorcache/deploy/helm/gitmirrorcache \
-  --set config.objectStore.s3.bucket=my-git-cache-bucket \
-  --set aws.region=us-west-2
+  --set config.objectStore.s3.bucket=my-git-cache-bucket
 ```
+
+The AWS region is picked up from the environment (IRSA injects `AWS_REGION`
+automatically on EKS); set `aws.region` only when nothing else provides one.
 
 See the [chart README](deploy/helm/gitmirrorcache/README.md) for credentials,
 sizing, and scaling guidance.
