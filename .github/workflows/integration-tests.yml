@@ -28,6 +28,8 @@ jobs:
             packages: -p git-cache-objectstore
           - group: api
             packages: -p git-cache-api
+          - group: fuzz
+            packages: -p git-cache-fuzz
     steps:
       - uses: actions/checkout@v4
 
