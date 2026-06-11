@@ -48,6 +48,48 @@ helm install git-cache "${CHART_REF}" \
   --set persistence.storageClass=gp3
 ```
 
+The chart does not provision EBS IOPS or throughput directly. Those values come
+from the selected StorageClass. A `gp3` StorageClass without explicit
+performance parameters gets the AWS gp3 baseline: 3,000 IOPS and 125 MiB/s
+throughput.
+
+For a larger cache node, create a tuned StorageClass and point the chart at it.
+This example matches the production ECS gp3 defaults:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gitmirrorcache-gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  fsType: ext4
+  iops: "8000"
+  throughput: "500"
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+```
+
+Install with the tuned class:
+
+```sh
+helm install git-cache "${CHART_REF}" \
+  --version "${CHART_VERSION}" \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket \
+  --set persistence.storageClass=gitmirrorcache-gp3
+```
+
+To inspect what AWS actually provisioned for an installed release:
+
+```sh
+PV="$(kubectl get pvc -n git-cache cache-git-cache-gitmirrorcache-0 -o jsonpath='{.spec.volumeName}')"
+VOL="$(kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeHandle}')"
+aws ec2 describe-volumes \
+  --volume-ids "$VOL" \
+  --query 'Volumes[0].{Type:VolumeType,SizeGiB:Size,Iops:Iops,ThroughputMiBs:Throughput}'
+```
+
 ## S3 credentials
 
 Prefer workload identity over static keys:
