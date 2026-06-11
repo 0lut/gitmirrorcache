@@ -341,10 +341,26 @@ impl Materializer {
             if !force_refetch && !needs_unshallow && fetch_options.hydrate_manifests {
                 if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
                     if manifest.complete {
-                        Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await?;
-                        self.expose_served_commit(&repo_dir, object_id).await?;
-                        hydrated_commits += 1;
-                        continue;
+                        match Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await {
+                            Ok(()) => {
+                                self.expose_served_commit(&repo_dir, object_id).await?;
+                                hydrated_commits += 1;
+                                continue;
+                            }
+                            // A commit manifest can point at a generation that
+                            // was swept or repointed by another node; fall
+                            // through to the read-through fetch instead of
+                            // failing the whole request.
+                            Err(GitCacheError::NotFound(_)) => {
+                                warn!(
+                                    %repo,
+                                    commit = %object_id,
+                                    generation = %manifest.generation,
+                                    "commit manifest hydrate missed; falling back to read-through fetch"
+                                );
+                            }
+                            Err(err) => return Err(err),
+                        }
                     }
                 }
             }

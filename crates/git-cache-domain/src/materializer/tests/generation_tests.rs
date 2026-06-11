@@ -743,6 +743,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_node_serves_commit_after_sweep_removes_superseded_generation() {
+        let fixture = GitFixture::new();
+        let config = AppConfig {
+            compaction: git_cache_core::CompactionConfig {
+                chain_depth_threshold: 64,
+                inline: false,
+                retention_secs: 0,
+            },
+            ..fixture.state_config()
+        };
+        let state = Arc::new(AppState::try_new(config).unwrap());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
+
+        let second = fixture.commit_and_push("second");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, second_manifest.generation).await;
+
+        let sweep = materializer
+            .sweep_superseded_generations(&fixture.repo)
+            .await
+            .unwrap();
+        assert!(sweep.swept_generations.contains(&first_manifest.generation));
+        assert!(
+            read_generation_manifest(&*state.store, &fixture.repo, first_manifest.generation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A node with a cold disk cache (same object store, fresh cache root)
+        // must still be able to serve the first commit: its manifest may not
+        // be left pointing at the swept generation.
+        let cold_config = AppConfig {
+            cache_root: fixture.tmp.path().join("cache-cold"),
+            ..fixture.state_config()
+        };
+        let cold_state = Arc::new(AppState::try_new(cold_config).unwrap());
+        let cold = Materializer::new(Arc::clone(&cold_state));
+        let response = cold
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(first.commit.clone()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.commit, first.commit);
+        let cold_repo_dir = cold.repo_dir(&fixture.repo);
+        assert!(cold.commit_exists(&cold_repo_dir, &first.commit).await);
+    }
+
+    #[tokio::test]
     async fn retention_sweep_collects_orphaned_packs_by_age() {
         use git_cache_objectstore::pack_prefix;
 
