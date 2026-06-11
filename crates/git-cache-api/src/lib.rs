@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -54,9 +54,28 @@ pub fn app_result(config: AppConfig) -> CoreResult<Router> {
 }
 
 pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
+    Ok(app_with_shutdown_async(config).await?.0)
+}
+
+/// Like [`app_result_async`], but also returns a [`ReadinessGate`] that the
+/// caller can flip during shutdown so `/healthz` starts failing and load
+/// balancers stop routing new traffic while in-flight requests drain.
+pub async fn app_with_shutdown_async(config: AppConfig) -> CoreResult<(Router, ReadinessGate)> {
     let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
-    router(git_remote_enabled, state)
+    let gate = ReadinessGate(Arc::clone(&state.shutting_down));
+    Ok((router(git_remote_enabled, state)?, gate))
+}
+
+/// Handle that marks the server as shutting down; once flipped, `/healthz`
+/// returns 503 so orchestrators stop sending new traffic.
+#[derive(Clone, Debug)]
+pub struct ReadinessGate(Arc<AtomicBool>);
+
+impl ReadinessGate {
+    pub fn begin_shutdown(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> {
@@ -86,6 +105,7 @@ struct ApiState {
     upstream_http: reqwest::Client,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl ApiState {
@@ -125,6 +145,7 @@ impl ApiState {
             upstream_http,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -161,27 +182,133 @@ fn spawn_repo_access_flusher(domain: &Arc<AppState>) {
     });
 }
 
-/// Serve the API on `listener` until ctrl-c, then flush any buffered repo
-/// access timestamps before returning.
+/// Serve the API on `listener` until SIGTERM/SIGINT, then drain gracefully:
+/// `/healthz` starts failing so load balancers stop routing new traffic, the
+/// configured readiness propagation delay passes, the server stops accepting
+/// connections and drains in-flight requests for up to the configured drain
+/// timeout, and finally any buffered repo access timestamps are flushed.
 pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> CoreResult<()> {
+    let shutdown_config = config.shutdown.clone();
     let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
     let domain = state.domain.clone();
+    let readiness = ReadinessGate(Arc::clone(&state.shutting_down));
     let app = router(git_remote_enabled, state)?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            if let Err(err) = tokio::signal::ctrl_c().await {
-                warn!(error = %err, "failed to listen for shutdown signal");
-            }
-        })
-        .await
-        .map_err(|err| GitCacheError::Internal(format!("server error: {err}")))?;
+    let readiness_delay = Duration::from_secs(shutdown_config.readiness_delay_seconds);
+    let drain_timeout = Duration::from_secs(shutdown_config.drain_timeout_seconds);
+    run_until_shutdown(
+        listener,
+        app,
+        readiness,
+        readiness_delay,
+        drain_timeout,
+        shutdown_signal(),
+    )
+    .await?;
 
     if let Err(err) = domain.disk.flush_repo_accesses().await {
         warn!(error = %err, "failed to flush repo access timestamps during shutdown");
     }
     Ok(())
+}
+
+/// Serve `app` on `listener` until `signal` resolves, then drain: fail
+/// readiness, wait `readiness_delay`, stop accepting connections, and let
+/// in-flight requests finish for at most `drain_timeout` before returning.
+async fn run_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    readiness: ReadinessGate,
+    readiness_delay: Duration,
+    drain_timeout: Duration,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> CoreResult<()> {
+    let (drain_deadline_tx, drain_deadline_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = axum::serve(listener, app).with_graceful_shutdown(graceful_shutdown(
+        readiness,
+        readiness_delay,
+        drain_timeout,
+        drain_deadline_tx,
+        signal,
+    ));
+
+    tokio::select! {
+        result = server => {
+            result.map_err(|err| GitCacheError::Internal(format!("server error: {err}")))?;
+        }
+        _ = wait_for_drain_deadline(drain_deadline_rx, drain_timeout) => {
+            warn!(
+                drain_timeout_seconds = drain_timeout.as_secs(),
+                "drain timeout elapsed with requests still in flight; exiting"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolves once the process should stop accepting new connections: after the
+/// shutdown signal is received, readiness is failed, and the configured
+/// readiness propagation delay has passed. Signals `drain_deadline_tx` so the
+/// caller can bound the remaining in-flight drain.
+async fn graceful_shutdown(
+    readiness: ReadinessGate,
+    readiness_delay: Duration,
+    drain_timeout: Duration,
+    drain_deadline_tx: tokio::sync::oneshot::Sender<()>,
+    signal: impl std::future::Future<Output = ()>,
+) {
+    signal.await;
+    readiness.begin_shutdown();
+    info!(
+        readiness_delay_seconds = readiness_delay.as_secs(),
+        drain_timeout_seconds = drain_timeout.as_secs(),
+        "shutdown signal received; failing readiness, then draining in-flight requests"
+    );
+    tokio::time::sleep(readiness_delay).await;
+    let _ = drain_deadline_tx.send(());
+}
+
+async fn wait_for_drain_deadline(
+    drain_started: tokio::sync::oneshot::Receiver<()>,
+    drain_timeout: Duration,
+) {
+    if drain_started.await.is_err() {
+        // Server finished before shutdown began; never force-exit.
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(drain_timeout).await;
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(%err, "failed to install SIGINT handler");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                warn!(%err, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -297,11 +424,17 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
+async fn healthz(State(state): State<Arc<ApiState>>) -> Response {
+    let shutting_down = state.shutting_down.load(Ordering::SeqCst);
+    let body = Json(HealthResponse {
+        ok: !shutting_down,
         checked_at: chrono::Utc::now(),
-    })
+    });
+    if shutting_down {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    } else {
+        body.into_response()
+    }
 }
 
 async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
@@ -1915,6 +2048,7 @@ mod tests {
             },
             git_remote: Default::default(),
             compaction: Default::default(),
+            shutdown: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
             use_gitoxide: true,
@@ -1937,6 +2071,142 @@ mod tests {
             Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),
             Ok(_) => panic!("rate-limited authenticated resolve should not succeed"),
         }
+    }
+
+    #[tokio::test]
+    async fn healthz_fails_after_shutdown_begins() {
+        let tmp = TempDir::new().unwrap();
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            cache_root: tmp.path().join("cache"),
+            upstream_root: None,
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 60,
+            max_git_output_bytes: 16 * 1024 * 1024,
+            object_store: ObjectStoreConfig::Local {
+                root: tmp.path().join("objects"),
+            },
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 0,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 1024 * 1024 * 1024,
+                min_free_bytes: 0,
+                access_flush_interval_secs: 60,
+            },
+            git_remote: Default::default(),
+            compaction: Default::default(),
+            shutdown: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
+            use_gitoxide: true,
+        };
+        let state = Arc::new(ApiState::try_new(config).unwrap());
+        let gate = ReadinessGate(Arc::clone(&state.shutting_down));
+
+        let response = healthz(State(Arc::clone(&state))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        gate.begin_shutdown();
+
+        let response = healthz(State(state)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Starts `run_until_shutdown` on an ephemeral port with a single `/slow`
+    /// route that sleeps for `handler_delay` before responding. Returns the
+    /// bound address, the shutdown flag readable by the test, a sender that
+    /// triggers shutdown, and the server task handle.
+    async fn spawn_drain_server(
+        handler_delay: Duration,
+        drain_timeout: Duration,
+    ) -> (
+        SocketAddr,
+        Arc<AtomicBool>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<CoreResult<()>>,
+    ) {
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let gate = ReadinessGate(Arc::clone(&shutting_down));
+        let app = Router::new().route(
+            "/slow",
+            get(move || async move {
+                tokio::time::sleep(handler_delay).await;
+                "done"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(run_until_shutdown(
+            listener,
+            app,
+            gate,
+            Duration::ZERO,
+            drain_timeout,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        (addr, shutting_down, shutdown_tx, server)
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_lets_in_flight_request_finish_within_drain_timeout() {
+        let (addr, shutting_down, shutdown_tx, server) =
+            spawn_drain_server(Duration::from_millis(300), Duration::from_secs(5)).await;
+
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{addr}/slow")).await });
+
+        // Let the request reach the handler, then trigger shutdown mid-flight.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .expect("request should finish well before the drain timeout")
+            .unwrap()
+            .expect("in-flight request must not be killed by graceful shutdown");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "done");
+        assert!(shutting_down.load(Ordering::SeqCst));
+
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server should stop promptly once the request drains")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_kills_request_still_in_flight_after_drain_timeout() {
+        let (addr, shutting_down, shutdown_tx, server) =
+            spawn_drain_server(Duration::from_secs(60), Duration::from_millis(200)).await;
+
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{addr}/slow")).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+
+        // The server must exit once the drain timeout elapses, without waiting
+        // for the 60s handler.
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server should force-exit at the drain deadline")
+            .unwrap()
+            .unwrap();
+        assert!(shutting_down.load(Ordering::SeqCst));
+
+        // In production the process exits at this point, cutting the request.
+        // In-process we can only assert the server gave up on it: the request
+        // is still in flight when run_until_shutdown returns.
+        assert!(
+            !request.is_finished(),
+            "request should still be in flight when the server force-exits"
+        );
+        request.abort();
     }
 
     #[tokio::test]

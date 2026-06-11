@@ -23,3 +23,10 @@ min_free_bytes = 107374182400
 [compaction]
 chain_depth_threshold = 10
 inline = false
+
+# Graceful shutdown: after SIGTERM the server fails /healthz readiness for
+# readiness_delay_seconds, then drains in-flight requests for up to
+# drain_timeout_seconds before exiting.
+[shutdown]
+readiness_delay_seconds = 5
+drain_timeout_seconds = 60

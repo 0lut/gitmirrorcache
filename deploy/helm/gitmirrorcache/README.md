@@ -63,6 +63,9 @@ upstreamAuth:
 | `compaction.enabled` | `true` | Hourly `git-cache compact --all` CronJob |
 | `configFile` | `""` | Optional full TOML config (see `config/production.example.toml`) |
 | `config.extraEnv` | `[]` | Extra `GIT_CACHE_*` env vars |
+| `config.shutdown.readinessDelaySeconds` | `5` | Failing-readiness window after SIGTERM before draining |
+| `config.shutdown.drainTimeoutSeconds` | `60` | Max in-flight drain time before exit |
+| `terminationGracePeriodSeconds` | `75` | Keep > readiness delay + drain timeout |
 
 See `values.yaml` for the full list.
 
