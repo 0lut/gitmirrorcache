@@ -1,11 +1,13 @@
 # gitmirrorcache
 
-A read-only Git fetch cache that sits between your CI fleet and GitHub-style
-upstreams. Instead of hammering the upstream with thousands of identical clones,
-clients fetch from the cache: an S3-compatible object store is the durable
-source of truth, and local disk is just a disposable hot layer that can be
-rebuilt at any time. The result is faster clones, fewer upstream rate-limit
-headaches, and a cache you can throw away without losing anything.
+A read-only Git fetch cache that sits between clone-heavy automation — CI
+runners, coding agents, sandboxes, build farms — and your Git upstreams
+(GitHub, GitLab, Bitbucket, or any Smart HTTP Git server). Instead of
+hammering the upstream with thousands of identical clones, clients fetch from
+the cache: an S3-compatible object store is the durable source of truth, and
+local disk is just a disposable hot layer that can be rebuilt at any time. The
+result is faster clones, fewer upstream rate-limit headaches, and a cache you
+can throw away without losing anything.
 
 It exposes two interfaces:
 
@@ -91,7 +93,7 @@ from the file.
 | `GIT_CACHE_CONFIG` | – | Path to a TOML config file. If set, other `GIT_CACHE_*` variables are ignored, except the S3 credential variables noted above. |
 | `GIT_CACHE_BIND_ADDR` | `127.0.0.1:8080` | Address and port the HTTP server listens on. |
 | `GIT_CACHE_ROOT` | `./cache` | Directory for the local hot cache (bare repos, temp files, repo index). |
-| `GIT_CACHE_ALLOWED_UPSTREAM_HOSTS` | `github.com` | Comma-separated allowlist of upstream hosts the cache will talk to. |
+| `GIT_CACHE_ALLOWED_UPSTREAM_HOSTS` | `github.com` | Comma-separated allowlist of upstream hosts the cache will talk to (e.g. `github.com,gitlab.com,git.internal.example`). |
 | `GIT_CACHE_UPSTREAM_ROOT` | – | Optional local directory of bare upstream repos, used instead of real network upstreams (mainly for tests and local dev). |
 | `GIT_CACHE_RATE_LIMIT_PER_MINUTE` | `120` | Global rate limit for materialize requests. |
 
@@ -134,7 +136,7 @@ from the file.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `GIT_CACHE_DISK_QUOTA_BYTES` | 10 GiB | Hot-cache disk quota; LRU eviction keeps usage under this. |
+| `GIT_CACHE_DISK_QUOTA_BYTES` | 10 GiB | Hot-cache disk quota; LRU eviction keeps usage under this. The Helm chart sets this to 100 GiB to match its default 100Gi PVC — keep the quota at or below the volume size. |
 | `GIT_CACHE_DISK_MIN_FREE_BYTES` | 1 GiB | Minimum free disk space to preserve on the cache volume. |
 | `GIT_CACHE_DISK_ACCESS_FLUSH_SECS` | `60` | How often buffered repo-access timestamps are flushed to the on-disk index. |
 
@@ -152,13 +154,15 @@ from the file.
 
 ### Helm (Kubernetes)
 
-The project ships as a Helm chart at
-[`deploy/helm/gitmirrorcache`](deploy/helm/gitmirrorcache). It runs the server
-as a StatefulSet with a persistent volume for the hot cache and an hourly
-CronJob for compaction:
+The project ships as a Helm chart that lives in this repository at
+[`deploy/helm/gitmirrorcache`](deploy/helm/gitmirrorcache) (it is not
+published to a chart registry yet, so install it from a checkout). It runs the
+server as a StatefulSet with a persistent volume for the hot cache and an
+hourly CronJob for compaction:
 
 ```sh
-helm install git-cache deploy/helm/gitmirrorcache \
+git clone https://github.com/0lut/gitmirrorcache.git
+helm install git-cache gitmirrorcache/deploy/helm/gitmirrorcache \
   --set config.objectStore.s3.bucket=my-git-cache-bucket \
   --set aws.region=us-west-2
 ```
