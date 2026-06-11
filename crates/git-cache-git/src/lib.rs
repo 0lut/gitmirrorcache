@@ -19,7 +19,7 @@ mod gix_backend;
 
 use backend::{GitBackend, GixBackend, LocalGitBackend};
 
-pub const DEFAULT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const DEFAULT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -469,12 +469,9 @@ impl Git {
                 continue;
             }
 
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() == 2 {
-                let sha = parts[0].trim();
-                let ref_name = parts[1].trim();
-                if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
-                    refs.insert(branch.to_string(), sha.to_string());
+            if let Some((sha, ref_name)) = line.split_once('\t') {
+                if let Some(branch) = ref_name.trim().strip_prefix("refs/heads/") {
+                    refs.insert(branch.to_string(), sha.trim().to_string());
                 }
             }
         }

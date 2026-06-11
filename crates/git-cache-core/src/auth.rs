@@ -40,13 +40,6 @@ impl UpstreamAuth {
             Self::Basic { raw } => Some(raw.expose_secret()),
         }
     }
-
-    pub fn redacted_header(&self) -> &'static str {
-        match self {
-            Self::Anonymous => "anonymous",
-            Self::Basic { .. } => "Basic <redacted>",
-        }
-    }
 }
 
 impl fmt::Debug for UpstreamAuth {
@@ -116,7 +109,6 @@ mod tests {
     fn upstream_auth_accepts_basic_and_redacts_debug() {
         let auth = UpstreamAuth::parse_header("Basic dXNlcjpnaHBfc2VjcmV0").unwrap();
         assert!(auth.is_authenticated());
-        assert_eq!(auth.redacted_header(), "Basic <redacted>");
         assert!(!format!("{auth:?}").contains("dXNlcjpnaHBfc2VjcmV0"));
     }
 

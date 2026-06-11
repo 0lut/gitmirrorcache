@@ -35,7 +35,6 @@ mod manifests;
 mod planning;
 mod proxy_tee;
 mod repo;
-mod util;
 
 pub use direct_git::{
     frame_ref_advertisement, synthesize_ref_advertisement, UpstreamRefComparison,

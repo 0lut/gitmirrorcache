@@ -5,8 +5,8 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, CommitSha, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult,
-    UpstreamAuth,
+    hex_lower, AppConfig, CommitSha, GitCacheError, MaterializeRequest, RepoKey,
+    Result as CoreResult, UpstreamAuth,
 };
 use git_cache_disk::{AsyncDiskManager, AsyncReservation};
 use git_cache_domain::materializer::repo_from_git_path;
@@ -412,16 +412,6 @@ impl DirectGitProofAuth {
         let digest = Sha256::digest(raw.as_bytes());
         Self::Authenticated(hex_lower(&digest))
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 async fn healthz(State(state): State<Arc<ApiState>>) -> Response {

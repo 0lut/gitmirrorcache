@@ -1,5 +1,5 @@
-use super::util::hex_lower;
 use super::*;
+use git_cache_core::hex_lower;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tokio::sync::Semaphore;
