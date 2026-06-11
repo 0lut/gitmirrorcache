@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Linux-only: build and push the arm64 image without a buildbox by
-# cross-compiling the Rust binaries natively on the host, then assembling a
-# runtime-only image with docker buildx (QEMU is only used for the apt layer).
+# Linux-only: build and push the arm64 image by cross-compiling the Rust
+# binaries natively on the host, then assembling a runtime-only image with
+# docker buildx (QEMU is only used for the apt layer).
 #
 # On macOS, use the standard buildx path instead (Apple Silicon builds the
 # full Dockerfile natively):
