@@ -77,6 +77,15 @@ curl http://localhost:8080/healthz
 git clone http://localhost:8080/git/github.com/<owner>/<repo>.git
 ```
 
+## Sizing
+
+Serving clones spawns `git pack-objects` children, which are CPU- and
+memory-intensive (bounded by `config.maxConcurrentGitProcesses`, default 64).
+The chart defaults to requests of 2 vCPU / 4 GiB with an 8 GiB memory limit —
+treat that as the floor. The production ECS deployment runs 8 vCPU / 24 GiB;
+scale CPU with concurrent clone traffic and tune
+`config.maxConcurrentGitProcesses` to match the allocation.
+
 ## Scaling
 
 Each replica keeps its own hot cache on its own PVC. Replicas coordinate only
