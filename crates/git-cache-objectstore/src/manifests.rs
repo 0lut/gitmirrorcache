@@ -1,21 +1,11 @@
 use crate::{validate_key, ObjectStore, ObjectVersion};
 use bytes::Bytes;
-use chrono::{DateTime, Duration, Utc};
 use git_cache_core::{
     CommitManifest, GenerationId, GenerationManifest, GitCacheError, RefManifest,
     RepoGenerationHead, RepoKey, Result,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fmt::Debug;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LeaseManifest {
-    pub repo: RepoKey,
-    pub name: String,
-    pub holder: String,
-    pub acquired_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishManifests {
@@ -162,14 +152,6 @@ pub fn repo_generation_head_key(repo: &RepoKey) -> String {
     format!("repos/{repo}/manifests/generation-head.json")
 }
 
-pub fn lease_key(repo: &RepoKey, name: &str) -> Result<String> {
-    validate_name(name, "lease")?;
-    Ok(format!(
-        "repos/{repo}/leases/{}.json",
-        encode_component(name)
-    ))
-}
-
 fn ref_observation_manifest_key(manifest: &RefManifest) -> Result<String> {
     validate_ref_name(&manifest.ref_name)?;
     Ok(format!(
@@ -254,22 +236,6 @@ where
     .await
 }
 
-pub async fn write_generation_manifest_if_absent<S>(
-    store: &S,
-    manifest: &GenerationManifest,
-) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    validate_generation_manifest(manifest)?;
-    write_json_if_absent(
-        store,
-        &generation_manifest_key(&manifest.repo, manifest.generation),
-        manifest,
-    )
-    .await
-}
-
 pub async fn write_generation_manifest_if_absent_or_matches<S>(
     store: &S,
     manifest: &GenerationManifest,
@@ -302,21 +268,6 @@ where
     S: ObjectStore + ?Sized,
 {
     write_json(
-        store,
-        &commit_manifest_key(&manifest.repo, &manifest.commit),
-        manifest,
-    )
-    .await
-}
-
-pub async fn write_commit_manifest_if_absent<S>(
-    store: &S,
-    manifest: &CommitManifest,
-) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    write_json_if_absent(
         store,
         &commit_manifest_key(&manifest.repo, &manifest.commit),
         manifest,
@@ -360,66 +311,6 @@ where
         manifest,
     )
     .await
-}
-
-pub async fn write_ref_manifest_if_absent<S>(store: &S, manifest: &RefManifest) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    write_json_if_absent(
-        store,
-        &ref_manifest_key(&manifest.repo, &manifest.ref_name)?,
-        manifest,
-    )
-    .await
-}
-
-pub async fn write_ref_manifest_if_absent_or_matches<S>(
-    store: &S,
-    manifest: &RefManifest,
-) -> Result<bool>
-where
-    S: ObjectStore + ?Sized,
-{
-    write_json_if_absent_or_matches(
-        store,
-        &ref_manifest_key(&manifest.repo, &manifest.ref_name)?,
-        manifest,
-    )
-    .await
-}
-
-pub async fn acquire_lease<S>(
-    store: &S,
-    repo: &RepoKey,
-    name: &str,
-    holder: impl Into<String>,
-    acquired_at: DateTime<Utc>,
-    ttl: Duration,
-) -> Result<Option<LeaseManifest>>
-where
-    S: ObjectStore + ?Sized,
-{
-    let lease = LeaseManifest {
-        repo: repo.clone(),
-        name: name.to_string(),
-        holder: holder.into(),
-        acquired_at,
-        expires_at: acquired_at + ttl,
-    };
-    let key = lease_key(repo, name)?;
-    if write_json_if_absent(store, &key, &lease).await? {
-        Ok(Some(lease))
-    } else {
-        Ok(None)
-    }
-}
-
-pub async fn read_lease<S>(store: &S, repo: &RepoKey, name: &str) -> Result<Option<LeaseManifest>>
-where
-    S: ObjectStore + ?Sized,
-{
-    read_json(store, &lease_key(repo, name)?).await
 }
 
 async fn write_publish_manifests<S>(store: &S, manifests: &PublishManifests) -> Result<()>

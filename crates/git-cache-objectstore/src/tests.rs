@@ -1,15 +1,14 @@
 mod tests {
     use crate::{
-        acquire_lease, commit_manifest_key, generation_manifest_key, lease_key, pack_key,
-        read_commit_manifest, read_generation_manifest, read_lease, read_ref_manifest,
-        read_repo_generation_head, ref_manifest_key, repo_generation_head_key, validate_key,
-        write_generation_manifest, write_generation_manifest_if_absent_or_matches,
-        write_ref_manifest_if_absent_or_matches, write_repo_generation_head,
-        write_repo_generation_head_if_version_matches, GenerationPublish, LeaseManifest,
-        LocalObjectStore, ObjectStore, PublishManifests,
+        commit_manifest_key, generation_manifest_key, pack_key, read_commit_manifest,
+        read_generation_manifest, read_ref_manifest, read_repo_generation_head, ref_manifest_key,
+        repo_generation_head_key, validate_key, write_generation_manifest,
+        write_generation_manifest_if_absent_or_matches, write_json_if_absent_or_matches,
+        write_repo_generation_head, write_repo_generation_head_if_version_matches,
+        GenerationPublish, LocalObjectStore, ObjectStore, PublishManifests,
     };
     use bytes::Bytes;
-    use chrono::{DateTime, Duration, Utc};
+    use chrono::{DateTime, Utc};
     use git_cache_core::{
         CommitManifest, CommitSha, GenerationId, GenerationManifest, PackInfo, PackKind,
         RefManifest, RepoGenerationHead, RepoKey,
@@ -366,54 +365,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_acquisition_uses_create_once_semantics() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-
-        let acquired = acquire_lease(
-            &store,
-            &repo,
-            "update",
-            "worker-a",
-            ts(10),
-            Duration::minutes(15),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            acquired,
-            LeaseManifest {
-                repo: repo.clone(),
-                name: "update".into(),
-                holder: "worker-a".into(),
-                acquired_at: ts(10),
-                expires_at: ts(10) + Duration::minutes(15),
-            }
-        );
-
-        assert!(acquire_lease(
-            &store,
-            &repo,
-            "update",
-            "worker-b",
-            ts(11),
-            Duration::minutes(15),
-        )
-        .await
-        .unwrap()
-        .is_none());
-
-        assert_eq!(
-            read_lease(&store, &repo, "update").await.unwrap(),
-            Some(acquired)
-        );
-
-        let _ = fs::remove_dir_all(root).await;
-    }
-
-    #[tokio::test]
     async fn publish_writes_packs_generation_then_manifests() {
         let root = temp_root();
         let store = LocalObjectStore::new(&root);
@@ -480,8 +431,9 @@ mod tests {
 
         let mut changed_ref = reference;
         changed_ref.commit = commit('b');
+        let changed_key = ref_manifest_key(&changed_ref.repo, &changed_ref.ref_name).unwrap();
         assert!(
-            write_ref_manifest_if_absent_or_matches(&store, &changed_ref)
+            write_json_if_absent_or_matches(&store, &changed_key, &changed_ref)
                 .await
                 .is_err()
         );
@@ -509,7 +461,6 @@ mod tests {
 
         assert!(ref_manifest_key(&repo, "refs/heads/../main").is_err());
         assert!(ref_manifest_key(&repo, "/refs/heads/main").is_err());
-        assert!(lease_key(&repo, "../update").is_err());
 
         assert_eq!(
             ref_manifest_key(&repo, "refs/heads/feature/cache").unwrap(),
@@ -607,48 +558,6 @@ mod tests {
 
         let data = store.get("dup/key.json").await.unwrap().unwrap();
         assert_eq!(data, Bytes::from("first"));
-
-        let _ = fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn ref_manifest_absent_or_matches_matching_content() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-        let gen_id = test_generation_id();
-        let reference = ref_manifest_with_gen(&repo, gen_id);
-
-        assert!(write_ref_manifest_if_absent_or_matches(&store, &reference)
-            .await
-            .unwrap());
-        // Same content → not an error, returns false (already exists)
-        assert!(!write_ref_manifest_if_absent_or_matches(&store, &reference)
-            .await
-            .unwrap());
-
-        let _ = fs::remove_dir_all(&root).await;
-    }
-
-    #[tokio::test]
-    async fn ref_manifest_absent_or_matches_conflicting_content() {
-        let root = temp_root();
-        let store = LocalObjectStore::new(&root);
-        let repo = repo();
-        let gen_id = test_generation_id();
-        let reference = ref_manifest_with_gen(&repo, gen_id);
-
-        write_ref_manifest_if_absent_or_matches(&store, &reference)
-            .await
-            .unwrap();
-
-        let mut conflicting = reference;
-        conflicting.commit = commit('b');
-        assert!(
-            write_ref_manifest_if_absent_or_matches(&store, &conflicting)
-                .await
-                .is_err()
-        );
 
         let _ = fs::remove_dir_all(&root).await;
     }

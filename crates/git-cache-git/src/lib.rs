@@ -172,27 +172,6 @@ impl Git {
             .await
     }
 
-    pub async fn fetch_branch(
-        &self,
-        repo_dir: &Path,
-        remote_url: &str,
-        branch: &str,
-        local_ref: &str,
-    ) -> Result<GitOutput> {
-        reject_ref_arg(branch, "branch")?;
-        reject_ref_arg(local_ref, "local ref")?;
-        reject_remote_url(remote_url)?;
-        self.check_branch_name(branch).await?;
-        self.check_ref_name(local_ref).await?;
-
-        let refspec = format!("refs/heads/{branch}:{local_ref}");
-        self.run_upstream(
-            Some(repo_dir),
-            ["fetch", "--no-tags", "--", remote_url, &refspec],
-        )
-        .await
-    }
-
     pub async fn rev_parse(&self, repo_dir: &Path, rev: &str) -> Result<String> {
         reject_revision_arg(rev)?;
         self.local_backend
@@ -269,37 +248,6 @@ impl Git {
             .collect()
     }
 
-    pub async fn object_reachable_from_commits(
-        &self,
-        repo_dir: &Path,
-        object_id: &CommitSha,
-        commits: &[CommitSha],
-    ) -> Result<bool> {
-        reject_revision_arg(object_id.as_str())?;
-        if commits.is_empty() {
-            return Ok(false);
-        }
-
-        let mut stdin = Vec::with_capacity(commits.len() * 41);
-        for commit in commits {
-            reject_revision_arg(commit.as_str())?;
-            stdin.extend_from_slice(commit.as_str().as_bytes());
-            stdin.push(b'\n');
-        }
-
-        let output = self
-            .run_with_stdin_and_limits(
-                Some(repo_dir),
-                ["rev-list", "--objects", "--no-object-names", "--stdin"],
-                Some(&stdin),
-                self.output_limit,
-                self.output_limit,
-            )
-            .await?;
-        let text = output.stdout_utf8("rev-list")?;
-        Ok(text.lines().any(|line| line.trim() == object_id.as_str()))
-    }
-
     /// Check, without lazy promisor fetches, that the full snapshot of
     /// `commit` — the commit object plus every tree and blob reachable from
     /// its root tree — is present locally. `--max-count=1` restricts the
@@ -361,70 +309,6 @@ impl Git {
     pub async fn fsck(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(Some(repo_dir), ["fsck", "--connectivity-only"])
             .await
-    }
-
-    pub async fn bundle_create(
-        &self,
-        repo_dir: &Path,
-        bundle_path: &Path,
-        rev: &str,
-    ) -> Result<GitOutput> {
-        reject_revision_arg(rev)?;
-        self.run(
-            Some(repo_dir),
-            ["bundle", "create", path_to_str(bundle_path)?, rev],
-        )
-        .await
-    }
-
-    pub async fn bundle_create_all(
-        &self,
-        repo_dir: &Path,
-        bundle_path: &Path,
-    ) -> Result<GitOutput> {
-        self.run(
-            Some(repo_dir),
-            ["bundle", "create", path_to_str(bundle_path)?, "--all"],
-        )
-        .await
-    }
-
-    pub async fn bundle_create_incremental(
-        &self,
-        repo_dir: &Path,
-        bundle_path: &Path,
-        exclude_tips: &[CommitSha],
-    ) -> Result<GitOutput> {
-        for tip in exclude_tips {
-            reject_revision_arg(tip.as_str())?;
-        }
-
-        let mut args: Vec<OsString> = vec![
-            OsString::from("bundle"),
-            OsString::from("create"),
-            path_to_str(bundle_path)?.into(),
-            OsString::from("--all"),
-        ];
-        for tip in exclude_tips {
-            args.push(OsString::from(format!("^{}", tip.as_str())));
-        }
-        self.run(Some(repo_dir), args).await
-    }
-
-    pub async fn fetch_bundle(&self, repo_dir: &Path, bundle_path: &Path) -> Result<GitOutput> {
-        self.run(
-            Some(repo_dir),
-            ["fetch", "--", path_to_str(bundle_path)?, "+refs/*:refs/*"],
-        )
-        .await
-    }
-
-    pub async fn bundle_verify(&self, repo_dir: &Path, bundle_path: &Path) -> Result<GitOutput> {
-        self.run(
-            Some(repo_dir),
-            ["bundle", "verify", "--", path_to_str(bundle_path)?],
-        )
-        .await
     }
 
     /// Run `git pack-objects --revs` writing a pack containing the objects
@@ -580,12 +464,8 @@ impl Git {
         let mut default_branch: Option<String> = None;
 
         for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
-                if let Some((branch, target)) = rest.split_once('\t') {
-                    if target == "HEAD" {
-                        default_branch = Some(branch.to_string());
-                    }
-                }
+            if let Some(branch) = parse_symref_head_branch(line) {
+                default_branch = Some(branch.to_string());
                 continue;
             }
 
@@ -614,14 +494,8 @@ impl Git {
 
         let text = output.stdout_utf8_upstream("ls-remote")?;
 
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("ref: refs/heads/") {
-                if let Some((branch, head)) = rest.split_once('\t') {
-                    if head == "HEAD" {
-                        return Ok(branch.to_string());
-                    }
-                }
-            }
+        if let Some(branch) = text.lines().find_map(parse_symref_head_branch) {
+            return Ok(branch.to_string());
         }
 
         Err(GitCacheError::UpstreamUnavailable(
@@ -744,43 +618,6 @@ impl Git {
         })
     }
 
-    pub async fn fetch_refs(
-        &self,
-        repo_dir: &Path,
-        remote_url: &str,
-        refspecs: &[String],
-    ) -> Result<GitOutput> {
-        reject_remote_url(remote_url)?;
-        for refspec in refspecs {
-            reject_refspec(refspec)?;
-        }
-        let mut args: Vec<String> = vec![
-            "fetch".to_string(),
-            "--no-tags".to_string(),
-            "--".to_string(),
-            remote_url.to_string(),
-        ];
-        args.extend(refspecs.iter().cloned());
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        self.run_upstream(Some(repo_dir), args_ref).await
-    }
-
-    pub async fn fetch_object(
-        &self,
-        repo_dir: &Path,
-        remote_url: &str,
-        object_id: &CommitSha,
-        options: FetchOptions<'_>,
-    ) -> Result<GitOutput> {
-        self.fetch_objects(
-            repo_dir,
-            remote_url,
-            std::slice::from_ref(object_id),
-            options,
-        )
-        .await
-    }
-
     pub async fn fetch_objects(
         &self,
         repo_dir: &Path,
@@ -875,12 +712,6 @@ impl Git {
             OsString::from(refspec),
         ]);
         self.run_upstream(Some(repo_dir), args).await
-    }
-
-    async fn check_branch_name(&self, branch: &str) -> Result<()> {
-        self.run(None, ["check-ref-format", "--branch", branch])
-            .await?;
-        Ok(())
     }
 
     async fn check_ref_name(&self, ref_name: &str) -> Result<()> {
@@ -1119,6 +950,14 @@ impl Git {
             other => other,
         }
     }
+}
+
+/// Parse a `ref: refs/heads/<branch>\tHEAD` symref line from
+/// `ls-remote --symref` output, returning the default branch name.
+fn parse_symref_head_branch(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("ref: refs/heads/")?;
+    let (branch, target) = rest.split_once('\t')?;
+    (target == "HEAD").then_some(branch)
 }
 
 fn path_to_str(path: &Path) -> Result<&str> {
@@ -1895,36 +1734,9 @@ printf '\n' >> "$FAKE_ARGS_OUT"
     }
 
     #[tokio::test]
-    async fn fetch_branch_rejects_dash_branch() {
-        let git = test_git();
-        assert!(git
-            .fetch_branch(Path::new("/unused"), "url", "-evil", "refs/cache/test")
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn fetch_branch_rejects_dash_local_ref() {
-        let git = test_git();
-        assert!(git
-            .fetch_branch(Path::new("/unused"), "url", "main", "--evil")
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
     async fn rev_parse_rejects_dash_rev() {
         let git = test_git();
         assert!(git.rev_parse(Path::new("/unused"), "--evil").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn bundle_create_rejects_dash_rev() {
-        let git = test_git();
-        assert!(git
-            .bundle_create(Path::new("/unused"), Path::new("/unused"), "-evil")
-            .await
-            .is_err());
     }
 
     #[tokio::test]
@@ -2001,28 +1813,6 @@ printf '\n' >> "$FAKE_ARGS_OUT"
     }
 
     #[tokio::test]
-    async fn fetch_refs_rejects_dash_url() {
-        let git = test_git();
-        assert!(git
-            .fetch_refs(Path::new("/unused"), "-evil", &[])
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn fetch_refs_rejects_nul_in_refspec() {
-        let git = test_git();
-        assert!(git
-            .fetch_refs(
-                Path::new("/unused"),
-                "https://example.com/repo.git",
-                &["bad\0spec".to_string()]
-            )
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
     async fn fetch_ref_rejects_dash_url() {
         let git = test_git();
         assert!(git
@@ -2068,14 +1858,14 @@ printf '\n' >> "$FAKE_ARGS_OUT"
     }
 
     #[tokio::test]
-    async fn fetch_object_rejects_zero_depth() {
+    async fn fetch_objects_rejects_zero_depth() {
         let git = test_git();
         let commit = CommitSha::parse("a".repeat(40)).unwrap();
         assert!(git
-            .fetch_object(
+            .fetch_objects(
                 Path::new("/unused"),
                 "https://example.com/repo.git",
-                &commit,
+                std::slice::from_ref(&commit),
                 FetchOptions {
                     filter: None,
                     depth: Some(0),
