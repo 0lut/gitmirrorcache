@@ -1,5 +1,8 @@
 # gitmirrorcache
 
+[![Latest release](https://img.shields.io/github/v/tag/0lut/gitmirrorcache?sort=semver&label=release)](https://github.com/0lut/gitmirrorcache/tags)
+[![Container image](https://img.shields.io/badge/ghcr.io-0lut%2Fgitmirrorcache-blue?logo=docker)](https://github.com/0lut/gitmirrorcache/pkgs/container/gitmirrorcache)
+
 A read-only Git fetch cache that sits between clone-heavy automation — CI
 runners, coding agents, sandboxes, build farms — and your Git upstreams
 (GitHub, GitLab, Bitbucket, or any Smart HTTP Git server). Instead of
@@ -188,10 +191,17 @@ ALB with `scripts/aws/deploy-preview.sh`. See
 ### Docker
 
 Prebuilt multi-arch images are published to `ghcr.io/0lut/gitmirrorcache` on
-`v*` release tags (pin a version like `v1.2.3`, or `latest` for the most
-recent release). A multi-stage [`Dockerfile`](Dockerfile) builds the server
-and CLI from source; configure either with the environment variables above.
-For local S3 testing there is a MinIO compose file:
+`v*` release tags — the badge at the top of this README always shows the
+newest release:
+
+```sh
+docker pull ghcr.io/0lut/gitmirrorcache:latest   # most recent release
+docker pull ghcr.io/0lut/gitmirrorcache:1.2.3    # pin an exact version
+```
+
+A multi-stage [`Dockerfile`](Dockerfile) builds the server and CLI from
+source; configure either with the environment variables above. For local S3
+testing there is a MinIO compose file:
 
 ```sh
 docker compose -f docker-compose.minio.yml up -d
