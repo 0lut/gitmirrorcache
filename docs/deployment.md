@@ -1,5 +1,14 @@
 # Deployment Notes
 
+## Kubernetes (Helm)
+
+A Helm chart for deploying to any Kubernetes cluster lives at
+[`deploy/helm/gitmirrorcache`](../deploy/helm/gitmirrorcache/README.md). It runs
+the server as a StatefulSet with a persistent `/cache` volume, an hourly
+`git-cache compact --all` CronJob, and S3 (or any S3-compatible store) as the
+durable source. Container images are published to
+`ghcr.io/0lut/gitmirrorcache` by the `Publish Docker Image` workflow.
+
 ## Current AWS Deployment Path
 
 Use **ECS on Graviton EC2 with host-mounted EBS** for large repository deployments.

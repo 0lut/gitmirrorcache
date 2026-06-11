@@ -1,0 +1,36 @@
+name: Helm Chart
+
+on:
+  push:
+    branches: [main]
+    paths: ["deploy/helm/**"]
+  pull_request:
+    branches: [main]
+    paths: ["deploy/helm/**"]
+
+jobs:
+  lint:
+    name: Lint & template
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint deploy/helm/gitmirrorcache --set config.objectStore.s3.bucket=ci-bucket
+
+      - name: helm template (s3 defaults)
+        run: |
+          helm template git-cache deploy/helm/gitmirrorcache \
+            --set config.objectStore.s3.bucket=ci-bucket \
+            --set aws.region=us-west-2 \
+            --set ingress.enabled=true
+
+      - name: helm template (local store, no persistence)
+        run: |
+          helm template git-cache deploy/helm/gitmirrorcache \
+            --set config.objectStore.kind=local \
+            --set persistence.enabled=false \
+            --set compaction.enabled=false

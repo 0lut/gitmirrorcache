@@ -1,0 +1,63 @@
+{{- if .Values.compaction.enabled -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "gitmirrorcache.fullname" . }}-compaction
+  labels:
+    {{- include "gitmirrorcache.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.compaction.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.compaction.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "gitmirrorcache.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: compaction
+        spec:
+          restartPolicy: {{ .Values.compaction.restartPolicy }}
+          serviceAccountName: {{ include "gitmirrorcache.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: compaction
+              image: {{ include "gitmirrorcache.image" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              command: ["/usr/local/bin/git-cache", "compact", "--all"]
+              env:
+                {{- include "gitmirrorcache.env" . | nindent 16 }}
+                # Compaction works against the object store; use scratch disk
+                # so the job does not contend with the server's hot cache.
+                - name: GIT_CACHE_ROOT
+                  value: /tmp/compaction-cache
+              {{- with .Values.compaction.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+              volumeMounts:
+                {{- if .Values.configFile }}
+                - name: config
+                  mountPath: /etc/gitmirrorcache
+                  readOnly: true
+                {{- end }}
+                - name: scratch
+                  mountPath: /tmp/compaction-cache
+          volumes:
+            - name: scratch
+              emptyDir: {}
+            {{- if .Values.configFile }}
+            - name: config
+              configMap:
+                name: {{ include "gitmirrorcache.fullname" . }}
+            {{- end }}
+{{- end }}
