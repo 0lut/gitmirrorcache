@@ -15,7 +15,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/git-cache"
+repository = "https://github.com/0lut/gitmirrorcache"
 rust-version = "1.82"
 
 [workspace.dependencies]

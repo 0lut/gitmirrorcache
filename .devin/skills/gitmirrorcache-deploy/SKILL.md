@@ -28,8 +28,10 @@ IFS=, read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY <<< "$(printf '%s' "$AWS_A
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 ```
 
-Account 411474713009, region us-west-2. EC2 vCPU quota is 32 — check running
-instances before launching large instance types (VcpuLimitExceeded otherwise).
+Region is us-west-2. Derive the account ID at runtime instead of hard-coding
+it: `aws sts get-caller-identity --query Account --output text`. The dev
+account's EC2 vCPU quota is 32 — check running instances before launching
+large instance types (VcpuLimitExceeded otherwise).
 
 ## AWS CLI v2 required
 

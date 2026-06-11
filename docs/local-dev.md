@@ -23,7 +23,7 @@ git --git-dir ../upstreams/github.com/acme/widgets.git symbolic-ref HEAD refs/he
 ## 2. Start The API
 
 ```sh
-cd /Users/sahin/dev/gitcache
+cd /path/to/gitmirrorcache
 GIT_CACHE_CONFIG=config/local.example.toml cargo run -p git-cache-api
 ```
 
