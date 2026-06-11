@@ -69,7 +69,7 @@ and correctness evidence for public GitHub repos:
 
 ```sh
 RUN_AWS_DEV_GIT_MATRIX=1 \
-GIT_CACHE_AWS_DEV_BASE_URL=http://gitmirrorcache-arm-ec2-alb-1840948451.us-west-2.elb.amazonaws.com \
+GIT_CACHE_AWS_DEV_BASE_URL=http://<dev-alb-dns>.us-west-2.elb.amazonaws.com \
 GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1 \
 python3 -m unittest -v integration_tests.test_aws_dev_git_matrix
 ```
@@ -97,7 +97,7 @@ To run only the heavier local read-through lanes with proxy-on-miss forced off:
 
 ```sh
 RUN_AWS_DEV_GIT_MATRIX=1 \
-GIT_CACHE_AWS_DEV_BASE_URL=http://gitmirrorcache-arm-ec2-alb-1840948451.us-west-2.elb.amazonaws.com \
+GIT_CACHE_AWS_DEV_BASE_URL=http://<dev-alb-dns>.us-west-2.elb.amazonaws.com \
 GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1 \
 GIT_CACHE_AWS_DEV_SKIP_STANDARD=1 \
 GIT_CACHE_AWS_DEV_TIER=heavy \

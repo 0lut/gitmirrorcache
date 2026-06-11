@@ -1,4 +1,10 @@
 # Git Fetch Cache: Rust Implementation Handoff
+
+> **Historical design document.** This is the original handoff plan and is kept
+> for context only. Parts of it no longer match the implementation: the request
+> `mode` field and pinned session URLs/refs were removed (see the "Current Cache
+> Contract" section in [AGENTS.md](AGENTS.md) for the live contract).
+
 **Read-only Git cache for GitHub fetch operations; object storage source of truth, local block storage as disposable hot cache**
 Prepared: May 18, 2026
 ## 1. Background and problem context

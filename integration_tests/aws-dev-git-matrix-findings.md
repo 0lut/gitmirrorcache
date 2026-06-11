@@ -3,10 +3,10 @@
 Run date: 2026-06-11 UTC
 
 Dev target:
-`http://gitmirrorcache-arm-ec2-alb-1840948451.us-west-2.elb.amazonaws.com`
+`http://<dev-alb-dns>.us-west-2.elb.amazonaws.com`
 
 Image:
-`411474713009.dkr.ecr.us-west-2.amazonaws.com/gitmirrorcache-arm:6443d09`
+`<account-id>.dkr.ecr.us-west-2.amazonaws.com/gitmirrorcache-arm:6443d09`
 
 ## Coverage
 
@@ -29,7 +29,7 @@ Command:
 
 ```sh
 RUN_AWS_DEV_GIT_MATRIX=1 \
-GIT_CACHE_AWS_DEV_BASE_URL=http://gitmirrorcache-arm-ec2-alb-1840948451.us-west-2.elb.amazonaws.com \
+GIT_CACHE_AWS_DEV_BASE_URL=http://<dev-alb-dns>.us-west-2.elb.amazonaws.com \
 GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1 \
 GIT_CACHE_AWS_DEV_RESULTS=/tmp/gitcache-aws-dev-matrix-20260611T0109.jsonl \
 AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm AWS_PAGER= \
@@ -61,7 +61,7 @@ Command:
 
 ```sh
 RUN_AWS_DEV_GIT_MATRIX=1 \
-GIT_CACHE_AWS_DEV_BASE_URL=http://gitmirrorcache-arm-ec2-alb-1840948451.us-west-2.elb.amazonaws.com \
+GIT_CACHE_AWS_DEV_BASE_URL=http://<dev-alb-dns>.us-west-2.elb.amazonaws.com \
 GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1 \
 GIT_CACHE_AWS_DEV_SKIP_STANDARD=1 \
 GIT_CACHE_AWS_DEV_TIER=heavy \

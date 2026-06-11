@@ -19,7 +19,7 @@ Ensure `git fsck --connectivity-only` never blocks clone/materialize request pat
 - [x] Keep branch/default request responses fast by serving from locally fetched refs rather than waiting for durable manifests.
 - [x] Enqueue background verification after branch/default materialize, exact commit materialize, direct Git read-through fetches, changed-ref fetches, and compaction publish.
 - [x] Bound concurrent generation verification with `max_concurrent_generation_verifications`.
-- [x] Add startup pending-generation scanner to resume verification after process restart.
+- [x] Recover pending generations request-driven: foreground materialize and direct Git want handling check pending metadata before fetching upstream (the earlier startup scanner was removed; see `implementation-notes.md` tradeoff T3).
 - [x] Add automatic v2 object-store namespace suffixing for local and S3 backends.
 - [x] Add/update tests for verified sidecars, background verification, checksum hydrate, cold hydrate, compaction, branch/default refs, and manifest publication ordering.
 - [x] Update example configs with the verifier concurrency knob.
