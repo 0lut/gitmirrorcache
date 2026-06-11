@@ -1,4 +1,3 @@
-use git_cache_api::app_result_async;
 use git_cache_core::AppConfig;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -13,6 +12,6 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(addr = %config.bind_addr, "starting git-cache-api");
 
-    axum::serve(listener, app_result_async(config).await?).await?;
+    git_cache_api::serve(listener, config).await?;
     Ok(())
 }

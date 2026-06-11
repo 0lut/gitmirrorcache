@@ -102,6 +102,7 @@ impl ApiState {
     }
 
     fn with_domain(rate_limiter: RateLimiter, domain: Arc<AppState>) -> CoreResult<Self> {
+        spawn_repo_access_flusher(&domain);
         let upstream_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(domain.config.git_timeout_seconds))
             .build()
@@ -130,6 +131,57 @@ impl ApiState {
     fn next_request_id(&self) -> u64 {
         self.metrics.request_ids.fetch_add(1, Ordering::Relaxed) + 1
     }
+}
+
+/// Periodically flush buffered in-memory repo access timestamps to the
+/// persistent disk index. The task holds only a weak reference to the app
+/// state and exits once the application has been dropped. Spawning is skipped
+/// when no tokio runtime is available (the next process start rebuilds
+/// recency from the persisted index, so a missed flush only loses at most one
+/// interval of recency).
+fn spawn_repo_access_flusher(domain: &Arc<AppState>) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let interval = Duration::from_secs(domain.config.disk.access_flush_interval_secs.max(1));
+    let weak = Arc::downgrade(domain);
+    handle.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(domain) = weak.upgrade() else {
+                break;
+            };
+            if let Err(err) = domain.disk.flush_repo_accesses().await {
+                warn!(error = %err, "failed to flush repo access timestamps");
+            }
+        }
+    });
+}
+
+/// Serve the API on `listener` until ctrl-c, then flush any buffered repo
+/// access timestamps before returning.
+pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> CoreResult<()> {
+    let git_remote_enabled = config.git_remote.enabled;
+    let state = Arc::new(ApiState::try_new_async(config).await?);
+    let domain = state.domain.clone();
+    let app = router(git_remote_enabled, state)?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                warn!(error = %err, "failed to listen for shutdown signal");
+            }
+        })
+        .await
+        .map_err(|err| GitCacheError::Internal(format!("server error: {err}")))?;
+
+    if let Err(err) = domain.disk.flush_repo_accesses().await {
+        warn!(error = %err, "failed to flush repo access timestamps during shutdown");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1863,6 +1915,7 @@ mod tests {
             disk: git_cache_core::DiskConfig {
                 quota_bytes: 1024 * 1024 * 1024,
                 min_free_bytes: 0,
+                access_flush_interval_secs: 60,
             },
             git_remote: Default::default(),
             compaction: Default::default(),

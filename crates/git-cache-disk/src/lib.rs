@@ -27,6 +27,7 @@ struct DiskState {
     active_reservations: HashMap<Uuid, ReservationMarker>,
     repo_locks: HashMap<PathBuf, usize>,
     invalidating_repos: HashSet<PathBuf>,
+    pending_accesses: HashMap<PathBuf, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -219,6 +220,59 @@ impl DiskManager {
         Ok(entry)
     }
 
+    /// Record a repo access in memory only. The timestamp is applied to the
+    /// persistent index by the next [`DiskManager::flush_repo_accesses`] call,
+    /// and is consulted by eviction in the meantime so recently accessed repos
+    /// are not selected as LRU victims before a flush happens.
+    pub fn note_repo_access(&self, repo_path: impl AsRef<Path>) -> Result<()> {
+        let repo_path = normalize_repo_path(&self.repos_dir(), repo_path.as_ref())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
+        state.pending_accesses.insert(repo_path, now_unix_millis());
+        Ok(())
+    }
+
+    /// Apply buffered in-memory access timestamps to the persistent repo
+    /// index in a single write. Returns the number of entries applied.
+    pub fn flush_repo_accesses(&self) -> Result<usize> {
+        self.ensure_layout()?;
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
+        let pending = std::mem::take(&mut state.pending_accesses);
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let mut index = self.load_index()?;
+        let mut applied = 0usize;
+        for (repo_path, accessed_at) in pending {
+            if let Some(entry) = index.repos.get_mut(&repo_path) {
+                entry.last_accessed_unix_millis = entry.last_accessed_unix_millis.max(accessed_at);
+                applied += 1;
+                continue;
+            }
+            let repo_dir = self.repo_dir(&repo_path);
+            if !repo_dir.exists() {
+                continue;
+            }
+            let entry = RepoIndexEntry {
+                path: repo_path.clone(),
+                size_bytes: directory_size(&repo_dir)?,
+                last_accessed_unix_millis: accessed_at,
+                protected: false,
+            };
+            index.repos.insert(repo_path, entry);
+            applied += 1;
+        }
+        self.write_index(&index)?;
+        Ok(applied)
+    }
+
     pub fn touch_repo_access(&self, repo_path: impl AsRef<Path>) -> Result<RepoIndexEntry> {
         self.ensure_layout()?;
 
@@ -320,6 +374,7 @@ impl DiskManager {
                 } else {
                     Ok(())
                 };
+                state.pending_accesses.remove(&repo_path);
                 state.invalidating_repos.remove(&repo_path);
                 index_result
             });
@@ -522,6 +577,11 @@ impl DiskManager {
 
     fn evict_until_available_locked(&self, bytes: u64, state: &DiskState) -> Result<()> {
         let mut index = self.sync_repo_index_locked()?;
+        for (repo_path, accessed_at) in &state.pending_accesses {
+            if let Some(entry) = index.repos.get_mut(repo_path) {
+                entry.last_accessed_unix_millis = entry.last_accessed_unix_millis.max(*accessed_at);
+            }
+        }
 
         loop {
             let accounting = self.accounting_locked(state)?;
@@ -912,6 +972,91 @@ mod tests {
         assert!(!manager.repos_dir().join("old.git").exists());
         assert!(manager.repos_dir().join("new.git").exists());
         assert_eq!(reservation.bytes(), 300);
+    }
+
+    #[test]
+    fn note_repo_access_is_invisible_until_flush_then_persisted() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "repo.git", 10);
+        manager.record_repo_access("repo.git").expect("record");
+        let before = manager.repo_index().expect("index").repos[Path::new("repo.git")]
+            .last_accessed_unix_millis;
+
+        std::thread::sleep(Duration::from_millis(2));
+        manager.note_repo_access("repo.git").expect("note");
+        let unflushed = manager.repo_index().expect("index").repos[Path::new("repo.git")]
+            .last_accessed_unix_millis;
+        assert_eq!(unflushed, before);
+
+        assert_eq!(manager.flush_repo_accesses().expect("flush"), 1);
+        let flushed = manager.repo_index().expect("index").repos[Path::new("repo.git")]
+            .last_accessed_unix_millis;
+        assert!(flushed > before);
+
+        // A second flush with nothing pending is a no-op.
+        assert_eq!(manager.flush_repo_accesses().expect("flush"), 0);
+
+        // The flushed timestamp survives a fresh manager (process restart).
+        let reopened = DiskManager::new(root.path(), 10_000, 0);
+        let restarted = reopened.repo_index().expect("index").repos[Path::new("repo.git")]
+            .last_accessed_unix_millis;
+        assert_eq!(restarted, flushed);
+    }
+
+    #[test]
+    fn flush_indexes_unknown_repo_dir_and_skips_missing_dirs() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "present.git", 10);
+
+        manager.note_repo_access("present.git").expect("note");
+        manager.note_repo_access("missing.git").expect("note");
+
+        assert_eq!(manager.flush_repo_accesses().expect("flush"), 1);
+        let index = manager.repo_index().expect("index");
+        assert!(index.repos.contains_key(Path::new("present.git")));
+        assert!(!index.repos.contains_key(Path::new("missing.git")));
+    }
+
+    #[test]
+    fn eviction_consults_pending_accesses_before_picking_victim() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 900, 0);
+        write_repo_file(&manager, "a.git", 300);
+        write_repo_file(&manager, "b.git", 500);
+
+        manager.record_repo_access("a.git").expect("a access");
+        std::thread::sleep(Duration::from_millis(2));
+        manager.record_repo_access("b.git").expect("b access");
+
+        // `a` is the persisted LRU victim, but an unflushed access makes it
+        // the most recently used; eviction must pick `b` instead.
+        std::thread::sleep(Duration::from_millis(2));
+        manager.note_repo_access("a.git").expect("note");
+
+        manager.reserve(300).expect("reservation");
+
+        assert!(manager.repos_dir().join("a.git").exists());
+        assert!(!manager.repos_dir().join("b.git").exists());
+    }
+
+    #[test]
+    fn invalidate_repo_drops_pending_access() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "repo.git", 10);
+        manager.record_repo_access("repo.git").expect("record");
+        manager.note_repo_access("repo.git").expect("note");
+
+        manager.invalidate_repo("repo.git").expect("invalidate");
+
+        assert_eq!(manager.flush_repo_accesses().expect("flush"), 0);
+        assert!(!manager
+            .repo_index()
+            .expect("index")
+            .repos
+            .contains_key(Path::new("repo.git")));
     }
 
     #[test]
