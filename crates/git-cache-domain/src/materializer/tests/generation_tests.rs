@@ -719,7 +719,7 @@ mod tests {
     }
 
     // ── upstream_url tests ───────────────────────────────────────────
-    use git_cache_objectstore::{ObjectStore, ObjectVersion};
+    use git_cache_objectstore::ObjectStore;
 
     /// Object store wrapper that pauses the first write to the generation
     /// head pointer while armed, letting the test interleave a concurrent
@@ -755,23 +755,6 @@ mod tests {
 
         async fn put_if_absent(&self, key: &str, value: bytes::Bytes) -> CoreResult<bool> {
             self.inner.put_if_absent(key, value).await
-        }
-
-        async fn get_versioned(
-            &self,
-            key: &str,
-        ) -> CoreResult<Option<(bytes::Bytes, ObjectVersion)>> {
-            self.inner.get_versioned(key).await
-        }
-
-        async fn put_if_version_matches(
-            &self,
-            key: &str,
-            value: bytes::Bytes,
-            version: &ObjectVersion,
-        ) -> CoreResult<bool> {
-            self.pause_if_armed(key).await;
-            self.inner.put_if_version_matches(key, value, version).await
         }
 
         async fn exists(&self, key: &str) -> CoreResult<bool> {
