@@ -33,6 +33,7 @@ mod executor;
 mod generations;
 mod manifests;
 mod planning;
+mod proxy_tee;
 mod repo;
 mod util;
 
@@ -41,6 +42,7 @@ pub use direct_git::{
 };
 pub use executor::MaterializerExecutor;
 pub use generations::{default_manifest_key, CompactionReport, GenerationSweepReport};
+pub use proxy_tee::{plan_upload_pack_tee, PackDemux, UploadPackTeePlan};
 pub use repo::repo_from_git_path;
 
 #[derive(Clone)]
