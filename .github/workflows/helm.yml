@@ -40,7 +40,7 @@ jobs:
           out=$(helm template git-cache deploy/helm/gitmirrorcache \
             --set config.objectStore.s3.bucket=ci-bucket \
             --set-string configFile='cache_root = "/cache"')
-          echo "$out" | grep -q 'GIT_CACHE_CONFIG' || { echo "server missing GIT_CACHE_CONFIG"; exit 1; }
+          echo "$out" | grep -q 'name: GIT_CACHE_CONFIG' || { echo "server missing GIT_CACHE_CONFIG"; exit 1; }
           cronjob=$(echo "$out" | awk '/^kind: CronJob$/{f=1} /^---$/{f=0} f')
-          echo "$cronjob" | grep -q 'GIT_CACHE_CONFIG' && { echo "CronJob must not set GIT_CACHE_CONFIG"; exit 1; }
+          echo "$cronjob" | grep -q 'name: GIT_CACHE_CONFIG' && { echo "CronJob must not set GIT_CACHE_CONFIG"; exit 1; }
           echo "ok"
