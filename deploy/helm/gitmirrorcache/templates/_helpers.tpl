@@ -104,6 +104,10 @@ mounts the ConfigMap) opts into it.
   value: {{ .Values.config.compaction.chainDepthThreshold | int64 | quote }}
 - name: GIT_CACHE_COMPACTION_INLINE
   value: {{ .Values.config.compaction.inline | quote }}
+- name: GIT_CACHE_SHUTDOWN_READINESS_DELAY_SECONDS
+  value: {{ .Values.config.shutdown.readinessDelaySeconds | int64 | quote }}
+- name: GIT_CACHE_SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+  value: {{ .Values.config.shutdown.drainTimeoutSeconds | int64 | quote }}
 - name: RUST_LOG
   value: {{ .Values.config.logLevel | quote }}
 {{- if eq .Values.config.objectStore.kind "s3" }}

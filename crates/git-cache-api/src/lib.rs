@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -54,9 +54,28 @@ pub fn app_result(config: AppConfig) -> CoreResult<Router> {
 }
 
 pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
+    Ok(app_with_shutdown_async(config).await?.0)
+}
+
+/// Like [`app_result_async`], but also returns a [`ReadinessGate`] that the
+/// caller can flip during shutdown so `/healthz` starts failing and load
+/// balancers stop routing new traffic while in-flight requests drain.
+pub async fn app_with_shutdown_async(config: AppConfig) -> CoreResult<(Router, ReadinessGate)> {
     let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
-    router(git_remote_enabled, state)
+    let gate = ReadinessGate(Arc::clone(&state.shutting_down));
+    Ok((router(git_remote_enabled, state)?, gate))
+}
+
+/// Handle that marks the server as shutting down; once flipped, `/healthz`
+/// returns 503 so orchestrators stop sending new traffic.
+#[derive(Clone, Debug)]
+pub struct ReadinessGate(Arc<AtomicBool>);
+
+impl ReadinessGate {
+    pub fn begin_shutdown(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> {
@@ -86,6 +105,7 @@ struct ApiState {
     upstream_http: reqwest::Client,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl ApiState {
@@ -124,6 +144,7 @@ impl ApiState {
             upstream_http,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -245,11 +266,17 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
+async fn healthz(State(state): State<Arc<ApiState>>) -> Response {
+    let shutting_down = state.shutting_down.load(Ordering::SeqCst);
+    let body = Json(HealthResponse {
+        ok: !shutting_down,
         checked_at: chrono::Utc::now(),
-    })
+    });
+    if shutting_down {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    } else {
+        body.into_response()
+    }
 }
 
 async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
@@ -1866,6 +1893,7 @@ mod tests {
             },
             git_remote: Default::default(),
             compaction: Default::default(),
+            shutdown: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
             use_gitoxide: true,
@@ -1888,6 +1916,45 @@ mod tests {
             Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),
             Ok(_) => panic!("rate-limited authenticated resolve should not succeed"),
         }
+    }
+
+    #[tokio::test]
+    async fn healthz_fails_after_shutdown_begins() {
+        let tmp = TempDir::new().unwrap();
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            cache_root: tmp.path().join("cache"),
+            upstream_root: None,
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 60,
+            max_git_output_bytes: 16 * 1024 * 1024,
+            object_store: ObjectStoreConfig::Local {
+                root: tmp.path().join("objects"),
+            },
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 0,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 1024 * 1024 * 1024,
+                min_free_bytes: 0,
+            },
+            git_remote: Default::default(),
+            compaction: Default::default(),
+            shutdown: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
+            use_gitoxide: true,
+        };
+        let state = Arc::new(ApiState::try_new(config).unwrap());
+        let gate = ReadinessGate(Arc::clone(&state.shutting_down));
+
+        let response = healthz(State(Arc::clone(&state))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        gate.begin_shutdown();
+
+        let response = healthz(State(state)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

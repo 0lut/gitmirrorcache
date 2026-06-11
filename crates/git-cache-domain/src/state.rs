@@ -396,6 +396,7 @@ mod tests {
             },
             git_remote: Default::default(),
             compaction: Default::default(),
+            shutdown: Default::default(),
             max_concurrent_git_processes: 1,
             async_materialize_concurrency: 2,
             use_gitoxide: true,
