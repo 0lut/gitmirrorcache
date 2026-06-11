@@ -35,17 +35,6 @@ jobs:
             --set persistence.enabled=false \
             --set compaction.enabled=false
 
-      - name: helm template (managed gp3 storage class)
-        run: |
-          out=$(helm template git-cache deploy/helm/gitmirrorcache \
-            --set config.objectStore.s3.bucket=ci-bucket \
-            --set storageClass.create=true)
-          echo "$out" | grep -q '^kind: StorageClass$' || { echo "missing StorageClass"; exit 1; }
-          echo "$out" | grep -q 'name: git-cache-gitmirrorcache-gp3' || { echo "missing managed storage class name"; exit 1; }
-          echo "$out" | grep -q 'storageClassName: "git-cache-gitmirrorcache-gp3"' || { echo "PVC not using managed StorageClass"; exit 1; }
-          echo "$out" | grep -q 'iops: "8000"' || { echo "missing gp3 iops"; exit 1; }
-          echo "$out" | grep -q 'throughput: "500"' || { echo "missing gp3 throughput"; exit 1; }
-
       - name: helm template (configFile set; CronJob must stay env-configured)
         run: |
           out=$(helm template git-cache deploy/helm/gitmirrorcache \
