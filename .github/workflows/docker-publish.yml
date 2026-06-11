@@ -2,7 +2,6 @@ name: Publish Docker Image
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -118,12 +117,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `latest` is added automatically for non-prerelease semver tags
+          # (flavor latest=auto), so v1.0.0-rc1 never moves `latest`.
           tags: |
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Create and push manifest list
         working-directory: ${{ runner.temp }}/digests
