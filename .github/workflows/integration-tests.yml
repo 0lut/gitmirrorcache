@@ -37,17 +37,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-integration-${{ matrix.group }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-integration-${{ matrix.group }}-
-            ${{ runner.os }}-cargo-integration-
-            ${{ runner.os }}-cargo-
+          shared-key: integration-${{ matrix.group }}
 
       - name: Run integration tests
         env:
@@ -95,17 +87,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-minio-rust-${{ matrix.group }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-minio-rust-
-            ${{ runner.os }}-cargo-minio-
-            ${{ runner.os }}-cargo-
+          shared-key: minio-rust-${{ matrix.group }}
 
       - name: Start MinIO
         run: |
@@ -136,17 +120,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-minio-python-api-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-minio-python-api-
-            ${{ runner.os }}-cargo-minio-
-            ${{ runner.os }}-cargo-
+          shared-key: minio-python-api
 
       - name: Build git-cache-api with S3 backend
         run: cargo build -p git-cache-api --features s3
