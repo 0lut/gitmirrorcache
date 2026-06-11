@@ -1,7 +1,8 @@
 //! Performance tests for the Git wrapper.
 
 mod tests {
-    use git_cache_git::Git;
+    use git_cache_core::CommitSha;
+    use git_cache_git::{FetchOptions, Git};
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -151,39 +152,53 @@ mod tests {
         );
     }
 
-    // ── 2. Bundle create/restore cycle ───────────────────────────────────────
+    // ── 2. Pack create/restore cycle ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_bundle_create_restore_cycle() {
-        let temp = TempTree::new("bundle-cycle");
+    async fn test_pack_create_restore_cycle() {
+        let temp = TempTree::new("pack-cycle");
         let git = test_git();
         let (source_repo, source_sha) = create_source_repo_with_commits(&temp.path, 50);
 
         let cache_repo = temp.path.join("cache.git");
         git.init_bare(&cache_repo).await.unwrap();
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .unwrap();
 
-        let bundle_path = temp.path.join("perf.bundle");
+        let head = CommitSha::parse(&source_sha).unwrap();
 
         let start = Instant::now();
-        git.bundle_create(&cache_repo, &bundle_path, "refs/cache/main")
+        let pack_path = git
+            .pack_objects_revs(
+                &cache_repo,
+                &temp.path.join("perf-pack"),
+                std::slice::from_ref(&head),
+                &[],
+            )
             .await
             .unwrap();
-        let bundle_elapsed = start.elapsed();
-        assert!(bundle_path.is_file());
+        let pack_elapsed = start.elapsed();
+        assert!(pack_path.is_file());
 
         let restore_repo = temp.path.join("restored.git");
         git.init_bare(&restore_repo).await.unwrap();
 
         let start = Instant::now();
-        git.fetch_bundle(&restore_repo, &bundle_path).await.unwrap();
+        let pack_dir = restore_repo.join("objects").join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let final_path = pack_dir.join("pack-perf.pack");
+        std::fs::copy(&pack_path, &final_path).unwrap();
+        git.index_pack(&restore_repo, &final_path).await.unwrap();
+        git.update_refs_batch(&restore_repo, &[("refs/cache/main".to_string(), head)])
+            .await
+            .unwrap();
         let restore_elapsed = start.elapsed();
 
         let restored_sha = git
@@ -192,11 +207,11 @@ mod tests {
             .unwrap();
         assert_eq!(source_sha, restored_sha);
 
-        let total = bundle_elapsed + restore_elapsed;
+        let total = pack_elapsed + restore_elapsed;
         eprintln!(
-            "bundle create/restore: create={bundle_elapsed:?}, restore={restore_elapsed:?}, total={total:?} (50 commits)"
+            "pack create/restore: create={pack_elapsed:?}, restore={restore_elapsed:?}, total={total:?} (50 commits)"
         );
-        assert!(total.as_secs() < 30, "bundle cycle too slow: {total:?}");
+        assert!(total.as_secs() < 30, "pack cycle too slow: {total:?}");
     }
 
     // ── 3. rev_parse latency ─────────────────────────────────────────────────
@@ -209,11 +224,12 @@ mod tests {
 
         let cache_repo = temp.path.join("cache.git");
         git.init_bare(&cache_repo).await.unwrap();
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .unwrap();
@@ -247,11 +263,12 @@ mod tests {
 
         let cache_repo = temp.path.join("cache.git");
         git.init_bare(&cache_repo).await.unwrap();
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .unwrap();

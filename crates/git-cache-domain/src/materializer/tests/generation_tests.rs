@@ -491,6 +491,7 @@ mod tests {
             compaction: git_cache_core::CompactionConfig {
                 chain_depth_threshold: 2,
                 inline: false,
+                retention_secs: 0,
             },
             ..fixture.state_config()
         };
@@ -628,12 +629,247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_sweep_keeps_recently_superseded_generations() {
+        let fixture = GitFixture::new();
+        let config = AppConfig {
+            compaction: git_cache_core::CompactionConfig {
+                chain_depth_threshold: 2,
+                inline: false,
+                retention_secs: 24 * 60 * 60,
+            },
+            ..fixture.state_config()
+        };
+        let state = Arc::new(AppState::try_new(config).unwrap());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        for message in ["second", "third"] {
+            materializer
+                .materialize(MaterializeRequest {
+                    repo: fixture.repo.clone(),
+                    selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                    upstream_authorization: Default::default(),
+                })
+                .await
+                .unwrap();
+            fixture.commit_and_push(message);
+        }
+        let last = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let last_manifest = wait_for_commit_manifest(&state, &fixture.repo, &last.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, last_manifest.generation).await;
+
+        let head_before = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_pack_keys: Vec<String> =
+            generation_manifest_for(&state, &fixture.repo, head_before.generation)
+                .await
+                .packs
+                .iter()
+                .map(|pack| pack.key.clone())
+                .collect();
+
+        let report = materializer
+            .compact_generation_chain(&fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+
+        for old_generation in &report.old_generations {
+            assert!(
+                read_generation_manifest(&*state.store, &fixture.repo, *old_generation)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "superseded generation must be retained within the retention window"
+            );
+        }
+        for old_key in &old_pack_keys {
+            assert!(
+                state.store.exists(old_key).await.unwrap(),
+                "superseded packs must be retained within the retention window"
+            );
+        }
+
+        let zero_retention = AppConfig {
+            compaction: git_cache_core::CompactionConfig {
+                chain_depth_threshold: 2,
+                inline: false,
+                retention_secs: 0,
+            },
+            ..fixture.state_config()
+        };
+        let sweeper_state = Arc::new(AppState::try_new(zero_retention).unwrap());
+        let sweeper = Materializer::new(Arc::clone(&sweeper_state));
+        let sweep = sweeper
+            .sweep_superseded_generations(&fixture.repo)
+            .await
+            .unwrap();
+        assert!(!sweep.swept_generations.is_empty());
+
+        for old_generation in &report.old_generations {
+            assert!(
+                read_generation_manifest(&*state.store, &fixture.repo, *old_generation)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let compacted = generation_manifest_for(&state, &fixture.repo, report.new_generation).await;
+        for old_key in &old_pack_keys {
+            if compacted.packs.iter().all(|pack| pack.key != *old_key) {
+                assert!(!state.store.exists(old_key).await.unwrap());
+            }
+        }
+        let head_after = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head_after.generation, report.new_generation);
+        assert!(
+            read_generation_manifest(&*state.store, &fixture.repo, report.new_generation)
+                .await
+                .unwrap()
+                .is_some(),
+            "head generation must always survive the sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_node_serves_commit_after_sweep_removes_superseded_generation() {
+        let fixture = GitFixture::new();
+        let config = AppConfig {
+            compaction: git_cache_core::CompactionConfig {
+                chain_depth_threshold: 64,
+                inline: false,
+                retention_secs: 0,
+            },
+            ..fixture.state_config()
+        };
+        let state = Arc::new(AppState::try_new(config).unwrap());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
+
+        let second = fixture.commit_and_push("second");
+        materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, second_manifest.generation).await;
+
+        let sweep = materializer
+            .sweep_superseded_generations(&fixture.repo)
+            .await
+            .unwrap();
+        assert!(sweep.swept_generations.contains(&first_manifest.generation));
+        assert!(
+            read_generation_manifest(&*state.store, &fixture.repo, first_manifest.generation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A node with a cold disk cache (same object store, fresh cache root)
+        // must still be able to serve the first commit: its manifest may not
+        // be left pointing at the swept generation.
+        let cold_config = AppConfig {
+            cache_root: fixture.tmp.path().join("cache-cold"),
+            ..fixture.state_config()
+        };
+        let cold_state = Arc::new(AppState::try_new(cold_config).unwrap());
+        let cold = Materializer::new(Arc::clone(&cold_state));
+        let response = cold
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Commit(first.commit.clone()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.commit, first.commit);
+        let cold_repo_dir = cold.repo_dir(&fixture.repo);
+        assert!(cold.commit_exists(&cold_repo_dir, &first.commit).await);
+    }
+
+    #[tokio::test]
+    async fn retention_sweep_collects_orphaned_packs_by_age() {
+        use git_cache_objectstore::pack_prefix;
+
+        let fixture = GitFixture::new();
+        let config = AppConfig {
+            compaction: git_cache_core::CompactionConfig {
+                chain_depth_threshold: 2,
+                inline: false,
+                retention_secs: 0,
+            },
+            ..fixture.state_config()
+        };
+        let state = Arc::new(AppState::try_new(config).unwrap());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
+
+        let orphan_key = format!("{}pack-{}.pack", pack_prefix(&fixture.repo), "f".repeat(64));
+        state
+            .store
+            .put(&orphan_key, bytes::Bytes::from_static(b"leaked"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        let sweep = materializer
+            .sweep_superseded_generations(&fixture.repo)
+            .await
+            .unwrap();
+        assert!(sweep.deleted_packs >= 1);
+        assert!(!state.store.exists(&orphan_key).await.unwrap());
+
+        let head_manifest =
+            generation_manifest_for(&state, &fixture.repo, first_manifest.generation).await;
+        for pack in &head_manifest.packs {
+            assert!(state.store.exists(&pack.key).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
     async fn inline_compaction_runs_after_verified_head_update() {
         let fixture = GitFixture::new();
         let config = AppConfig {
             compaction: git_cache_core::CompactionConfig {
                 chain_depth_threshold: 2,
                 inline: true,
+                retention_secs: 0,
             },
             ..fixture.state_config()
         };
@@ -813,6 +1049,7 @@ mod tests {
             compaction: git_cache_core::CompactionConfig {
                 chain_depth_threshold: 2,
                 inline: false,
+                retention_secs: 24 * 60 * 60,
             },
             ..fixture.state_config()
         };
