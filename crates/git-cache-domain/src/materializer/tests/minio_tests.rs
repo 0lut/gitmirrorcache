@@ -54,6 +54,7 @@ mod tests {
         config.compaction = git_cache_core::CompactionConfig {
             chain_depth_threshold: 2,
             inline: false,
+            retention_secs: 0,
         };
         let git = Git::with_concurrency_limit(
             config.git_binary.clone(),

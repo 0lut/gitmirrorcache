@@ -119,6 +119,10 @@ pub fn generation_manifest_prefix(repo: &RepoKey) -> String {
     format!("repos/{repo}/generations/")
 }
 
+pub fn pack_prefix(repo: &RepoKey) -> String {
+    format!("repos/{repo}/packs/")
+}
+
 pub fn pack_key(repo: &RepoKey, sha256: &str) -> Result<String> {
     validate_sha256(sha256)?;
     Ok(format!("repos/{repo}/packs/pack-{sha256}.pack"))

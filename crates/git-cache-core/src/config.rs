@@ -112,6 +112,10 @@ impl AppConfig {
                     default_compaction_threshold(),
                 )?,
                 inline: parse_bool_env("GIT_CACHE_COMPACTION_INLINE", false)?,
+                retention_secs: parse_env(
+                    "GIT_CACHE_COMPACTION_RETENTION_SECS",
+                    default_compaction_retention_secs(),
+                )?,
             },
             max_concurrent_git_processes: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
@@ -194,6 +198,10 @@ pub struct CompactionConfig {
     pub chain_depth_threshold: u32,
     #[serde(default)]
     pub inline: bool,
+    /// How long a superseded generation is kept before the retention sweep
+    /// may delete it, measured from its successor's `created_at`.
+    #[serde(default = "default_compaction_retention_secs")]
+    pub retention_secs: u64,
 }
 
 impl Default for CompactionConfig {
@@ -201,12 +209,17 @@ impl Default for CompactionConfig {
         Self {
             chain_depth_threshold: default_compaction_threshold(),
             inline: false,
+            retention_secs: default_compaction_retention_secs(),
         }
     }
 }
 
 fn default_compaction_threshold() -> u32 {
     10
+}
+
+fn default_compaction_retention_secs() -> u64 {
+    24 * 60 * 60
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +471,7 @@ min_free_bytes = 100000
         let config = CompactionConfig::default();
         assert_eq!(config.chain_depth_threshold, 10);
         assert!(!config.inline);
+        assert_eq!(config.retention_secs, 24 * 60 * 60);
     }
 
     #[test]
@@ -501,6 +515,7 @@ min_free_bytes = 100000
             ("GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT", "off"),
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
+            ("GIT_CACHE_COMPACTION_RETENTION_SECS", "3600"),
         ]);
 
         let config = AppConfig::from_env().unwrap();
@@ -517,6 +532,7 @@ min_free_bytes = 100000
         assert!(!config.git_remote.proxy_tee_import);
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
+        assert_eq!(config.compaction.retention_secs, 3600);
 
         match config.object_store {
             ObjectStoreConfig::S3 {
