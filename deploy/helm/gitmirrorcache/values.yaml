@@ -1,0 +1,164 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/0lut/gitmirrorcache
+  pullPolicy: IfNotPresent
+  # Defaults to the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  # Useful for EKS IRSA, e.g.
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/gitmirrorcache
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 999
+
+securityContext:
+  runAsNonRoot: true
+  # The image runs as the system user "git-cache" (uid/gid 999). A numeric
+  # runAsUser is required for runAsNonRoot verification with named users.
+  runAsUser: 999
+  runAsGroup: 999
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: git-cache.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Serving upload-pack spawns git pack-objects children (CPU- and memory-heavy,
+# up to config.maxConcurrentGitProcesses at once), so do not run this small.
+# The production ECS deployment uses 8 vCPU / 24 GiB (docs/deployment.md);
+# treat ~2 vCPU / 4 GiB as the floor for light workloads and scale CPU with
+# concurrent clone traffic.
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    memory: 8Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Persistent hot cache mounted at /cache. The cache is disposable from a
+# correctness perspective (S3 is the durable source); losing the volume only
+# forces rehydration. Disable persistence to fall back to an emptyDir.
+persistence:
+  enabled: true
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 100Gi
+  annotations: {}
+
+# Application configuration. Each field maps to a GIT_CACHE_* environment
+# variable understood by the server and CLI.
+config:
+  bindAddr: "0.0.0.0:8080"
+  cacheRoot: /cache
+  gitBinary: git
+  gitTimeoutSeconds: 120
+  maxGitOutputBytes: 16777216
+  rateLimitPerMinute: 120
+  allowedUpstreamHosts:
+    - github.com
+  maxConcurrentGitProcesses: 64
+  logLevel: info
+  objectStore:
+    # "s3" or "local"
+    kind: s3
+    s3:
+      bucket: ""
+      # Runtime appends the v2 schema suffix (e.g. "repos" stores under repos-v2).
+      prefix: repos
+      # Optional custom endpoint for S3-compatible stores (MinIO, R2, ...).
+      endpoint: ""
+    # Only used when kind is "local"; stored on the cache volume.
+    local:
+      root: /cache/object-store
+  disk:
+    quotaBytes: 107374182400 # 100 GiB; keep below the persistence size
+    minFreeBytes: 10737418240 # 10 GiB
+  gitRemote:
+    # Serve git clone/fetch directly via /git/{host}/{owner}/{repo}.git
+    enabled: true
+  compaction:
+    chainDepthThreshold: 10
+    inline: false
+  # Extra environment variables appended verbatim to the container, e.g. to
+  # set GIT_CACHE_* knobs not surfaced above.
+  extraEnv: []
+  # extraEnv:
+  #   - name: GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT
+  #     value: "false"
+
+# Optional full TOML config mounted into the server pod and pointed to by
+# GIT_CACHE_CONFIG. When set, the server reads its ENTIRE config from this
+# file and ignores GIT_CACHE_* env vars (see config/production.example.toml).
+# The compaction CronJob always uses env-var config so it can keep its
+# scratch cache root.
+configFile: ""
+
+# Token used to authenticate against upstream hosts when warming/serving
+# private repositories.
+upstreamAuth:
+  # Name of an existing Secret containing the token.
+  existingSecret: ""
+  secretKey: token
+  # Environment variable the server reads the token from.
+  tokenEnv: GITHUB_TOKEN
+
+# Static AWS credentials for S3. Prefer IRSA / pod identity via
+# serviceAccount.annotations and leave existingSecret empty.
+aws:
+  region: ""
+  # Existing Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY keys.
+  existingSecret: ""
+
+# Hourly generation-chain compaction (git-cache compact --all), mirroring the
+# EventBridge rule used by the AWS deployment.
+compaction:
+  enabled: true
+  schedule: "0 * * * *"
+  resources: {}
+  # Concurrency-safe: publish uses conditional PUT on the generation head.
+  restartPolicy: Never
+  backoffLimit: 0
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 5
