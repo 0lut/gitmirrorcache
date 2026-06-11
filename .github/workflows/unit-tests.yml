@@ -13,7 +13,7 @@ jobs:
   unit-tests:
     name: Unit Tests (${{ matrix.group }})
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

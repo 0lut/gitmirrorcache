@@ -292,6 +292,13 @@ mod tests {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "3")
+            .env("GIT_CONFIG_KEY_0", "gc.auto")
+            .env("GIT_CONFIG_VALUE_0", "0")
+            .env("GIT_CONFIG_KEY_1", "gc.autoDetach")
+            .env("GIT_CONFIG_VALUE_1", "false")
+            .env("GIT_CONFIG_KEY_2", "maintenance.auto")
+            .env("GIT_CONFIG_VALUE_2", "false")
             .env("GIT_ASKPASS", "/bin/false")
             .env("SSH_ASKPASS", "/bin/false")
             .env("HOME", "/nonexistent");
