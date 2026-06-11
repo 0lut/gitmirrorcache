@@ -78,13 +78,17 @@ Clients can opt out of cold-miss proxying per request with the
 
 The server reads either a TOML config file (set `GIT_CACHE_CONFIG` to its path;
 see `config/*.example.toml`) or individual environment variables. When
-`GIT_CACHE_CONFIG` is set, the file wins and the other variables are ignored.
+`GIT_CACHE_CONFIG` is set, the file wins and the other configuration variables
+are ignored — except S3 credentials (`GIT_CACHE_S3_ACCESS_KEY`,
+`GIT_CACHE_S3_SECRET_KEY`, `GIT_CACHE_S3_SESSION_TOKEN`,
+`GIT_CACHE_S3_REGION`), which are always read from the environment and never
+from the file.
 
 ### Core
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `GIT_CACHE_CONFIG` | – | Path to a TOML config file. If set, all other `GIT_CACHE_*` variables are ignored. |
+| `GIT_CACHE_CONFIG` | – | Path to a TOML config file. If set, other `GIT_CACHE_*` variables are ignored, except the S3 credential variables noted above. |
 | `GIT_CACHE_BIND_ADDR` | `127.0.0.1:8080` | Address and port the HTTP server listens on. |
 | `GIT_CACHE_ROOT` | `./cache` | Directory for the local hot cache (bare repos, temp files, repo index). |
 | `GIT_CACHE_ALLOWED_UPSTREAM_HOSTS` | `github.com` | Comma-separated allowlist of upstream hosts the cache will talk to. |
