@@ -86,6 +86,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
   {{- if .Values.persistence.enabled }}
+  {{- $storageClassName := include "gitmirrorcache.storageClassName" . }}
   volumeClaimTemplates:
     - metadata:
         name: cache
@@ -96,8 +97,8 @@ spec:
       spec:
         accessModes:
           {{- toYaml .Values.persistence.accessModes | nindent 10 }}
-        {{- if .Values.persistence.storageClass }}
-        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- if $storageClassName }}
+        storageClassName: {{ $storageClassName | quote }}
         {{- end }}
         resources:
           requests:

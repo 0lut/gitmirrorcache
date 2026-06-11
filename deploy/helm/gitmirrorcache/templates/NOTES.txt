@@ -12,11 +12,12 @@ Quick checks:
 Clone through the cache:
   git clone http://localhost:8080/git/github.com/<owner>/<repo>.git
 {{- end }}
-{{- if and .Values.persistence.enabled (not .Values.persistence.storageClass) }}
+{{- if and .Values.persistence.enabled (not (include "gitmirrorcache.storageClassName" .)) }}
 
 NOTE: persistence.storageClass is empty, so the PVC relies on a cluster default
 StorageClass. If the pod stays Pending with an unbound PVC, set
-persistence.storageClass to a real class such as gp3 on EKS.
+persistence.storageClass to a real class such as gp3 on EKS, or enable
+storageClass.create to let the chart create a tuned gp3 class.
 {{- end }}
 {{- if and (eq .Values.config.objectStore.kind "s3") (not .Values.aws.existingSecret) }}
 

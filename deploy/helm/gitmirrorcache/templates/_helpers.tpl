@@ -60,6 +60,18 @@ Service account name.
 {{- end }}
 
 {{/*
+Storage class name for the hot-cache PVC. If a chart-managed StorageClass is
+enabled, this also names the StorageClass object.
+*/}}
+{{- define "gitmirrorcache.storageClassName" -}}
+{{- if .Values.persistence.storageClass }}
+{{- .Values.persistence.storageClass | trunc 63 | trimSuffix "-" }}
+{{- else if .Values.storageClass.create }}
+{{- default (printf "%s-gp3" (include "gitmirrorcache.fullname" .)) .Values.storageClass.name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{/*
 Image reference.
 */}}
 {{- define "gitmirrorcache.image" -}}

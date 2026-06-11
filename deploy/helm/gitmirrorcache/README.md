@@ -48,13 +48,22 @@ helm install git-cache "${CHART_REF}" \
   --set persistence.storageClass=gp3
 ```
 
-The chart does not provision EBS IOPS or throughput directly. Those values come
-from the selected StorageClass. A `gp3` StorageClass without explicit
-performance parameters gets the AWS gp3 baseline: 3,000 IOPS and 125 MiB/s
-throughput.
+For EKS installs, the chart can optionally create a tuned `gp3` StorageClass
+and use it for the cache PVC:
 
-For a larger cache node, create a tuned StorageClass and point the chart at it.
-This example matches the production ECS gp3 defaults:
+```sh
+helm install git-cache "${CHART_REF}" \
+  --version "${CHART_VERSION}" \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket \
+  --set storageClass.create=true
+```
+
+By default this chart-managed StorageClass provisions 8,000 IOPS and 500 MiB/s
+throughput, matching the production ECS gp3 defaults. Tune it with
+`storageClass.parameters.iops` and `storageClass.parameters.throughput`.
+
+If you manage StorageClasses outside the chart, create one like this and set
+`persistence.storageClass` to its name:
 
 ```yaml
 apiVersion: storage.k8s.io/v1
@@ -64,7 +73,7 @@ metadata:
 provisioner: ebs.csi.aws.com
 parameters:
   type: gp3
-  fsType: ext4
+  csi.storage.k8s.io/fstype: ext4
   iops: "8000"
   throughput: "500"
 allowVolumeExpansion: true
@@ -79,6 +88,9 @@ helm install git-cache "${CHART_REF}" \
   --set config.objectStore.s3.bucket=my-git-cache-bucket \
   --set persistence.storageClass=gitmirrorcache-gp3
 ```
+
+A `gp3` StorageClass without explicit performance parameters gets the AWS gp3
+baseline: 3,000 IOPS and 125 MiB/s throughput.
 
 To inspect what AWS actually provisioned for an installed release:
 
@@ -135,6 +147,9 @@ upstreamAuth:
 | `persistence.size` | `100Gi` | PVC size (keep ≥ disk quota) |
 | `persistence.storageClass` | `""` | PVC StorageClass; empty uses the cluster default. Use `gp3` on EKS. |
 | `persistence.enabled` | `true` | Use a PVC; `false` falls back to emptyDir |
+| `storageClass.create` | `false` | Create and use a chart-managed EBS CSI `gp3` StorageClass |
+| `storageClass.parameters.iops` | `"8000"` | IOPS for the chart-managed gp3 StorageClass |
+| `storageClass.parameters.throughput` | `"500"` | MiB/s throughput for the chart-managed gp3 StorageClass |
 | `compaction.enabled` | `true` | Hourly `git-cache compact --all` CronJob |
 | `configFile` | `""` | Optional full TOML config (see `config/production.example.toml`) |
 | `config.extraEnv` | `[]` | Extra `GIT_CACHE_*` env vars |
