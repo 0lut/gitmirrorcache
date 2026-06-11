@@ -21,10 +21,14 @@ podAnnotations: {}
 podLabels: {}
 
 podSecurityContext:
-  fsGroup: 1000
+  fsGroup: 999
 
 securityContext:
   runAsNonRoot: true
+  # The image runs as the system user "git-cache" (uid/gid 999). A numeric
+  # runAsUser is required for runAsNonRoot verification with named users.
+  runAsUser: 999
+  runAsGroup: 999
   allowPrivilegeEscalation: false
   capabilities:
     drop: ["ALL"]
