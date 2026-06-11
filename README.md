@@ -4,10 +4,10 @@
 [![Container image](https://img.shields.io/badge/ghcr.io-0lut%2Fgitmirrorcache-blue?logo=docker)](https://github.com/0lut/gitmirrorcache/pkgs/container/gitmirrorcache)
 
 A read-only Git fetch cache that sits between clone-heavy automation — CI
-runners, coding agents, sandboxes, build farms — and your Git upstreams
-(GitHub, GitLab, Bitbucket, or any Smart HTTP Git server). Instead of
-hammering the upstream with thousands of identical clones, clients fetch from
-the cache: an S3-compatible object store is the durable source of truth, and
+runners, coding agents, sandboxes, build farms — and allowlisted HTTPS
+upstreams addressable as `host/owner/repo` (GitHub-style remotes, including
+top-level GitLab and Bitbucket repos). Instead of hammering the upstream with
+thousands of identical clones, clients fetch from the cache: an S3-compatible object store is the durable source of truth, and
 local disk is just a disposable hot layer that can be rebuilt at any time. The
 result is faster clones, fewer upstream rate-limit headaches, and a cache you
 can throw away without losing anything.
@@ -22,7 +22,9 @@ It exposes two interfaces:
 
 On a cold miss, the server proxies upstream's response straight to the client
 (so first-clone latency stays close to a direct clone) while warming the cache
-in the background. Everything after that is served locally.
+in the background. Once the cache is warm, pack data is served from the local
+bare repo; ref advertisements and branch/default-branch selectors still verify
+refs against upstream so clients never see stale tips.
 
 ## Quick Start
 
