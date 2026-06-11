@@ -2,7 +2,7 @@
 
 mod tests {
     use git_cache_core::CommitSha;
-    use git_cache_git::Git;
+    use git_cache_git::{FetchOptions, Git};
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -128,11 +128,11 @@ mod tests {
         (source_repo, sha)
     }
 
-    // ── 1. fetch_branch throughput ───────────────────────────────────────────
+    // ── 1. fetch_ref throughput ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_fetch_branch_throughput() {
-        let temp = TempTree::new("fetch-branch-throughput");
+    async fn test_fetch_ref_throughput() {
+        let temp = TempTree::new("fetch-ref-throughput");
         let git = test_git();
         let (source_repo, _) = create_source_repo(&temp.path);
 
@@ -145,11 +145,12 @@ mod tests {
         let start = Instant::now();
         for _ in 0..iterations {
             let iter_start = Instant::now();
-            git.fetch_branch(
+            git.fetch_ref(
                 &cache_repo,
                 path_arg(&source_repo),
-                "main",
+                "refs/heads/main",
                 "refs/cache/main",
+                FetchOptions::default(),
             )
             .await
             .unwrap();
@@ -161,90 +162,104 @@ mod tests {
         let avg = total / iterations as u32;
         let p50 = latencies[latencies.len() / 2];
         eprintln!(
-            "fetch_branch throughput: {iterations} fetches in {total:?}, avg={avg:?}, p50={p50:?}"
+            "fetch_ref throughput: {iterations} fetches in {total:?}, avg={avg:?}, p50={p50:?}"
         );
         assert!(
             total.as_secs() < 120,
-            "fetch_branch throughput too slow: {total:?}"
+            "fetch_ref throughput too slow: {total:?}"
         );
     }
 
-    // ── 2. bundle_create scaling ─────────────────────────────────────────────
+    // ── 2. pack_objects_revs scaling ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_bundle_create_scaling() {
+    async fn test_pack_objects_scaling() {
         let commit_counts = [10, 50, 200];
         let mut timings = Vec::new();
 
         for &count in &commit_counts {
-            let temp = TempTree::new(&format!("bundle-scale-{count}"));
+            let temp = TempTree::new(&format!("pack-scale-{count}"));
             let git = test_git();
-            let (source_repo, _) = create_source_repo_with_commits(&temp.path, count);
+            let (source_repo, source_sha) = create_source_repo_with_commits(&temp.path, count);
 
             let cache_repo = temp.path.join("cache.git");
             git.init_bare(&cache_repo).await.unwrap();
-            git.fetch_branch(
+            git.fetch_ref(
                 &cache_repo,
                 path_arg(&source_repo),
-                "main",
+                "refs/heads/main",
                 "refs/cache/main",
+                FetchOptions::default(),
             )
             .await
             .unwrap();
 
-            let bundle_path = temp.path.join("scale.bundle");
-
+            let head = CommitSha::parse(&source_sha).unwrap();
             let start = Instant::now();
-            git.bundle_create(&cache_repo, &bundle_path, "refs/cache/main")
+            let pack_path = git
+                .pack_objects_revs(
+                    &cache_repo,
+                    &temp.path.join("scale-pack"),
+                    std::slice::from_ref(&head),
+                    &[],
+                )
                 .await
                 .unwrap();
             let elapsed = start.elapsed();
 
-            let bundle_size = std::fs::metadata(&bundle_path).unwrap().len();
-            timings.push((count, elapsed, bundle_size));
+            let pack_size = std::fs::metadata(&pack_path).unwrap().len();
+            timings.push((count, elapsed, pack_size));
         }
 
-        eprintln!("bundle_create scaling:");
+        eprintln!("pack_objects_revs scaling:");
         for (count, elapsed, size) in &timings {
-            eprintln!("  {count} commits: {elapsed:?}, bundle={size} bytes");
+            eprintln!("  {count} commits: {elapsed:?}, pack={size} bytes");
         }
 
         // Each timing should be reasonable.
         for (count, elapsed, _) in &timings {
             assert!(
                 elapsed.as_secs() < 120,
-                "bundle_create for {count} commits too slow: {elapsed:?}"
+                "pack_objects_revs for {count} commits too slow: {elapsed:?}"
             );
         }
     }
 
-    // ── 3. bundle_create_incremental vs full ─────────────────────────────────
+    // ── 3. incremental pack vs full ──────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_bundle_create_incremental_vs_full() {
-        let temp = TempTree::new("bundle-incr-vs-full");
+    async fn test_pack_incremental_vs_full() {
+        let temp = TempTree::new("pack-incr-vs-full");
         let git = test_git();
-        let (source_repo, _) = create_source_repo_with_commits(&temp.path, 100);
+        let (source_repo, source_sha) = create_source_repo_with_commits(&temp.path, 100);
 
         let cache_repo = temp.path.join("cache.git");
         git.init_bare(&cache_repo).await.unwrap();
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .unwrap();
 
-        // Full bundle.
-        let full_bundle = temp.path.join("full.bundle");
+        let head = CommitSha::parse(&source_sha).unwrap();
+
+        // Full pack.
         let start = Instant::now();
-        git.bundle_create(&cache_repo, &full_bundle, "refs/cache/main")
+        let full_pack = git
+            .pack_objects_revs(
+                &cache_repo,
+                &temp.path.join("full-pack"),
+                std::slice::from_ref(&head),
+                &[],
+            )
             .await
             .unwrap();
         let full_elapsed = start.elapsed();
-        let full_size = std::fs::metadata(&full_bundle).unwrap().len();
+        let full_size = std::fs::metadata(&full_pack).unwrap().len();
 
         // Get a mid-point commit for incremental base (exclude tip).
         let base_rev_str = git
@@ -253,31 +268,36 @@ mod tests {
             .unwrap();
         let base_sha = CommitSha::parse(&base_rev_str).unwrap();
 
-        // Incremental bundle (all refs minus the base commit).
-        let incr_bundle = temp.path.join("incr.bundle");
+        // Incremental pack (tip minus the base commit).
         let start = Instant::now();
-        git.bundle_create_incremental(&cache_repo, &incr_bundle, &[base_sha])
+        let incr_pack = git
+            .pack_objects_revs(
+                &cache_repo,
+                &temp.path.join("incr-pack"),
+                std::slice::from_ref(&head),
+                std::slice::from_ref(&base_sha),
+            )
             .await
             .unwrap();
         let incr_elapsed = start.elapsed();
-        let incr_size = std::fs::metadata(&incr_bundle).unwrap().len();
+        let incr_size = std::fs::metadata(&incr_pack).unwrap().len();
 
         eprintln!(
-            "bundle full vs incremental (100 commits):\n  full:  {full_elapsed:?}, {full_size} bytes\n  incr:  {incr_elapsed:?}, {incr_size} bytes"
+            "pack full vs incremental (100 commits):\n  full:  {full_elapsed:?}, {full_size} bytes\n  incr:  {incr_elapsed:?}, {incr_size} bytes"
         );
 
-        // Incremental bundle should be smaller.
+        // Incremental pack should be smaller.
         assert!(
             incr_size < full_size,
-            "incremental bundle ({incr_size}) should be smaller than full ({full_size})"
+            "incremental pack ({incr_size}) should be smaller than full ({full_size})"
         );
         assert!(
             full_elapsed.as_secs() < 120,
-            "full bundle too slow: {full_elapsed:?}"
+            "full pack too slow: {full_elapsed:?}"
         );
         assert!(
             incr_elapsed.as_secs() < 120,
-            "incremental bundle too slow: {incr_elapsed:?}"
+            "incremental pack too slow: {incr_elapsed:?}"
         );
     }
 
@@ -291,11 +311,12 @@ mod tests {
 
         let cache_repo = temp.path.join("cache.git");
         git.init_bare(&cache_repo).await.unwrap();
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .unwrap();
