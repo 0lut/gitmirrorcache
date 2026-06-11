@@ -8,11 +8,12 @@ use git_cache_core::{
     AppConfig, CommitSha, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult,
     UpstreamAuth,
 };
+use git_cache_disk::{AsyncDiskManager, AsyncReservation};
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
-    UpstreamRefComparison,
+    frame_ref_advertisement, plan_upload_pack_tee, synthesize_ref_advertisement, AppState,
+    Materializer, PackDemux, UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -26,7 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 use tracing::{info, info_span, warn, Instrument};
@@ -34,6 +36,12 @@ use tracing::{info, info_span, warn, Instrument};
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const DIRECT_GIT_PROOF_TTL: Duration = Duration::from_secs(30);
 const PROXY_ON_MISS_HEADER: &str = "git-cache-use-proxy-on-miss";
+/// Disk reservation granularity for spooling a proxied upload-pack response
+/// whose final size is unknown up front.
+const TEE_SPOOL_RESERVE_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+/// Bounded queue between the proxy stream and the spool writer; a full queue
+/// (slow disk) abandons the tee rather than stalling the client stream.
+const TEE_SPOOL_CHANNEL_CAPACITY: usize = 256;
 
 pub fn app(config: AppConfig) -> Router {
     app_result(config).expect("failed to initialize git-cache-api")
@@ -918,6 +926,25 @@ async fn proxy_upload_pack_to_upstream(
         ));
     }
 
+    let tee = if state.domain.config.git_remote.proxy_tee_import {
+        plan_upload_pack_tee(&body).map(|plan| {
+            info!(
+                request_id,
+                repo = %repo,
+                sideband = plan.sideband,
+                blobless = plan.blobless,
+                "direct git proxy tee import engaged"
+            );
+            let (sender, writer) = spawn_tee_spool_writer(state.domain.disk.clone(), request_id);
+            ProxyTee {
+                demux: PackDemux::new(plan.sideband),
+                sender,
+                writer,
+            }
+        })
+    } else {
+        None
+    };
     let warm_task = DirectGitWarmTask {
         imports: Arc::clone(&state.direct_git_background_imports),
         materializer: materializer.clone(),
@@ -929,6 +956,7 @@ async fn proxy_upload_pack_to_upstream(
     let stream = UpstreamProxyStream {
         inner: Box::pin(response.bytes_stream()),
         warm_task: Some(warm_task),
+        tee,
         bytes_sent: 0,
         max_bytes: state.domain.config.max_git_output_bytes as u64,
     };
@@ -1090,6 +1118,164 @@ impl DirectGitWarmTask {
     }
 }
 
+enum TeeSpoolMsg {
+    Chunk(Bytes),
+    Done,
+}
+
+struct TeeSpoolOutput {
+    path: std::path::PathBuf,
+    sha256: String,
+    bytes: u64,
+    reservations: Vec<AsyncReservation>,
+}
+
+async fn release_reservations(reservations: Vec<AsyncReservation>) {
+    for reservation in reservations {
+        if let Err(error) = reservation.release().await {
+            warn!(%error, "failed to release tee spool disk reservation");
+        }
+    }
+}
+
+/// Spawns the spool writer task that persists demuxed pack bytes to a
+/// reserved temp file. Returns `Some(output)` only when a `Done` message was
+/// received and all writes flushed; any other termination (sender dropped,
+/// write/reservation failure) cleans up and returns `None`.
+fn spawn_tee_spool_writer(
+    disk: AsyncDiskManager,
+    request_id: u64,
+) -> (
+    mpsc::Sender<TeeSpoolMsg>,
+    tokio::task::JoinHandle<Option<TeeSpoolOutput>>,
+) {
+    let (sender, mut receiver) = mpsc::channel(TEE_SPOOL_CHANNEL_CAPACITY);
+    let handle = tokio::spawn(async move {
+        let mut reservations: Vec<AsyncReservation> = Vec::new();
+        let result = async {
+            let first = disk.reserve(TEE_SPOOL_RESERVE_CHUNK_BYTES).await?;
+            let spool_dir = first.temp_path()?;
+            reservations.push(first);
+            tokio::fs::create_dir_all(&spool_dir).await?;
+            let path = spool_dir.join("tee-spool.pack");
+            let mut file = tokio::fs::File::create(&path).await?;
+            let mut reserved = TEE_SPOOL_RESERVE_CHUNK_BYTES;
+            let mut hasher = Sha256::new();
+            let mut bytes: u64 = 0;
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    TeeSpoolMsg::Chunk(chunk) => {
+                        bytes = bytes.saturating_add(chunk.len() as u64);
+                        while bytes > reserved {
+                            reservations.push(disk.reserve(TEE_SPOOL_RESERVE_CHUNK_BYTES).await?);
+                            reserved += TEE_SPOOL_RESERVE_CHUNK_BYTES;
+                        }
+                        hasher.update(&chunk);
+                        file.write_all(&chunk).await?;
+                    }
+                    TeeSpoolMsg::Done => {
+                        file.flush().await?;
+                        return Ok::<_, GitCacheError>(Some(TeeSpoolOutput {
+                            path,
+                            sha256: format!("{:x}", hasher.finalize()),
+                            bytes,
+                            reservations: Vec::new(),
+                        }));
+                    }
+                }
+            }
+            // Sender dropped without `Done`: the tee was abandoned.
+            Ok(None)
+        }
+        .await;
+        match result {
+            Ok(Some(mut output)) => {
+                output.reservations = std::mem::take(&mut reservations);
+                Some(output)
+            }
+            Ok(None) => {
+                release_reservations(std::mem::take(&mut reservations)).await;
+                None
+            }
+            Err(error) => {
+                warn!(request_id, %error, "tee spool writer failed; abandoning tee import");
+                release_reservations(std::mem::take(&mut reservations)).await;
+                None
+            }
+        }
+    });
+    (sender, handle)
+}
+
+/// Per-response state for tee-importing a proxied upload-pack stream.
+struct ProxyTee {
+    demux: PackDemux,
+    sender: mpsc::Sender<TeeSpoolMsg>,
+    writer: tokio::task::JoinHandle<Option<TeeSpoolOutput>>,
+}
+
+/// Imports the spooled pack once the writer finishes; falls back to the
+/// warm refetch on any failure so the repo still becomes servable.
+fn spawn_tee_import(
+    writer: tokio::task::JoinHandle<Option<TeeSpoolOutput>>,
+    warm: DirectGitWarmTask,
+) {
+    tokio::spawn(async move {
+        let output = match writer.await {
+            Ok(Some(output)) => output,
+            Ok(None) => {
+                warm.spawn();
+                return;
+            }
+            Err(error) => {
+                warn!(request_id = warm.request_id, %error, "tee spool writer task panicked");
+                warm.spawn();
+                return;
+            }
+        };
+        let imports = Arc::clone(&warm.imports);
+        let permit = match imports.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(
+                    request_id = warm.request_id,
+                    repo = %warm.repo,
+                    "tee import semaphore closed"
+                );
+                release_reservations(output.reservations).await;
+                return;
+            }
+        };
+        let import_started = Instant::now();
+        let result = warm
+            .materializer
+            .import_proxied_upload_pack(&warm.repo, &warm.body, &output.path, &output.sha256)
+            .await;
+        drop(permit);
+        release_reservations(output.reservations).await;
+        match result {
+            Ok(()) => info!(
+                request_id = warm.request_id,
+                repo = %warm.repo,
+                pack_bytes = output.bytes,
+                import_elapsed_ms = elapsed_ms(import_started),
+                "tee import of proxied upload-pack response finished"
+            ),
+            Err(error) => {
+                warn!(
+                    request_id = warm.request_id,
+                    repo = %warm.repo,
+                    %error,
+                    pack_bytes = output.bytes,
+                    import_elapsed_ms = elapsed_ms(import_started),
+                    "tee import failed; falling back to warm refetch"
+                );
+                warm.spawn();
+            }
+        }
+    });
+}
+
 /// Bounded background runner for `/v1/materialize?async=true`. Jobs are
 /// deduplicated per repo+commit; callers poll `/v1/resolve` for completion.
 struct AsyncMaterializeJobs {
@@ -1165,8 +1351,34 @@ type ReqwestBytesStream =
 struct UpstreamProxyStream {
     inner: ReqwestBytesStream,
     warm_task: Option<DirectGitWarmTask>,
+    tee: Option<ProxyTee>,
     bytes_sent: u64,
     max_bytes: u64,
+}
+
+impl UpstreamProxyStream {
+    /// Feed a proxied chunk into the tee demux/spool; abandons the tee on
+    /// demux failure or spool backpressure (dropping the sender makes the
+    /// writer task clean up).
+    fn tee_chunk(&mut self, chunk: &Bytes) {
+        let Some(tee) = self.tee.as_mut() else {
+            return;
+        };
+        let mut pack = Vec::new();
+        if tee.demux.feed(chunk, &mut pack).is_err() {
+            self.tee = None;
+            return;
+        }
+        if !pack.is_empty()
+            && tee
+                .sender
+                .try_send(TeeSpoolMsg::Chunk(Bytes::from(pack)))
+                .is_err()
+        {
+            warn!("tee spool backpressure or writer gone; abandoning tee import");
+            self.tee = None;
+        }
+    }
 }
 
 impl Stream for UpstreamProxyStream {
@@ -1188,6 +1400,7 @@ impl Stream for UpstreamProxyStream {
                         this.max_bytes
                     )))))
                 } else {
+                    this.tee_chunk(&chunk);
                     Poll::Ready(Some(Ok(chunk)))
                 }
             }
@@ -1195,8 +1408,19 @@ impl Stream for UpstreamProxyStream {
                 format!("upstream upload-pack proxy stream failed: {error}"),
             )))),
             Poll::Ready(None) => {
-                if let Some(task) = this.warm_task.take() {
-                    task.spawn();
+                let mut tee_spawned = false;
+                if let Some(tee) = this.tee.take() {
+                    if tee.demux.pack_complete() && tee.sender.try_send(TeeSpoolMsg::Done).is_ok() {
+                        if let Some(warm) = this.warm_task.take() {
+                            spawn_tee_import(tee.writer, warm);
+                            tee_spawned = true;
+                        }
+                    }
+                }
+                if !tee_spawned {
+                    if let Some(task) = this.warm_task.take() {
+                        task.spawn();
+                    }
                 }
                 Poll::Ready(None)
             }

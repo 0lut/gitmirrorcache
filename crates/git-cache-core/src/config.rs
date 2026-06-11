@@ -104,6 +104,7 @@ impl AppConfig {
                     "GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT",
                     true,
                 )?,
+                proxy_tee_import: parse_bool_env("GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT", true)?,
             },
             compaction: CompactionConfig {
                 chain_depth_threshold: parse_env(
@@ -218,6 +219,11 @@ pub struct GitRemoteConfig {
     pub background_import_concurrency: usize,
     #[serde(default = "default_true")]
     pub proxy_on_miss_by_default: bool,
+    /// When proxying a cold miss upstream, tee the proxied upload-pack
+    /// response into the local cache instead of re-fetching upstream in the
+    /// background warm.
+    #[serde(default = "default_true")]
+    pub proxy_tee_import: bool,
 }
 
 impl Default for GitRemoteConfig {
@@ -227,6 +233,7 @@ impl Default for GitRemoteConfig {
             commit_read_through: true,
             background_import_concurrency: default_background_import_concurrency(),
             proxy_on_miss_by_default: true,
+            proxy_tee_import: true,
         }
     }
 }
@@ -345,6 +352,7 @@ mod tests {
         "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
         "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
         "GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT",
+        "GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT",
         "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
         "GIT_CACHE_COMPACTION_INLINE",
         "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
@@ -459,6 +467,7 @@ min_free_bytes = 100000
         assert!(config.commit_read_through);
         assert_eq!(config.background_import_concurrency, 1);
         assert!(config.proxy_on_miss_by_default);
+        assert!(config.proxy_tee_import);
     }
 
     #[test]
@@ -468,6 +477,7 @@ min_free_bytes = 100000
             commit_read_through: false,
             background_import_concurrency: 2,
             proxy_on_miss_by_default: false,
+            proxy_tee_import: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: GitRemoteConfig = serde_json::from_str(&json).unwrap();
@@ -488,6 +498,7 @@ min_free_bytes = 100000
             ("GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "off"),
             ("GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY", "4"),
             ("GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT", "off"),
+            ("GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT", "off"),
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
         ]);
@@ -503,6 +514,7 @@ min_free_bytes = 100000
         assert!(!config.git_remote.commit_read_through);
         assert_eq!(config.git_remote.background_import_concurrency, 4);
         assert!(!config.git_remote.proxy_on_miss_by_default);
+        assert!(!config.git_remote.proxy_tee_import);
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
 
