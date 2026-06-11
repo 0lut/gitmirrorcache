@@ -924,7 +924,7 @@ impl Materializer {
     }
 }
 
-fn exact_hydrate_error_allows_upstream_fallback(err: &GitCacheError) -> bool {
+pub(super) fn exact_hydrate_error_allows_upstream_fallback(err: &GitCacheError) -> bool {
     matches!(
         err,
         GitCacheError::NotFound(_)

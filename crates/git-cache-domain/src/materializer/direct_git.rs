@@ -351,11 +351,16 @@ impl Materializer {
                             // was swept or repointed by another node; fall
                             // through to the read-through fetch instead of
                             // failing the whole request.
-                            Err(GitCacheError::NotFound(_)) => {
+                            Err(err)
+                                if super::planning::exact_hydrate_error_allows_upstream_fallback(
+                                    &err,
+                                ) =>
+                            {
                                 warn!(
                                     %repo,
                                     commit = %object_id,
                                     generation = %manifest.generation,
+                                    %err,
                                     "commit manifest hydrate missed; falling back to read-through fetch"
                                 );
                             }
