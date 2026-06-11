@@ -4,6 +4,8 @@
 //! init_bare, fetch, rev_parse, fsck, upload-pack,
 //! run, output limits, and timeout enforcement.
 
+mod common;
+
 mod tests {
     use git_cache_git::{FetchOptions, Git};
     use std::ffi::OsString;
@@ -54,25 +56,8 @@ mod tests {
             .map(|a| a.as_ref().to_os_string())
             .collect();
         let mut command = Command::new("git");
-        command
-            .args(&args)
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_COUNT", "3")
-            .env("GIT_CONFIG_KEY_0", "gc.auto")
-            .env("GIT_CONFIG_VALUE_0", "0")
-            .env("GIT_CONFIG_KEY_1", "gc.autoDetach")
-            .env("GIT_CONFIG_VALUE_1", "false")
-            .env("GIT_CONFIG_KEY_2", "maintenance.auto")
-            .env("GIT_CONFIG_VALUE_2", "false")
-            .env("GIT_ASKPASS", "/bin/false")
-            .env("SSH_ASKPASS", "/bin/false")
-            .env("HOME", "/nonexistent");
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
+        command.args(&args);
+        crate::common::configure_git_env(&mut command);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -296,23 +281,10 @@ mod tests {
         let temp = TempTree::new("timeout");
         let repo_dir = temp.path.join("repo.git");
         // Use std::process to init so the Git struct timeout doesn't interfere
-        let status = Command::new("git")
-            .args(["init", "--bare", repo_dir.to_str().unwrap()])
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_COUNT", "3")
-            .env("GIT_CONFIG_KEY_0", "gc.auto")
-            .env("GIT_CONFIG_VALUE_0", "0")
-            .env("GIT_CONFIG_KEY_1", "gc.autoDetach")
-            .env("GIT_CONFIG_VALUE_1", "false")
-            .env("GIT_CONFIG_KEY_2", "maintenance.auto")
-            .env("GIT_CONFIG_VALUE_2", "false")
-            .env("HOME", "/nonexistent")
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .output()
-            .expect("init repo");
+        let mut init_command = Command::new("git");
+        init_command.args(["init", "--bare", repo_dir.to_str().unwrap()]);
+        crate::common::configure_git_env(&mut init_command);
+        let status = init_command.output().expect("init repo");
         assert!(status.status.success());
 
         // Try a basic command with 1ms timeout. It should either timeout or
