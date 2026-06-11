@@ -134,6 +134,7 @@ impl GitFixture {
             disk: git_cache_core::DiskConfig {
                 quota_bytes: 1024 * 1024 * 1024,
                 min_free_bytes: 0,
+                access_flush_interval_secs: 60,
             },
             git_remote: Default::default(),
             compaction: Default::default(),

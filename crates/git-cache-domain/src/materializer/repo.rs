@@ -405,11 +405,7 @@ impl Materializer {
     }
 
     pub(super) async fn touch_repo_access(&self, repo: &RepoKey) -> CoreResult<()> {
-        self.state
-            .disk
-            .touch_repo_access(self.repo_disk_path(repo))
-            .await?;
-        Ok(())
+        self.state.disk.note_repo_access(self.repo_disk_path(repo))
     }
 
     pub(super) async fn lock_repo(&self, repo: &RepoKey) -> CoreResult<RepoLock> {

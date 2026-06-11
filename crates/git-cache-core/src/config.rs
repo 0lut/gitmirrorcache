@@ -89,6 +89,10 @@ impl AppConfig {
             disk: DiskConfig {
                 quota_bytes: parse_env("GIT_CACHE_DISK_QUOTA_BYTES", 10 * 1024 * 1024 * 1024)?,
                 min_free_bytes: parse_env("GIT_CACHE_DISK_MIN_FREE_BYTES", 1024 * 1024 * 1024)?,
+                access_flush_interval_secs: parse_env(
+                    "GIT_CACHE_DISK_ACCESS_FLUSH_SECS",
+                    default_disk_access_flush_secs(),
+                )?,
             },
             git_remote: GitRemoteConfig {
                 enabled: parse_bool_env("GIT_CACHE_GIT_REMOTE_ENABLED", true)?,
@@ -190,6 +194,14 @@ pub enum ObjectStoreConfig {
 pub struct DiskConfig {
     pub quota_bytes: u64,
     pub min_free_bytes: u64,
+    /// How often buffered repo-access timestamps are flushed from memory to
+    /// the on-disk repo index.
+    #[serde(default = "default_disk_access_flush_secs")]
+    pub access_flush_interval_secs: u64,
+}
+
+fn default_disk_access_flush_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
