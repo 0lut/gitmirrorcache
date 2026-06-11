@@ -2,7 +2,7 @@
 
 mod tests {
     use git_cache_core::CommitSha;
-    use git_cache_git::Git;
+    use git_cache_git::{FetchOptions, Git};
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -180,61 +180,84 @@ mod tests {
         (bare_repo, work_dir)
     }
 
-    // ── 1. Bundle large repo (100 commits) ──────────────────────────────────
+    // ── 1. Pack large repo (100 commits) ────────────────────────────────────
 
     #[tokio::test]
-    async fn bundle_large_repo() {
-        let temp = TempTree::new("bundle-large");
-        let (bare_repo, _work_dir, _head_sha) =
-            create_repo_with_n_commits(&temp.path, "large", 100);
+    async fn pack_large_repo() {
+        let temp = TempTree::new("pack-large");
+        let (bare_repo, _work_dir, head_sha) = create_repo_with_n_commits(&temp.path, "large", 100);
 
         let cache_repo = temp.path.join("cache.git");
-        let bundle_path = temp.path.join("large.bundle");
         let hydrated_repo = temp.path.join("hydrated.git");
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
-            .await
-            .expect("fetch main into cache repo");
+        git.fetch_ref(
+            &cache_repo,
+            path_arg(&bare_repo),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions::default(),
+        )
+        .await
+        .expect("fetch main into cache repo");
 
-        git.bundle_create(&cache_repo, &bundle_path, "refs/cache/main")
+        let head = CommitSha::parse(&head_sha).unwrap();
+        let pack_path = git
+            .pack_objects_revs(
+                &cache_repo,
+                &temp.path.join("large-pack"),
+                std::slice::from_ref(&head),
+                &[],
+            )
             .await
-            .expect("create bundle from 500-commit repo");
-        assert!(bundle_path.is_file(), "bundle file should exist");
+            .expect("pack 100-commit repo");
+        assert!(pack_path.is_file(), "pack file should exist");
 
         git.init_bare(&hydrated_repo)
             .await
             .expect("init hydrated repo");
-        git.fetch_bundle(&hydrated_repo, &bundle_path)
+        index_pack_into(&git, &hydrated_repo, &pack_path, "large").await;
+        git.update_refs_batch(&hydrated_repo, &[("refs/cache/main".to_string(), head)])
             .await
-            .expect("fetch bundle into hydrated repo");
+            .expect("update refs in hydrated repo");
         git.fsck(&hydrated_repo)
             .await
-            .expect("fsck hydrated repo after large bundle");
+            .expect("fsck hydrated repo after large pack");
     }
 
-    // ── 2. Incremental bundle chain ─────────────────────────────────────────
+    // ── 2. Incremental pack chain ───────────────────────────────────────────
 
     #[tokio::test]
-    async fn incremental_bundle_chain() {
-        let temp = TempTree::new("incr-bundle-chain");
+    async fn incremental_pack_chain() {
+        let temp = TempTree::new("incr-pack-chain");
         let (bare_repo, work_dir, first_head) = create_repo_with_n_commits(&temp.path, "incr", 100);
 
         let cache_repo = temp.path.join("cache.git");
-        let full_bundle = temp.path.join("full.bundle");
-        let delta_bundle = temp.path.join("delta.bundle");
         let hydrated_repo = temp.path.join("hydrated.git");
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
-            .await
-            .expect("fetch initial 100 commits");
+        git.fetch_ref(
+            &cache_repo,
+            path_arg(&bare_repo),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions::default(),
+        )
+        .await
+        .expect("fetch initial 100 commits");
 
-        git.bundle_create_all(&cache_repo, &full_bundle)
+        let first = CommitSha::parse(&first_head).unwrap();
+        let full_pack = git
+            .pack_objects_revs(
+                &cache_repo,
+                &temp.path.join("full-pack"),
+                std::slice::from_ref(&first),
+                &[],
+            )
             .await
-            .expect("create full bundle");
+            .expect("create full pack");
 
         for i in 0..50 {
             std::fs::write(work_dir.join("data.txt"), format!("extra commit {i}\n"))
@@ -247,34 +270,41 @@ mod tests {
         }
         run_git(Some(&work_dir), ["push", "origin", "main"]);
 
-        git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
-            .await
-            .expect("fetch 50 new commits");
-
-        git.bundle_create_incremental(
+        git.fetch_ref(
             &cache_repo,
-            &delta_bundle,
-            &[CommitSha::parse(&first_head).unwrap()],
+            path_arg(&bare_repo),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
-        .expect("create incremental bundle");
+        .expect("fetch 50 new commits");
+
+        let expected_sha = run_git(Some(&work_dir), ["rev-parse", "HEAD"]);
+        let new_head = CommitSha::parse(&expected_sha).unwrap();
+        let delta_pack = git
+            .pack_objects_revs(
+                &cache_repo,
+                &temp.path.join("delta-pack"),
+                std::slice::from_ref(&new_head),
+                std::slice::from_ref(&first),
+            )
+            .await
+            .expect("create incremental pack");
 
         git.init_bare(&hydrated_repo)
             .await
             .expect("init hydrated repo");
-        git.fetch_bundle(&hydrated_repo, &full_bundle)
+        index_pack_into(&git, &hydrated_repo, &full_pack, "full").await;
+        index_pack_into(&git, &hydrated_repo, &delta_pack, "delta").await;
+        git.update_refs_batch(&hydrated_repo, &[("refs/cache/main".to_string(), new_head)])
             .await
-            .expect("fetch full bundle");
-        git.fetch_bundle(&hydrated_repo, &delta_bundle)
-            .await
-            .expect("fetch delta bundle");
+            .expect("update refs in hydrated repo");
 
         let hydrated_sha = git
             .rev_parse(&hydrated_repo, "refs/cache/main^{commit}")
             .await
             .expect("resolve hydrated ref");
-
-        let expected_sha = run_git(Some(&work_dir), ["rev-parse", "HEAD"]);
         assert_eq!(hydrated_sha, expected_sha);
 
         git.rev_parse(&hydrated_repo, &format!("{first_head}^{{commit}}"))
@@ -294,42 +324,69 @@ mod tests {
         git.fsck(&hydrated_repo).await.expect("fsck hydrated repo");
     }
 
-    // ── 3. Many branches bundle ─────────────────────────────────────────────
+    // ── 3. Many branches pack ───────────────────────────────────────────────
 
     #[tokio::test]
-    async fn many_branches_bundle() {
-        let temp = TempTree::new("many-branches-bundle");
+    async fn many_branches_pack() {
+        let temp = TempTree::new("many-branches-pack");
         let (bare_repo, _work_dir) = create_repo_with_n_branches(&temp.path, "branchy", 50);
 
         let cache_repo = temp.path.join("cache.git");
-        let bundle_path = temp.path.join("branches.bundle");
         let hydrated_repo = temp.path.join("hydrated.git");
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
 
-        // Fetch all branches into cache
+        let mut updates = Vec::new();
         for i in 0..50 {
             let branch = format!("feature-{i}");
             let local_ref = format!("refs/cache/{branch}");
-            git.fetch_branch(&cache_repo, path_arg(&bare_repo), &branch, &local_ref)
+            git.fetch_ref(
+                &cache_repo,
+                path_arg(&bare_repo),
+                &format!("refs/heads/{branch}"),
+                &local_ref,
+                FetchOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("fetch branch {branch}: {e}"));
+            let sha = git
+                .rev_parse(&cache_repo, &format!("{local_ref}^{{commit}}"))
                 .await
-                .unwrap_or_else(|e| panic!("fetch branch {branch}: {e}"));
+                .unwrap_or_else(|e| panic!("resolve {local_ref}: {e}"));
+            updates.push((local_ref, CommitSha::parse(&sha).unwrap()));
         }
-        git.fetch_branch(&cache_repo, path_arg(&bare_repo), "main", "refs/cache/main")
+        git.fetch_ref(
+            &cache_repo,
+            path_arg(&bare_repo),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions::default(),
+        )
+        .await
+        .expect("fetch main");
+        let main_sha = git
+            .rev_parse(&cache_repo, "refs/cache/main^{commit}")
             .await
-            .expect("fetch main");
+            .expect("resolve main");
+        updates.push((
+            "refs/cache/main".to_string(),
+            CommitSha::parse(&main_sha).unwrap(),
+        ));
 
-        git.bundle_create_all(&cache_repo, &bundle_path)
+        let tips: Vec<CommitSha> = updates.iter().map(|(_, sha)| sha.clone()).collect();
+        let pack_path = git
+            .pack_objects_revs(&cache_repo, &temp.path.join("branches-pack"), &tips, &[])
             .await
-            .expect("bundle_create_all with many branches");
+            .expect("pack_objects_revs with many branches");
 
         git.init_bare(&hydrated_repo)
             .await
             .expect("init hydrated repo");
-        git.fetch_bundle(&hydrated_repo, &bundle_path)
+        index_pack_into(&git, &hydrated_repo, &pack_path, "branches").await;
+        git.update_refs_batch(&hydrated_repo, &updates)
             .await
-            .expect("fetch bundle with many branches");
+            .expect("update refs with many branches");
 
         // Verify all branches are present
         let refs_output = run_git(
@@ -347,10 +404,10 @@ mod tests {
         git.fsck(&hydrated_repo).await.expect("fsck hydrated repo");
     }
 
-    // ── 4. Concurrent fetch_branch ──────────────────────────────────────────
+    // ── 4. Concurrent fetch_ref ─────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn concurrent_fetch_branch() {
+    async fn concurrent_fetch_ref() {
         let temp = TempTree::new("concurrent-fetch");
         let (bare_repo, _work_dir, _head_sha) =
             create_repo_with_n_commits(&temp.path, "source", 20);
@@ -366,9 +423,15 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let cache_repo = root.join(format!("cache-{i}.git"));
                 git.init_bare(&cache_repo).await.expect("init cache repo");
-                git.fetch_branch(&cache_repo, &url, "main", "refs/cache/main")
-                    .await
-                    .expect("concurrent fetch_branch should succeed");
+                git.fetch_ref(
+                    &cache_repo,
+                    &url,
+                    "refs/heads/main",
+                    "refs/cache/main",
+                    FetchOptions::default(),
+                )
+                .await
+                .expect("concurrent fetch_ref should succeed");
                 git.fsck(&cache_repo).await.expect("fsck cache repo");
             }));
         }
@@ -376,5 +439,17 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+
+    /// Copy a pack into the repo's objects/pack dir and index it so its
+    /// objects become available, mirroring the hydration flow.
+    async fn index_pack_into(git: &Git, repo_dir: &Path, pack_path: &Path, name: &str) {
+        let pack_dir = repo_dir.join("objects").join("pack");
+        std::fs::create_dir_all(&pack_dir).expect("create pack dir");
+        let final_path = pack_dir.join(format!("pack-{name}.pack"));
+        std::fs::copy(pack_path, &final_path).expect("copy pack into repo");
+        git.index_pack(repo_dir, &final_path)
+            .await
+            .unwrap_or_else(|e| panic!("index pack {name}: {e}"));
     }
 }

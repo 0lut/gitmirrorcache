@@ -1596,10 +1596,6 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub fn empty_body() -> Body {
-    Body::empty()
-}
-
 /// Wraps a `ReaderStream` and holds a child process handle to keep the process
 /// alive for the duration of the HTTP response body stream. Also holds the
 /// semaphore permit so it is not released until the stream is fully consumed.
