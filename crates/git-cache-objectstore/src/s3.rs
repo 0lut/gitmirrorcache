@@ -49,6 +49,24 @@ impl S3ObjectStore {
         })
     }
 
+    /// Startup probe: confirms the configured bucket exists and is reachable
+    /// with the current credentials, so misconfiguration fails fast with a
+    /// clear error instead of surfacing as `NoSuchBucket` on the first cache
+    /// operation.
+    pub async fn verify_bucket_access(&self) -> Result<()> {
+        match self.client.head_bucket().bucket(&self.bucket).send().await {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) => Err(GitCacheError::Validation(format!(
+                "s3 bucket `{}` does not exist; create it (the server never creates buckets) or fix GIT_CACHE_S3_BUCKET",
+                self.bucket
+            ))),
+            Err(err) => Err(GitCacheError::UpstreamUnavailable(format!(
+                "s3 bucket `{}` is not accessible with the current credentials/endpoint: {err:?}",
+                self.bucket
+            ))),
+        }
+    }
+
     pub fn client(&self) -> &Client {
         &self.client
     }

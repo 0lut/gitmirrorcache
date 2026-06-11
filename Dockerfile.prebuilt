@@ -1,0 +1,29 @@
+# Runtime-only image for CI: binaries are built on the runner (with the
+# shared cargo cache) and copied in, instead of compiling inside Docker.
+# Keep the runtime stage in sync with Dockerfile.
+#
+# Runtime needs git >= 2.45: serving and want-classification rely on
+# GIT_NO_LAZY_FETCH printing `missing` for absent promisor objects (older
+# gits die with `could not fetch ... from promisor remote` instead).
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --create-home --home-dir /home/git-cache git-cache \
+    && mkdir -p /cache \
+    && chown -R git-cache:git-cache /cache
+
+COPY dist/git-cache-api /usr/local/bin/git-cache-api
+COPY dist/git-cache /usr/local/bin/git-cache
+
+ENV GIT_CACHE_BIND_ADDR=0.0.0.0:8080
+ENV GIT_CACHE_ROOT=/cache
+ENV GIT_CACHE_OBJECT_STORE_KIND=s3
+ENV GIT_CACHE_GIT_BINARY=git
+ENV RUST_LOG=info
+
+USER git-cache
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/git-cache-api"]

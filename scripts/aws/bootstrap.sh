@@ -76,25 +76,7 @@ ensure_ecr_repository() {
     --repository-name "$ECR_REPOSITORY" \
     --image-scanning-configuration scanOnPush=true >/dev/null
 
-  python3 - "$tmpdir/ecr-lifecycle.json" <<'PY'
-import json
-import os
-import sys
-
-retain = int(os.environ.get("ECR_RETAIN_IMAGES", "30"))
-json.dump({
-    "rules": [{
-        "rulePriority": 1,
-        "description": f"Keep the last {retain} images",
-        "selection": {
-            "tagStatus": "any",
-            "countType": "imageCountMoreThan",
-            "countNumber": retain,
-        },
-        "action": {"type": "expire"},
-    }]
-}, open(sys.argv[1], "w"))
-PY
+  python3 "$REPO_ROOT/python/aws/ecr_lifecycle_policy.py" "$tmpdir/ecr-lifecycle.json"
   aws_cli ecr put-lifecycle-policy \
     --repository-name "$ECR_REPOSITORY" \
     --lifecycle-policy-text "file://$tmpdir/ecr-lifecycle.json" >/dev/null

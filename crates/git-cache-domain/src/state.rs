@@ -82,9 +82,10 @@ impl AppState {
             } => {
                 #[cfg(feature = "s3")]
                 {
-                    Arc::new(
-                        s3_store_async(bucket, &v2_s3_prefix(prefix), endpoint.as_deref()).await?,
-                    )
+                    let store =
+                        s3_store_async(bucket, &v2_s3_prefix(prefix), endpoint.as_deref()).await?;
+                    store.verify_bucket_access().await?;
+                    Arc::new(store)
                 }
                 #[cfg(not(feature = "s3"))]
                 {
