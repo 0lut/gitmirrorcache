@@ -102,6 +102,42 @@ checkout for `uv` and `ruff`.
 | `torvalds/linux` | full-history blobless no-checkout | `157.707s` | `233.921s` |
 | `llvm/llvm-project` | full-history blobless no-checkout | `74.500s` | `241.279s` |
 
+## Linux/LLVM Heavy Rerun
+
+Rerun date: 2026-06-11 UTC
+
+Command:
+
+```sh
+RUN_AWS_DEV_GIT_MATRIX=1 \
+GIT_CACHE_AWS_DEV_BASE_URL=http://gitmirrorcache-arm-ec2-alb-1840948451.us-west-2.elb.amazonaws.com \
+GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1 \
+GIT_CACHE_AWS_DEV_SKIP_STANDARD=1 \
+GIT_CACHE_AWS_DEV_TIER=heavy \
+GIT_CACHE_AWS_DEV_DIRECT_HEAVY_BASELINE=1 \
+GIT_CACHE_AWS_DEV_USE_GH_TOKEN=0 \
+GIT_CACHE_AWS_DEV_COMMAND_TIMEOUT=7200 \
+GIT_CACHE_AWS_DEV_REPOS=github.com/torvalds/linux:master,github.com/llvm/llvm-project:main \
+GIT_CACHE_AWS_DEV_RESULTS=/tmp/gitcache-aws-dev-linux-llvm-heavy-rerun-20260611T044654Z.jsonl \
+AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm AWS_PAGER= \
+python3 -m unittest -v integration_tests.test_aws_dev_git_matrix
+```
+
+Result: `Ran 1 test in 1185.324s OK`.
+
+| Repo | Case | First run | Rerun |
+| --- | --- | ---: | ---: |
+| `torvalds/linux` | direct GitHub full-history blobless no-checkout | `157.707s` | `518.289s` |
+| `torvalds/linux` | AWS proxy-off full-history blobless no-checkout | `233.921s` | `243.482s` |
+| `llvm/llvm-project` | direct GitHub full-history blobless no-checkout | `74.500s` | `252.546s` |
+| `llvm/llvm-project` | AWS proxy-off full-history blobless no-checkout | `241.279s` | `155.192s` |
+
+All rerun HEAD checks matched upstream and the 1000-commit history walks passed.
+The LLVM upstream HEAD changed between the first run and rerun, so that pair is
+not an identical pack comparison. Even with that caveat, the direct GitHub
+numbers varied by 3.29x for Linux and 3.39x for LLVM, which makes single-sample
+direct baselines too noisy for firm cache-path conclusions.
+
 ## Takeaways
 
 - The cache path was correct for every measured scenario: HEADs matched
@@ -115,3 +151,6 @@ checkout for `uv` and `ruff`.
 - For giant full-history blobless clones, direct GitHub was faster than AWS
   proxy-off in this run: Linux was 1.48x faster direct, and LLVM was 3.24x
   faster direct.
+- Repeated direct-GitHub heavy samples are highly variable, likely due to
+  GitHub-side pack/cache state, network path, or both. Treat the first direct
+  timing table as a snapshot rather than a stable baseline.
