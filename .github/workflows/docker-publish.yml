@@ -1,4 +1,4 @@
-name: Publish Docker Image
+name: Publish Release Artifacts
 
 on:
   push:
@@ -8,6 +8,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  CHART_DIR: deploy/helm/gitmirrorcache
+  CHART_REPOSITORY: ghcr.io/${{ github.repository_owner }}/charts
 
 jobs:
   build:
@@ -127,9 +129,68 @@ jobs:
       - name: Create and push manifest list
         working-directory: ${{ runner.temp }}/digests
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "${REGISTRY}/${IMAGE_NAME}@sha256:%s " *)
+          tag_args=()
+          while IFS= read -r tag; do
+            tag_args+=("-t" "$tag")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+
+          shopt -s nullglob
+          sources=()
+          for digest_path in ./*; do
+            digest="${digest_path#./}"
+            sources+=("${REGISTRY}/${IMAGE_NAME}@sha256:${digest}")
+          done
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "no image digests found"
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
       - name: Inspect manifest list
         run: docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${{ steps.meta.outputs.version }}"
+
+  publish-helm-chart:
+    name: Package & push Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: merge
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Extract release metadata
+        id: release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          chart_name="$(helm show chart "${CHART_DIR}" | awk '$1 == "name:" { print $2; exit }')"
+          if [ -z "${chart_name}" ]; then
+            echo "chart name is missing from ${CHART_DIR}/Chart.yaml"
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "chart_name=${chart_name}"
+            echo "chart_package=dist/${chart_name}-${version}.tgz"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Lint chart
+        run: helm lint "${CHART_DIR}" --set config.objectStore.s3.bucket=ci-bucket
+
+      - name: Package chart
+        run: |
+          helm package "${CHART_DIR}" \
+            --destination dist \
+            --version "${{ steps.release.outputs.version }}" \
+            --app-version "${{ steps.release.outputs.version }}"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Push chart
+        run: helm push "${{ steps.release.outputs.chart_package }}" "oci://${CHART_REPOSITORY}"

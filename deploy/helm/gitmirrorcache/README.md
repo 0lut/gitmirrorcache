@@ -10,8 +10,11 @@ compaction rule from the AWS deployment.
 
 ## Install
 
+Helm install commands take both a release name and a chart reference. From this
+chart directory, use `.` as the chart reference:
+
 ```sh
-helm install git-cache deploy/helm/gitmirrorcache \
+helm install git-cache . \
   --set config.objectStore.s3.bucket=my-git-cache-bucket
 ```
 
@@ -20,6 +23,17 @@ The server resolves the S3 region from `GIT_CACHE_S3_REGION`, `AWS_REGION`,
 `AWS_REGION` is injected into the pod automatically, so no region value is
 needed. Set `aws.region` (rendered as `AWS_REGION`) only when nothing else
 provides one — e.g. static credentials on a non-AWS cluster.
+
+For a published chart, set `CHART_REF` to the OCI chart reference and
+`CHART_VERSION` to the release version:
+
+```sh
+helm install git-cache "${CHART_REF}" \
+  --version "${CHART_VERSION}" \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket
+```
+
+For release tag `vX.Y.Z`, use chart version `X.Y.Z`.
 
 ## S3 credentials
 
