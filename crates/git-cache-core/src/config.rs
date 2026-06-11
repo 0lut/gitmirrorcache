@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub git_remote: GitRemoteConfig,
     #[serde(default)]
     pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
     #[serde(default = "default_max_concurrent_git_processes")]
     pub max_concurrent_git_processes: usize,
     #[serde(default = "default_async_materialize_concurrency")]
@@ -119,6 +121,16 @@ impl AppConfig {
                 retention_secs: parse_env(
                     "GIT_CACHE_COMPACTION_RETENTION_SECS",
                     default_compaction_retention_secs(),
+                )?,
+            },
+            shutdown: ShutdownConfig {
+                readiness_delay_seconds: parse_env(
+                    "GIT_CACHE_SHUTDOWN_READINESS_DELAY_SECONDS",
+                    default_shutdown_readiness_delay_seconds(),
+                )?,
+                drain_timeout_seconds: parse_env(
+                    "GIT_CACHE_SHUTDOWN_DRAIN_TIMEOUT_SECONDS",
+                    default_shutdown_drain_timeout_seconds(),
                 )?,
             },
             max_concurrent_git_processes: parse_env(
@@ -226,6 +238,28 @@ impl Default for CompactionConfig {
     }
 }
 
+/// Graceful shutdown behavior for the API server. On SIGTERM/SIGINT the
+/// server first fails readiness (`/healthz` returns 503) for
+/// `readiness_delay_seconds` so load balancers stop routing new traffic,
+/// then stops accepting connections and drains in-flight requests for up to
+/// `drain_timeout_seconds` before exiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownConfig {
+    #[serde(default = "default_shutdown_readiness_delay_seconds")]
+    pub readiness_delay_seconds: u64,
+    #[serde(default = "default_shutdown_drain_timeout_seconds")]
+    pub drain_timeout_seconds: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            readiness_delay_seconds: default_shutdown_readiness_delay_seconds(),
+            drain_timeout_seconds: default_shutdown_drain_timeout_seconds(),
+        }
+    }
+}
+
 fn default_compaction_threshold() -> u32 {
     10
 }
@@ -301,6 +335,14 @@ pub fn default_async_materialize_concurrency() -> usize {
 
 pub fn default_use_gitoxide() -> bool {
     true
+}
+
+fn default_shutdown_readiness_delay_seconds() -> u64 {
+    5
+}
+
+fn default_shutdown_drain_timeout_seconds() -> u64 {
+    60
 }
 
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> crate::Result<T>

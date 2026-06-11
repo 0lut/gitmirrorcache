@@ -37,6 +37,7 @@ pub fn test_config_with_upstream(
             ..Default::default()
         },
         compaction: Default::default(),
+        shutdown: Default::default(),
         max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
         async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
         use_gitoxide: true,

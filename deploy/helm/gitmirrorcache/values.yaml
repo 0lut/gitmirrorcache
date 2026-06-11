@@ -64,6 +64,10 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+# Must exceed config.shutdown.readinessDelaySeconds + drainTimeoutSeconds so
+# Kubernetes does not SIGKILL the pod while it is still draining.
+terminationGracePeriodSeconds: 75
+
 # Persistent hot cache mounted at /cache. The cache is disposable from a
 # correctness perspective (S3 is the durable source); losing the volume only
 # forces rehydration. Disable persistence to fall back to an emptyDir.
@@ -109,6 +113,14 @@ config:
   compaction:
     chainDepthThreshold: 10
     inline: false
+  # Graceful shutdown: on SIGTERM the server fails /healthz readiness for
+  # readinessDelaySeconds (so endpoints drop out of rotation), then stops
+  # accepting connections and drains in-flight requests for up to
+  # drainTimeoutSeconds before exiting. Keep terminationGracePeriodSeconds
+  # above readinessDelaySeconds + drainTimeoutSeconds.
+  shutdown:
+    readinessDelaySeconds: 5
+    drainTimeoutSeconds: 60
   # Extra environment variables appended verbatim to the container, e.g. to
   # set GIT_CACHE_* knobs not surfaced above.
   extraEnv: []
