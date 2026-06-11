@@ -719,4 +719,220 @@ mod tests {
     }
 
     // ── upstream_url tests ───────────────────────────────────────────
+    use git_cache_objectstore::{ObjectStore, ObjectVersion};
+
+    /// Object store wrapper that pauses the first write to the generation
+    /// head pointer while armed, letting the test interleave a concurrent
+    /// publish (as another node would) between compaction's reads and its
+    /// head write + pack cleanup.
+    struct HeadWriteGate {
+        inner: Arc<dyn ObjectStore>,
+        head_key: String,
+        armed: std::sync::atomic::AtomicBool,
+        hit: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl HeadWriteGate {
+        async fn pause_if_armed(&self, key: &str) {
+            if key == self.head_key && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.hit.notify_one();
+                self.resume.notified().await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for HeadWriteGate {
+        async fn get(&self, key: &str) -> CoreResult<Option<bytes::Bytes>> {
+            self.inner.get(key).await
+        }
+
+        async fn put(&self, key: &str, value: bytes::Bytes) -> CoreResult<()> {
+            self.pause_if_armed(key).await;
+            self.inner.put(key, value).await
+        }
+
+        async fn put_if_absent(&self, key: &str, value: bytes::Bytes) -> CoreResult<bool> {
+            self.inner.put_if_absent(key, value).await
+        }
+
+        async fn get_versioned(
+            &self,
+            key: &str,
+        ) -> CoreResult<Option<(bytes::Bytes, ObjectVersion)>> {
+            self.inner.get_versioned(key).await
+        }
+
+        async fn put_if_version_matches(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            version: &ObjectVersion,
+        ) -> CoreResult<bool> {
+            self.pause_if_armed(key).await;
+            self.inner.put_if_version_matches(key, value, version).await
+        }
+
+        async fn exists(&self, key: &str) -> CoreResult<bool> {
+            self.inner.exists(key).await
+        }
+
+        async fn delete(&self, key: &str) -> CoreResult<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+            max_keys: Option<usize>,
+        ) -> CoreResult<Vec<String>> {
+            self.inner.list_prefix(prefix, max_keys).await
+        }
+
+        async fn head(&self, key: &str) -> CoreResult<Option<git_cache_objectstore::ObjectMeta>> {
+            self.inner.head(key).await
+        }
+    }
+
+    /// Regression test for the compaction/publish TOCTOU: a generation
+    /// published concurrently (e.g. by another node) between compaction's
+    /// reads and its head write must survive — the CAS head write makes
+    /// compaction abort its cleanup instead of clobbering the publish and
+    /// deleting the packs it references.
+    #[tokio::test]
+    async fn compaction_preserves_generation_published_concurrently() {
+        use git_cache_objectstore::{
+            repo_generation_head_key, write_generation_manifest, write_repo_generation_head,
+        };
+
+        let fixture = GitFixture::new();
+        let config = AppConfig {
+            compaction: git_cache_core::CompactionConfig {
+                chain_depth_threshold: 2,
+                inline: false,
+            },
+            ..fixture.state_config()
+        };
+        let inner: Arc<dyn ObjectStore> = Arc::new(git_cache_objectstore::LocalObjectStore::new(
+            fixture.tmp.path().join("objects"),
+        ));
+        let gate = Arc::new(HeadWriteGate {
+            inner: Arc::clone(&inner),
+            head_key: repo_generation_head_key(&fixture.repo),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            hit: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let git = git_cache_git::Git::with_concurrency_limit(
+            config.git_binary.clone(),
+            std::time::Duration::from_secs(config.git_timeout_seconds),
+            config.max_concurrent_git_processes,
+        )
+        .with_output_limit(config.max_git_output_bytes);
+        let disk = git_cache_disk::DiskManager::new(
+            &config.cache_root,
+            config.disk.quota_bytes,
+            config.disk.min_free_bytes,
+        );
+        let state = Arc::new(AppState {
+            config,
+            store: Arc::clone(&gate) as Arc<dyn ObjectStore>,
+            git,
+            disk: git_cache_disk::AsyncDiskManager::new(disk),
+            serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+        });
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let first = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
+        let _ = wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
+        let mut last_commit = first.commit.clone();
+        for contents in ["second", "third"] {
+            last_commit = fixture.commit_and_push(contents);
+            materializer
+                .materialize(MaterializeRequest {
+                    repo: fixture.repo.clone(),
+                    selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                    upstream_authorization: Default::default(),
+                })
+                .await
+                .unwrap();
+            let manifest = wait_for_commit_manifest(&state, &fixture.repo, &last_commit).await;
+            let _ = wait_for_generation_head(&state, &fixture.repo, manifest.generation).await;
+        }
+        let last_manifest = wait_for_commit_manifest(&state, &fixture.repo, &last_commit).await;
+        let head_before =
+            wait_for_generation_head(&state, &fixture.repo, last_manifest.generation).await;
+        let head_manifest =
+            generation_manifest_for(&state, &fixture.repo, head_before.generation).await;
+        assert!(head_manifest.packs.len() > 2, "need a compactable chain");
+
+        // The "concurrent publish": a generation created by another node in
+        // the window between compaction's reads and its head write. It
+        // references the packs that existed when it was published. It is
+        // written through the inner store directly, bypassing this process's
+        // repo lock, exactly as a second node would.
+        let published_generation = GenerationId::new();
+        let published_manifest = GenerationManifest {
+            repo: fixture.repo.clone(),
+            generation: published_generation,
+            created_at: Utc::now(),
+            verified_at: Some(Utc::now()),
+            packs: head_manifest.packs.clone(),
+            refs: head_manifest.refs.clone(),
+            head_ref: head_manifest.head_ref.clone(),
+            commits: head_manifest.commits.clone(),
+        };
+        let published_head = RepoGenerationHead {
+            repo: fixture.repo.clone(),
+            generation: published_generation,
+            tip_commits: head_before.tip_commits.clone(),
+            updated_at: Utc::now(),
+        };
+
+        gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let inject = async {
+            gate.hit.notified().await;
+            write_generation_manifest(&*inner, &published_manifest)
+                .await
+                .unwrap();
+            write_repo_generation_head(&*inner, &published_head)
+                .await
+                .unwrap();
+            gate.resume.notify_one();
+        };
+        let (report, ()) =
+            tokio::join!(materializer.compact_generation_chain(&fixture.repo), inject);
+        report.unwrap();
+
+        let head_after = read_repo_generation_head(&*inner, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            head_after.generation, published_generation,
+            "compaction must not clobber a generation head published concurrently"
+        );
+        let surviving = read_generation_manifest(&*inner, &fixture.repo, published_generation)
+            .await
+            .unwrap()
+            .expect("concurrently published generation manifest must survive");
+        for pack in &surviving.packs {
+            assert!(
+                inner.exists(&pack.key).await.unwrap(),
+                "pack `{}` referenced by the concurrently published generation was deleted",
+                pack.key
+            );
+        }
+    }
 }
