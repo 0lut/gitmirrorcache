@@ -2,7 +2,7 @@ pub mod materializer;
 pub mod state;
 
 pub use materializer::{
-    frame_ref_advertisement, synthesize_ref_advertisement, Materializer, MaterializerExecutor,
-    UploadPackProcess, UpstreamRefComparison,
+    frame_ref_advertisement, plan_upload_pack_tee, synthesize_ref_advertisement, Materializer,
+    MaterializerExecutor, PackDemux, UploadPackProcess, UploadPackTeePlan, UpstreamRefComparison,
 };
 pub use state::AppState;

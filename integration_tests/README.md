@@ -62,6 +62,57 @@ What the tests do:
   - `git ls-remote` via the cache and compare to the upstream HEAD
   - `git clone --depth 1` via the cache and verify the cloned HEAD matches upstream
 
+## AWS dev correctness/speed matrix (`test_aws_dev_git_matrix`)
+
+This suite targets an already-deployed AWS dev instance and records JSONL timing
+and correctness evidence for public GitHub repos:
+
+```sh
+RUN_AWS_DEV_GIT_MATRIX=1 \
+GIT_CACHE_AWS_DEV_BASE_URL=http://gitmirrorcache-arm-ec2-alb-1840948451.us-west-2.elb.amazonaws.com \
+GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1 \
+python3 -m unittest -v integration_tests.test_aws_dev_git_matrix
+```
+
+By default it covers `astral-sh/uv`, `astral-sh/ruff`, `torvalds/linux`, and
+`llvm/llvm-project` with:
+
+- upstream and cache `ls-remote` correctness
+- direct GitHub `--depth 1 --filter=blob:none --no-checkout` baseline timing
+- cold proxy-on-miss, hot proxy repeat, cold read-through opt-out, and hot
+  read-through repeat against the cache
+- request-scoped Basic auth runs when `GIT_CACHE_AWS_DEV_BASIC_AUTH`,
+  `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` is available
+- blobless-to-full depth-1 transition checks for `uv` and `ruff`
+- `git-receive-pack` rejection
+
+`GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1` uses
+`scripts/aws/remove-cache-repo.sh` to delete only the local EBS hot-cache repo
+before cold lanes; it does not delete S3 durable cache state. Set
+`GIT_CACHE_AWS_DEV_RESULTS=/path/results.jsonl` to choose the report path.
+Use `GIT_CACHE_AWS_DEV_TIER=heavy` only for explicit large-repo full-history
+walk checks.
+
+To run only the heavier local read-through lanes with proxy-on-miss forced off:
+
+```sh
+RUN_AWS_DEV_GIT_MATRIX=1 \
+GIT_CACHE_AWS_DEV_BASE_URL=http://gitmirrorcache-arm-ec2-alb-1840948451.us-west-2.elb.amazonaws.com \
+GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1 \
+GIT_CACHE_AWS_DEV_SKIP_STANDARD=1 \
+GIT_CACHE_AWS_DEV_TIER=heavy \
+GIT_CACHE_AWS_DEV_COMMAND_TIMEOUT=7200 \
+python3 -m unittest -v integration_tests.test_aws_dev_git_matrix
+```
+
+Heavy mode sends `git-cache-use-proxy-on-miss: false` for full-history
+`--filter=blob:none --no-checkout` clones on every configured repo, verifies
+HEAD plus a bounded history walk, and also runs a blobless full checkout for
+`uv` and `ruff`. Add `GIT_CACHE_AWS_DEV_DIRECT_HEAVY_BASELINE=1` to also
+measure the same heavy shapes directly from GitHub for comparison. The first
+dev run findings are summarized in
+[`aws-dev-git-matrix-findings.md`](aws-dev-git-matrix-findings.md).
+
 ## Docker / MinIO object-store tests
 
 These tests use Docker Compose to run MinIO locally and exercise the S3-compatible

@@ -4,7 +4,7 @@ const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v2";
 /// Marker recording that the bare repo was hydrated with a filtered
 /// (blobless) fetch and therefore cannot serve full-object clone shapes
 /// until an unfiltered `--refetch` completes.
-const PARTIAL_HYDRATION_MARKER: &str = "git-cache-partial-hydration";
+pub(super) const PARTIAL_HYDRATION_MARKER: &str = "git-cache-partial-hydration";
 const BLOBLESS_FETCH_FILTER: &str = "blob:none";
 
 /// Local git config applied to every served bare repo. Marker-gated by
@@ -37,7 +37,7 @@ const SERVING_MAINTENANCE_DELAY: StdDuration = StdDuration::from_millis(20);
 #[cfg(not(test))]
 const SERVING_MAINTENANCE_DELAY: StdDuration = StdDuration::from_secs(60);
 
-enum DirectFetchedWantKind {
+pub(super) enum DirectFetchedWantKind {
     Commit,
     NonCommit,
 }
@@ -573,7 +573,7 @@ impl Materializer {
         Ok(fetched_all_heads)
     }
 
-    async fn prepare_fetched_direct_want(
+    pub(super) async fn prepare_fetched_direct_want(
         &self,
         repo_dir: &FsPath,
         object_id: &CommitSha,
@@ -615,7 +615,7 @@ impl Materializer {
         Ok(DirectFetchedWantKind::Commit)
     }
 
-    fn enqueue_direct_fsck(&self, repo: RepoKey, repo_dir: PathBuf, commit: CommitSha) {
+    pub(super) fn enqueue_direct_fsck(&self, repo: RepoKey, repo_dir: PathBuf, commit: CommitSha) {
         let materializer = self.clone();
         info!(
             %repo,
@@ -649,7 +649,7 @@ impl Materializer {
     /// after hydration, so server-side pack-objects can reuse pack bytes and
     /// bitmaps instead of recomputing deltas over millions of objects. At
     /// most one maintenance run per repo is queued or running at a time.
-    fn enqueue_serving_maintenance(&self, repo: RepoKey, repo_dir: PathBuf) {
+    pub(super) fn enqueue_serving_maintenance(&self, repo: RepoKey, repo_dir: PathBuf) {
         {
             let Ok(mut inflight) = self.state.serving_maintenance_inflight.lock() else {
                 warn!(%repo, "serving maintenance in-flight lock poisoned; skipping");
@@ -705,7 +705,7 @@ impl Materializer {
     /// - `uploadpack.allowFilter=true`
     /// - `uploadpack.hideRefs=refs/cache`
     /// - `transfer.hideRefs=refs/cache`
-    async fn configure_served_repo(&self, repo_dir: &FsPath) -> CoreResult<()> {
+    pub(super) async fn configure_served_repo(&self, repo_dir: &FsPath) -> CoreResult<()> {
         let marker = repo_dir.join(SERVED_REPO_CONFIG_MARKER);
         if fs::try_exists(&marker).await? {
             return Ok(());
@@ -1123,7 +1123,7 @@ fn parse_want_strings(wants: &[String]) -> CoreResult<Vec<CommitSha>> {
         .collect()
 }
 
-fn visit_upload_pack_lines(body: &[u8], mut visit: impl FnMut(&str)) {
+pub(super) fn visit_upload_pack_lines(body: &[u8], mut visit: impl FnMut(&str)) {
     let mut offset = 0;
     while offset + 4 <= body.len() {
         let hex = match std::str::from_utf8(&body[offset..offset + 4]) {

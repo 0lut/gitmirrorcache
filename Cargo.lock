@@ -1312,6 +1312,7 @@ dependencies = [
  "flate2",
  "futures",
  "git-cache-core",
+ "git-cache-disk",
  "git-cache-domain",
  "git-cache-git",
  "http 1.4.0",
