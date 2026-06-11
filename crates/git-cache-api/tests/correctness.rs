@@ -110,7 +110,7 @@ mod tests {
         }
 
         fn object_store_root(&self) -> PathBuf {
-            self.tmp.path().join("objects-v2")
+            self.tmp.path().join("objects-v3")
         }
     }
 

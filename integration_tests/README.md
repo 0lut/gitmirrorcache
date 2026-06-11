@@ -46,7 +46,7 @@ python3 -m unittest -v integration_tests.test_astral_uv
 ```
 
 In MinIO mode, the tests assert the local object-store directory is not used,
-the configured MinIO bucket prefix is non-empty, and cached bundle objects were
+the configured MinIO bucket prefix is non-empty, and cached pack objects were
 written to MinIO.
 
 ## Direct Git remote tests (`test_git_remote_public`)

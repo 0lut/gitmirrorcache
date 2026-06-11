@@ -252,8 +252,29 @@ impl Materializer {
         // pack-objects mid-stream. Force a `--refetch` covering every want so
         // git re-downloads full objects despite the local (partial) haves.
         let partial_marker = repo_dir.join(PARTIAL_HYDRATION_MARKER);
-        let force_refetch =
+        let mut force_refetch =
             !fetch_options.blobless_fetch() && fs::try_exists(&partial_marker).await?;
+        // A blobless hydration followed by client checkout blob storms often
+        // leaves the depth-1 snapshot of a tip fully present locally even
+        // though the repo as a whole is partial. For single-commit-deep
+        // intents the served pack is exactly each want's own snapshot, so a
+        // local completeness walk can prove the refetch unnecessary — at the
+        // cost of one rev-list per want instead of re-downloading the pack
+        // from upstream. Deeper or full-history intents keep the refetch:
+        // their pack shape cannot be cheaply proven complete.
+        if force_refetch
+            && fetch_options.depth == Some(1)
+            && self
+                .depth1_snapshots_complete_no_lazy(&repo_dir, object_ids)
+                .await?
+        {
+            force_refetch = false;
+            info!(
+                %repo,
+                wants = object_ids.len(),
+                "partially hydrated repo already holds complete depth-1 snapshots; skipping forced refetch"
+            );
+        }
         let fetch_options = if force_refetch {
             fetch_options.with_refetch()
         } else {
@@ -730,12 +751,27 @@ impl Materializer {
         if intent.filter.is_none()
             && fs::try_exists(repo_dir.join(PARTIAL_HYDRATION_MARKER)).await?
         {
-            info!(
-                %repo,
-                wants_count = intent.wants.len(),
-                "direct git cache prepare declined: repo partially hydrated (blobless), request needs full objects"
-            );
-            return Ok(false);
+            // Exception: a depth-1 intent whose tips' snapshots are fully
+            // present locally (e.g. filled by checkout blob storms after the
+            // blobless hydration) can be served from cache.
+            if intent.depth == Some(1)
+                && self
+                    .depth1_snapshots_complete_no_lazy(&repo_dir, &intent.wants)
+                    .await?
+            {
+                info!(
+                    %repo,
+                    wants_count = intent.wants.len(),
+                    "partially hydrated repo holds complete depth-1 snapshots; serving from cache"
+                );
+            } else {
+                info!(
+                    %repo,
+                    wants_count = intent.wants.len(),
+                    "direct git cache prepare declined: repo partially hydrated (blobless), request needs full objects"
+                );
+                return Ok(false);
+            }
         }
 
         // A shallow cache repo (depth-limited hydration) cannot serve

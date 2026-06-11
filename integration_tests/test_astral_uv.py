@@ -225,8 +225,8 @@ commit_read_through = true
         objects = list_minio_objects(self.object_prefix)
         self.assertTrue(objects, "expected MinIO bucket prefix to contain cached objects")
         self.assertTrue(
-            any(".bundle" in path for path in objects),
-            f"expected MinIO cached objects to include a bundle, got: {objects}",
+            any("/packs/pack-" in path for path in objects),
+            f"expected MinIO cached objects to include a pack, got: {objects}",
         )
 
     def materialize(self, selector: dict[str, object]) -> dict[str, object]:

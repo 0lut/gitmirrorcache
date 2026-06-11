@@ -292,8 +292,10 @@ mod tests {
         let manifest = GenerationManifest {
             repo: repo.clone(),
             generation: gen,
-            bundle_key: format!("repos/{repo}/generations/{gen}/base.bundle"),
-            parent_generation: None,
+            verified_at: None,
+            packs: Vec::new(),
+            refs: Default::default(),
+            head_ref: None,
             created_at: ts(1),
             commits: vec![commit('a')],
         };

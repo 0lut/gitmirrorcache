@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn generation_manifest_missing_repo_field() {
-        let json = r#"{"generation":"550e8400-e29b-41d4-a716-446655440000","bundle_key":"k","created_at":"2026-01-01T00:00:00Z"}"#;
+        let json = r#"{"generation":"550e8400-e29b-41d4-a716-446655440000","created_at":"2026-01-01T00:00:00Z"}"#;
         assert!(serde_json::from_str::<GenerationManifest>(json).is_err());
     }
 

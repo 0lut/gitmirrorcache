@@ -1,4 +1,3 @@
-use super::generations::{bundle_key, pending_generation_from_key, push_unique_commit};
 use super::*;
 #[cfg(feature = "s3-tests")]
 use aws_credential_types::Credentials;
@@ -39,6 +38,13 @@ async fn generation_manifest_for(
         .unwrap()
 }
 
+async fn delete_generation_packs(state: &AppState, repo: &RepoKey, generation: GenerationId) {
+    let manifest = generation_manifest_for(state, repo, generation).await;
+    for pack in &manifest.packs {
+        state.store.delete(&pack.key).await.unwrap();
+    }
+}
+
 async fn generation_object_keys(state: &AppState, repo: &RepoKey) -> Vec<String> {
     state
         .store
@@ -49,10 +55,10 @@ async fn generation_object_keys(state: &AppState, repo: &RepoKey) -> Vec<String>
 
 async fn wait_for_verified_generation(state: &AppState, repo: &RepoKey, generation: GenerationId) {
     for _ in 0..100 {
-        if read_verified_generation_manifest(&*state.store, repo, generation)
+        if read_generation_manifest(&*state.store, repo, generation)
             .await
             .unwrap()
-            .is_some()
+            .is_some_and(|manifest| manifest.verified_at.is_some())
         {
             return;
         }
@@ -132,7 +138,6 @@ impl GitFixture {
             git_remote: Default::default(),
             compaction: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            max_concurrent_generation_verifications: 1,
             async_materialize_concurrency: 2,
             use_gitoxide: true,
         }
@@ -161,7 +166,6 @@ impl GitFixture {
             store,
             git,
             disk: AsyncDiskManager::new(disk),
-            generation_verification_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),

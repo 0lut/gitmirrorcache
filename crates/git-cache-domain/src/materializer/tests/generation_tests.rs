@@ -18,7 +18,7 @@ mod tests {
         let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
         let first_generation =
             generation_manifest_for(&state, &fixture.repo, first_manifest.generation).await;
-        assert_eq!(first_generation.parent_generation, None);
+        assert_eq!(first_generation.packs.len(), 1);
 
         let second_commit = fixture.commit_and_push("second");
         materializer
@@ -32,102 +32,16 @@ mod tests {
         let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second_commit).await;
         let second_generation =
             generation_manifest_for(&state, &fixture.repo, second_manifest.generation).await;
-        assert_eq!(
-            second_generation.parent_generation,
-            Some(first_manifest.generation)
-        );
+        assert_eq!(second_generation.packs.len(), 2);
+        assert!(second_generation
+            .packs
+            .iter()
+            .any(|pack| pack.key == first_generation.packs[0].key));
 
         let head =
             wait_for_generation_head(&state, &fixture.repo, second_manifest.generation).await;
         assert_eq!(head.generation, second_manifest.generation);
         assert_eq!(head.tip_commits, vec![first.commit, second_commit]);
-    }
-
-    #[tokio::test]
-    async fn pending_generation_verifies_from_local_repo_without_parent_bundle() {
-        let fixture = GitFixture::new();
-        let state = Arc::new(fixture.state());
-        let materializer = Materializer::new(Arc::clone(&state));
-
-        let first = materializer
-            .materialize(MaterializeRequest {
-                repo: fixture.repo.clone(),
-                selector: Selector::Branch(BranchName::parse("main").unwrap()),
-                upstream_authorization: Default::default(),
-            })
-            .await
-            .unwrap();
-        let first_manifest = wait_for_commit_manifest(&state, &fixture.repo, &first.commit).await;
-        let parent_head =
-            wait_for_generation_head(&state, &fixture.repo, first_manifest.generation).await;
-        state
-            .store
-            .delete(&bundle_key(&fixture.repo, first_manifest.generation))
-            .await
-            .unwrap();
-
-        let child_commit = fixture.commit_and_push("second");
-        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
-        run_git(
-            &repo_dir,
-            [
-                "fetch",
-                "--no-tags",
-                fixture.upstream_path().to_str().unwrap(),
-                "+refs/heads/main:refs/cache/upstream/heads/main",
-            ],
-        );
-
-        let child_generation = GenerationId::new();
-        let reservation = state.disk.reserve(1024 * 1024 * 64).await.unwrap();
-        let temp_path = reservation.temp_path().unwrap();
-        fs::create_dir_all(&temp_path).await.unwrap();
-        let bundle_path = temp_path.join("pending-child.bundle");
-        state
-            .git
-            .bundle_create_incremental(&repo_dir, &bundle_path, &parent_head.tip_commits)
-            .await
-            .unwrap();
-
-        let now = Utc::now();
-        let child_manifest = GenerationManifest {
-            repo: fixture.repo.clone(),
-            generation: child_generation,
-            bundle_key: bundle_key(&fixture.repo, child_generation),
-            parent_generation: Some(parent_head.generation),
-            created_at: now,
-            commits: vec![child_commit.clone()],
-        };
-        let mut child_tip_commits = parent_head.tip_commits.clone();
-        push_unique_commit(&mut child_tip_commits, child_commit.clone());
-        let child_head = RepoGenerationHead {
-            repo: fixture.repo.clone(),
-            generation: child_generation,
-            tip_commits: child_tip_commits,
-            updated_at: now,
-        };
-        let child_manifests = PublishManifests {
-            commits: vec![CommitManifest {
-                repo: fixture.repo.clone(),
-                commit: child_commit.clone(),
-                generation: child_generation,
-                complete: true,
-                verified_at: now,
-            }],
-            refs: Vec::new(),
-        };
-        GenerationPublish::with_manifests(child_manifest, child_manifests)
-            .publish_pending_bundle_file(&*state.store, &bundle_path, child_head, None)
-            .await
-            .unwrap();
-        reservation.release().await.unwrap();
-
-        materializer
-            .verify_generation_with_semaphore(fixture.repo.clone(), child_generation, false)
-            .await
-            .unwrap();
-        let child_manifest = wait_for_commit_manifest(&state, &fixture.repo, &child_commit).await;
-        assert_eq!(child_manifest.generation, child_generation);
     }
 
     #[tokio::test]
@@ -281,7 +195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_ancestor_missing_generation_bundle_falls_back_to_upstream_fetch() {
+    async fn exact_ancestor_missing_generation_packs_falls_back_to_upstream_fetch() {
         let fixture = GitFixture::new();
         let ancestor_commit = fixture.head_commit();
         let tip_commit = fixture.commit_and_push("second");
@@ -299,11 +213,11 @@ mod tests {
         let tip_manifest = wait_for_commit_manifest(&state, &fixture.repo, &tip_commit).await;
         wait_for_verified_generation(&state, &fixture.repo, tip_manifest.generation).await;
 
-        state
-            .store
-            .delete(&bundle_key(&fixture.repo, tip_manifest.generation))
-            .await
-            .unwrap();
+        let tip_generation =
+            generation_manifest_for(&state, &fixture.repo, tip_manifest.generation).await;
+        for pack in &tip_generation.packs {
+            state.store.delete(&pack.key).await.unwrap();
+        }
         stdfs::remove_dir_all(materializer.repo_dir(&fixture.repo)).unwrap();
 
         let response = materializer
@@ -382,7 +296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_descendants_after_cold_ancestor_fetch_reuse_full_bundle() {
+    async fn exact_descendants_after_cold_ancestor_fetch_reuse_full_generation() {
         let fixture = GitFixture::new();
         let tip_2 = fixture.head_commit();
         let tip_1 = fixture.commit_and_push("second");
@@ -436,7 +350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_commit_ahead_of_known_generation_publishes_incremental_bundle() {
+    async fn exact_commit_ahead_of_known_generation_publishes_incremental_pack() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());
         let materializer = Materializer::new(Arc::clone(&state));
@@ -464,19 +378,22 @@ mod tests {
         assert_eq!(response.source, MaterializeSource::UpstreamVerified);
 
         let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second_commit).await;
+        let first_generation =
+            generation_manifest_for(&state, &fixture.repo, first_manifest.generation).await;
         let second_generation =
             generation_manifest_for(&state, &fixture.repo, second_manifest.generation).await;
-        assert_eq!(
-            second_generation.parent_generation,
-            Some(first_manifest.generation)
-        );
+        assert_eq!(second_generation.packs.len(), 2);
+        assert!(second_generation
+            .packs
+            .iter()
+            .any(|pack| pack.key == first_generation.packs[0].key));
         let head =
             wait_for_generation_head(&state, &fixture.repo, second_manifest.generation).await;
         assert_eq!(head.tip_commits, vec![first.commit, second_commit]);
     }
 
     #[tokio::test]
-    async fn delta_publish_falls_back_to_full_bundle_when_previous_tip_is_missing_locally() {
+    async fn delta_publish_falls_back_to_full_pack_when_previous_tip_is_missing_locally() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());
         let materializer = Materializer::new(Arc::clone(&state));
@@ -516,7 +433,7 @@ mod tests {
         let second_generation =
             generation_manifest_for(&state, &fixture.repo, second_manifest.generation).await;
         assert_ne!(first_manifest.generation, second_manifest.generation);
-        assert_eq!(second_generation.parent_generation, None);
+        assert_eq!(second_generation.packs.len(), 1);
         let head =
             wait_for_generation_head(&state, &fixture.repo, second_manifest.generation).await;
         assert_eq!(head.tip_commits, vec![second_commit]);
@@ -620,12 +537,24 @@ mod tests {
             .await
             .unwrap();
 
+        let head_before = read_repo_generation_head(&*state.store, &fixture.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_pack_keys: Vec<String> =
+            generation_manifest_for(&state, &fixture.repo, head_before.generation)
+                .await
+                .packs
+                .iter()
+                .map(|pack| pack.key.clone())
+                .collect();
+
         let report = materializer
             .compact_generation_chain(&fixture.repo)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(report.old_chain_depth, 3);
+        assert_eq!(report.old_pack_count, 3);
 
         let head = read_repo_generation_head(&*state.store, &fixture.repo)
             .await
@@ -633,7 +562,7 @@ mod tests {
             .unwrap();
         assert_eq!(head.generation, report.new_generation);
         let compacted = generation_manifest_for(&state, &fixture.repo, report.new_generation).await;
-        assert_eq!(compacted.parent_generation, None);
+        assert_eq!(compacted.packs.len(), 1);
 
         for old_generation in &report.old_generations {
             assert!(
@@ -642,20 +571,11 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            assert!(state
-                .store
-                .get(&bundle_key(&fixture.repo, *old_generation))
-                .await
-                .unwrap()
-                .is_none());
-            assert!(read_verified_generation_manifest(
-                &*state.store,
-                &fixture.repo,
-                *old_generation
-            )
-            .await
-            .unwrap()
-            .is_none());
+        }
+        for old_key in &old_pack_keys {
+            if compacted.packs.iter().all(|pack| pack.key != *old_key) {
+                assert!(!state.store.exists(old_key).await.unwrap());
+            }
         }
 
         for commit in [
@@ -758,11 +678,12 @@ mod tests {
                 .await
                 .unwrap()
             {
-                let chain = materializer
-                    .generation_chain(&fixture.repo, head.generation)
-                    .await
-                    .unwrap();
-                if chain.len() == 1 && head.generation != third_manifest.generation {
+                let head_manifest =
+                    read_generation_manifest(&*state.store, &fixture.repo, head.generation)
+                        .await
+                        .unwrap();
+                let single_pack = head_manifest.is_some_and(|manifest| manifest.packs.len() == 1);
+                if single_pack && head.generation != third_manifest.generation {
                     let old_generations_deleted = read_generation_manifest(
                         &*state.store,
                         &fixture.repo,
@@ -795,121 +716,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("inline compaction did not collapse the verified generation chain");
-    }
-
-    #[tokio::test]
-    async fn compaction_preserves_parents_needed_by_pending_generation_verification() {
-        let fixture = GitFixture::new();
-        let config = AppConfig {
-            compaction: git_cache_core::CompactionConfig {
-                chain_depth_threshold: 1,
-                inline: false,
-            },
-            ..fixture.state_config()
-        };
-        let state = Arc::new(AppState::try_new(config).unwrap());
-        let materializer = Materializer::new(Arc::clone(&state));
-
-        materializer
-            .materialize(MaterializeRequest {
-                repo: fixture.repo.clone(),
-                selector: Selector::Branch(BranchName::parse("main").unwrap()),
-                upstream_authorization: Default::default(),
-            })
-            .await
-            .unwrap();
-        let second_commit = fixture.commit_and_push("second");
-        materializer
-            .materialize(MaterializeRequest {
-                repo: fixture.repo.clone(),
-                selector: Selector::Branch(BranchName::parse("main").unwrap()),
-                upstream_authorization: Default::default(),
-            })
-            .await
-            .unwrap();
-        let second_manifest = wait_for_commit_manifest(&state, &fixture.repo, &second_commit).await;
-        let _ = wait_for_generation_head(&state, &fixture.repo, second_manifest.generation).await;
-
-        let third_commit = fixture.commit_and_push("third");
-        materializer
-            .materialize(MaterializeRequest {
-                repo: fixture.repo.clone(),
-                selector: Selector::Branch(BranchName::parse("main").unwrap()),
-                upstream_authorization: Default::default(),
-            })
-            .await
-            .unwrap();
-        let third_manifest = wait_for_commit_manifest(&state, &fixture.repo, &third_commit).await;
-        let parent_head =
-            wait_for_generation_head(&state, &fixture.repo, third_manifest.generation).await;
-
-        let child_commit = fixture.commit_and_push("fourth");
-        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
-        run_git(
-            &repo_dir,
-            [
-                "fetch",
-                "--no-tags",
-                fixture.upstream_path().to_str().unwrap(),
-                "+refs/heads/main:refs/cache/upstream/heads/main",
-            ],
-        );
-
-        let child_generation = GenerationId::new();
-        let reservation = state.disk.reserve(1024 * 1024 * 64).await.unwrap();
-        let temp_path = reservation.temp_path().unwrap();
-        fs::create_dir_all(&temp_path).await.unwrap();
-        let bundle_path = temp_path.join("pending-child.bundle");
-        state
-            .git
-            .bundle_create_incremental(&repo_dir, &bundle_path, &parent_head.tip_commits)
-            .await
-            .unwrap();
-
-        let now = Utc::now();
-        let child_manifest = GenerationManifest {
-            repo: fixture.repo.clone(),
-            generation: child_generation,
-            bundle_key: bundle_key(&fixture.repo, child_generation),
-            parent_generation: Some(parent_head.generation),
-            created_at: now,
-            commits: vec![child_commit.clone()],
-        };
-        let mut child_tip_commits = parent_head.tip_commits.clone();
-        push_unique_commit(&mut child_tip_commits, child_commit.clone());
-        let child_head = RepoGenerationHead {
-            repo: fixture.repo.clone(),
-            generation: child_generation,
-            tip_commits: child_tip_commits,
-            updated_at: now,
-        };
-        let child_manifests = PublishManifests {
-            commits: vec![CommitManifest {
-                repo: fixture.repo.clone(),
-                commit: child_commit,
-                generation: child_generation,
-                complete: true,
-                verified_at: now,
-            }],
-            refs: Vec::new(),
-        };
-        GenerationPublish::with_manifests(child_manifest, child_manifests)
-            .publish_pending_bundle_file(&*state.store, &bundle_path, child_head, None)
-            .await
-            .unwrap();
-        reservation.release().await.unwrap();
-
-        let report = materializer
-            .compact_generation_chain(&fixture.repo)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(report.old_generations.contains(&parent_head.generation));
-
-        materializer
-            .verify_generation_with_semaphore(fixture.repo.clone(), child_generation, false)
-            .await
-            .expect("pending generation should verify after parent chain compaction");
     }
 
     // ── upstream_url tests ───────────────────────────────────────────
