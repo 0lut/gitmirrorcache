@@ -109,7 +109,7 @@ AL2-to-AL2023 migration and validation history is recorded in
 App Runner was removed from the maintained deployment path. Large repositories
 need a larger and more durable local hot cache than App Runner's ephemeral
 filesystem provides. The Linux kernel and GCC validation runs showed that the
-service needs to keep hydrated bare repositories and large Git bundle work files
+service needs to keep hydrated bare repositories and large Git pack work files
 on block storage to avoid repeatedly rehydrating or regenerating expensive cache
 state.
 
@@ -125,8 +125,10 @@ S3 remains the durable cache source. The EBS volume is still disposable from a
 correctness perspective; losing it should only force hydration from object
 storage or upstream verification.
 
-The application appends the v2 schema suffix to the configured object-store
-namespace at runtime. For example, `S3_PREFIX=repos` is served from `repos-v2`.
+The application appends the current object-store schema suffix (defined in
+`crates/git-cache-domain/object-store-schema-suffix`, currently `v3`) to the
+configured object-store namespace at runtime. For example, `S3_PREFIX=repos`
+is served from `repos-v3`.
 The ECS deploy script grants task IAM access to that runtime prefix while still
 passing the base prefix to the container.
 
@@ -159,7 +161,7 @@ That command computes:
 - `ECS_PUBLIC_PATH_PREFIX=/v/$VERSION_ID`
 
 The application still appends the runtime schema suffix, so preview cache
-objects land below `previews/$VERSION_ID/repos-v2`. By default, the preview
+objects land below `previews/$VERSION_ID/repos-v3`. By default, the preview
 stack uses the shared production-style bucket and ECR repository derived from
 `PREVIEW_SHARED_NAME_PREFIX=gitmirrorcache-arm`. It also uses a static shared
 preview ALB named `$PREVIEW_SHARED_NAME_PREFIX-preview-alb` and creates a
@@ -237,18 +239,18 @@ The large-repository investigation found two important cache behaviors:
 
 1. Hydrated local repositories can already contain requested ancestor commits.
    Those exact-commit requests should be indexed from known complete generations
-   without creating a new bundle.
-2. A cold request for an older commit can produce a full bundle that also
+   without publishing a new generation.
+2. A cold request for an older commit can produce a full generation that also
    contains branch tips and other descendants. The publish path now writes
-   commit manifests for local cache-ref tips included in that bundle, so later
-   descendant requests can be metadata-only `cache_verified` operations.
+   commit manifests for local cache-ref tips included in that generation, so
+   later descendant requests can be metadata-only `cache_verified` operations.
 
 The deployed verification used a clean repo and requested `tip~2`, then
 `tip~1`, then `tip`. After the cold `tip~2` request, both descendant requests
-returned `cache_verified` and the bundle count stayed at one.
+returned `cache_verified` and the generation count stayed at one.
 
 Previously published generations are not retroactively repaired. If an old
-revision created a full bundle without descendant commit manifests, a clean
+revision created a full generation without descendant commit manifests, a clean
 end-to-end retest requires clearing that repo's test cache prefix/local hot
 cache or using a fresh repo.
 
@@ -337,7 +339,7 @@ deleted without losing durable state.
 Object storage is the source of truth for:
 
 - generation manifests
-- bundles
+- content-addressed pack files
 - commit manifests
 - ref manifests
 - lease objects
