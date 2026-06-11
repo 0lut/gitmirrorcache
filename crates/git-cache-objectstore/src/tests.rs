@@ -1050,6 +1050,44 @@ mod tests {
 
     #[cfg(feature = "gcs")]
     #[tokio::test]
+    async fn fake_gcs_put_if_version_matches_detects_concurrent_update() {
+        let Some(fixture) = FakeGcsFixture::new("cas").await else {
+            eprintln!(
+                "skipping fake_gcs_put_if_version_matches_detects_concurrent_update: set GIT_CACHE_GCS_INTEGRATION=1"
+            );
+            return;
+        };
+        let store = fixture.store;
+
+        let key = "cas/item.json";
+        store.put(key, Bytes::from_static(b"v1")).await.unwrap();
+        let (value, version) = store.get_versioned(key).await.unwrap().unwrap();
+        assert_eq!(value, Bytes::from_static(b"v1"));
+
+        assert!(store
+            .put_if_version_matches(key, Bytes::from_static(b"v2"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"v2")
+        );
+
+        // The token from v1 is now stale; the swap must be refused.
+        assert!(!store
+            .put_if_version_matches(key, Bytes::from_static(b"v3"), &version)
+            .await
+            .unwrap());
+        assert_eq!(
+            store.get(key).await.unwrap().unwrap(),
+            Bytes::from_static(b"v2")
+        );
+
+        store.delete(key).await.unwrap();
+    }
+
+    #[cfg(feature = "gcs")]
+    #[tokio::test]
     async fn fake_gcs_list_prefix_honors_max_keys_and_strips_prefix() {
         let Some(fixture) = FakeGcsFixture::new("listing").await else {
             eprintln!(

@@ -1,4 +1,4 @@
-use crate::{validate_key, ObjectMeta, ObjectStore};
+use crate::{validate_key, ObjectMeta, ObjectStore, ObjectVersion};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -139,6 +139,65 @@ impl ObjectStore for GcsObjectStore {
             Ok(_) => Ok(true),
             Err(err) if is_precondition_failed(&err) => Ok(false),
             Err(err) => Err(gcs_error("put_if_absent", &gcs_key, err)),
+        }
+    }
+
+    async fn get_versioned(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>> {
+        let gcs_key = self.gcs_key(key)?;
+        let object = match self.client.get_object(&self.get_request(&gcs_key)).await {
+            Ok(object) => object,
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(gcs_error("get_versioned", &gcs_key, err)),
+        };
+
+        let mut request = self.get_request(&gcs_key);
+        request.generation = Some(object.generation);
+        match self
+            .client
+            .download_object(&request, &Range::default())
+            .await
+        {
+            Ok(data) => Ok(Some((
+                Bytes::from(data),
+                ObjectVersion::new(object.generation.to_string()),
+            ))),
+            Err(err) if is_not_found(&err) => Ok(None),
+            Err(err) => Err(gcs_error("get_versioned", &gcs_key, err)),
+        }
+    }
+
+    async fn put_if_version_matches(
+        &self,
+        key: &str,
+        value: Bytes,
+        version: &ObjectVersion,
+    ) -> Result<bool> {
+        let gcs_key = self.gcs_key(key)?;
+        let generation: i64 = version.token().parse().map_err(|_| {
+            GitCacheError::Validation(format!(
+                "gcs version token for `{gcs_key}` is not a generation number"
+            ))
+        })?;
+        let upload_type = UploadType::Multipart(Box::new(Object {
+            name: gcs_key.clone(),
+            ..Default::default()
+        }));
+        match self
+            .client
+            .upload_object(
+                &UploadObjectRequest {
+                    bucket: self.bucket.clone(),
+                    if_generation_match: Some(generation),
+                    ..Default::default()
+                },
+                value,
+                &upload_type,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) if is_precondition_failed(&err) || is_not_found(&err) => Ok(false),
+            Err(err) => Err(gcs_error("put_if_version_matches", &gcs_key, err)),
         }
     }
 
