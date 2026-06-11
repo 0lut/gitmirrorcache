@@ -1,43 +1,27 @@
-# Git Fetch Cache
+# gitmirrorcache
 
-Read-only Git fetch cache for GitHub-style upstreams. The service keeps object
-storage as the durable source of truth and treats local block storage as a
-disposable hot cache. It exposes both a materialization API for cache manifests
-and, when enabled, a Smart HTTP Git remote for read-through fetch and clone
-traffic.
+A read-only Git fetch cache that sits between clone-heavy automation — CI
+runners, coding agents, sandboxes, build farms — and your Git upstreams
+(GitHub, GitLab, Bitbucket, or any Smart HTTP Git server). Instead of
+hammering the upstream with thousands of identical clones, clients fetch from
+the cache: an S3-compatible object store is the durable source of truth, and
+local disk is just a disposable hot layer that can be rebuilt at any time. The
+result is faster clones, fewer upstream rate-limit headaches, and a cache you
+can throw away without losing anything.
 
-## What Works
+It exposes two interfaces:
 
-- `POST /v1/materialize` for `commit`, `short_commit`, `branch`, and
-  `default_branch` selectors.
-- `POST /v1/resolve` verifies a selector to a canonical commit and reports
-  whether cache state is already available.
-- Known-complete exact commits are served from cache without contacting
-  upstream. Exact commit materialization also hydrates known generation heads
-  before falling back to upstream fetches.
-- Branch, default-branch, and short-commit requests verify upstream refs with
-  `git ls-remote` before serving.
-- Optional read-through Git remote at `/git/{host}/{owner}/{repo}.git` for
-  `info/refs` and `git-upload-pack`, including shallow and blobless fetches.
-- Direct Git cold misses proxy upstream upload-pack responses immediately by
-  default, then warm the cache in the background; clients can opt out per
-  request with the `git-cache-use-proxy-on-miss` header.
-- `git-receive-pack` is rejected and never advertised.
-- Local object-store adapter and feature-gated S3-compatible adapter.
-- Disk reservations, LRU eviction, repo locks, protected repos, stale temp
-  cleanup, and `git-cache disk-status`.
-- Per-repo leases, in-flight request dedupe, generation publishing/hydration,
-  read-through updates, and hourly compaction support.
-- Metrics at `/metrics`, a simple global materialize rate limit, bounded Git
-  output/streams, and a semaphore for Git subprocess concurrency.
-- Request-scoped upstream authorization for protected repos, plus optional
-  deployment-wide upstream token injection through Git config environment
-  variables without putting secrets in argv or manifests.
-- ECS-on-Graviton EC2/EBS deployment scripts, Amazon Linux 2023 host defaults,
-  shared-ALB preview stacks, smoke tests, diagnostics, and stale-container
-  recovery tooling.
+- A **materialization API** (`/v1/materialize`, `/v1/resolve`) for warming and
+  inspecting cache state by commit, branch, or default branch.
+- A **read-through Git remote** at `/git/{host}/{owner}/{repo}.git` that
+  standard Git clients can clone and fetch from over Smart HTTP, including
+  shallow and blobless fetches. Pushes (`git-receive-pack`) are rejected.
 
-## Run Locally
+On a cold miss, the server proxies upstream's response straight to the client
+(so first-clone latency stays close to a direct clone) while warming the cache
+in the background. Everything after that is served locally.
+
+## Quick Start
 
 ```sh
 cargo test --workspace
@@ -49,67 +33,181 @@ The local config enables the direct Git remote and expects fake upstream bare
 repositories under `./tmp/upstreams/{host}/{owner}/{repo}.git`. See
 [docs/local-dev.md](docs/local-dev.md).
 
-## API Examples
+## Using the Cache
+
+Clone or fetch through the Git remote like any other HTTP remote:
+
+```sh
+git clone http://127.0.0.1:8080/git/github.com/org/repo.git
+git clone --depth 1 http://127.0.0.1:8080/git/github.com/org/repo.git
+git fetch http://127.0.0.1:8080/git/github.com/org/repo.git refs/heads/main
+```
+
+Or drive the materialization API directly:
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/materialize \
   -H 'content-type: application/json' \
   -d '{"repo":"github.com/org/repo","selector":{"branch":"main"}}'
-```
 
-The materialize response contains `repo`, the verified canonical `commit`,
-`source`, and `verified_at`. To check a selector without forcing
-materialization, use `/v1/resolve`:
-
-```sh
 curl -s http://127.0.0.1:8080/v1/resolve \
   -H 'content-type: application/json' \
   -d '{"repo":"github.com/org/repo","selector":{"default_branch":true}}'
 ```
 
-When the read-through Git remote is enabled, fetch or clone through `/git/...`:
-
-```sh
-git fetch http://127.0.0.1:8080/git/github.com/org/repo.git refs/heads/main
-git clone http://127.0.0.1:8080/git/github.com/org/repo.git
-git clone --depth 1 http://127.0.0.1:8080/git/github.com/org/repo.git
-```
-
-Full commit IDs belong in the `commit` selector. Abbreviated hashes are accepted
-through `short_commit`; they are resolved with Git first and all manifests still
-store only the canonical full object ID.
-
-Request bodies are strict: send only supported fields such as `repo`,
-`selector`, and `upstream_authorization`. The legacy `mode` field is no longer
+Selectors are `commit`, `short_commit`, `branch`, and `default_branch`. Request
+bodies are strict: only `repo`, `selector`, and `upstream_authorization` are
 accepted.
 
-For a protected materialize or resolve request, require request-scoped upstream
-authorization and pass Basic credentials in the cache-specific header:
+For private repositories, pass credentials per request. The materialize API
+uses a cache-specific header; direct Git uses the normal HTTP authorization
+header:
 
 ```sh
 curl -s http://127.0.0.1:8080/v1/materialize \
   -H 'content-type: application/json' \
   -H 'git-cache-upstream-authorization: Basic <base64-user-colon-token>' \
   -d '{"repo":"github.com/org/private","selector":{"branch":"main"},"upstream_authorization":"required"}'
-```
 
-For direct Git, use the normal Git HTTP authorization header:
-
-```sh
 git -c http.extraHeader='Authorization: Basic <base64-user-colon-token>' \
   fetch http://127.0.0.1:8080/git/github.com/org/private.git refs/heads/main
 ```
 
-On a cold direct-Git miss, the server proxies upload-pack to the upstream by
-default (then warms the cache in the background) so client latency stays close
-to a direct clone. Set `GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT=false`
-(config: `git_remote.proxy_on_miss_by_default`) to disable, or override per
-request with the `git-cache-use-proxy-on-miss` header:
+Clients can opt out of cold-miss proxying per request with the
+`git-cache-use-proxy-on-miss: false` header.
+
+## Configuration
+
+The server reads either a TOML config file (set `GIT_CACHE_CONFIG` to its path;
+see `config/*.example.toml`) or individual environment variables. When
+`GIT_CACHE_CONFIG` is set, the file wins and the other configuration variables
+are ignored — except S3 credentials (`GIT_CACHE_S3_ACCESS_KEY`,
+`GIT_CACHE_S3_SECRET_KEY`, `GIT_CACHE_S3_SESSION_TOKEN`,
+`GIT_CACHE_S3_REGION`), which are always read from the environment and never
+from the file.
+
+### Core
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `GIT_CACHE_CONFIG` | – | Path to a TOML config file. If set, other `GIT_CACHE_*` variables are ignored, except the S3 credential variables noted above. |
+| `GIT_CACHE_BIND_ADDR` | `127.0.0.1:8080` | Address and port the HTTP server listens on. |
+| `GIT_CACHE_ROOT` | `./cache` | Directory for the local hot cache (bare repos, temp files, repo index). |
+| `GIT_CACHE_ALLOWED_UPSTREAM_HOSTS` | `github.com` | Comma-separated allowlist of upstream hosts the cache will talk to (e.g. `github.com,gitlab.com,git.internal.example`). |
+| `GIT_CACHE_UPSTREAM_ROOT` | – | Optional local directory of bare upstream repos, used instead of real network upstreams (mainly for tests and local dev). |
+| `GIT_CACHE_RATE_LIMIT_PER_MINUTE` | `120` | Global rate limit for materialize requests. |
+
+### Object store
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `GIT_CACHE_OBJECT_STORE_KIND` | `local` | `local` (filesystem), `s3`, or `gcs`. S3 requires building with the `s3` feature, GCS the `gcs` feature. |
+| `GIT_CACHE_OBJECT_STORE_ROOT` | `./tmp/object-store` | Root directory for the `local` object store. |
+| `GIT_CACHE_S3_BUCKET` | – | S3 bucket name. Required when kind is `s3`. |
+| `GIT_CACHE_S3_PREFIX` | `repos` | Key prefix inside the bucket. A schema-version suffix is appended automatically (e.g. `repos` stores under `repos-v3`). |
+| `GIT_CACHE_S3_ENDPOINT` | – | Custom S3 endpoint for compatible stores (MinIO, Cloudflare R2, ...). Enables path-style addressing. |
+| `GIT_CACHE_S3_REGION` | falls back to `AWS_REGION` / `AWS_DEFAULT_REGION` | AWS region for the bucket. |
+| `GIT_CACHE_S3_ACCESS_KEY` / `GIT_CACHE_S3_SECRET_KEY` | – | Static S3 credentials. If unset, the standard AWS credential chain is used (env vars, profiles, IAM roles, workload identity). |
+| `GIT_CACHE_S3_SESSION_TOKEN` | falls back to `AWS_SESSION_TOKEN` | Session token for temporary credentials. |
+| `GIT_CACHE_GCS_BUCKET` | – | GCS bucket name. Required when kind is `gcs`. |
+| `GIT_CACHE_GCS_PREFIX` | `repos` | Key prefix inside the bucket. A schema-version suffix is appended automatically. |
+| `GIT_CACHE_GCS_ENDPOINT` | – | Custom GCS endpoint for emulators such as fake-gcs-server. |
+| `GIT_CACHE_GCS_ANONYMOUS` | `false` | Skip credential resolution (for emulators). Otherwise Application Default Credentials are used (`GOOGLE_APPLICATION_CREDENTIALS` or the GCE metadata server). |
+
+A deployment uses exactly one durable backend: the `s3` and `gcs` features are
+mutually exclusive (enforced at compile time), and configuration rejects mixed
+`GIT_CACHE_S3_*` / `GIT_CACHE_GCS_*` bucket settings at startup.
+
+### Git remote
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `GIT_CACHE_GIT_REMOTE_ENABLED` | `true` | Serve the read-through Git remote at `/git/{host}/{owner}/{repo}.git`. |
+| `GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH` | `true` | Fetch missing commits from upstream during a client request instead of failing. |
+| `GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT` | `true` | On a cold miss, proxy upstream's upload-pack response to the client immediately and warm the cache in the background. |
+| `GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT` | `true` | While proxying a cold miss, tee the response into the local cache instead of re-fetching upstream afterwards. |
+| `GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY` | `1` | How many background cache-warm imports may run at once. |
+
+### Git subprocess
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `GIT_CACHE_GIT_BINARY` | `git` | Path to the `git` binary. |
+| `GIT_CACHE_GIT_TIMEOUT_SECONDS` | `120` | Timeout for individual Git subprocess invocations. |
+| `GIT_CACHE_MAX_GIT_OUTPUT_BYTES` | 16 MiB | Upper bound on captured Git subprocess output. |
+| `GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES` | `64` | Semaphore limiting concurrent Git subprocesses (the main CPU/memory knob). |
+| `GIT_CACHE_ASYNC_MATERIALIZE_CONCURRENCY` | `2` | Concurrency for background materialization work. |
+| `GIT_CACHE_USE_GITOXIDE` | `true` | Use in-process gitoxide for local read-only Git operations; disable as a kill switch to fall back to the `git` binary. |
+| `GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV` | – | Name of another env var holding a deployment-wide upstream token, injected via Git config env (never argv or manifests). |
+
+### Disk
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `GIT_CACHE_DISK_QUOTA_BYTES` | 10 GiB | Hot-cache disk quota; LRU eviction keeps usage under this. The Helm chart sets this to 100 GiB to match its default 100Gi PVC — keep the quota at or below the volume size. |
+| `GIT_CACHE_DISK_MIN_FREE_BYTES` | 1 GiB | Minimum free disk space to preserve on the cache volume. |
+| `GIT_CACHE_DISK_ACCESS_FLUSH_SECS` | `60` | How often buffered repo-access timestamps are flushed to the on-disk index. |
+
+### Compaction and shutdown
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD` | `10` | Generation chain depth that triggers compaction into a single base pack. |
+| `GIT_CACHE_COMPACTION_INLINE` | `false` | Run compaction inline after publishes instead of relying on the scheduled job. |
+| `GIT_CACHE_COMPACTION_RETENTION_SECS` | 24h | How long superseded generations are kept before the retention sweep may delete them. |
+| `GIT_CACHE_SHUTDOWN_READINESS_DELAY_SECONDS` | `5` | After SIGTERM, how long `/healthz` fails before draining, so load balancers stop routing traffic. |
+| `GIT_CACHE_SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `60` | Maximum time to drain in-flight requests before exiting. |
+
+## Deployment
+
+### Helm (Kubernetes)
+
+The project ships as a Helm chart that lives in this repository at
+[`deploy/helm/gitmirrorcache`](deploy/helm/gitmirrorcache) (it is not
+published to a chart registry yet, so install it from a checkout). It runs the
+server as a StatefulSet with a persistent volume for the hot cache and an
+hourly CronJob for compaction:
 
 ```sh
-git -c http.extraHeader='git-cache-use-proxy-on-miss: false' \
-  clone http://127.0.0.1:8080/git/github.com/org/repo.git
+git clone https://github.com/0lut/gitmirrorcache.git
+helm install git-cache gitmirrorcache/deploy/helm/gitmirrorcache \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket \
+  --set aws.region=us-west-2
 ```
+
+See the [chart README](deploy/helm/gitmirrorcache/README.md) for credentials,
+sizing, and scaling guidance.
+
+### AWS (ECS on EC2)
+
+The maintained AWS path is ECS on Graviton EC2 with host-mounted EBS for the
+hot cache and S3 for durable storage. The checked-in wrapper builds, deploys,
+and smoke-tests the stack:
+
+```sh
+AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm \
+  scripts/aws/deploy-and-smoke.sh
+```
+
+Preview stacks for any branch, tag, or commit can be deployed behind a shared
+ALB with `scripts/aws/deploy-preview.sh`. See
+[docs/deployment.md](docs/deployment.md).
+
+### Docker
+
+A multi-stage [`Dockerfile`](Dockerfile) builds the server and CLI; configure
+it with the environment variables above. For local S3 testing there is a MinIO
+compose file:
+
+```sh
+docker compose -f docker-compose.minio.yml up -d
+```
+
+### Bare metal / anything else
+
+It's a single binary plus the `git` CLI. Build with
+`cargo build --release -p git-cache-api --features s3`, point it at a config
+file or env vars, and put it behind whatever process supervisor you like.
 
 ## CLI
 
@@ -122,10 +220,14 @@ cargo run -p git-cache-cli -- compact --all --dry-run
 cargo run -p git-cache-cli -- compact --repo github.com/org/repo
 ```
 
-## Integration Tests
+## Testing
 
-There is an opt-in Python integration test against `github.com/astral-sh/uv`.
-It uses only Python's standard library and shells out to `cargo` and `git`:
+```sh
+cargo test --workspace
+```
+
+Opt-in integration tests run against real GitHub repositories using only the
+Python standard library:
 
 ```sh
 RUN_GITHUB_INTEGRATION=1 python3 -m unittest -v integration_tests.test_astral_uv
@@ -133,53 +235,8 @@ RUN_GITHUB_INTEGRATION=1 python3 -m unittest -v integration_tests.test_git_remot
 ```
 
 See [integration_tests/README.md](integration_tests/README.md) for MinIO/S3
-variants and larger direct-Git clone coverage.
-
-## S3 Adapter
-
-The object-store crate includes a feature-gated S3-compatible adapter:
+variants. The S3 adapter itself is feature-gated:
 
 ```sh
 cargo test -p git-cache-objectstore --features s3
 ```
-
-Runtime S3 wiring is enabled by building `git-cache-api` with the `s3` feature
-and setting `GIT_CACHE_OBJECT_STORE_KIND=s3`, `GIT_CACHE_S3_BUCKET`, and
-`GIT_CACHE_S3_PREFIX`. Runtime object-store namespaces are suffixed with `-v2`,
-so `GIT_CACHE_S3_PREFIX=repos` stores cache objects under `repos-v2`.
-
-A deployment uses exactly one durable backend: the `s3` and `gcs` features are
-mutually exclusive (enforced at compile time), and configuration rejects mixed
-`GIT_CACHE_S3_*` / `GIT_CACHE_GCS_*` bucket settings at startup.
-
-A Google Cloud Storage backend is available behind the `gcs` feature with
-`GIT_CACHE_OBJECT_STORE_KIND=gcs`, `GIT_CACHE_GCS_BUCKET`, and optional
-`GIT_CACHE_GCS_PREFIX` / `GIT_CACHE_GCS_ENDPOINT` (for emulators such as
-fake-gcs-server, combined with `GIT_CACHE_GCS_ANONYMOUS=1`). Credentials are
-resolved through Application Default Credentials
-(`GOOGLE_APPLICATION_CREDENTIALS` or the GCE metadata server).
-
-## Deployment
-
-The maintained AWS deployment path is ECS on Graviton EC2 with host-mounted EBS
-for the local hot cache and S3 for durable cache objects. The checked-in deploy
-wrapper builds, deploys, and smoke-tests the stack:
-
-```sh
-AWS_REGION=us-west-2 \
-ENVIRONMENT=dev-arm \
-NAME_PREFIX=gitmirrorcache-arm \
-scripts/aws/deploy-and-smoke.sh
-```
-
-The deployment scripts default to an Amazon Linux 2023 ECS-optimized ARM64 host
-AMI, register hourly compaction as a one-off ECS task, and include diagnostics
-for stuck rollouts. Script-driven preview stacks can deploy any branch, tag, or
-commit behind a shared preview ALB:
-
-```sh
-AWS_REGION=us-west-2 scripts/aws/deploy-preview.sh HEAD
-scripts/aws/destroy-preview.sh HEAD
-```
-
-See [docs/deployment.md](docs/deployment.md).

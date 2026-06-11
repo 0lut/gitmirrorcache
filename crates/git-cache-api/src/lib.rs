@@ -8,11 +8,12 @@ use git_cache_core::{
     AppConfig, CommitSha, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult,
     UpstreamAuth,
 };
+use git_cache_disk::{AsyncDiskManager, AsyncReservation};
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, synthesize_ref_advertisement, AppState, Materializer,
-    UpstreamRefComparison,
+    frame_ref_advertisement, plan_upload_pack_tee, synthesize_ref_advertisement, AppState,
+    Materializer, PackDemux, UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -21,12 +22,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 use tracing::{info, info_span, warn, Instrument};
@@ -34,6 +36,12 @@ use tracing::{info, info_span, warn, Instrument};
 const GIT_UPLOAD_PACK_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const DIRECT_GIT_PROOF_TTL: Duration = Duration::from_secs(30);
 const PROXY_ON_MISS_HEADER: &str = "git-cache-use-proxy-on-miss";
+/// Disk reservation granularity for spooling a proxied upload-pack response
+/// whose final size is unknown up front.
+const TEE_SPOOL_RESERVE_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+/// Bounded queue between the proxy stream and the spool writer; a full queue
+/// (slow disk) abandons the tee rather than stalling the client stream.
+const TEE_SPOOL_CHANNEL_CAPACITY: usize = 256;
 
 pub fn app(config: AppConfig) -> Router {
     app_result(config).expect("failed to initialize git-cache-api")
@@ -46,9 +54,28 @@ pub fn app_result(config: AppConfig) -> CoreResult<Router> {
 }
 
 pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
+    Ok(app_with_shutdown_async(config).await?.0)
+}
+
+/// Like [`app_result_async`], but also returns a [`ReadinessGate`] that the
+/// caller can flip during shutdown so `/healthz` starts failing and load
+/// balancers stop routing new traffic while in-flight requests drain.
+pub async fn app_with_shutdown_async(config: AppConfig) -> CoreResult<(Router, ReadinessGate)> {
     let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
-    router(git_remote_enabled, state)
+    let gate = ReadinessGate(Arc::clone(&state.shutting_down));
+    Ok((router(git_remote_enabled, state)?, gate))
+}
+
+/// Handle that marks the server as shutting down; once flipped, `/healthz`
+/// returns 503 so orchestrators stop sending new traffic.
+#[derive(Clone, Debug)]
+pub struct ReadinessGate(Arc<AtomicBool>);
+
+impl ReadinessGate {
+    pub fn begin_shutdown(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> {
@@ -78,6 +105,7 @@ struct ApiState {
     upstream_http: reqwest::Client,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<RateLimiter>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl ApiState {
@@ -94,6 +122,7 @@ impl ApiState {
     }
 
     fn with_domain(rate_limiter: RateLimiter, domain: Arc<AppState>) -> CoreResult<Self> {
+        spawn_repo_access_flusher(&domain);
         let upstream_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(domain.config.git_timeout_seconds))
             .build()
@@ -116,11 +145,169 @@ impl ApiState {
             upstream_http,
             metrics: Arc::new(Metrics::default()),
             rate_limiter: Arc::new(rate_limiter),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
     fn next_request_id(&self) -> u64 {
         self.metrics.request_ids.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+/// Periodically flush buffered in-memory repo access timestamps to the
+/// persistent disk index. The task holds only a weak reference to the app
+/// state and exits once the application has been dropped. Spawning is skipped
+/// when no tokio runtime is available (the next process start rebuilds
+/// recency from the persisted index, so a missed flush only loses at most one
+/// interval of recency).
+fn spawn_repo_access_flusher(domain: &Arc<AppState>) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let interval = Duration::from_secs(domain.config.disk.access_flush_interval_secs.max(1));
+    let weak = Arc::downgrade(domain);
+    handle.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(domain) = weak.upgrade() else {
+                break;
+            };
+            if let Err(err) = domain.disk.flush_repo_accesses().await {
+                warn!(error = %err, "failed to flush repo access timestamps");
+            }
+        }
+    });
+}
+
+/// Serve the API on `listener` until SIGTERM/SIGINT, then drain gracefully:
+/// `/healthz` starts failing so load balancers stop routing new traffic, the
+/// configured readiness propagation delay passes, the server stops accepting
+/// connections and drains in-flight requests for up to the configured drain
+/// timeout, and finally any buffered repo access timestamps are flushed.
+pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> CoreResult<()> {
+    let shutdown_config = config.shutdown.clone();
+    let git_remote_enabled = config.git_remote.enabled;
+    let state = Arc::new(ApiState::try_new_async(config).await?);
+    let domain = state.domain.clone();
+    let readiness = ReadinessGate(Arc::clone(&state.shutting_down));
+    let app = router(git_remote_enabled, state)?;
+
+    let readiness_delay = Duration::from_secs(shutdown_config.readiness_delay_seconds);
+    let drain_timeout = Duration::from_secs(shutdown_config.drain_timeout_seconds);
+    run_until_shutdown(
+        listener,
+        app,
+        readiness,
+        readiness_delay,
+        drain_timeout,
+        shutdown_signal(),
+    )
+    .await?;
+
+    if let Err(err) = domain.disk.flush_repo_accesses().await {
+        warn!(error = %err, "failed to flush repo access timestamps during shutdown");
+    }
+    Ok(())
+}
+
+/// Serve `app` on `listener` until `signal` resolves, then drain: fail
+/// readiness, wait `readiness_delay`, stop accepting connections, and let
+/// in-flight requests finish for at most `drain_timeout` before returning.
+async fn run_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    readiness: ReadinessGate,
+    readiness_delay: Duration,
+    drain_timeout: Duration,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> CoreResult<()> {
+    let (drain_deadline_tx, drain_deadline_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = axum::serve(listener, app).with_graceful_shutdown(graceful_shutdown(
+        readiness,
+        readiness_delay,
+        drain_timeout,
+        drain_deadline_tx,
+        signal,
+    ));
+
+    tokio::select! {
+        result = server => {
+            result.map_err(|err| GitCacheError::Internal(format!("server error: {err}")))?;
+        }
+        _ = wait_for_drain_deadline(drain_deadline_rx, drain_timeout) => {
+            warn!(
+                drain_timeout_seconds = drain_timeout.as_secs(),
+                "drain timeout elapsed with requests still in flight; exiting"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolves once the process should stop accepting new connections: after the
+/// shutdown signal is received, readiness is failed, and the configured
+/// readiness propagation delay has passed. Signals `drain_deadline_tx` so the
+/// caller can bound the remaining in-flight drain.
+async fn graceful_shutdown(
+    readiness: ReadinessGate,
+    readiness_delay: Duration,
+    drain_timeout: Duration,
+    drain_deadline_tx: tokio::sync::oneshot::Sender<()>,
+    signal: impl std::future::Future<Output = ()>,
+) {
+    signal.await;
+    readiness.begin_shutdown();
+    info!(
+        readiness_delay_seconds = readiness_delay.as_secs(),
+        drain_timeout_seconds = drain_timeout.as_secs(),
+        "shutdown signal received; failing readiness, then draining in-flight requests"
+    );
+    tokio::time::sleep(readiness_delay).await;
+    let _ = drain_deadline_tx.send(());
+}
+
+async fn wait_for_drain_deadline(
+    drain_started: tokio::sync::oneshot::Receiver<()>,
+    drain_timeout: Duration,
+) {
+    if drain_started.await.is_err() {
+        // Server finished before shutdown began; never force-exit.
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(drain_timeout).await;
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(%err, "failed to install SIGINT handler");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                warn!(%err, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }
 
@@ -237,11 +424,17 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
+async fn healthz(State(state): State<Arc<ApiState>>) -> Response {
+    let shutting_down = state.shutting_down.load(Ordering::SeqCst);
+    let body = Json(HealthResponse {
+        ok: !shutting_down,
         checked_at: chrono::Utc::now(),
-    })
+    });
+    if shutting_down {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    } else {
+        body.into_response()
+    }
 }
 
 async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
@@ -918,6 +1111,25 @@ async fn proxy_upload_pack_to_upstream(
         ));
     }
 
+    let tee = if state.domain.config.git_remote.proxy_tee_import {
+        plan_upload_pack_tee(&body).map(|plan| {
+            info!(
+                request_id,
+                repo = %repo,
+                sideband = plan.sideband,
+                blobless = plan.blobless,
+                "direct git proxy tee import engaged"
+            );
+            let (sender, writer) = spawn_tee_spool_writer(state.domain.disk.clone(), request_id);
+            ProxyTee {
+                demux: PackDemux::new(plan.sideband),
+                sender,
+                writer,
+            }
+        })
+    } else {
+        None
+    };
     let warm_task = DirectGitWarmTask {
         imports: Arc::clone(&state.direct_git_background_imports),
         materializer: materializer.clone(),
@@ -929,6 +1141,7 @@ async fn proxy_upload_pack_to_upstream(
     let stream = UpstreamProxyStream {
         inner: Box::pin(response.bytes_stream()),
         warm_task: Some(warm_task),
+        tee,
         bytes_sent: 0,
         max_bytes: state.domain.config.max_git_output_bytes as u64,
     };
@@ -1090,6 +1303,164 @@ impl DirectGitWarmTask {
     }
 }
 
+enum TeeSpoolMsg {
+    Chunk(Bytes),
+    Done,
+}
+
+struct TeeSpoolOutput {
+    path: std::path::PathBuf,
+    sha256: String,
+    bytes: u64,
+    reservations: Vec<AsyncReservation>,
+}
+
+async fn release_reservations(reservations: Vec<AsyncReservation>) {
+    for reservation in reservations {
+        if let Err(error) = reservation.release().await {
+            warn!(%error, "failed to release tee spool disk reservation");
+        }
+    }
+}
+
+/// Spawns the spool writer task that persists demuxed pack bytes to a
+/// reserved temp file. Returns `Some(output)` only when a `Done` message was
+/// received and all writes flushed; any other termination (sender dropped,
+/// write/reservation failure) cleans up and returns `None`.
+fn spawn_tee_spool_writer(
+    disk: AsyncDiskManager,
+    request_id: u64,
+) -> (
+    mpsc::Sender<TeeSpoolMsg>,
+    tokio::task::JoinHandle<Option<TeeSpoolOutput>>,
+) {
+    let (sender, mut receiver) = mpsc::channel(TEE_SPOOL_CHANNEL_CAPACITY);
+    let handle = tokio::spawn(async move {
+        let mut reservations: Vec<AsyncReservation> = Vec::new();
+        let result = async {
+            let first = disk.reserve(TEE_SPOOL_RESERVE_CHUNK_BYTES).await?;
+            let spool_dir = first.temp_path()?;
+            reservations.push(first);
+            tokio::fs::create_dir_all(&spool_dir).await?;
+            let path = spool_dir.join("tee-spool.pack");
+            let mut file = tokio::fs::File::create(&path).await?;
+            let mut reserved = TEE_SPOOL_RESERVE_CHUNK_BYTES;
+            let mut hasher = Sha256::new();
+            let mut bytes: u64 = 0;
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    TeeSpoolMsg::Chunk(chunk) => {
+                        bytes = bytes.saturating_add(chunk.len() as u64);
+                        while bytes > reserved {
+                            reservations.push(disk.reserve(TEE_SPOOL_RESERVE_CHUNK_BYTES).await?);
+                            reserved += TEE_SPOOL_RESERVE_CHUNK_BYTES;
+                        }
+                        hasher.update(&chunk);
+                        file.write_all(&chunk).await?;
+                    }
+                    TeeSpoolMsg::Done => {
+                        file.flush().await?;
+                        return Ok::<_, GitCacheError>(Some(TeeSpoolOutput {
+                            path,
+                            sha256: format!("{:x}", hasher.finalize()),
+                            bytes,
+                            reservations: Vec::new(),
+                        }));
+                    }
+                }
+            }
+            // Sender dropped without `Done`: the tee was abandoned.
+            Ok(None)
+        }
+        .await;
+        match result {
+            Ok(Some(mut output)) => {
+                output.reservations = std::mem::take(&mut reservations);
+                Some(output)
+            }
+            Ok(None) => {
+                release_reservations(std::mem::take(&mut reservations)).await;
+                None
+            }
+            Err(error) => {
+                warn!(request_id, %error, "tee spool writer failed; abandoning tee import");
+                release_reservations(std::mem::take(&mut reservations)).await;
+                None
+            }
+        }
+    });
+    (sender, handle)
+}
+
+/// Per-response state for tee-importing a proxied upload-pack stream.
+struct ProxyTee {
+    demux: PackDemux,
+    sender: mpsc::Sender<TeeSpoolMsg>,
+    writer: tokio::task::JoinHandle<Option<TeeSpoolOutput>>,
+}
+
+/// Imports the spooled pack once the writer finishes; falls back to the
+/// warm refetch on any failure so the repo still becomes servable.
+fn spawn_tee_import(
+    writer: tokio::task::JoinHandle<Option<TeeSpoolOutput>>,
+    warm: DirectGitWarmTask,
+) {
+    tokio::spawn(async move {
+        let output = match writer.await {
+            Ok(Some(output)) => output,
+            Ok(None) => {
+                warm.spawn();
+                return;
+            }
+            Err(error) => {
+                warn!(request_id = warm.request_id, %error, "tee spool writer task panicked");
+                warm.spawn();
+                return;
+            }
+        };
+        let imports = Arc::clone(&warm.imports);
+        let permit = match imports.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(
+                    request_id = warm.request_id,
+                    repo = %warm.repo,
+                    "tee import semaphore closed"
+                );
+                release_reservations(output.reservations).await;
+                return;
+            }
+        };
+        let import_started = Instant::now();
+        let result = warm
+            .materializer
+            .import_proxied_upload_pack(&warm.repo, &warm.body, &output.path, &output.sha256)
+            .await;
+        drop(permit);
+        release_reservations(output.reservations).await;
+        match result {
+            Ok(()) => info!(
+                request_id = warm.request_id,
+                repo = %warm.repo,
+                pack_bytes = output.bytes,
+                import_elapsed_ms = elapsed_ms(import_started),
+                "tee import of proxied upload-pack response finished"
+            ),
+            Err(error) => {
+                warn!(
+                    request_id = warm.request_id,
+                    repo = %warm.repo,
+                    %error,
+                    pack_bytes = output.bytes,
+                    import_elapsed_ms = elapsed_ms(import_started),
+                    "tee import failed; falling back to warm refetch"
+                );
+                warm.spawn();
+            }
+        }
+    });
+}
+
 /// Bounded background runner for `/v1/materialize?async=true`. Jobs are
 /// deduplicated per repo+commit; callers poll `/v1/resolve` for completion.
 struct AsyncMaterializeJobs {
@@ -1165,8 +1536,34 @@ type ReqwestBytesStream =
 struct UpstreamProxyStream {
     inner: ReqwestBytesStream,
     warm_task: Option<DirectGitWarmTask>,
+    tee: Option<ProxyTee>,
     bytes_sent: u64,
     max_bytes: u64,
+}
+
+impl UpstreamProxyStream {
+    /// Feed a proxied chunk into the tee demux/spool; abandons the tee on
+    /// demux failure or spool backpressure (dropping the sender makes the
+    /// writer task clean up).
+    fn tee_chunk(&mut self, chunk: &Bytes) {
+        let Some(tee) = self.tee.as_mut() else {
+            return;
+        };
+        let mut pack = Vec::new();
+        if tee.demux.feed(chunk, &mut pack).is_err() {
+            self.tee = None;
+            return;
+        }
+        if !pack.is_empty()
+            && tee
+                .sender
+                .try_send(TeeSpoolMsg::Chunk(Bytes::from(pack)))
+                .is_err()
+        {
+            warn!("tee spool backpressure or writer gone; abandoning tee import");
+            self.tee = None;
+        }
+    }
 }
 
 impl Stream for UpstreamProxyStream {
@@ -1188,6 +1585,7 @@ impl Stream for UpstreamProxyStream {
                         this.max_bytes
                     )))))
                 } else {
+                    this.tee_chunk(&chunk);
                     Poll::Ready(Some(Ok(chunk)))
                 }
             }
@@ -1195,8 +1593,19 @@ impl Stream for UpstreamProxyStream {
                 format!("upstream upload-pack proxy stream failed: {error}"),
             )))),
             Poll::Ready(None) => {
-                if let Some(task) = this.warm_task.take() {
-                    task.spawn();
+                let mut tee_spawned = false;
+                if let Some(tee) = this.tee.take() {
+                    if tee.demux.pack_complete() && tee.sender.try_send(TeeSpoolMsg::Done).is_ok() {
+                        if let Some(warm) = this.warm_task.take() {
+                            spawn_tee_import(tee.writer, warm);
+                            tee_spawned = true;
+                        }
+                    }
+                }
+                if !tee_spawned {
+                    if let Some(task) = this.warm_task.take() {
+                        task.spawn();
+                    }
                 }
                 Poll::Ready(None)
             }
@@ -1370,10 +1779,6 @@ impl IntoResponse for ApiError {
         )
             .into_response()
     }
-}
-
-pub fn empty_body() -> Body {
-    Body::empty()
 }
 
 /// Wraps a `ReaderStream` and holds a child process handle to keep the process
@@ -1639,9 +2044,11 @@ mod tests {
             disk: git_cache_core::DiskConfig {
                 quota_bytes: 1024 * 1024 * 1024,
                 min_free_bytes: 0,
+                access_flush_interval_secs: 60,
             },
             git_remote: Default::default(),
             compaction: Default::default(),
+            shutdown: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
             use_gitoxide: true,
@@ -1664,6 +2071,142 @@ mod tests {
             Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),
             Ok(_) => panic!("rate-limited authenticated resolve should not succeed"),
         }
+    }
+
+    #[tokio::test]
+    async fn healthz_fails_after_shutdown_begins() {
+        let tmp = TempDir::new().unwrap();
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            cache_root: tmp.path().join("cache"),
+            upstream_root: None,
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 60,
+            max_git_output_bytes: 16 * 1024 * 1024,
+            object_store: ObjectStoreConfig::Local {
+                root: tmp.path().join("objects"),
+            },
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 0,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 1024 * 1024 * 1024,
+                min_free_bytes: 0,
+                access_flush_interval_secs: 60,
+            },
+            git_remote: Default::default(),
+            compaction: Default::default(),
+            shutdown: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
+            use_gitoxide: true,
+        };
+        let state = Arc::new(ApiState::try_new(config).unwrap());
+        let gate = ReadinessGate(Arc::clone(&state.shutting_down));
+
+        let response = healthz(State(Arc::clone(&state))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        gate.begin_shutdown();
+
+        let response = healthz(State(state)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Starts `run_until_shutdown` on an ephemeral port with a single `/slow`
+    /// route that sleeps for `handler_delay` before responding. Returns the
+    /// bound address, the shutdown flag readable by the test, a sender that
+    /// triggers shutdown, and the server task handle.
+    async fn spawn_drain_server(
+        handler_delay: Duration,
+        drain_timeout: Duration,
+    ) -> (
+        SocketAddr,
+        Arc<AtomicBool>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<CoreResult<()>>,
+    ) {
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let gate = ReadinessGate(Arc::clone(&shutting_down));
+        let app = Router::new().route(
+            "/slow",
+            get(move || async move {
+                tokio::time::sleep(handler_delay).await;
+                "done"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(run_until_shutdown(
+            listener,
+            app,
+            gate,
+            Duration::ZERO,
+            drain_timeout,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        (addr, shutting_down, shutdown_tx, server)
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_lets_in_flight_request_finish_within_drain_timeout() {
+        let (addr, shutting_down, shutdown_tx, server) =
+            spawn_drain_server(Duration::from_millis(300), Duration::from_secs(5)).await;
+
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{addr}/slow")).await });
+
+        // Let the request reach the handler, then trigger shutdown mid-flight.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .expect("request should finish well before the drain timeout")
+            .unwrap()
+            .expect("in-flight request must not be killed by graceful shutdown");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "done");
+        assert!(shutting_down.load(Ordering::SeqCst));
+
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server should stop promptly once the request drains")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_kills_request_still_in_flight_after_drain_timeout() {
+        let (addr, shutting_down, shutdown_tx, server) =
+            spawn_drain_server(Duration::from_secs(60), Duration::from_millis(200)).await;
+
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{addr}/slow")).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+
+        // The server must exit once the drain timeout elapses, without waiting
+        // for the 60s handler.
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server should force-exit at the drain deadline")
+            .unwrap()
+            .unwrap();
+        assert!(shutting_down.load(Ordering::SeqCst));
+
+        // In production the process exits at this point, cutting the request.
+        // In-process we can only assert the server gave up on it: the request
+        // is still in flight when run_until_shutdown returns.
+        assert!(
+            !request.is_finished(),
+            "request should still be in flight when the server force-exits"
+        );
+        request.abort();
     }
 
     #[tokio::test]

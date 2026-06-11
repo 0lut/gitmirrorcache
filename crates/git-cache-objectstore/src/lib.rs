@@ -20,21 +20,38 @@ use std::path::{Component, Path};
 
 pub use local::LocalObjectStore;
 pub use manifests::{
-    acquire_lease, commit_manifest_key, generation_manifest_key, generation_manifest_prefix,
-    lease_key, pack_key, read_commit_manifest, read_generation_manifest, read_json, read_lease,
-    read_ref_manifest, read_repo_generation_head, ref_manifest_key, repo_generation_head_key,
-    write_commit_manifest, write_commit_manifest_if_absent,
-    write_commit_manifest_if_absent_or_matches, write_generation_manifest,
-    write_generation_manifest_if_absent, write_generation_manifest_if_absent_or_matches,
-    write_json, write_json_if_absent, write_json_if_absent_or_matches, write_ref_manifest,
-    write_ref_manifest_if_absent, write_ref_manifest_if_absent_or_matches,
-    write_repo_generation_head, GenerationPublish, LeaseManifest, PublishManifests,
+    commit_manifest_key, generation_manifest_key, generation_manifest_prefix, pack_key,
+    pack_prefix, read_commit_manifest, read_generation_manifest, read_json, read_ref_manifest,
+    read_repo_generation_head, read_repo_generation_head_versioned, ref_manifest_key,
+    repo_generation_head_key, write_commit_manifest, write_commit_manifest_if_absent_or_matches,
+    write_generation_manifest, write_generation_manifest_if_absent_or_matches, write_json,
+    write_json_if_absent, write_json_if_absent_or_matches, write_ref_manifest,
+    write_repo_generation_head, write_repo_generation_head_if_version_matches, GenerationPublish,
+    PublishManifests,
 };
 
 #[cfg(feature = "gcs")]
 pub use gcs::GcsObjectStore;
 #[cfg(feature = "s3")]
 pub use s3::S3ObjectStore;
+
+/// Opaque version token returned by `get_versioned` and consumed by
+/// `put_if_version_matches`. Backends choose the representation (S3 uses
+/// the object ETag, the local store uses a content digest); callers must
+/// treat it as opaque and only pass it back to the same store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersion(String);
+
+impl ObjectVersion {
+    pub(crate) fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    #[cfg(feature = "s3")]
+    pub(crate) fn token(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
@@ -48,6 +65,19 @@ pub trait ObjectStore: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Bytes>>;
     async fn put(&self, key: &str, value: Bytes) -> Result<()>;
     async fn put_if_absent(&self, key: &str, value: Bytes) -> Result<bool>;
+
+    /// Fetch an object together with an opaque version token for a later
+    /// compare-and-swap via `put_if_version_matches`.
+    async fn get_versioned(&self, key: &str) -> Result<Option<(Bytes, ObjectVersion)>>;
+
+    /// Replace `key` only if the stored object still matches `version`.
+    /// Returns `Ok(false)` when the object changed or no longer exists.
+    async fn put_if_version_matches(
+        &self,
+        key: &str,
+        value: Bytes,
+        version: &ObjectVersion,
+    ) -> Result<bool>;
     async fn exists(&self, key: &str) -> Result<bool>;
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list_prefix(&self, prefix: &str, max_keys: Option<usize>) -> Result<Vec<String>>;

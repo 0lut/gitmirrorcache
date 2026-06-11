@@ -1,0 +1,14 @@
+apiVersion: v2
+name: gitmirrorcache
+description: Read-through Git mirroring and caching service backed by S3-compatible object storage.
+type: application
+version: 0.1.0
+appVersion: "latest"
+home: https://github.com/0lut/gitmirrorcache
+sources:
+  - https://github.com/0lut/gitmirrorcache
+keywords:
+  - git
+  - cache
+  - mirror
+  - s3

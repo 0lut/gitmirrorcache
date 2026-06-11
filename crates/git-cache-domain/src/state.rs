@@ -507,9 +507,11 @@ mod tests {
             disk: git_cache_core::DiskConfig {
                 quota_bytes: 10_000,
                 min_free_bytes: 0,
+                access_flush_interval_secs: 60,
             },
             git_remote: Default::default(),
             compaction: Default::default(),
+            shutdown: Default::default(),
             max_concurrent_git_processes: 1,
             async_materialize_concurrency: 2,
             use_gitoxide: true,

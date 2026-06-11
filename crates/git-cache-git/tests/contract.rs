@@ -1,12 +1,13 @@
 //! Full git wrapper contract tests.
 //!
 //! Tests the complete lifecycle of the `Git` struct methods including
-//! init_bare, fetch, rev_parse, fsck, bundle round-trips, upload-pack,
+//! init_bare, fetch, rev_parse, fsck, upload-pack,
 //! run, output limits, and timeout enforcement.
 
+mod common;
+
 mod tests {
-    use git_cache_core::CommitSha;
-    use git_cache_git::Git;
+    use git_cache_git::{FetchOptions, Git};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -55,18 +56,8 @@ mod tests {
             .map(|a| a.as_ref().to_os_string())
             .collect();
         let mut command = Command::new("git");
-        command
-            .args(&args)
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_ASKPASS", "/bin/false")
-            .env("SSH_ASKPASS", "/bin/false")
-            .env("HOME", "/nonexistent");
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
+        command.args(&args);
+        crate::common::configure_git_env(&mut command);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -100,52 +91,6 @@ mod tests {
         (source_repo, sha)
     }
 
-    fn commit_source(source_repo: &Path, contents: &str) -> String {
-        std::fs::write(source_repo.join("README.md"), format!("{contents}\n"))
-            .expect("write README");
-        run_git(Some(source_repo), ["add", "README.md"]);
-        run_git(Some(source_repo), ["commit", "-m", contents]);
-        run_git(Some(source_repo), ["rev-parse", "HEAD"])
-    }
-
-    fn create_multi_branch_source(root: &Path) -> (PathBuf, String, String, String) {
-        let source_repo = root.join("multi-source");
-        run_git(None, ["init", "--", path_arg(&source_repo)]);
-        run_git(Some(&source_repo), ["checkout", "-B", "main"]);
-        run_git(
-            Some(&source_repo),
-            ["config", "user.email", "test@example.invalid"],
-        );
-        run_git(
-            Some(&source_repo),
-            ["config", "user.name", "Git Cache Test"],
-        );
-        std::fs::write(source_repo.join("README.md"), "main branch\n").expect("write README");
-        run_git(Some(&source_repo), ["add", "README.md"]);
-        run_git(Some(&source_repo), ["commit", "-m", "main-commit"]);
-        let main_sha = run_git(Some(&source_repo), ["rev-parse", "HEAD"]);
-
-        // Create feature1 branch
-        run_git(Some(&source_repo), ["checkout", "-b", "feature1"]);
-        std::fs::write(source_repo.join("feature1.txt"), "feature1\n").expect("write feature1");
-        run_git(Some(&source_repo), ["add", "feature1.txt"]);
-        run_git(Some(&source_repo), ["commit", "-m", "feature1"]);
-        let f1_sha = run_git(Some(&source_repo), ["rev-parse", "HEAD"]);
-
-        // Create feature2 branch from main
-        run_git(Some(&source_repo), ["checkout", "main"]);
-        run_git(Some(&source_repo), ["checkout", "-b", "feature2"]);
-        std::fs::write(source_repo.join("feature2.txt"), "feature2\n").expect("write feature2");
-        run_git(Some(&source_repo), ["add", "feature2.txt"]);
-        run_git(Some(&source_repo), ["commit", "-m", "feature2"]);
-        let f2_sha = run_git(Some(&source_repo), ["rev-parse", "HEAD"]);
-
-        // Go back to main
-        run_git(Some(&source_repo), ["checkout", "main"]);
-
-        (source_repo, main_sha, f1_sha, f2_sha)
-    }
-
     // ── init_bare ───────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -176,32 +121,6 @@ mod tests {
             .expect("second init_bare should not fail");
     }
 
-    // ── fetch_branch ────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn fetch_branch_from_local_source() {
-        let temp = TempTree::new("fetch-branch");
-        let (source_repo, source_sha) = create_source_repo(&temp.path);
-        let cache_repo = temp.path.join("cache.git");
-        let git = test_git();
-
-        git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch main into cache repo");
-
-        let cached_sha = git
-            .rev_parse(&cache_repo, "refs/cache/main^{commit}")
-            .await
-            .expect("resolve cached ref");
-        assert_eq!(source_sha, cached_sha);
-    }
-
     // ── rev_parse ───────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -212,11 +131,12 @@ mod tests {
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
             "refs/heads/main",
+            "refs/heads/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch main");
@@ -241,11 +161,12 @@ mod tests {
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch main");
@@ -265,11 +186,12 @@ mod tests {
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch main");
@@ -291,11 +213,12 @@ mod tests {
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch main");
@@ -313,181 +236,6 @@ mod tests {
         git.fsck(&repo_dir)
             .await
             .expect("fsck should pass on empty repo");
-    }
-
-    // ── bundle_create + fetch_bundle round-trip ─────────────────────────────
-
-    #[tokio::test]
-    async fn bundle_create_and_fetch_bundle_round_trip() {
-        let temp = TempTree::new("bundle-roundtrip");
-        let (source_repo, source_sha) = create_source_repo(&temp.path);
-        let cache_repo = temp.path.join("cache.git");
-        let hydrated_repo = temp.path.join("hydrated.git");
-        let bundle_path = temp.path.join("test.bundle");
-        let git = test_git();
-
-        git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch main");
-
-        git.bundle_create(&cache_repo, &bundle_path, "refs/cache/main")
-            .await
-            .expect("create bundle");
-        assert!(bundle_path.is_file(), "bundle file should exist");
-
-        git.init_bare(&hydrated_repo)
-            .await
-            .expect("init hydrated repo");
-        git.fetch_bundle(&hydrated_repo, &bundle_path)
-            .await
-            .expect("fetch from bundle");
-
-        let hydrated_sha = git
-            .rev_parse(&hydrated_repo, "refs/cache/main^{commit}")
-            .await
-            .expect("resolve hydrated ref");
-        assert_eq!(source_sha, hydrated_sha);
-        git.fsck(&hydrated_repo).await.expect("fsck hydrated repo");
-    }
-
-    // ── bundle_create_all ───────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn bundle_create_all_includes_all_branches() {
-        let temp = TempTree::new("bundle-all");
-        let (source_repo, _main_sha, f1_sha, f2_sha) = create_multi_branch_source(&temp.path);
-        let cache_repo = temp.path.join("cache.git");
-        let hydrated_repo = temp.path.join("hydrated.git");
-        let bundle_path = temp.path.join("all.bundle");
-        let git = test_git();
-
-        git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch main");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "feature1",
-            "refs/cache/feature1",
-        )
-        .await
-        .expect("fetch feature1");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "feature2",
-            "refs/cache/feature2",
-        )
-        .await
-        .expect("fetch feature2");
-
-        git.bundle_create_all(&cache_repo, &bundle_path)
-            .await
-            .expect("create all bundle");
-        assert!(bundle_path.is_file());
-
-        git.init_bare(&hydrated_repo)
-            .await
-            .expect("init hydrated repo");
-        git.fetch_bundle(&hydrated_repo, &bundle_path)
-            .await
-            .expect("fetch all bundle");
-
-        let h_f1 = git
-            .rev_parse(&hydrated_repo, "refs/cache/feature1^{commit}")
-            .await
-            .expect("resolve feature1");
-        assert_eq!(h_f1, f1_sha);
-
-        let h_f2 = git
-            .rev_parse(&hydrated_repo, "refs/cache/feature2^{commit}")
-            .await
-            .expect("resolve feature2");
-        assert_eq!(h_f2, f2_sha);
-    }
-
-    // ── bundle_create_incremental ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn bundle_create_incremental_only_includes_new_commits() {
-        let temp = TempTree::new("bundle-incr");
-        let (source_repo, first_sha) = create_source_repo(&temp.path);
-        let cache_repo = temp.path.join("cache.git");
-        let full_bundle = temp.path.join("full.bundle");
-        let delta_bundle = temp.path.join("delta.bundle");
-        let git = test_git();
-
-        git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch initial main");
-
-        git.bundle_create_all(&cache_repo, &full_bundle)
-            .await
-            .expect("create full bundle");
-
-        // Add more commits
-        commit_source(&source_repo, "second commit");
-        commit_source(&source_repo, "third commit");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch updated main");
-
-        git.bundle_create_incremental(
-            &cache_repo,
-            &delta_bundle,
-            &[CommitSha::parse(&first_sha).unwrap()],
-        )
-        .await
-        .expect("create incremental bundle");
-
-        // Incremental bundle should be smaller than a full bundle of the same repo
-        let full_size = std::fs::metadata(&full_bundle).unwrap().len();
-        let delta_size = std::fs::metadata(&delta_bundle).unwrap().len();
-        // The delta should exist and be non-zero
-        assert!(delta_size > 0, "delta bundle should not be empty");
-        // We won't assert delta < full since the first full bundle only has 1 commit
-        // and the delta has 2 new commits. But we verify it's a valid bundle by fetching.
-
-        let hydrated = temp.path.join("hydrated.git");
-        git.init_bare(&hydrated).await.expect("init hydrated");
-        git.fetch_bundle(&hydrated, &full_bundle)
-            .await
-            .expect("fetch full bundle");
-        git.fetch_bundle(&hydrated, &delta_bundle)
-            .await
-            .expect("fetch delta bundle");
-        git.fsck(&hydrated).await.expect("fsck hydrated");
-
-        // Verify both the initial and new commits are present
-        git.rev_parse(&hydrated, &format!("{first_sha}^{{commit}}"))
-            .await
-            .expect("initial commit should be present");
-
-        let _ = full_size; // suppress unused warning
-        let _ = delta_size;
     }
 
     // ── run ─────────────────────────────────────────────────────────────────
@@ -533,16 +281,10 @@ mod tests {
         let temp = TempTree::new("timeout");
         let repo_dir = temp.path.join("repo.git");
         // Use std::process to init so the Git struct timeout doesn't interfere
-        let status = Command::new("git")
-            .args(["init", "--bare", repo_dir.to_str().unwrap()])
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("HOME", "/nonexistent")
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .output()
-            .expect("init repo");
+        let mut init_command = Command::new("git");
+        init_command.args(["init", "--bare", repo_dir.to_str().unwrap()]);
+        crate::common::configure_git_env(&mut init_command);
+        let status = init_command.output().expect("init repo");
         assert!(status.status.success());
 
         // Try a basic command with 1ms timeout. It should either timeout or
@@ -572,11 +314,12 @@ mod tests {
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch main");

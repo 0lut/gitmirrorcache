@@ -63,8 +63,19 @@ impl<'a> ManifestStore<'a> {
         read_repo_generation_head(&*self.state.store, repo).await
     }
 
-    pub(super) async fn write_repo_head(&self, head: &RepoGenerationHead) -> CoreResult<()> {
-        write_repo_generation_head(&*self.state.store, head).await
+    pub(super) async fn repo_head_versioned(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<Option<(RepoGenerationHead, ObjectVersion)>> {
+        read_repo_generation_head_versioned(&*self.state.store, repo).await
+    }
+
+    pub(super) async fn write_repo_head_if_version_matches(
+        &self,
+        head: &RepoGenerationHead,
+        version: Option<&ObjectVersion>,
+    ) -> CoreResult<bool> {
+        write_repo_generation_head_if_version_matches(&*self.state.store, head, version).await
     }
 }
 

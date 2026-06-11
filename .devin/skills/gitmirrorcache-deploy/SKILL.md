@@ -28,8 +28,10 @@ IFS=, read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY <<< "$(printf '%s' "$AWS_A
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 ```
 
-Account 411474713009, region us-west-2. EC2 vCPU quota is 32 — check running
-instances before launching large instance types (VcpuLimitExceeded otherwise).
+Region is us-west-2. Derive the account ID at runtime instead of hard-coding
+it: `aws sts get-caller-identity --query Account --output text`. The dev
+account's EC2 vCPU quota is 32 — check running instances before launching
+large instance types (VcpuLimitExceeded otherwise).
 
 ## AWS CLI v2 required
 
@@ -74,12 +76,12 @@ VERSION_ID=<12-char-commit> scripts/aws/destroy-preview.sh   # teardown
   build when the ECR tag already exists (e.g. after `build-image-cross.sh`).
 - API logs: `aws logs tail /ecs/gmc-p-<VERSION_ID>/ec2-api --region us-west-2 --since 15m --format short`
 
-## arm64 image build WITHOUT a buildbox (preferred)
+## arm64 image build (cross-compile)
 
-Building the full Dockerfile under QEMU is very slow because `cargo build`
-emulates arm64. On a Linux x86 host, use the checked-in wrapper instead
-(~2.5 min total): it cross-compiles the binaries natively, assembles a
-runtime-only image from `Dockerfile.cross` via buildx, and pushes to ECR.
+On a Linux x86 host, use the checked-in cross-compile wrapper (~2.5 min
+total): it compiles the Rust binaries natively with the aarch64 cross-linker,
+assembles a runtime-only image from `Dockerfile.cross` via buildx, and pushes
+to ECR.
 
 ```sh
 AWS_REGION=us-west-2 scripts/aws/build-image-cross.sh
@@ -94,25 +96,6 @@ the qemu binfmt handler itself if missing. `PUSH=false` does a local-only
 `--load` build (no AWS access needed). The script is Linux-only; on macOS
 (Apple Silicon) build the full Dockerfile natively:
 `docker buildx build --platform linux/arm64 -f Dockerfile .`
-
-## Native arm64 image build on a buildbox (fallback)
-
-Only if the cross-build path is unavailable. Build natively
-(~6 min on c8g.2xlarge), and ALWAYS terminate the buildbox afterwards:
-
-```sh
-AWS_REGION=us-west-2 ENVIRONMENT=dev-arm NAME_PREFIX=gitmirrorcache-arm \
-  DEVBOX_INSTANCE_TYPE=c8g.2xlarge DEVBOX_NAME=gitmirrorcache-arm-buildbox \
-  DEVBOX_KEY_NAME=gitmirrorcache-arm-buildbox scripts/aws/devbox.sh
-# prints INSTANCE_ID, PUBLIC_HOST, SSH_USER=ec2-user, PRIVATE_KEY_PATH
-
-ssh -i $KEY ec2-user@$HOST 'sudo dnf install -y docker git && sudo systemctl start docker'
-git archive --format=tar HEAD | gzip | ssh -i $KEY ec2-user@$HOST 'mkdir -p ~/src && tar -xzf - -C ~/src'
-aws ecr get-login-password --region us-west-2 | ssh -i $KEY ec2-user@$HOST "sudo docker login --username AWS --password-stdin <ECR_URI>"
-ssh -i $KEY ec2-user@$HOST "cd ~/src && sudo DOCKER_BUILDKIT=1 docker build --platform linux/arm64 -t <ECR_URI>:<tag> -f Dockerfile . && sudo docker push <ECR_URI>:<tag>"
-
-aws ec2 terminate-instances --instance-ids <INSTANCE_ID> --region us-west-2
-```
 
 ## Stuck rollout recovery
 

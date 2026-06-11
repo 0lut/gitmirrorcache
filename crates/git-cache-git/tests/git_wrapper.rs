@@ -1,6 +1,8 @@
+mod common;
+
 mod tests {
     use git_cache_core::CommitSha;
-    use git_cache_git::Git;
+    use git_cache_git::{FetchOptions, Git};
     use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -30,53 +32,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_bundle_and_verify_local_bare_repos() {
-        let temp = TempTree::new("bundle-flow");
-        let (source_repo, source_sha) = create_source_repo(&temp.path);
-        let cache_repo = temp.path.join("cache.git");
-        let hydrated_repo = temp.path.join("hydrated.git");
-        let bundle_path = temp.path.join("cache.bundle");
-        let git = test_git();
-
-        git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch main into cache repo");
-
-        let cached_sha = git
-            .rev_parse(&cache_repo, "refs/cache/main^{commit}")
-            .await
-            .expect("resolve cached ref");
-        assert_eq!(source_sha, cached_sha);
-
-        git.fsck(&cache_repo).await.expect("fsck cache repo");
-        git.bundle_create(&cache_repo, &bundle_path, "refs/cache/main")
-            .await
-            .expect("create cache bundle");
-        assert!(bundle_path.is_file());
-
-        git.init_bare(&hydrated_repo)
-            .await
-            .expect("init hydrated repo");
-        git.fetch_bundle(&hydrated_repo, &bundle_path)
-            .await
-            .expect("fetch refs from bundle");
-
-        let hydrated_sha = git
-            .rev_parse(&hydrated_repo, "refs/cache/main^{commit}")
-            .await
-            .expect("resolve hydrated ref");
-        assert_eq!(source_sha, hydrated_sha);
-
-        git.fsck(&hydrated_repo).await.expect("fsck hydrated repo");
-    }
-
-    #[tokio::test]
     async fn repack_for_serving_writes_bitmap_index() {
         let temp = TempTree::new("repack-serving");
         let (source_repo, _) = create_source_repo(&temp.path);
@@ -84,11 +39,12 @@ mod tests {
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch main into cache repo");
@@ -129,67 +85,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundle_create_incremental_round_trips_from_base_bundle() {
-        let temp = TempTree::new("incremental-bundle");
-        let (source_repo, first_sha) = create_source_repo(&temp.path);
-        let cache_repo = temp.path.join("cache.git");
-        let hydrated_repo = temp.path.join("hydrated.git");
-        let full_bundle = temp.path.join("full.bundle");
-        let delta_bundle = temp.path.join("delta.bundle");
-        let git = test_git();
-
-        git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch initial main");
-        git.bundle_create_all(&cache_repo, &full_bundle)
-            .await
-            .expect("create full bundle");
-
-        let second_sha = commit_source(&source_repo, "second");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch updated main");
-        git.bundle_create_incremental(
-            &cache_repo,
-            &delta_bundle,
-            &[CommitSha::parse(&first_sha).unwrap()],
-        )
-        .await
-        .expect("create incremental bundle");
-
-        git.init_bare(&hydrated_repo)
-            .await
-            .expect("init hydrated repo");
-        git.fetch_bundle(&hydrated_repo, &full_bundle)
-            .await
-            .expect("fetch full bundle");
-        git.fetch_bundle(&hydrated_repo, &delta_bundle)
-            .await
-            .expect("fetch delta bundle");
-
-        let hydrated_sha = git
-            .rev_parse(&hydrated_repo, "refs/cache/main^{commit}")
-            .await
-            .expect("resolve hydrated ref");
-        assert_eq!(second_sha, hydrated_sha);
-        git.rev_parse(&hydrated_repo, &format!("{first_sha}^{{commit}}"))
-            .await
-            .expect("initial commit remains present");
-        git.fsck(&hydrated_repo).await.expect("fsck hydrated repo");
-    }
-
-    #[tokio::test]
     async fn is_ancestor_reports_commit_reachability() {
         let temp = TempTree::new("is-ancestor");
         let (source_repo, first_sha) = create_source_repo(&temp.path);
@@ -198,11 +93,12 @@ mod tests {
 
         let second_sha = commit_source(&source_repo, "second");
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch main");
@@ -220,38 +116,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_reachable_from_commits_reports_blob_reachability() {
-        let temp = TempTree::new("object-reachability");
-        let (source_repo, source_sha) = create_source_repo(&temp.path);
-        let cache_repo = temp.path.join("cache.git");
-        let git = test_git();
-
-        git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch main");
-
-        let tip = CommitSha::parse(&source_sha).unwrap();
-        let blob =
-            CommitSha::parse(run_git(Some(&source_repo), ["rev-parse", "HEAD:README.md"])).unwrap();
-        assert!(git
-            .object_reachable_from_commits(&cache_repo, &blob, std::slice::from_ref(&tip))
-            .await
-            .expect("check blob reachability"));
-
-        let unrelated = CommitSha::parse("f".repeat(40)).unwrap();
-        assert!(!git
-            .object_reachable_from_commits(&cache_repo, &unrelated, &[tip])
-            .await
-            .expect("check unrelated object reachability"));
-    }
-
-    #[tokio::test]
     async fn for_each_ref_commits_lists_matching_refs() {
         let temp = TempTree::new("for-each-ref");
         let (source_repo, source_sha) = create_source_repo(&temp.path);
@@ -259,11 +123,12 @@ mod tests {
         let git = test_git();
 
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/upstream/heads/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch cache ref");
@@ -284,11 +149,12 @@ mod tests {
 
         let second_sha = commit_source(&source_repo, "second");
         git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
+        git.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/upstream/heads/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch cache ref");
@@ -318,11 +184,12 @@ mod tests {
 
         let second_sha = commit_source(&source_repo, "second");
         gix.init_bare(&cache_repo).await.expect("init cache repo");
-        gix.fetch_branch(
+        gix.fetch_ref(
             &cache_repo,
             path_arg(&source_repo),
-            "main",
+            "refs/heads/main",
             "refs/cache/upstream/heads/main",
+            FetchOptions::default(),
         )
         .await
         .expect("fetch cache ref");
@@ -377,41 +244,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn bundle_create_incremental_empty_excludes_creates_full_bundle() {
-        let temp = TempTree::new("incremental-empty");
-        let (source_repo, source_sha) = create_source_repo(&temp.path);
-        let cache_repo = temp.path.join("cache.git");
-        let bundle_path = temp.path.join("cache.bundle");
-        let hydrated_repo = temp.path.join("hydrated.git");
-        let git = test_git();
-
-        git.init_bare(&cache_repo).await.expect("init cache repo");
-        git.fetch_branch(
-            &cache_repo,
-            path_arg(&source_repo),
-            "main",
-            "refs/cache/main",
-        )
-        .await
-        .expect("fetch main");
-        git.bundle_create_incremental(&cache_repo, &bundle_path, &[])
-            .await
-            .expect("create full bundle through incremental wrapper");
-
-        git.init_bare(&hydrated_repo)
-            .await
-            .expect("init hydrated repo");
-        git.fetch_bundle(&hydrated_repo, &bundle_path)
-            .await
-            .expect("fetch bundle");
-        let hydrated_sha = git
-            .rev_parse(&hydrated_repo, "refs/cache/main^{commit}")
-            .await
-            .expect("resolve hydrated ref");
-        assert_eq!(source_sha, hydrated_sha);
-    }
-
     fn test_git() -> Git {
         Git::default_with_timeout(Duration::from_secs(10))
     }
@@ -456,19 +288,8 @@ mod tests {
             .map(|arg| arg.as_ref().to_os_string())
             .collect();
         let mut command = Command::new("git");
-        command
-            .args(&args)
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_ASKPASS", "/bin/false")
-            .env("SSH_ASKPASS", "/bin/false")
-            .env("HOME", "/nonexistent");
-
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
+        command.args(&args);
+        crate::common::configure_git_env(&mut command);
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
             command.env("TMPDIR", tmpdir);
         }
