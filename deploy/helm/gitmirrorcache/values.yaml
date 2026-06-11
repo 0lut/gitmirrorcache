@@ -48,13 +48,17 @@ ingress:
           pathType: Prefix
   tls: []
 
-resources: {}
-# resources:
-#   requests:
-#     cpu: "2"
-#     memory: 4Gi
-#   limits:
-#     memory: 8Gi
+# Serving upload-pack spawns git pack-objects children (CPU- and memory-heavy,
+# up to config.maxConcurrentGitProcesses at once), so do not run this small.
+# The production ECS deployment uses 8 vCPU / 24 GiB (docs/deployment.md);
+# treat ~2 vCPU / 4 GiB as the floor for light workloads and scale CPU with
+# concurrent clone traffic.
+resources:
+  requests:
+    cpu: "2"
+    memory: 4Gi
+  limits:
+    memory: 8Gi
 
 nodeSelector: {}
 tolerations: []
