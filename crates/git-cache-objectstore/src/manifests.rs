@@ -211,10 +211,7 @@ pub async fn read_repo_generation_head_versioned<S>(
 where
     S: ObjectStore + ?Sized,
 {
-    let Some((value, version)) = store
-        .get_versioned(&repo_generation_head_key(repo))
-        .await?
-    else {
+    let Some((value, version)) = store.get_versioned(&repo_generation_head_key(repo)).await? else {
         return Ok(None);
     };
     Ok(Some((serde_json::from_slice(&value)?, version)))

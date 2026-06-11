@@ -265,9 +265,7 @@ impl ObjectStore for S3ObjectStore {
         let e_tag = output
             .e_tag()
             .ok_or_else(|| {
-                GitCacheError::UpstreamUnavailable(format!(
-                    "s3 get `{s3_key}` returned no etag"
-                ))
+                GitCacheError::UpstreamUnavailable(format!("s3 get `{s3_key}` returned no etag"))
             })?
             .to_string();
         let body = output
