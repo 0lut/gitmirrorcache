@@ -1,7 +1,7 @@
 use crate::state::AppState;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use git_cache_core::{
     BranchName, CommitManifest, CommitSha, GenerationId, GenerationManifest, GitCacheError,
     MaterializeRequest, MaterializeResponse, MaterializeSource, PackInfo, PackKind, RefManifest,
@@ -12,8 +12,8 @@ use git_cache_core::{UpdateExecutor, UpdateRequest, UpdateTarget};
 use git_cache_disk::RepoLock;
 pub use git_cache_git::UploadPackProcess;
 use git_cache_objectstore::{
-    generation_manifest_key, generation_manifest_prefix, pack_key, read_commit_manifest,
-    read_generation_manifest, read_json, read_repo_generation_head,
+    generation_manifest_key, generation_manifest_prefix, pack_key, pack_prefix,
+    read_commit_manifest, read_generation_manifest, read_json, read_repo_generation_head,
     read_repo_generation_head_versioned, write_commit_manifest, write_json, write_ref_manifest,
     write_repo_generation_head_if_version_matches, GenerationPublish, ObjectVersion,
     PublishManifests,
@@ -40,7 +40,7 @@ pub use direct_git::{
     frame_ref_advertisement, synthesize_ref_advertisement, UpstreamRefComparison,
 };
 pub use executor::MaterializerExecutor;
-pub use generations::{default_manifest_key, CompactionReport};
+pub use generations::{default_manifest_key, CompactionReport, GenerationSweepReport};
 pub use repo::repo_from_git_path;
 
 #[derive(Clone)]

@@ -18,6 +18,14 @@ pub struct CompactionReport {
     pub bytes_reclaimed: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GenerationSweepReport {
+    pub repo: RepoKey,
+    pub swept_generations: Vec<GenerationId>,
+    pub deleted_packs: usize,
+    pub bytes_reclaimed: u64,
+}
+
 impl Materializer {
     pub(super) async fn hydrate_commit(&self, manifest: &CommitManifest) -> CoreResult<()> {
         let repo_dir = self.ensure_repo_dir(&manifest.repo).await?;
@@ -620,7 +628,138 @@ impl Materializer {
         repo: &RepoKey,
     ) -> CoreResult<Option<CompactionReport>> {
         let threshold = self.state.config.compaction.chain_depth_threshold as usize;
-        Box::pin(self.compact_generation_chain_inner(repo, threshold, false)).await
+        let report = Box::pin(self.compact_generation_chain_inner(repo, threshold, false)).await?;
+        let sweep = self.sweep_superseded_generations(repo).await?;
+        Ok(report.map(|mut report| {
+            report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(sweep.bytes_reclaimed);
+            report
+        }))
+    }
+
+    /// Delete generation manifests (and the packs only they reference) that
+    /// have been superseded for longer than the configured retention window.
+    ///
+    /// Eligibility is derived purely from durable manifest data: a generation
+    /// is swept only when another generation with a strictly newer
+    /// `created_at` has existed for longer than the retention window. The
+    /// generation the head pointer references is always kept. Packs not
+    /// referenced by any manifest are deleted once their store timestamp is
+    /// older than the window, which retroactively collects packs leaked by
+    /// crashes between publish and cleanup.
+    pub async fn sweep_superseded_generations(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<GenerationSweepReport> {
+        let mut report = GenerationSweepReport {
+            repo: repo.clone(),
+            swept_generations: Vec::new(),
+            deleted_packs: 0,
+            bytes_reclaimed: 0,
+        };
+        let _repo_lock = self.lock_repo(repo).await?;
+        let Some(head) = self.manifests().repo_head(repo).await? else {
+            return Ok(report);
+        };
+
+        let mut manifests = Vec::new();
+        for generation in self.list_generation_ids(repo).await? {
+            if let Some(manifest) = self.get_generation_manifest(repo, generation).await? {
+                manifests.push(manifest);
+            }
+        }
+
+        let retention_secs = self
+            .state
+            .config
+            .compaction
+            .retention_secs
+            .min(i64::MAX as u64) as i64;
+        let cutoff = Utc::now() - chrono::Duration::seconds(retention_secs);
+
+        let mut created_at_sorted: Vec<(DateTime<Utc>, GenerationId)> = manifests
+            .iter()
+            .map(|manifest| (manifest.created_at, manifest.generation))
+            .collect();
+        created_at_sorted.sort();
+
+        let mut swept: HashSet<GenerationId> = HashSet::new();
+        for manifest in &manifests {
+            if manifest.generation == head.generation {
+                continue;
+            }
+            let successor_created_at = created_at_sorted
+                .iter()
+                .find(|(created_at, generation)| {
+                    *generation != manifest.generation && *created_at > manifest.created_at
+                })
+                .map(|(created_at, _)| *created_at);
+            if let Some(successor_created_at) = successor_created_at {
+                if successor_created_at < cutoff {
+                    swept.insert(manifest.generation);
+                }
+            }
+        }
+
+        let kept_packs: HashSet<&str> = manifests
+            .iter()
+            .filter(|manifest| !swept.contains(&manifest.generation))
+            .flat_map(|manifest| manifest.packs.iter().map(|pack| pack.key.as_str()))
+            .collect();
+
+        let mut deleted_pack_keys: HashSet<&str> = HashSet::new();
+        for manifest in &manifests {
+            if !swept.contains(&manifest.generation) {
+                continue;
+            }
+            for pack in &manifest.packs {
+                if kept_packs.contains(pack.key.as_str()) {
+                    continue;
+                }
+                if deleted_pack_keys.insert(pack.key.as_str()) {
+                    self.state.store.delete(&pack.key).await?;
+                    report.deleted_packs += 1;
+                    report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(pack.len);
+                }
+            }
+            self.state
+                .store
+                .delete(&generation_manifest_key(repo, manifest.generation))
+                .await?;
+            report.swept_generations.push(manifest.generation);
+        }
+
+        let pack_keys = self
+            .state
+            .store
+            .list_prefix(&pack_prefix(repo), Some(MAX_GENERATION_MANIFEST_SCAN_KEYS))
+            .await?;
+        for key in pack_keys {
+            if kept_packs.contains(key.as_str()) || deleted_pack_keys.contains(key.as_str()) {
+                continue;
+            }
+            let Some(meta) = self.state.store.head(&key).await? else {
+                continue;
+            };
+            let Some(updated_at) = meta.updated_at else {
+                continue;
+            };
+            if updated_at < cutoff {
+                self.state.store.delete(&key).await?;
+                report.deleted_packs += 1;
+                report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(meta.len);
+            }
+        }
+
+        if !report.swept_generations.is_empty() || report.deleted_packs > 0 {
+            info!(
+                %repo,
+                swept_generations = report.swept_generations.len(),
+                deleted_packs = report.deleted_packs,
+                bytes_reclaimed = report.bytes_reclaimed,
+                "retention sweep removed superseded generations"
+            );
+        }
+        Ok(report)
     }
 
     pub async fn compact_generation_chain_dry_run(
@@ -633,8 +772,9 @@ impl Materializer {
 
     /// Compact a repo whose head generation references too many packs:
     /// hydrate the head snapshot, repack the local repo into a single pack,
-    /// publish it as a fresh self-contained generation, then delete the old
-    /// generation manifests and any packs no longer referenced.
+    /// then publish it as a fresh self-contained generation. Superseded
+    /// generations are not deleted here; the retention sweep removes them
+    /// once their successor is older than the configured window.
     pub(super) async fn compact_generation_chain_inner(
         &self,
         repo: &RepoKey,
@@ -772,25 +912,9 @@ impl Materializer {
             warn!(
                 %repo,
                 %new_generation,
-                "generation head changed during compaction; skipping cleanup of old packs"
+                "generation head changed during compaction; superseded generations left for the retention sweep"
             );
             return Ok(None);
-        }
-
-        let retained_keys: HashSet<&str> = packs.iter().map(|pack| pack.key.as_str()).collect();
-        let mut bytes_reclaimed = 0_u64;
-        for (key, len) in &old_packs {
-            if retained_keys.contains(key.as_str()) {
-                continue;
-            }
-            self.state.store.delete(key).await?;
-            bytes_reclaimed = bytes_reclaimed.saturating_add(*len);
-        }
-        for generation in &old_generations {
-            self.state
-                .store
-                .delete(&generation_manifest_key(repo, *generation))
-                .await?;
         }
 
         Ok(Some(CompactionReport {
@@ -798,7 +922,7 @@ impl Materializer {
             old_pack_count: head_manifest.packs.len(),
             old_generations,
             new_generation,
-            bytes_reclaimed,
+            bytes_reclaimed: 0,
         }))
     }
 
