@@ -1,0 +1,46 @@
+name: Actions Artifact Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      older_than_days:
+        description: Delete artifacts created more than this many days ago
+        required: true
+        default: "1"
+      delete_all:
+        description: Delete every completed-run GitHub Actions artifact
+        required: true
+        type: boolean
+        default: false
+      dry_run:
+        description: Print what would be deleted without deleting it
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    - cron: "47 9 * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: actions-artifact-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Delete stale Actions artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Delete GitHub Actions artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ARTIFACT_OLDER_THAN_DAYS: ${{ github.event.inputs.older_than_days || '1' }}
+          DELETE_ALL_ARTIFACTS: ${{ github.event.inputs.delete_all || 'false' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: scripts/github/cleanup-actions-artifacts.sh
