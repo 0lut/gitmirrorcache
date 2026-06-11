@@ -73,6 +73,9 @@ terminationGracePeriodSeconds: 75
 # forces rehydration. Disable persistence to fall back to an emptyDir.
 persistence:
   enabled: true
+  # Empty omits storageClassName and relies on a cluster default StorageClass.
+  # Some clusters, including fresh eksctl clusters, may not mark a default
+  # class; set this explicitly there, e.g. gp3 on EKS.
   storageClass: ""
   accessModes:
     - ReadWriteOnce

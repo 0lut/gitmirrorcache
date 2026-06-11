@@ -35,6 +35,19 @@ helm install git-cache "${CHART_REF}" \
 
 For release tag `vX.Y.Z`, use chart version `X.Y.Z`.
 
+## Persistence storage class
+
+By default the chart omits `storageClassName`, so the PVC binds only when the
+cluster has a default StorageClass. On EKS, prefer an EBS CSI `gp3`
+StorageClass and set it explicitly when no default class is configured:
+
+```sh
+helm install git-cache "${CHART_REF}" \
+  --version "${CHART_VERSION}" \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket \
+  --set persistence.storageClass=gp3
+```
+
 ## S3 credentials
 
 Prefer workload identity over static keys:
@@ -78,6 +91,7 @@ upstreamAuth:
 | `config.gitRemote.enabled` | `true` | Serve `/git/{host}/{owner}/{repo}.git` |
 | `config.disk.quotaBytes` | 100 GiB | Hot-cache disk quota |
 | `persistence.size` | `100Gi` | PVC size (keep ≥ disk quota) |
+| `persistence.storageClass` | `""` | PVC StorageClass; empty uses the cluster default. Use `gp3` on EKS. |
 | `persistence.enabled` | `true` | Use a PVC; `false` falls back to emptyDir |
 | `compaction.enabled` | `true` | Hourly `git-cache compact --all` CronJob |
 | `configFile` | `""` | Optional full TOML config (see `config/production.example.toml`) |
