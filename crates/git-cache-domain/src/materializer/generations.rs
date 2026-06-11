@@ -892,18 +892,6 @@ impl Materializer {
             .publish_pack_files(&*self.state.store, &local_packs)
             .await?;
 
-        self.repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)
-            .await?;
-        for commit in old_commits {
-            let manifest = CommitManifest {
-                repo: repo.clone(),
-                commit,
-                generation: new_generation,
-                complete: true,
-                verified_at: now,
-            };
-            self.manifests().write_commit(&manifest).await?;
-        }
         if !self
             .manifests()
             .write_repo_head_if_version_matches(&new_head, Some(&head_version))
@@ -915,6 +903,19 @@ impl Materializer {
                 "generation head changed during compaction; superseded generations left for the retention sweep"
             );
             return Ok(None);
+        }
+
+        self.repoint_manifests_after_compaction(repo, &old_generation_set, new_generation)
+            .await?;
+        for commit in old_commits {
+            let manifest = CommitManifest {
+                repo: repo.clone(),
+                commit,
+                generation: new_generation,
+                complete: true,
+                verified_at: now,
+            };
+            self.manifests().write_commit(&manifest).await?;
         }
 
         Ok(Some(CompactionReport {
