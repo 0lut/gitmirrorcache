@@ -13,7 +13,9 @@ list_statement = {
     "Resource": bucket_arn,
 }
 if prefix:
-    list_statement["Condition"] = {"StringLike": {"s3:prefix": [prefix, f"{prefix}/*"]}}
+    list_statement["Condition"] = {
+        "StringLikeIfExists": {"s3:prefix": [prefix, f"{prefix}/*"]}
+    }
 policy = {
     "Version": "2012-10-17",
     "Statement": [
