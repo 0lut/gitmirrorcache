@@ -197,6 +197,33 @@ pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> Core
 
     let readiness_delay = Duration::from_secs(shutdown_config.readiness_delay_seconds);
     let drain_timeout = Duration::from_secs(shutdown_config.drain_timeout_seconds);
+    run_until_shutdown(
+        listener,
+        app,
+        readiness,
+        readiness_delay,
+        drain_timeout,
+        shutdown_signal(),
+    )
+    .await?;
+
+    if let Err(err) = domain.disk.flush_repo_accesses().await {
+        warn!(error = %err, "failed to flush repo access timestamps during shutdown");
+    }
+    Ok(())
+}
+
+/// Serve `app` on `listener` until `signal` resolves, then drain: fail
+/// readiness, wait `readiness_delay`, stop accepting connections, and let
+/// in-flight requests finish for at most `drain_timeout` before returning.
+async fn run_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    readiness: ReadinessGate,
+    readiness_delay: Duration,
+    drain_timeout: Duration,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> CoreResult<()> {
     let (drain_deadline_tx, drain_deadline_rx) = tokio::sync::oneshot::channel::<()>();
 
     let server = axum::serve(listener, app).with_graceful_shutdown(graceful_shutdown(
@@ -204,6 +231,7 @@ pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> Core
         readiness_delay,
         drain_timeout,
         drain_deadline_tx,
+        signal,
     ));
 
     tokio::select! {
@@ -217,15 +245,11 @@ pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> Core
             );
         }
     }
-
-    if let Err(err) = domain.disk.flush_repo_accesses().await {
-        warn!(error = %err, "failed to flush repo access timestamps during shutdown");
-    }
     Ok(())
 }
 
-/// Resolves once the process should stop accepting new connections: after a
-/// SIGTERM/SIGINT is received, readiness is failed, and the configured
+/// Resolves once the process should stop accepting new connections: after the
+/// shutdown signal is received, readiness is failed, and the configured
 /// readiness propagation delay has passed. Signals `drain_deadline_tx` so the
 /// caller can bound the remaining in-flight drain.
 async fn graceful_shutdown(
@@ -233,8 +257,9 @@ async fn graceful_shutdown(
     readiness_delay: Duration,
     drain_timeout: Duration,
     drain_deadline_tx: tokio::sync::oneshot::Sender<()>,
+    signal: impl std::future::Future<Output = ()>,
 ) {
-    shutdown_signal().await;
+    signal.await;
     readiness.begin_shutdown();
     info!(
         readiness_delay_seconds = readiness_delay.as_secs(),
@@ -2086,6 +2111,102 @@ mod tests {
 
         let response = healthz(State(state)).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Starts `run_until_shutdown` on an ephemeral port with a single `/slow`
+    /// route that sleeps for `handler_delay` before responding. Returns the
+    /// bound address, the shutdown flag readable by the test, a sender that
+    /// triggers shutdown, and the server task handle.
+    async fn spawn_drain_server(
+        handler_delay: Duration,
+        drain_timeout: Duration,
+    ) -> (
+        SocketAddr,
+        Arc<AtomicBool>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<CoreResult<()>>,
+    ) {
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let gate = ReadinessGate(Arc::clone(&shutting_down));
+        let app = Router::new().route(
+            "/slow",
+            get(move || async move {
+                tokio::time::sleep(handler_delay).await;
+                "done"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(run_until_shutdown(
+            listener,
+            app,
+            gate,
+            Duration::ZERO,
+            drain_timeout,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        (addr, shutting_down, shutdown_tx, server)
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_lets_in_flight_request_finish_within_drain_timeout() {
+        let (addr, shutting_down, shutdown_tx, server) =
+            spawn_drain_server(Duration::from_millis(300), Duration::from_secs(5)).await;
+
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{addr}/slow")).await });
+
+        // Let the request reach the handler, then trigger shutdown mid-flight.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .expect("request should finish well before the drain timeout")
+            .unwrap()
+            .expect("in-flight request must not be killed by graceful shutdown");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "done");
+        assert!(shutting_down.load(Ordering::SeqCst));
+
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server should stop promptly once the request drains")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_kills_request_still_in_flight_after_drain_timeout() {
+        let (addr, shutting_down, shutdown_tx, server) =
+            spawn_drain_server(Duration::from_secs(60), Duration::from_millis(200)).await;
+
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{addr}/slow")).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+
+        // The server must exit once the drain timeout elapses, without waiting
+        // for the 60s handler.
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server should force-exit at the drain deadline")
+            .unwrap()
+            .unwrap();
+        assert!(shutting_down.load(Ordering::SeqCst));
+
+        // In production the process exits at this point, cutting the request.
+        // In-process we can only assert the server gave up on it: the request
+        // is still in flight when run_until_shutdown returns.
+        assert!(
+            !request.is_finished(),
+            "request should still be in flight when the server force-exits"
+        );
+        request.abort();
     }
 
     #[tokio::test]
