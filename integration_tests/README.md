@@ -109,9 +109,7 @@ Heavy mode sends `git-cache-use-proxy-on-miss: false` for full-history
 `--filter=blob:none --no-checkout` clones on every configured repo, verifies
 HEAD plus a bounded history walk, and also runs a blobless full checkout for
 `uv` and `ruff`. Add `GIT_CACHE_AWS_DEV_DIRECT_HEAVY_BASELINE=1` to also
-measure the same heavy shapes directly from GitHub for comparison. The first
-dev run findings are summarized in
-[`aws-dev-git-matrix-findings.md`](aws-dev-git-matrix-findings.md).
+measure the same heavy shapes directly from GitHub for comparison.
 
 ## Docker / MinIO object-store tests
 
