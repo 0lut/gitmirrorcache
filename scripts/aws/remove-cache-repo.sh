@@ -36,8 +36,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export ECS_TASK_FAMILY ECS_CONTAINER_NAME GIT_CACHE_REPO
-python3 "$REPO_ROOT/python/aws/remove_cache_repo_ssm_command.py" >"$tmpdir/ssm-parameters.json"
+python3 "$REPO_ROOT/python/aws/ssm_command.py" "$SCRIPT_DIR/ssm/remove-cache-repo.sh" \
+  expected_family="$ECS_TASK_FAMILY" \
+  expected_container="$ECS_CONTAINER_NAME" \
+  repo="$GIT_CACHE_REPO" >"$tmpdir/ssm-parameters.json"
 
 command_id="$(aws_cli ssm send-command \
   --instance-ids "$ECS_INSTANCE_ID" \

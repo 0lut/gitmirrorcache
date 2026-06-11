@@ -31,8 +31,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export ECS_HOST_PORT
-python3 "$REPO_ROOT/python/aws/ecs_host_diagnostics_ssm_command.py" >"$tmpdir/ssm-parameters.json"
+python3 "$REPO_ROOT/python/aws/ssm_command.py" "$SCRIPT_DIR/ssm/ecs-host-diagnostics.sh" \
+  host_port="$ECS_HOST_PORT" >"$tmpdir/ssm-parameters.json"
 
 command_id="$(aws_cli ssm send-command \
   --instance-ids "$ECS_INSTANCE_ID" \

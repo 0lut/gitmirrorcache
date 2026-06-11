@@ -38,8 +38,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export ECS_TASK_FAMILY ECS_CONTAINER_NAME GIT_CACHE_REPO ECS_HOST_PORT
-python3 "$REPO_ROOT/python/aws/api_runtime_diagnostics_ssm_command.py" >"$tmpdir/ssm-parameters.json"
+python3 "$REPO_ROOT/python/aws/ssm_command.py" "$SCRIPT_DIR/ssm/api-runtime-diagnostics.sh" \
+  expected_family="$ECS_TASK_FAMILY" \
+  expected_container="$ECS_CONTAINER_NAME" \
+  repo="${GIT_CACHE_REPO:-}" \
+  host_port="$ECS_HOST_PORT" >"$tmpdir/ssm-parameters.json"
 
 command_id="$(aws_cli ssm send-command \
   --instance-ids "$ECS_INSTANCE_ID" \

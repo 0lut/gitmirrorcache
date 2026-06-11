@@ -1,39 +1,25 @@
-import json
-import os
-import shlex
+# shellcheck shell=sh disable=SC2154
+# Remote AWS-RunShellScript fragment; python/aws/ssm_command.py prepends
+# 'set -euo pipefail' and the shell-quoted variable assignments.
 
-expected_family = shlex.quote(os.environ["ECS_TASK_FAMILY"])
-expected_container = shlex.quote(os.environ["ECS_CONTAINER_NAME"])
-repo = shlex.quote(os.environ.get("GIT_CACHE_REPO", ""))
-host_port = shlex.quote(os.environ["ECS_HOST_PORT"])
-
-script = f"""set -euo pipefail
-expected_family={expected_family}
-expected_container={expected_container}
-repo={repo}
-host_port={host_port}
-
-container_id="$(docker ps \
-  --filter "label=com.amazonaws.ecs.task-definition-family=$expected_family" \
-  --filter "label=com.amazonaws.ecs.container-name=$expected_container" \
-  --format '{{{{.ID}}}}' | head -n1)"
+container_id="$(docker ps   --filter "label=com.amazonaws.ecs.task-definition-family=$expected_family"   --filter "label=com.amazonaws.ecs.container-name=$expected_container"   --format '{{.ID}}' | head -n1)"
 
 if [ -z "$container_id" ]; then
   echo "no running ECS API container found for $expected_family/$expected_container" >&2
-  docker ps -a --format '{{{{.ID}}}} {{{{.Image}}}} {{{{.Names}}}} {{{{.Status}}}}'
+  docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}'
   exit 20
 fi
 
-family="$(docker inspect --format '{{{{ index .Config.Labels "com.amazonaws.ecs.task-definition-family" }}}}' "$container_id")"
-container_name="$(docker inspect --format '{{{{ index .Config.Labels "com.amazonaws.ecs.container-name" }}}}' "$container_id")"
-image="$(docker inspect --format '{{{{ .Config.Image }}}}' "$container_id")"
-running="$(docker inspect --format '{{{{ .State.Running }}}}' "$container_id")"
+family="$(docker inspect --format '{{ index .Config.Labels "com.amazonaws.ecs.task-definition-family" }}' "$container_id")"
+container_name="$(docker inspect --format '{{ index .Config.Labels "com.amazonaws.ecs.container-name" }}' "$container_id")"
+image="$(docker inspect --format '{{ .Config.Image }}' "$container_id")"
+running="$(docker inspect --format '{{ .State.Running }}' "$container_id")"
 
-printf 'container: %s\\n' "$container_id"
-printf 'image: %s\\n' "$image"
-printf 'ecs family: %s\\n' "$family"
-printf 'ecs container: %s\\n' "$container_name"
-printf 'running: %s\\n' "$running"
+printf 'container: %s\n' "$container_id"
+printf 'image: %s\n' "$image"
+printf 'ecs family: %s\n' "$family"
+printf 'ecs container: %s\n' "$container_name"
+printf 'running: %s\n' "$running"
 
 if [ "$family" != "$expected_family" ]; then
   echo "refusing diagnostics: expected ECS task family $expected_family, got $family" >&2
@@ -51,7 +37,7 @@ df -i /cache || true
 du -sh /cache /cache/* 2>/dev/null | sort -h || true
 echo
 echo '--- cache tree top levels ---'
-find /cache -maxdepth 2 -mindepth 1 -type d -printf '%p\\n' 2>/dev/null | sort | head -120 || true
+find /cache -maxdepth 2 -mindepth 1 -type d -printf '%p\n' 2>/dev/null | sort | head -120 || true
 echo
 echo '--- largest cache directories ---'
 du -xh --max-depth=2 /cache 2>/dev/null | sort -h | tail -40 || true
@@ -78,26 +64,23 @@ docker top "$container_id" -eo pid,ppid,stat,etime,pcpu,pmem,args || true
 
 echo
 echo '--- recent cache repo sizes ---'
-find /cache/repos /cache/tmp -mindepth 3 -maxdepth 4 -type d -name '*.git' -printf '%T@ %p\\n' 2>/dev/null \\
-  | sort -nr \\
-  | head -20 \\
+find /cache/repos /cache/tmp -mindepth 3 -maxdepth 4 -type d -name '*.git' -printf '%T@ %p\n' 2>/dev/null \
+  | sort -nr \
+  | head -20 \
   | while read -r _ path; do du -sh "$path" 2>/dev/null || true; done
 
 if [ -n "$repo" ]; then
-  repo_dir="/cache/repos/${{repo}}.git"
+  repo_dir="/cache/repos/${repo}.git"
   echo
-  printf '%s\\n' "--- repo diagnostics: $repo ---"
+  printf '%s\n' "--- repo diagnostics: $repo ---"
   if [ -d "$repo_dir" ]; then
     du -sh "$repo_dir" || true
-    find "$repo_dir" -maxdepth 2 -type f -printf '%p %s\\n' 2>/dev/null | sort | head -80 || true
+    find "$repo_dir" -maxdepth 2 -type f -printf '%p %s\n' 2>/dev/null | sort | head -80 || true
     docker exec "$container_id" git -C "$repo_dir" status --short --branch || true
     docker exec "$container_id" git -C "$repo_dir" count-objects -vH || true
     docker exec "$container_id" git -C "$repo_dir" show-ref --heads | head -20 || true
     docker exec "$container_id" git -C "$repo_dir" for-each-ref --count=20 --sort=-committerdate --format='%(refname) %(objectname)' refs/heads refs/cache 2>/dev/null || true
   else
-    printf 'repo dir not found: %s\\n' "$repo_dir"
+    printf 'repo dir not found: %s\n' "$repo_dir"
   fi
 fi
-"""
-
-json.dump({"commands": [script]}, open("/dev/stdout", "w"))
