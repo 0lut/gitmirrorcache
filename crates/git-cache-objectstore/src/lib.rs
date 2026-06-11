@@ -13,7 +13,7 @@ use std::path::{Component, Path};
 pub use local::LocalObjectStore;
 pub use manifests::{
     commit_manifest_key, generation_manifest_key, generation_manifest_prefix, pack_key,
-    read_commit_manifest, read_generation_manifest, read_json, read_ref_manifest,
+    pack_prefix, read_commit_manifest, read_generation_manifest, read_json, read_ref_manifest,
     read_repo_generation_head, read_repo_generation_head_versioned, ref_manifest_key,
     repo_generation_head_key, write_commit_manifest, write_commit_manifest_if_absent_or_matches,
     write_generation_manifest, write_generation_manifest_if_absent_or_matches, write_json,

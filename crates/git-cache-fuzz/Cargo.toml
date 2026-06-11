@@ -1,0 +1,21 @@
+[package]
+name = "git-cache-fuzz"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+fastrand = "2"
+
+[dev-dependencies]
+async-trait.workspace = true
+futures.workspace = true
+git-cache-core = { path = "../git-cache-core" }
+git-cache-disk = { path = "../git-cache-disk" }
+git-cache-domain = { path = "../git-cache-domain" }
+git-cache-worker = { path = "../git-cache-worker" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

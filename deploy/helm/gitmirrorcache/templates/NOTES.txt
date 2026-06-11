@@ -1,0 +1,20 @@
+gitmirrorcache has been deployed.
+
+Service endpoint (in-cluster):
+  http://{{ include "gitmirrorcache.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+Quick checks:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "gitmirrorcache.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://localhost:8080/healthz
+
+{{- if .Values.config.gitRemote.enabled }}
+
+Clone through the cache:
+  git clone http://localhost:8080/git/github.com/<owner>/<repo>.git
+{{- end }}
+{{- if and (eq .Values.config.objectStore.kind "s3") (not .Values.aws.existingSecret) }}
+
+NOTE: objectStore.kind is "s3" and no aws.existingSecret was provided.
+Make sure pods can reach S3 via IRSA/pod identity (serviceAccount.annotations)
+or node instance roles.
+{{- end }}

@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub git_remote: GitRemoteConfig,
     #[serde(default)]
     pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
     #[serde(default = "default_max_concurrent_git_processes")]
     pub max_concurrent_git_processes: usize,
     #[serde(default = "default_async_materialize_concurrency")]
@@ -89,6 +91,10 @@ impl AppConfig {
             disk: DiskConfig {
                 quota_bytes: parse_env("GIT_CACHE_DISK_QUOTA_BYTES", 10 * 1024 * 1024 * 1024)?,
                 min_free_bytes: parse_env("GIT_CACHE_DISK_MIN_FREE_BYTES", 1024 * 1024 * 1024)?,
+                access_flush_interval_secs: parse_env(
+                    "GIT_CACHE_DISK_ACCESS_FLUSH_SECS",
+                    default_disk_access_flush_secs(),
+                )?,
             },
             git_remote: GitRemoteConfig {
                 enabled: parse_bool_env("GIT_CACHE_GIT_REMOTE_ENABLED", true)?,
@@ -112,6 +118,20 @@ impl AppConfig {
                     default_compaction_threshold(),
                 )?,
                 inline: parse_bool_env("GIT_CACHE_COMPACTION_INLINE", false)?,
+                retention_secs: parse_env(
+                    "GIT_CACHE_COMPACTION_RETENTION_SECS",
+                    default_compaction_retention_secs(),
+                )?,
+            },
+            shutdown: ShutdownConfig {
+                readiness_delay_seconds: parse_env(
+                    "GIT_CACHE_SHUTDOWN_READINESS_DELAY_SECONDS",
+                    default_shutdown_readiness_delay_seconds(),
+                )?,
+                drain_timeout_seconds: parse_env(
+                    "GIT_CACHE_SHUTDOWN_DRAIN_TIMEOUT_SECONDS",
+                    default_shutdown_drain_timeout_seconds(),
+                )?,
             },
             max_concurrent_git_processes: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
@@ -186,6 +206,14 @@ pub enum ObjectStoreConfig {
 pub struct DiskConfig {
     pub quota_bytes: u64,
     pub min_free_bytes: u64,
+    /// How often buffered repo-access timestamps are flushed from memory to
+    /// the on-disk repo index.
+    #[serde(default = "default_disk_access_flush_secs")]
+    pub access_flush_interval_secs: u64,
+}
+
+fn default_disk_access_flush_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +222,10 @@ pub struct CompactionConfig {
     pub chain_depth_threshold: u32,
     #[serde(default)]
     pub inline: bool,
+    /// How long a superseded generation is kept before the retention sweep
+    /// may delete it, measured from its successor's `created_at`.
+    #[serde(default = "default_compaction_retention_secs")]
+    pub retention_secs: u64,
 }
 
 impl Default for CompactionConfig {
@@ -201,12 +233,39 @@ impl Default for CompactionConfig {
         Self {
             chain_depth_threshold: default_compaction_threshold(),
             inline: false,
+            retention_secs: default_compaction_retention_secs(),
+        }
+    }
+}
+
+/// Graceful shutdown behavior for the API server. On SIGTERM/SIGINT the
+/// server first fails readiness (`/healthz` returns 503) for
+/// `readiness_delay_seconds` so load balancers stop routing new traffic,
+/// then stops accepting connections and drains in-flight requests for up to
+/// `drain_timeout_seconds` before exiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownConfig {
+    #[serde(default = "default_shutdown_readiness_delay_seconds")]
+    pub readiness_delay_seconds: u64,
+    #[serde(default = "default_shutdown_drain_timeout_seconds")]
+    pub drain_timeout_seconds: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            readiness_delay_seconds: default_shutdown_readiness_delay_seconds(),
+            drain_timeout_seconds: default_shutdown_drain_timeout_seconds(),
         }
     }
 }
 
 fn default_compaction_threshold() -> u32 {
     10
+}
+
+fn default_compaction_retention_secs() -> u64 {
+    24 * 60 * 60
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +335,14 @@ pub fn default_async_materialize_concurrency() -> usize {
 
 pub fn default_use_gitoxide() -> bool {
     true
+}
+
+fn default_shutdown_readiness_delay_seconds() -> u64 {
+    5
+}
+
+fn default_shutdown_drain_timeout_seconds() -> u64 {
+    60
 }
 
 fn parse_env<T: std::str::FromStr>(name: &str, default: T) -> crate::Result<T>
@@ -458,6 +525,7 @@ min_free_bytes = 100000
         let config = CompactionConfig::default();
         assert_eq!(config.chain_depth_threshold, 10);
         assert!(!config.inline);
+        assert_eq!(config.retention_secs, 24 * 60 * 60);
     }
 
     #[test]
@@ -501,6 +569,7 @@ min_free_bytes = 100000
             ("GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT", "off"),
             ("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "4"),
             ("GIT_CACHE_COMPACTION_INLINE", "yes"),
+            ("GIT_CACHE_COMPACTION_RETENTION_SECS", "3600"),
         ]);
 
         let config = AppConfig::from_env().unwrap();
@@ -517,6 +586,7 @@ min_free_bytes = 100000
         assert!(!config.git_remote.proxy_tee_import);
         assert_eq!(config.compaction.chain_depth_threshold, 4);
         assert!(config.compaction.inline);
+        assert_eq!(config.compaction.retention_secs, 3600);
 
         match config.object_store {
             ObjectStoreConfig::S3 {

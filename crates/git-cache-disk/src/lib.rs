@@ -20,13 +20,13 @@ pub struct DiskManager {
     quota_bytes: u64,
     min_free_bytes: u64,
     state: Arc<Mutex<DiskState>>,
+    pending_accesses: Arc<Mutex<HashMap<PathBuf, u64>>>,
 }
 
 #[derive(Debug, Default)]
 struct DiskState {
     active_reservations: HashMap<Uuid, ReservationMarker>,
     repo_locks: HashMap<PathBuf, usize>,
-    invalidating_repos: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -101,6 +101,7 @@ impl DiskManager {
             quota_bytes,
             min_free_bytes,
             state: Arc::new(Mutex::new(DiskState::default())),
+            pending_accesses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -219,6 +220,86 @@ impl DiskManager {
         Ok(entry)
     }
 
+    /// Record a repo access in memory only. The timestamp is applied to the
+    /// persistent index by the next [`DiskManager::flush_repo_accesses`] call,
+    /// and is consulted by eviction in the meantime so recently accessed repos
+    /// are not selected as LRU victims before a flush happens.
+    pub fn note_repo_access(&self, repo_path: impl AsRef<Path>) -> Result<()> {
+        let repo_path = normalize_repo_path(&self.repos_dir(), repo_path.as_ref())?;
+        let mut pending = self
+            .pending_accesses
+            .lock()
+            .map_err(|_| GitCacheError::Internal("pending accesses mutex poisoned".into()))?;
+        pending.insert(repo_path, now_unix_millis());
+        Ok(())
+    }
+
+    /// Apply buffered in-memory access timestamps to the persistent repo
+    /// index in a single write. Returns the number of entries applied.
+    ///
+    /// The pending-accesses mutex is held only to take the buffered map, and
+    /// the buffer lives behind its own lock, so concurrent
+    /// [`DiskManager::note_repo_access`] calls never contend with index I/O.
+    /// On I/O failure the taken entries are merged back into the pending map
+    /// so the next flush retries them.
+    pub fn flush_repo_accesses(&self) -> Result<usize> {
+        self.ensure_layout()?;
+
+        let pending = {
+            let mut pending = self
+                .pending_accesses
+                .lock()
+                .map_err(|_| GitCacheError::Internal("pending accesses mutex poisoned".into()))?;
+            std::mem::take(&mut *pending)
+        };
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let result = self.apply_pending_accesses(&pending);
+        if result.is_err() {
+            if let Ok(mut current) = self.pending_accesses.lock() {
+                for (repo_path, accessed_at) in pending {
+                    let entry = current.entry(repo_path).or_insert(0);
+                    *entry = (*entry).max(accessed_at);
+                }
+            }
+        }
+        result
+    }
+
+    /// Index reads/writes elsewhere are serialized under the state mutex, so
+    /// hold it here too while rewriting the index.
+    fn apply_pending_accesses(&self, pending: &HashMap<PathBuf, u64>) -> Result<usize> {
+        let _state = self
+            .state
+            .lock()
+            .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
+        let mut index = self.load_index()?;
+        let mut applied = 0usize;
+        for (repo_path, accessed_at) in pending {
+            if let Some(entry) = index.repos.get_mut(repo_path) {
+                entry.last_accessed_unix_millis = entry.last_accessed_unix_millis.max(*accessed_at);
+                applied += 1;
+                continue;
+            }
+            let repo_dir = self.repo_dir(repo_path);
+            if !repo_dir.exists() {
+                continue;
+            }
+            let entry = RepoIndexEntry {
+                path: repo_path.clone(),
+                size_bytes: directory_size(&repo_dir)?,
+                last_accessed_unix_millis: *accessed_at,
+                protected: false,
+            };
+            index.repos.insert(repo_path.clone(), entry);
+            applied += 1;
+        }
+        self.write_index(&index)?;
+        Ok(applied)
+    }
+
     pub fn touch_repo_access(&self, repo_path: impl AsRef<Path>) -> Result<RepoIndexEntry> {
         self.ensure_layout()?;
 
@@ -280,55 +361,46 @@ impl DiskManager {
         Ok(entry)
     }
 
+    /// Invalidate a cached repo. The repo directory is atomically renamed into
+    /// the tmp area and the index entry removed while holding the state lock,
+    /// so the repo is unavailable only for the duration of a rename; the slow
+    /// recursive delete then runs outside any lock. Until that delete
+    /// completes the moved directory still counts against the quota (usage is
+    /// measured over the whole cache root, including tmp), so reservations
+    /// cannot over-allocate. If the delete fails the directory is collected
+    /// later by [`DiskManager::cleanup_stale_temps`].
     pub fn invalidate_repo(&self, repo_path: impl AsRef<Path>) -> Result<()> {
         self.ensure_layout()?;
 
         let repo_path = normalize_repo_path(&self.repos_dir(), repo_path.as_ref())?;
+        let trash_dir = self.temp_dir_for(Uuid::new_v4());
         {
-            let mut state = self
+            let state = self
                 .state
                 .lock()
                 .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
-            if state.repo_locks.contains_key(&repo_path)
-                || state.invalidating_repos.contains(&repo_path)
-            {
+            if state.repo_locks.contains_key(&repo_path) {
                 return Err(GitCacheError::Conflict(format!(
                     "repo `{}` is currently locked",
                     repo_path.display()
                 )));
             }
-            state.invalidating_repos.insert(repo_path.clone());
-        }
-
-        let result = (|| {
             let repo_dir = self.repo_dir(&repo_path);
             if repo_dir.exists() {
-                fs::remove_dir_all(&repo_dir)?;
+                fs::rename(&repo_dir, &trash_dir)?;
             }
-            Ok(())
-        })();
-
-        let cleanup_result = self
-            .state
-            .lock()
-            .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))
-            .and_then(|mut state| {
-                let index_result = if result.is_ok() {
-                    let mut index = self.load_index()?;
-                    index.repos.remove(&repo_path);
-                    self.write_index(&index)
-                } else {
-                    Ok(())
-                };
-                state.invalidating_repos.remove(&repo_path);
-                index_result
-            });
-
-        match (result, cleanup_result) {
-            (Err(err), _) => Err(err),
-            (Ok(()), Err(err)) => Err(err),
-            (Ok(()), Ok(())) => Ok(()),
+            let mut index = self.load_index()?;
+            index.repos.remove(&repo_path);
+            self.write_index(&index)?;
+            if let Ok(mut pending) = self.pending_accesses.lock() {
+                pending.remove(&repo_path);
+            }
         }
+
+        if trash_dir.exists() {
+            fs::remove_dir_all(&trash_dir)?;
+        }
+        Ok(())
     }
 
     pub fn lock_repo(&self, repo_path: impl AsRef<Path>) -> Result<RepoLock> {
@@ -339,12 +411,6 @@ impl DiskManager {
             .state
             .lock()
             .map_err(|_| GitCacheError::Internal("disk manager mutex poisoned".into()))?;
-        if state.invalidating_repos.contains(&repo_path) {
-            return Err(GitCacheError::Conflict(format!(
-                "repo `{}` is currently being invalidated",
-                repo_path.display()
-            )));
-        }
         *state.repo_locks.entry(repo_path.clone()).or_insert(0) += 1;
 
         Ok(RepoLock {
@@ -522,6 +588,18 @@ impl DiskManager {
 
     fn evict_until_available_locked(&self, bytes: u64, state: &DiskState) -> Result<()> {
         let mut index = self.sync_repo_index_locked()?;
+        {
+            let pending = self
+                .pending_accesses
+                .lock()
+                .map_err(|_| GitCacheError::Internal("pending accesses mutex poisoned".into()))?;
+            for (repo_path, accessed_at) in pending.iter() {
+                if let Some(entry) = index.repos.get_mut(repo_path) {
+                    entry.last_accessed_unix_millis =
+                        entry.last_accessed_unix_millis.max(*accessed_at);
+                }
+            }
+        }
 
         loop {
             let accounting = self.accounting_locked(state)?;
@@ -534,9 +612,7 @@ impl DiskManager {
                 return Ok(());
             }
 
-            let Some(victim) =
-                lru_evictable_repo(&index, &state.repo_locks, &state.invalidating_repos)
-            else {
+            let Some(victim) = lru_evictable_repo(&index, &state.repo_locks) else {
                 return Err(disk_full_error(
                     bytes,
                     accounting.used_bytes,
@@ -727,19 +803,11 @@ fn discover_repos(repos_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(repos)
 }
 
-fn lru_evictable_repo(
-    index: &RepoIndex,
-    locks: &HashMap<PathBuf, usize>,
-    invalidating_repos: &HashSet<PathBuf>,
-) -> Option<PathBuf> {
+fn lru_evictable_repo(index: &RepoIndex, locks: &HashMap<PathBuf, usize>) -> Option<PathBuf> {
     index
         .repos
         .values()
-        .filter(|entry| {
-            !entry.protected
-                && !locks.contains_key(&entry.path)
-                && !invalidating_repos.contains(&entry.path)
-        })
+        .filter(|entry| !entry.protected && !locks.contains_key(&entry.path))
         .min_by_key(|entry| entry.last_accessed_unix_millis)
         .map(|entry| entry.path.clone())
 }
@@ -912,6 +980,91 @@ mod tests {
         assert!(!manager.repos_dir().join("old.git").exists());
         assert!(manager.repos_dir().join("new.git").exists());
         assert_eq!(reservation.bytes(), 300);
+    }
+
+    #[test]
+    fn note_repo_access_is_invisible_until_flush_then_persisted() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "repo.git", 10);
+        manager.record_repo_access("repo.git").expect("record");
+        let before = manager.repo_index().expect("index").repos[Path::new("repo.git")]
+            .last_accessed_unix_millis;
+
+        std::thread::sleep(Duration::from_millis(2));
+        manager.note_repo_access("repo.git").expect("note");
+        let unflushed = manager.repo_index().expect("index").repos[Path::new("repo.git")]
+            .last_accessed_unix_millis;
+        assert_eq!(unflushed, before);
+
+        assert_eq!(manager.flush_repo_accesses().expect("flush"), 1);
+        let flushed = manager.repo_index().expect("index").repos[Path::new("repo.git")]
+            .last_accessed_unix_millis;
+        assert!(flushed > before);
+
+        // A second flush with nothing pending is a no-op.
+        assert_eq!(manager.flush_repo_accesses().expect("flush"), 0);
+
+        // The flushed timestamp survives a fresh manager (process restart).
+        let reopened = DiskManager::new(root.path(), 10_000, 0);
+        let restarted = reopened.repo_index().expect("index").repos[Path::new("repo.git")]
+            .last_accessed_unix_millis;
+        assert_eq!(restarted, flushed);
+    }
+
+    #[test]
+    fn flush_indexes_unknown_repo_dir_and_skips_missing_dirs() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "present.git", 10);
+
+        manager.note_repo_access("present.git").expect("note");
+        manager.note_repo_access("missing.git").expect("note");
+
+        assert_eq!(manager.flush_repo_accesses().expect("flush"), 1);
+        let index = manager.repo_index().expect("index");
+        assert!(index.repos.contains_key(Path::new("present.git")));
+        assert!(!index.repos.contains_key(Path::new("missing.git")));
+    }
+
+    #[test]
+    fn eviction_consults_pending_accesses_before_picking_victim() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 900, 0);
+        write_repo_file(&manager, "a.git", 300);
+        write_repo_file(&manager, "b.git", 500);
+
+        manager.record_repo_access("a.git").expect("a access");
+        std::thread::sleep(Duration::from_millis(2));
+        manager.record_repo_access("b.git").expect("b access");
+
+        // `a` is the persisted LRU victim, but an unflushed access makes it
+        // the most recently used; eviction must pick `b` instead.
+        std::thread::sleep(Duration::from_millis(2));
+        manager.note_repo_access("a.git").expect("note");
+
+        manager.reserve(300).expect("reservation");
+
+        assert!(manager.repos_dir().join("a.git").exists());
+        assert!(!manager.repos_dir().join("b.git").exists());
+    }
+
+    #[test]
+    fn invalidate_repo_drops_pending_access() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "repo.git", 10);
+        manager.record_repo_access("repo.git").expect("record");
+        manager.note_repo_access("repo.git").expect("note");
+
+        manager.invalidate_repo("repo.git").expect("invalidate");
+
+        assert_eq!(manager.flush_repo_accesses().expect("flush"), 0);
+        assert!(!manager
+            .repo_index()
+            .expect("index")
+            .repos
+            .contains_key(Path::new("repo.git")));
     }
 
     #[test]
@@ -1182,6 +1335,37 @@ mod tests {
 
         assert!(matches!(err, GitCacheError::Conflict(_)));
         assert!(manager.repos_dir().join("locked.git").exists());
+    }
+
+    #[test]
+    fn invalidate_repo_leaves_repo_immediately_lockable() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 10_000, 0);
+        write_repo_file(&manager, "stale.git", 10);
+        manager.record_repo_access("stale.git").expect("access");
+
+        manager.invalidate_repo("stale.git").expect("invalidate");
+
+        let _lock = manager
+            .lock_repo("stale.git")
+            .expect("repo must be lockable right after invalidation");
+    }
+
+    #[test]
+    fn pending_delete_temp_dirs_count_against_quota() {
+        let root = tempdir().expect("tempdir");
+        let manager = DiskManager::new(root.path(), 100, 0);
+        manager.ensure_layout().expect("layout");
+        let trash = manager.temp_dir_for(Uuid::new_v4());
+        fs::create_dir_all(&trash).expect("trash dir");
+        fs::write(trash.join("pack"), vec![0u8; 80]).expect("trash payload");
+
+        let status = manager.status().expect("status");
+        assert!(status.used_bytes >= 80);
+        let err = manager
+            .reserve(50)
+            .expect_err("reserve must account for pending-delete bytes");
+        assert!(matches!(err, GitCacheError::DiskFull(_)));
     }
 
     #[test]

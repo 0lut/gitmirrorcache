@@ -1,0 +1,11 @@
+{{- if .Values.configFile -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gitmirrorcache.fullname" . }}
+  labels:
+    {{- include "gitmirrorcache.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    {{- .Values.configFile | nindent 4 }}
+{{- end }}
