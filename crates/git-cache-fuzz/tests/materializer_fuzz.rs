@@ -50,6 +50,7 @@ impl Fixture {
                 // Small quota keeps LRU eviction racing materialization.
                 quota_bytes: 256 * 1024 * 1024,
                 min_free_bytes: 0,
+                access_flush_interval_secs: 60,
             },
             git_remote: Default::default(),
             compaction: Default::default(),
