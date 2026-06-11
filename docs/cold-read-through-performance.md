@@ -1,8 +1,8 @@
 # Cold Read-Through Performance
 
-Benchmarks against the AWS dev stack (see PR #82, `git_matrix` findings)
-showed that cold full-history clones through the cache's read-through path
-are much slower than cloning GitHub directly:
+Benchmarks against the AWS dev stack (see PR #82) showed that cold
+full-history clones through the cache's read-through path are much slower
+than cloning GitHub directly:
 
 | repo  | direct GitHub | AWS cold read-through (proxy off) |
 |-------|---------------|-----------------------------------|

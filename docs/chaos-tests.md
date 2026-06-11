@@ -6,7 +6,7 @@ Automated tests currently cover the key local chaos cases:
 - branch selector failure when upstream is unavailable
 - default branch selector resolution
 - branch force-push updating the branch manifest while retaining the old commit manifest
-- local bundle hydration after deleting the local hot repo
+- local generation hydration after deleting the local hot repo
 - disk reservation failure and LRU eviction behavior
 - locked/protected repos skipped during eviction
 - stale temp and reservation marker cleanup
@@ -17,7 +17,7 @@ Useful manual drills:
 
 ```sh
 cargo test --workspace
-cargo test -p git-cache-api cached_exact_commit_survives_upstream_offline
+cargo test -p git-cache-domain cached_exact_commit_requires_repo_access_when_upstream_is_offline
 cargo test -p git-cache-disk reserve_evicts_unlocked_lru_repo_until_it_fits
 cargo test -p git-cache-worker dedupes_concurrent_updates_for_same_repo_and_ref
 ```
