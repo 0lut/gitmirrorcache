@@ -116,26 +116,7 @@ listener_rule_arn_by_destroy_path_pattern() {
   rules_json="$(aws_cli elbv2 describe-rules \
     --listener-arn "$listener_arn" \
     --output json 2>/dev/null || true)"
-  RULES_JSON="$rules_json" python3 - "$path_pattern" <<'PY'
-import json
-import os
-import sys
-
-path_pattern = sys.argv[1]
-try:
-    rules = json.loads(os.environ.get("RULES_JSON") or "{}").get("Rules", [])
-except json.JSONDecodeError:
-    rules = []
-for rule in rules:
-    for condition in rule.get("Conditions", []):
-        if condition.get("Field") != "path-pattern":
-            continue
-        values = condition.get("Values") or condition.get("PathPatternConfig", {}).get("Values", [])
-        if path_pattern in values:
-            print(rule["RuleArn"])
-            raise SystemExit(0)
-print("None")
-PY
+  RULES_JSON="$rules_json" python3 "$REPO_ROOT/python/aws/destroy_preview_listener_rule.py" "$path_pattern"
 }
 
 delete_shared_listener_rule() {
