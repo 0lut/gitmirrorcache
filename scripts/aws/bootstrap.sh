@@ -8,9 +8,14 @@ init_aws_context
 require_cmd python3
 
 BOOTSTRAP_FAST_EXISTING="${BOOTSTRAP_FAST_EXISTING:-false}"
+BOOTSTRAP_SKIP_ECR="${BOOTSTRAP_SKIP_ECR:-false}"
 case "$BOOTSTRAP_FAST_EXISTING" in
   true | false) ;;
   *) die "BOOTSTRAP_FAST_EXISTING must be true or false" ;;
+esac
+case "$BOOTSTRAP_SKIP_ECR" in
+  true | false) ;;
+  *) die "BOOTSTRAP_SKIP_ECR must be true or false" ;;
 esac
 
 tmpdir="$(mktemp -d)"
@@ -83,11 +88,16 @@ ensure_ecr_repository() {
 }
 
 ensure_bucket
-ensure_ecr_repository
+if [[ "$BOOTSTRAP_SKIP_ECR" == "true" ]]; then
+  printf 'skipping ECR repository because BOOTSTRAP_SKIP_ECR=true\n'
+else
+  ensure_ecr_repository
+fi
 
 cat <<EOF
 AWS bootstrap complete.
 S3_BUCKET=$S3_BUCKET
 S3_PREFIX=$S3_PREFIX
 ECR_REPOSITORY_URI=$ECR_REPOSITORY_URI
+BOOTSTRAP_SKIP_ECR=$BOOTSTRAP_SKIP_ECR
 EOF

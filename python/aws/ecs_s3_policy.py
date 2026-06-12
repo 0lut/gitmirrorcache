@@ -12,8 +12,6 @@ list_statement = {
     "Action": ["s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketMultipartUploads"],
     "Resource": bucket_arn,
 }
-if prefix:
-    list_statement["Condition"] = {"StringLike": {"s3:prefix": [prefix, f"{prefix}/*"]}}
 policy = {
     "Version": "2012-10-17",
     "Statement": [

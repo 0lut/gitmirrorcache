@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy Cloudflare Front Door"
+  short_description: "Deploy gitcache.sh static Worker front door"
+  default_prompt: "Deploy or update the gitcache.sh Cloudflare Worker/static landing page and verify /git proxying."

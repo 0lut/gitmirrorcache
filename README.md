@@ -204,6 +204,22 @@ Preview stacks for any branch, tag, or commit can be deployed behind a shared
 ALB with `scripts/aws/deploy-preview.sh`. See
 [docs/deployment.md](docs/deployment.md).
 
+The production target pulls the latest published GHCR image for this repository
+and skips local Docker/ECR image builds:
+
+```sh
+AWS_REGION=us-west-2 scripts/aws/deploy-prod.sh
+```
+
+The Cloudflare static front door serves the landing page at `gitcache.sh` and
+proxies `/git/*` plus API paths to the production ALB, so public clones use the
+apex hostname:
+
+```sh
+AWS_REGION=us-west-2 scripts/cloudflare/deploy-static-site.sh
+git clone https://gitcache.sh/git/github.com/org/repo.git
+```
+
 ### Docker
 
 Prebuilt multi-arch images are published to `ghcr.io/0lut/gitmirrorcache` on
