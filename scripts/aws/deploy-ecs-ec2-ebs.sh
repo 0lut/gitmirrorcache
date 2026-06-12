@@ -51,9 +51,10 @@ ECS_LOG_GROUP="${ECS_LOG_GROUP:-/ecs/$NAME_PREFIX/ec2-api}"
 ECS_CPU="${ECS_CPU:-8192}"
 ECS_MEMORY="${ECS_MEMORY:-24576}"
 ECS_DESIRED_COUNT="${ECS_DESIRED_COUNT:-1}"
-ECS_EC2_INSTANCE_TYPE="${ECS_EC2_INSTANCE_TYPE:-m8g.2xlarge}"
+ECS_EC2_INSTANCE_TYPE="${ECS_EC2_INSTANCE_TYPE:-m9gd.2xlarge}"
 ECS_PRECHECK_VCPU_QUOTA="${ECS_PRECHECK_VCPU_QUOTA:-false}"
 ECS_CPU_ARCHITECTURE="${ECS_CPU_ARCHITECTURE:-ARM64}"
+ECS_CACHE_VOLUME_KIND="${ECS_CACHE_VOLUME_KIND:-instance-store}"
 ECS_EBS_SIZE_GIB="${ECS_EBS_SIZE_GIB:-128}"
 ECS_EBS_VOLUME_TYPE="${ECS_EBS_VOLUME_TYPE:-gp3}"
 ECS_EBS_IOPS="${ECS_EBS_IOPS:-8000}"
@@ -83,6 +84,11 @@ DEFAULT_AL2023_ARM64_ECS_AMI_ID="ami-0ac01d3c8b7a34f9d"
 case "$ECS_EBS_DELETE_ON_TERMINATION" in
   true | false) ;;
   *) die "ECS_EBS_DELETE_ON_TERMINATION must be true or false" ;;
+esac
+
+case "$ECS_CACHE_VOLUME_KIND" in
+  ebs | instance-store) ;;
+  *) die "ECS_CACHE_VOLUME_KIND must be ebs or instance-store" ;;
 esac
 
 case "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" in
@@ -160,8 +166,27 @@ runtime_s3_prefix() {
 
 S3_RUNTIME_PREFIX="${S3_RUNTIME_PREFIX:-$(runtime_s3_prefix "$S3_PREFIX")}"
 
+default_instance_store_quota_bytes() {
+  local total_size_gb
+  total_size_gb="$(aws_cli ec2 describe-instance-types \
+    --instance-types "$ECS_EC2_INSTANCE_TYPE" \
+    --query 'InstanceTypes[0].InstanceStorageInfo.TotalSizeInGB' \
+    --output text)"
+  [[ "$total_size_gb" =~ ^[0-9]+$ && "$total_size_gb" -gt 0 ]] || die "$ECS_EC2_INSTANCE_TYPE does not expose EC2 instance store"
+
+  # EC2 reports instance store capacity in decimal GB. Leave headroom for ext4
+  # metadata, Git pack work files, and disk guard hysteresis.
+  printf '%s\n' "$((total_size_gb * 1000 * 1000 * 1000 * 90 / 100))"
+}
+
 GIT_CACHE_DISK_MIN_FREE_BYTES="${GIT_CACHE_DISK_MIN_FREE_BYTES:-10737418240}"
-GIT_CACHE_DISK_QUOTA_BYTES="${GIT_CACHE_DISK_QUOTA_BYTES:-$((ECS_EBS_SIZE_GIB * 1024 * 1024 * 1024))}"
+if [[ -z "${GIT_CACHE_DISK_QUOTA_BYTES:-}" ]]; then
+  if [[ "$ECS_CACHE_VOLUME_KIND" == "instance-store" ]]; then
+    GIT_CACHE_DISK_QUOTA_BYTES="$(default_instance_store_quota_bytes)"
+  else
+    GIT_CACHE_DISK_QUOTA_BYTES="$((ECS_EBS_SIZE_GIB * 1024 * 1024 * 1024))"
+  fi
+fi
 if ((GIT_CACHE_DISK_QUOTA_BYTES < 0)); then
   GIT_CACHE_DISK_QUOTA_BYTES=0
 fi
@@ -175,6 +200,7 @@ export ECS_ALB_NAME ECS_TARGET_GROUP_NAME ECS_ALB_SG_NAME ECS_TASK_SG_NAME ECS_L
 export ECS_EXECUTION_ROLE_NAME ECS_TASK_ROLE_NAME ECS_INSTANCE_ROLE_NAME ECS_INSTANCE_PROFILE_NAME
 export ECS_INSTANCE_NAME ECS_CPU ECS_MEMORY ECS_DESIRED_COUNT ECS_EC2_INSTANCE_TYPE ECS_CPU_ARCHITECTURE
 export ECS_PRECHECK_VCPU_QUOTA
+export ECS_CACHE_VOLUME_KIND
 export ECS_EBS_SIZE_GIB ECS_EBS_VOLUME_TYPE ECS_EBS_IOPS ECS_EBS_THROUGHPUT ECS_EBS_DEVICE_NAME
 export ECS_EBS_DELETE_ON_TERMINATION
 export IMAGE_URI S3_RUNTIME_PREFIX GIT_CACHE_DISK_MIN_FREE_BYTES GIT_CACHE_DISK_QUOTA_BYTES
@@ -658,27 +684,49 @@ ECS_ENABLE_TASK_IAM_ROLE=true
 ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true
 ECSCONF
 
+cache_volume_kind="$ECS_CACHE_VOLUME_KIND"
 device=""
-for candidate in /dev/nvme1n1 /dev/xvdf /dev/sdf $ECS_EBS_DEVICE_NAME; do
-  if [ -b "\$candidate" ]; then
-    device="\$candidate"
-    break
-  fi
-done
-for _ in \$(seq 1 120); do
-  if [ -n "\$device" ] && [ -b "\$device" ]; then
-    break
-  fi
+find_instance_store_device() {
+  local candidate resolved
+  for candidate in /dev/disk/by-id/nvme-Amazon_EC2_NVMe_Instance_Storage_* /dev/nvme*n1; do
+    if [ ! -e "\$candidate" ]; then
+      continue
+    fi
+    resolved="\$(readlink -f "\$candidate")"
+    if [ ! -b "\$resolved" ]; then
+      continue
+    fi
+    if lsblk -nr -o MOUNTPOINT "\$resolved" | grep -qx '/'; then
+      continue
+    fi
+    device="\$resolved"
+    return 0
+  done
+  return 1
+}
+
+find_ebs_device() {
+  local candidate
   for candidate in /dev/nvme1n1 /dev/xvdf /dev/sdf $ECS_EBS_DEVICE_NAME; do
     if [ -b "\$candidate" ]; then
       device="\$candidate"
-      break
+      return 0
     fi
   done
+  return 1
+}
+
+for _ in \$(seq 1 120); do
+  if [ "\$cache_volume_kind" = "instance-store" ]; then
+    find_instance_store_device || true
+  else
+    find_ebs_device || true
+  fi
+  [ -n "\$device" ] && [ -b "\$device" ] && break
   sleep 1
 done
 if [ -z "\$device" ]; then
-  echo "cache EBS device not found" >&2
+  echo "cache \$cache_volume_kind device not found" >&2
   exit 1
 fi
 
@@ -708,13 +756,26 @@ instance_id_by_name() {
 ensure_container_instance() {
   local subnet_id="$1"
   local instance_sg_id="$2"
-  local instance_id state ami_id
+  local instance_id state ami_id current_instance_type
 
   instance_id="$(instance_id_by_name)"
   if [[ "$instance_id" == "None" || -z "$instance_id" ]]; then
     ami_id="$(ecs_optimized_ami_id)"
     write_instance_user_data
-    cat >"$tmpdir/block-device-mappings.json" <<EOF
+    local run_args tag_specs
+    run_args=(
+      --image-id "$ami_id"
+      --instance-type "$ECS_EC2_INSTANCE_TYPE"
+      --iam-instance-profile "Name=$ECS_INSTANCE_PROFILE_NAME"
+      --subnet-id "$subnet_id"
+      --security-group-ids "$instance_sg_id"
+      --user-data "file://$tmpdir/user-data.sh"
+    )
+    tag_specs=(
+      "ResourceType=instance,Tags=[{Key=Name,Value=$ECS_INSTANCE_NAME},{Key=App,Value=$APP_NAME},{Key=Environment,Value=$ENVIRONMENT}]"
+    )
+    if [[ "$ECS_CACHE_VOLUME_KIND" == "ebs" ]]; then
+      cat >"$tmpdir/block-device-mappings.json" <<EOF
 [
   {
     "DeviceName": "$ECS_EBS_DEVICE_NAME",
@@ -729,24 +790,29 @@ ensure_container_instance() {
   }
 ]
 EOF
+      run_args+=(
+        --block-device-mappings "file://$tmpdir/block-device-mappings.json"
+      )
+      tag_specs+=("ResourceType=volume,Tags=[{Key=Name,Value=$ECS_INSTANCE_NAME-cache},{Key=App,Value=$APP_NAME},{Key=Environment,Value=$ENVIRONMENT}]")
+    fi
+    run_args+=(--tag-specifications "${tag_specs[@]}")
     printf 'launching ECS container instance: %s\n' "$ECS_INSTANCE_NAME" >&2
     if ! instance_id="$(aws_cli ec2 run-instances \
-      --image-id "$ami_id" \
-      --instance-type "$ECS_EC2_INSTANCE_TYPE" \
-      --iam-instance-profile "Name=$ECS_INSTANCE_PROFILE_NAME" \
-      --subnet-id "$subnet_id" \
-      --security-group-ids "$instance_sg_id" \
-      --block-device-mappings "file://$tmpdir/block-device-mappings.json" \
-      --user-data "file://$tmpdir/user-data.sh" \
-      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$ECS_INSTANCE_NAME},{Key=App,Value=$APP_NAME},{Key=Environment,Value=$ENVIRONMENT}]" "ResourceType=volume,Tags=[{Key=Name,Value=$ECS_INSTANCE_NAME-cache},{Key=App,Value=$APP_NAME},{Key=Environment,Value=$ENVIRONMENT}]" \
+      "${run_args[@]}" \
       --query 'Instances[0].InstanceId' \
       --output text)"; then
       die "failed to launch ECS container instance: $ECS_INSTANCE_NAME"
     fi
     [[ -n "$instance_id" && "$instance_id" != "None" ]] || die "EC2 launch did not return an instance id for $ECS_INSTANCE_NAME"
   else
-    state="$(aws_cli ec2 describe-instances --instance-ids "$instance_id" --query 'Reservations[0].Instances[0].State.Name' --output text)"
+    read -r state current_instance_type < <(aws_cli ec2 describe-instances \
+      --instance-ids "$instance_id" \
+      --query 'Reservations[0].Instances[0].[State.Name,InstanceType]' \
+      --output text)
     printf 'using existing ECS container instance: %s (%s)\n' "$instance_id" "$state" >&2
+    if [[ "$current_instance_type" != "$ECS_EC2_INSTANCE_TYPE" ]]; then
+      die "existing ECS container instance $instance_id is $current_instance_type, but ECS_EC2_INSTANCE_TYPE=$ECS_EC2_INSTANCE_TYPE; destroy or replace the instance to change cache storage"
+    fi
     if [[ "$state" == "stopped" ]]; then
       aws_cli ec2 start-instances --instance-ids "$instance_id" >/dev/null
     fi
@@ -793,6 +859,12 @@ cache_volume_id_for_instance() {
 ensure_cache_volume_performance() {
   local instance_id="$1"
   local volume_id volume_type iops throughput
+
+  if [[ "$ECS_CACHE_VOLUME_KIND" == "instance-store" ]]; then
+    printf 'using EC2 instance store for cache volume on %s\n' "$instance_id" >&2
+    printf 'instance-store\n'
+    return 0
+  fi
 
   volume_id="$(cache_volume_id_for_instance "$instance_id")"
   if [[ "$volume_id" == "None" || -z "$volume_id" ]]; then
@@ -978,7 +1050,7 @@ listener_rule_arn="$(printf '%s\n' "$lb_output" | sed -n '3p')"
 public_base_url="${PUBLIC_BASE_URL:-$(public_base_url_by_alb_name "$ECS_ALB_NAME")}"
 
 container_instance_id="$(timed "ensure EC2/ECS container instance" ensure_container_instance "$instance_subnet_id" "$instance_sg_id")"
-cache_volume_id="$(timed "ensure EBS cache volume performance" ensure_cache_volume_performance "$container_instance_id")"
+cache_volume_id="$(timed "ensure cache volume" ensure_cache_volume_performance "$container_instance_id")"
 timed "build and push image" build_and_push_image
 
 execution_role_arn="$(timed "resolve execution role ARN" role_arn_by_name "$ECS_EXECUTION_ROLE_NAME")"
@@ -1006,7 +1078,7 @@ fi
 timing_record "ecs/ec2 deployment total" "$(( $(timing_now) - deploy_started_at ))" 0
 
 cat <<EOF
-ECS EC2/EBS deployment complete.
+ECS EC2 deployment complete.
 IMAGE_URI=$IMAGE_URI
 ECS_CLUSTER_NAME=$ECS_CLUSTER_NAME
 ECS_SERVICE_NAME=$ECS_SERVICE_NAME
@@ -1020,6 +1092,7 @@ ECS_LOAD_BALANCER_ARN=$load_balancer_arn
 ECS_LISTENER_RULE_ARN=$listener_rule_arn
 PUBLIC_BASE_URL=$public_base_url
 HEALTH_URL=$public_base_url/healthz
+ECS_CACHE_VOLUME_KIND=$ECS_CACHE_VOLUME_KIND
 ECS_CACHE_VOLUME_ID=$cache_volume_id
 ECS_EBS_SIZE_GIB=$ECS_EBS_SIZE_GIB
 ECS_EBS_IOPS=$ECS_EBS_IOPS
@@ -1030,5 +1103,5 @@ EOF
 
 if [[ "$owns_timing_file" == "true" ]]; then
   timing_print_summary
-  timing_write_github_summary "ECS EC2/EBS deployment timings"
+  timing_write_github_summary "ECS EC2 deployment timings"
 fi

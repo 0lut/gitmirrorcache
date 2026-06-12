@@ -11,17 +11,20 @@ images to GHCR and release Helm charts to the configured OCI chart repository.
 
 ## Current AWS Deployment Path
 
-Use **ECS on Graviton EC2 with host-mounted EBS** for large repository deployments.
-Object storage remains the durable source of truth, and the EC2 EBS volume is a
-hot cache mounted at `/cache` that survives task/container replacement on the
-same host.
+Use **ECS on Graviton EC2 with a host-mounted cache volume** for large
+repository deployments. Object storage remains the durable source of truth, and
+the EC2 cache volume is a hot cache mounted at `/cache`.
+
+The maintained production and preview wrappers default to `m9gd.2xlarge` with
+local NVMe instance store for `/cache`. The lower-level EC2 deploy script still
+supports gp3 EBS by setting `ECS_CACHE_VOLUME_KIND=ebs`.
 
 ```sh
 scripts/aws/bootstrap.sh
 scripts/aws/deploy-and-smoke.sh
 ```
 
-The AWS helper scripts default to the current EC2/EBS stack discovered in
+The AWS helper scripts default to the current ECS/EC2 stack discovered in
 `us-west-2`: `ENVIRONMENT=dev-arm` and `NAME_PREFIX=gitmirrorcache-arm`.
 
 `bootstrap.sh` creates the shared S3 bucket and ECR repository. The ECS deploy
@@ -32,7 +35,7 @@ script creates or updates the runtime infrastructure:
 - hourly EventBridge rule that runs `git-cache compact --all` as a one-off ECS task
 - internet-facing HTTP ALB and target group
 - Amazon Linux 2023 ECS-optimized EC2 instance
-- non-root gp3 EBS volume mounted on the host at `/cache`
+- non-root cache volume mounted on the host at `/cache`
 - Docker image built with `git-cache-api` and `git-cache` CLI S3 support
 
 Common overrides:
@@ -42,13 +45,11 @@ APP_NAME=gitmirrorcache
 ENVIRONMENT=dev-arm
 NAME_PREFIX=gitmirrorcache-arm
 AWS_REGION=us-west-2
-ECS_EC2_INSTANCE_TYPE=m8g.2xlarge
+ECS_EC2_INSTANCE_TYPE=m9gd.2xlarge
 ECS_CPU_ARCHITECTURE=ARM64
 ECS_EC2_AMI_ID=ami-0ac01d3c8b7a34f9d
 DOCKER_PLATFORM=linux/arm64
-ECS_EBS_SIZE_GIB=128
-ECS_EBS_IOPS=8000
-ECS_EBS_THROUGHPUT=500
+ECS_CACHE_VOLUME_KIND=instance-store
 ECS_CPU=8192
 ECS_MEMORY=24576
 GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES=8
@@ -60,6 +61,16 @@ GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD=10
 ECS_ALB_HEALTH_CHECK_INTERVAL_SECONDS=5
 ECS_ALB_HEALTH_CHECK_TIMEOUT_SECONDS=2
 ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS=15
+```
+
+Use gp3 EBS explicitly only when an environment needs a persistent host cache:
+
+```sh
+ECS_EC2_INSTANCE_TYPE=m8g.2xlarge
+ECS_CACHE_VOLUME_KIND=ebs
+ECS_EBS_SIZE_GIB=128
+ECS_EBS_IOPS=8000
+ECS_EBS_THROUGHPUT=500
 ```
 
 If `PUBLIC_BASE_URL` is omitted, the deployment script uses the ALB DNS name for
@@ -104,24 +115,36 @@ Changing the AMI ID only affects newly launched EC2 instances. The completed
 AL2-to-AL2023 migration and validation history is recorded in
 [PR #48](https://github.com/0lut/gitmirrorcache/pull/48).
 
-## Why EC2/EBS Instead Of App Runner
+For the default instance-store path:
+
+```sh
+ECS_EC2_INSTANCE_TYPE=m9gd.2xlarge
+ECS_CACHE_VOLUME_KIND=instance-store
+```
+
+When `ECS_CACHE_VOLUME_KIND=instance-store`, the EC2 user-data script formats and
+mounts the non-root NVMe instance-store disk at `/cache`. The deployment script
+derives the default disk quota from the EC2 instance type's advertised instance
+store capacity and reserves 10% headroom. Instance-store cache data is lost when
+the EC2 host is terminated, so S3 remains the only durable cache source.
+
+## Why EC2/Instance Store Instead Of App Runner
 
 App Runner was removed from the maintained deployment path. Large repositories
-need a larger and more durable local hot cache than App Runner's ephemeral
-filesystem provides. The Linux kernel and GCC validation runs showed that the
-service needs to keep hydrated bare repositories and large Git pack work files
-on block storage to avoid repeatedly rehydrating or regenerating expensive cache
-state.
+need a larger local hot cache than App Runner's ephemeral filesystem provides.
+The Linux kernel and GCC validation runs showed that the service needs to keep
+hydrated bare repositories and large Git pack work files on host storage to
+avoid repeatedly rehydrating or regenerating expensive cache state.
 
-ECS on Graviton EC2 with host-mounted EBS gives the service:
+ECS on Graviton EC2 with host-mounted storage gives the service:
 
-- controllable disk size and gp3 performance settings
-- hot-cache persistence across task replacement on the same instance
+- local NVMe instance-store performance on `m9gd.*` hosts
+- optional gp3 EBS fallback for environments that need a persistent host cache
 - direct host volume mounting for `/cache`
 - SSM access for operational inspection
 - ordinary ECS service rollout semantics behind an ALB
 
-S3 remains the durable cache source. The EBS volume is still disposable from a
+S3 remains the durable cache source. The host cache is disposable from a
 correctness perspective; losing it should only force hydration from object
 storage or upstream verification.
 
@@ -134,7 +157,7 @@ passing the base prefix to the container.
 
 ## Production Target
 
-The production target is a thin wrapper around the ECS/EC2/EBS deploy path. It
+The production target is a thin wrapper around the ECS/EC2 deploy path. It
 uses the published GHCR image for this repository instead of building and
 pushing an ECR image:
 
@@ -148,9 +171,10 @@ Defaults:
 - `NAME_PREFIX=gitmirrorcache-prod`
 - `IMAGE_URI=ghcr.io/0lut/gitmirrorcache:latest`
 - `S3_PREFIX=repos`
+- `ECS_EC2_INSTANCE_TYPE=m9gd.2xlarge`
+- `ECS_CACHE_VOLUME_KIND=instance-store`
 - `ECS_SKIP_DOCKER_BUILD=true`
 - `BOOTSTRAP_SKIP_ECR=true`
-- `ECS_EBS_DELETE_ON_TERMINATION=false`
 - `ECS_COMPACTION_ENABLED=true`
 
 Set `IMAGE_TAG` to pin a published tag, or set `IMAGE_URI` to deploy a specific
@@ -250,14 +274,15 @@ GitHub token from Secrets Manager.
 
 Preview deploys set `ECR_PUSH_LATEST=false`,
 `ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS=true`,
-`ECS_EC2_INSTANCE_TYPE=m8g.2xlarge`, `ECS_PRECHECK_VCPU_QUOTA=true`,
+`ECS_EC2_INSTANCE_TYPE=m9gd.2xlarge`,
+`ECS_CACHE_VOLUME_KIND=instance-store`, `ECS_PRECHECK_VCPU_QUOTA=true`,
 `ECS_EBS_DELETE_ON_TERMINATION=true`, `ECS_COMPACTION_ENABLED=false`,
 `ECS_LOG_RETENTION_DAYS=3`, `BOOTSTRAP_FAST_EXISTING=true`,
 `PREVIEW_SHARED_ALB=true`, a 15-second ECS health-check grace period, faster ECS
 service polling, and shorter ALB target health-check intervals unless you
 override them. This keeps previews isolated, disposable, faster to redeploy, and
-less noisy while still exercising the ECS, EC2/EBS, ALB listener-rule, IAM, ECR,
-S3, and smoke-test path. The quota preflight fails before creating preview
+less noisy while still exercising the ECS, EC2, ALB listener-rule, IAM, ECR, S3,
+and smoke-test path. The quota preflight fails before creating preview
 infrastructure if launching the preview instance would exceed the account's EC2
 on-demand vCPU quota.
 
@@ -283,17 +308,42 @@ VERSION_ID=d35c30fab123 scripts/aws/destroy-preview.sh
 ```
 
 Destroy removes the preview ECS service, cluster, shared ALB listener rule,
-target group, EC2 instance, available preview EBS volume, task definitions,
-EventBridge compaction rule, log group, preview IAM roles, and the preview image
-tag. It also cleans up a legacy per-preview ALB if that version was deployed
-before shared preview ingress was enabled. It removes the deployment manifest by
-default and preserves durable cache objects unless you opt in:
+target group, EC2 instance, available preview EBS cache volume if one exists,
+task definitions, EventBridge compaction rule, log group, preview IAM roles, and
+the preview image tag. It also cleans up a legacy per-preview ALB if that
+version was deployed before shared preview ingress was enabled. It removes the
+deployment manifest by default and preserves durable cache objects unless you
+opt in:
 
 ```sh
 DELETE_DATA=true VERSION_ID=d35c30fab123 scripts/aws/destroy-preview.sh
 ```
 
 ## Deployment Findings
+
+The `m9gd.2xlarge` instance-store validation on June 12, 2026 compared the
+existing `m8g.2xlarge` gp3 EBS stack with a preview stack using only root EBS
+plus the local NVMe instance-store disk mounted at `/cache`. The benchmark
+client ran from an AWS devbox in `us-west-2`; cold runs reset the API host's
+local repo before cloning with `git-cache-use-proxy-on-miss: false`.
+
+Depth-1 blobless clone results:
+
+| Repo | EBS cold | SSD cold | Cold gain | EBS hot | SSD hot | Hot gain |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `github.com/astral-sh/uv` | 4.95s | 4.46s | 10.0% | 1.36s | 1.26s | 7.2% |
+| `github.com/astral-sh/ruff` | 10.98s | 10.73s | 2.3% | 2.55s | 2.53s | 0.7% |
+| `github.com/torvalds/linux` | 100.25s | 94.26s | 6.0% | 52.24s | 48.59s | 7.0% |
+| `github.com/llvm/llvm-project` | 278.40s | 242.67s | 12.8% | 98.56s | 97.35s | 1.2% |
+
+The no-checkout full-history `ruff` read-through sample removed most client
+worktree cost and showed a clearer server-side storage improvement: cold
+read-through improved from 5.73s on EBS to 4.09s on SSD (28.6%), and hot
+read-through improved from 2.86s to 2.56s (10.5%).
+
+The takeaway is that instance-store helps, especially for cold server-side
+read-through, but shallow clone wall time is often dominated by checkout,
+networking, and Git object work rather than only cache volume throughput.
 
 The large-repository investigation found two important cache behaviors:
 
@@ -423,7 +473,9 @@ Git config environment variables:
 - `git_timeout_seconds` bounds Git process lifetime.
 - `GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES` bounds simultaneous Git subprocesses,
   including active upload-pack streams.
-- `ECS_EBS_IOPS` and `ECS_EBS_THROUGHPUT` provision gp3 hot-cache performance.
+- `ECS_CACHE_VOLUME_KIND=instance-store` mounts local EC2 NVMe storage at `/cache`.
+- `ECS_EBS_IOPS` and `ECS_EBS_THROUGHPUT` provision gp3 hot-cache performance
+  when `ECS_CACHE_VOLUME_KIND=ebs`.
 
 ## Pack Strategy And Compaction
 
