@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 init_aws_context
-require_cmd docker
 require_cmd python3
 
 tmpdir="$(mktemp -d)"
@@ -588,12 +587,13 @@ cluster_arn_by_name() {
 }
 
 build_and_push_image() {
-  aws_cli ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || die "ECR repository not found; run scripts/aws/bootstrap.sh first"
-
   if [[ "$ECS_SKIP_DOCKER_BUILD" == "true" ]]; then
     printf 'skipping Docker build; using image: %s\n' "$IMAGE_URI"
     return
   fi
+
+  require_cmd docker
+  aws_cli ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || die "ECR repository not found; run scripts/aws/bootstrap.sh first"
 
   if [[ "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" == "true" ]] \
     && aws_cli ecr describe-images \
