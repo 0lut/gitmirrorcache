@@ -158,13 +158,11 @@ fn object_store_from_env() -> crate::Result<ObjectStoreConfig> {
             ),
         }),
         "s3" => {
-            let bucket = env::var("GIT_CACHE_S3_BUCKET")
-                .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_BUCKET"))
-                .map_err(|_| {
-                    crate::GitCacheError::Validation(
-                        "GIT_CACHE_OBJECT_STORE_KIND=s3 requires GIT_CACHE_S3_BUCKET".into(),
-                    )
-                })?;
+            let bucket = env::var("GIT_CACHE_S3_BUCKET").map_err(|_| {
+                crate::GitCacheError::Validation(
+                    "GIT_CACHE_OBJECT_STORE_KIND=s3 requires GIT_CACHE_S3_BUCKET".into(),
+                )
+            })?;
             if bucket.trim().is_empty() {
                 return Err(crate::GitCacheError::Validation(
                     "GIT_CACHE_S3_BUCKET must not be empty".into(),
@@ -173,11 +171,8 @@ fn object_store_from_env() -> crate::Result<ObjectStoreConfig> {
 
             Ok(ObjectStoreConfig::S3 {
                 bucket,
-                prefix: env::var("GIT_CACHE_S3_PREFIX")
-                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_PREFIX"))
-                    .unwrap_or_else(|_| "repos".into()),
+                prefix: env::var("GIT_CACHE_S3_PREFIX").unwrap_or_else(|_| "repos".into()),
                 endpoint: env::var("GIT_CACHE_S3_ENDPOINT")
-                    .or_else(|_| env::var("GIT_CACHE_OBJECT_STORE_ENDPOINT"))
                     .ok()
                     .filter(|value| !value.trim().is_empty()),
             })
