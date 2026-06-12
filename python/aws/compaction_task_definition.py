@@ -14,7 +14,6 @@ env = [
     {"name": "GIT_CACHE_COMPACTION_INLINE", "value": os.environ.get("GIT_CACHE_COMPACTION_INLINE", "false")},
     {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
     {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
-    {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
     {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "8589934592")},
     {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
     {"name": "GIT_CACHE_RATE_LIMIT_PER_MINUTE", "value": os.environ.get("GIT_CACHE_RATE_LIMIT_PER_MINUTE", "120")},
