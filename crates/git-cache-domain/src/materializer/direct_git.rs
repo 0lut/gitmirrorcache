@@ -973,7 +973,7 @@ pub struct UpstreamRefComparison {
 }
 
 impl UpstreamRefComparison {
-    fn branch_for_commit(&self, commit: &CommitSha) -> Option<&str> {
+    pub fn branch_for_commit(&self, commit: &CommitSha) -> Option<&str> {
         if let Some(default_branch) = self.default_branch.as_deref() {
             if self
                 .all_upstream
@@ -1134,6 +1134,10 @@ pub(super) fn parse_upload_pack_intent(body: &[u8]) -> CoreResult<UploadPackInte
         return Err(error);
     }
     Ok(intent)
+}
+
+pub fn upload_pack_wants(body: &[u8]) -> CoreResult<Vec<CommitSha>> {
+    Ok(parse_upload_pack_intent(body)?.wants)
 }
 
 #[cfg(test)]

@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn materialize_hot_local_branch_does_not_publish_generation() {
+    async fn materialize_hot_local_branch_publishes_generation() {
         let server = TestServer::start().await;
         server.warm_local_branch_cache();
         let client = reqwest::Client::new();
@@ -217,14 +217,10 @@ mod tests {
 
         let store_root = server.object_store_root();
         assert!(
-            !store_root
+            store_root
                 .join("repos/github.com/org/repo/generations")
                 .exists(),
-            "hot branch materialize should not publish a generation"
-        );
-        assert!(
-            !store_root.join("pending-generations").exists(),
-            "hot branch materialize should not enqueue generation verification"
+            "hot branch materialize should publish a generation"
         );
     }
 

@@ -749,8 +749,36 @@ impl Materializer {
                 default_branch,
             )
             .await?;
-            self.record_verified_branch_manifests(repo, branch, upstream_commit, default_branch)
+            if self
+                .get_commit_manifest(repo, upstream_commit)
+                .await?
+                .is_some_and(|manifest| manifest.complete)
+            {
+                self.record_verified_branch_manifests(
+                    repo,
+                    branch,
+                    upstream_commit,
+                    default_branch,
+                )
                 .await?;
+            } else {
+                let publish_started = Instant::now();
+                self.publish_generation(
+                    repo,
+                    &repo_dir,
+                    upstream_commit,
+                    Some(branch.clone()),
+                    default_branch,
+                )
+                .await?;
+                info!(
+                    %repo,
+                    %branch,
+                    commit = %upstream_commit,
+                    elapsed_ms = elapsed_ms(publish_started),
+                    "published hot branch generation"
+                );
+            }
             info!(
                 %repo,
                 %branch,

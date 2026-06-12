@@ -46,7 +46,9 @@ client, the cache now:
 4. On clean stream completion, imports the spooled pack with
    `git index-pack` into the shared bare repo
    (`Materializer::import_proxied_upload_pack`), exposes the served wants,
-   and queues the usual fsck + serving maintenance.
+   queues the usual fsck + serving maintenance, and schedules async
+   materialization for advertised branch-tip wants so S3/object-store
+   generation manifests are published outside the client response path.
 
 This makes a cold miss populate the cache with **one** upstream download and
 no second pack generation. Safety properties:
