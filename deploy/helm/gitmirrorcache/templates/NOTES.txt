@@ -7,10 +7,13 @@ Quick checks:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "gitmirrorcache.fullname" . }} 8080:{{ .Values.service.port }}
   curl http://localhost:8080/healthz
 
-{{- if .Values.config.gitRemote.enabled }}
-
 Clone through the cache:
   git clone http://localhost:8080/git/github.com/<owner>/<repo>.git
+{{- if and .Values.persistence.enabled (not .Values.persistence.storageClass) }}
+
+NOTE: persistence.storageClass is empty, so the PVC relies on a cluster default
+StorageClass. If the pod stays Pending with an unbound PVC, set
+persistence.storageClass to a real class such as gp3 on EKS.
 {{- end }}
 {{- if and (eq .Values.config.objectStore.kind "s3") (not .Values.aws.existingSecret) }}
 

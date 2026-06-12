@@ -10,10 +10,84 @@ compaction rule from the AWS deployment.
 
 ## Install
 
+Helm install commands take both a release name and a chart reference. From this
+chart directory, use `.` as the chart reference:
+
 ```sh
-helm install git-cache deploy/helm/gitmirrorcache \
+helm install git-cache . \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket
+```
+
+The server resolves the S3 region from `GIT_CACHE_S3_REGION`, `AWS_REGION`,
+`AWS_DEFAULT_REGION`, or the AWS SDK default chain. On EKS with IRSA,
+`AWS_REGION` is injected into the pod automatically, so no region value is
+needed. Set `aws.region` (rendered as `AWS_REGION`) only when nothing else
+provides one — e.g. static credentials on a non-AWS cluster.
+
+For a published chart, set `CHART_REF` to the OCI chart reference and
+`CHART_VERSION` to the release version:
+
+```sh
+helm install git-cache "${CHART_REF}" \
+  --version "${CHART_VERSION}" \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket
+```
+
+For release tag `vX.Y.Z`, use chart version `X.Y.Z`.
+
+## Persistence storage class
+
+By default the chart omits `storageClassName`, so the PVC binds only when the
+cluster has a default StorageClass. On EKS, prefer an EBS CSI `gp3`
+StorageClass and set it explicitly when no default class is configured:
+
+```sh
+helm install git-cache "${CHART_REF}" \
+  --version "${CHART_VERSION}" \
   --set config.objectStore.s3.bucket=my-git-cache-bucket \
-  --set aws.region=us-west-2
+  --set persistence.storageClass=gp3
+```
+
+The chart does not provision EBS IOPS or throughput directly. Those values come
+from the selected StorageClass. A `gp3` StorageClass without explicit
+performance parameters gets the AWS gp3 baseline: 3,000 IOPS and 125 MiB/s
+throughput.
+
+For a larger cache node, create a tuned StorageClass and point the chart at it.
+This example matches the production ECS gp3 defaults:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gitmirrorcache-gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  csi.storage.k8s.io/fstype: ext4
+  iops: "8000"
+  throughput: "500"
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+```
+
+Install with the tuned class:
+
+```sh
+helm install git-cache "${CHART_REF}" \
+  --version "${CHART_VERSION}" \
+  --set config.objectStore.s3.bucket=my-git-cache-bucket \
+  --set persistence.storageClass=gitmirrorcache-gp3
+```
+
+To inspect what AWS actually provisioned for an installed release:
+
+```sh
+PV="$(kubectl get pvc -n git-cache cache-git-cache-gitmirrorcache-0 -o jsonpath='{.spec.volumeName}')"
+VOL="$(kubectl get pv "$PV" -o jsonpath='{.spec.csi.volumeHandle}')"
+aws ec2 describe-volumes \
+  --volume-ids "$VOL" \
+  --query 'Volumes[0].{Type:VolumeType,SizeGiB:Size,Iops:Iops,ThroughputMiBs:Throughput}'
 ```
 
 ## S3 credentials
@@ -56,9 +130,9 @@ upstreamAuth:
 | `config.objectStore.kind` | `s3` | `s3` or `local` (testing only) |
 | `config.objectStore.s3.bucket` | – | Required for `s3` |
 | `config.allowedUpstreamHosts` | `[github.com]` | Upstream allowlist |
-| `config.gitRemote.enabled` | `true` | Serve `/git/{host}/{owner}/{repo}.git` |
 | `config.disk.quotaBytes` | 100 GiB | Hot-cache disk quota |
 | `persistence.size` | `100Gi` | PVC size (keep ≥ disk quota) |
+| `persistence.storageClass` | `""` | PVC StorageClass; empty uses the cluster default. Use `gp3` on EKS. |
 | `persistence.enabled` | `true` | Use a PVC; `false` falls back to emptyDir |
 | `compaction.enabled` | `true` | Hourly `git-cache compact --all` CronJob |
 | `configFile` | `""` | Optional full TOML config (see `config/production.example.toml`) |

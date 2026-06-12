@@ -8,9 +8,14 @@ init_aws_context
 require_cmd python3
 
 BOOTSTRAP_FAST_EXISTING="${BOOTSTRAP_FAST_EXISTING:-false}"
+BOOTSTRAP_SKIP_ECR="${BOOTSTRAP_SKIP_ECR:-false}"
 case "$BOOTSTRAP_FAST_EXISTING" in
   true | false) ;;
   *) die "BOOTSTRAP_FAST_EXISTING must be true or false" ;;
+esac
+case "$BOOTSTRAP_SKIP_ECR" in
+  true | false) ;;
+  *) die "BOOTSTRAP_SKIP_ECR must be true or false" ;;
 esac
 
 tmpdir="$(mktemp -d)"
@@ -76,36 +81,23 @@ ensure_ecr_repository() {
     --repository-name "$ECR_REPOSITORY" \
     --image-scanning-configuration scanOnPush=true >/dev/null
 
-  python3 - "$tmpdir/ecr-lifecycle.json" <<'PY'
-import json
-import os
-import sys
-
-retain = int(os.environ.get("ECR_RETAIN_IMAGES", "30"))
-json.dump({
-    "rules": [{
-        "rulePriority": 1,
-        "description": f"Keep the last {retain} images",
-        "selection": {
-            "tagStatus": "any",
-            "countType": "imageCountMoreThan",
-            "countNumber": retain,
-        },
-        "action": {"type": "expire"},
-    }]
-}, open(sys.argv[1], "w"))
-PY
+  python3 "$REPO_ROOT/python/aws/ecr_lifecycle_policy.py" "$tmpdir/ecr-lifecycle.json"
   aws_cli ecr put-lifecycle-policy \
     --repository-name "$ECR_REPOSITORY" \
     --lifecycle-policy-text "file://$tmpdir/ecr-lifecycle.json" >/dev/null
 }
 
 ensure_bucket
-ensure_ecr_repository
+if [[ "$BOOTSTRAP_SKIP_ECR" == "true" ]]; then
+  printf 'skipping ECR repository because BOOTSTRAP_SKIP_ECR=true\n'
+else
+  ensure_ecr_repository
+fi
 
 cat <<EOF
 AWS bootstrap complete.
 S3_BUCKET=$S3_BUCKET
 S3_PREFIX=$S3_PREFIX
 ECR_REPOSITORY_URI=$ECR_REPOSITORY_URI
+BOOTSTRAP_SKIP_ECR=$BOOTSTRAP_SKIP_ECR
 EOF

@@ -9,6 +9,14 @@ pub mod update;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Git Smart HTTP service used for fetch and clone requests.
+pub const GIT_UPLOAD_PACK_SERVICE: &str = "git-upload-pack";
+pub const GIT_UPLOAD_PACK_PATH: &str = "/git-upload-pack";
+pub const GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE: &str =
+    "application/x-git-upload-pack-advertisement";
+pub const GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE: &str = "application/x-git-upload-pack-request";
+pub const GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE: &str = "application/x-git-upload-pack-result";
+
 pub use auth::{SecretString, UpstreamAuth, UpstreamAuthorizationMode};
 pub use config::{
     default_async_materialize_concurrency, default_max_concurrent_git_processes, AppConfig,
@@ -70,15 +78,4 @@ pub struct ResolveResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn materialize_source_uses_provider_neutral_public_label() {
-        let serialized = serde_json::to_string(&MaterializeSource::UpstreamVerified).unwrap();
-        assert_eq!(serialized, "\"upstream_verified\"");
-
-        let parsed: MaterializeSource = serde_json::from_str("\"github_verified\"").unwrap();
-        assert_eq!(parsed, MaterializeSource::UpstreamVerified);
-    }
-}
+mod tests;

@@ -14,7 +14,7 @@ git-cache-core = { path = "../git-cache-core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-aws-sdk-s3 = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
 aws-smithy-runtime-api = { version = "1", optional = true }
 aws-smithy-types = { version = "1", optional = true }
 

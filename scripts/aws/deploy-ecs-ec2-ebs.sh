@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 init_aws_context
-require_cmd docker
 require_cmd python3
 
 tmpdir="$(mktemp -d)"
@@ -248,63 +247,14 @@ JSON
     --role-name "$ECS_INSTANCE_ROLE_NAME" \
     --policy-arn "arn:$AWS_PARTITION:iam::aws:policy/AmazonSSMManagedInstanceCore" >/dev/null
 
-  python3 - "$tmpdir/ecs-s3-policy.json" <<'PY'
-import json
-import os
-import sys
-
-partition = os.environ["AWS_PARTITION"]
-bucket = os.environ["S3_BUCKET"]
-prefix = os.environ.get("S3_RUNTIME_PREFIX", os.environ.get("S3_PREFIX", "")).strip("/")
-bucket_arn = f"arn:{partition}:s3:::{bucket}"
-object_arn = f"{bucket_arn}/{prefix}/*" if prefix else f"{bucket_arn}/*"
-list_statement = {
-    "Effect": "Allow",
-    "Action": ["s3:GetBucketLocation", "s3:ListBucket", "s3:ListBucketMultipartUploads"],
-    "Resource": bucket_arn,
-}
-if prefix:
-    list_statement["Condition"] = {"StringLike": {"s3:prefix": [prefix, f"{prefix}/*"]}}
-policy = {
-    "Version": "2012-10-17",
-    "Statement": [
-        list_statement,
-        {
-            "Effect": "Allow",
-            "Action": [
-                "s3:AbortMultipartUpload",
-                "s3:DeleteObject",
-                "s3:GetObject",
-                "s3:ListMultipartUploadParts",
-                "s3:PutObject",
-            ],
-            "Resource": object_arn,
-        },
-    ],
-}
-json.dump(policy, open(sys.argv[1], "w"))
-PY
+  python3 "$REPO_ROOT/python/aws/ecs_s3_policy.py" "$tmpdir/ecs-s3-policy.json"
   aws_cli iam put-role-policy \
     --role-name "$ECS_TASK_ROLE_NAME" \
     --policy-name "${NAME_PREFIX}-s3-object-store" \
     --policy-document "file://$tmpdir/ecs-s3-policy.json" >/dev/null
 
   if [[ -n "${GITHUB_TOKEN_SECRET_ARN:-}" ]]; then
-    python3 - "$tmpdir/ecs-secrets-policy.json" <<'PY'
-import json
-import os
-import sys
-
-policy = {
-    "Version": "2012-10-17",
-    "Statement": [{
-        "Effect": "Allow",
-        "Action": ["secretsmanager:GetSecretValue"],
-        "Resource": os.environ["GITHUB_TOKEN_SECRET_ARN"],
-    }],
-}
-json.dump(policy, open(sys.argv[1], "w"))
-PY
+    python3 "$REPO_ROOT/python/aws/ecs_secrets_policy.py" "$tmpdir/ecs-secrets-policy.json"
     aws_cli iam put-role-policy \
       --role-name "$ECS_EXECUTION_ROLE_NAME" \
       --policy-name "${NAME_PREFIX}-github-token-secret" \
@@ -437,28 +387,7 @@ preflight_ec2_vcpu_quota() {
   fi
 
   projected_vcpus=$((used_vcpus + desired_vcpus))
-  python3 - "$used_vcpus" "$desired_vcpus" "$projected_vcpus" "$quota" "$ECS_EC2_INSTANCE_TYPE" <<'PY'
-import sys
-
-used = int(sys.argv[1])
-desired = int(sys.argv[2])
-projected = int(sys.argv[3])
-quota = float(sys.argv[4])
-instance_type = sys.argv[5]
-
-if projected > quota:
-    raise SystemExit(
-        "EC2 vCPU quota preflight failed: "
-        f"running/pending={used}, requested {instance_type}={desired}, "
-        f"projected={projected}, quota={quota:g}"
-    )
-
-print(
-    "EC2 vCPU quota preflight passed: "
-    f"running/pending={used}, requested {instance_type}={desired}, "
-    f"projected={projected}, quota={quota:g}"
-)
-PY
+  python3 "$REPO_ROOT/python/aws/check_vcpu_quota.py" "$used_vcpus" "$desired_vcpus" "$projected_vcpus" "$quota" "$ECS_EC2_INSTANCE_TYPE"
 }
 
 load_balancer_arn_by_name() {
@@ -482,23 +411,7 @@ listener_rule_arn_by_path_pattern() {
   rules_json="$(aws_cli elbv2 describe-rules \
     --listener-arn "$listener_arn" \
     --output json)"
-  RULES_JSON="$rules_json" python3 - "$path_pattern" <<'PY'
-import json
-import os
-import sys
-
-path_pattern = sys.argv[1]
-rules = json.loads(os.environ["RULES_JSON"]).get("Rules", [])
-for rule in rules:
-    for condition in rule.get("Conditions", []):
-        if condition.get("Field") != "path-pattern":
-            continue
-        values = condition.get("Values") or condition.get("PathPatternConfig", {}).get("Values", [])
-        if path_pattern in values:
-            print(rule["RuleArn"])
-            raise SystemExit(0)
-print("None")
-PY
+  RULES_JSON="$rules_json" python3 "$REPO_ROOT/python/aws/find_listener_rule_arn.py" "$path_pattern"
 }
 
 next_listener_rule_priority() {
@@ -508,87 +421,17 @@ next_listener_rule_priority() {
   rules_json="$(aws_cli elbv2 describe-rules \
     --listener-arn "$listener_arn" \
     --output json)"
-  RULES_JSON="$rules_json" python3 - "$version_seed" <<'PY'
-import json
-import os
-import sys
-
-seed = sys.argv[1]
-rules = json.loads(os.environ["RULES_JSON"]).get("Rules", [])
-used = set()
-for rule in rules:
-    priority = rule.get("Priority")
-    if priority and priority != "default":
-        used.add(int(priority))
-
-try:
-    base = int(seed[:8], 16)
-except ValueError:
-    base = 1000
-
-candidate = 100 + (base % 49900)
-for offset in range(49900):
-    priority = 100 + ((candidate - 100 + offset) % 49900)
-    if priority not in used:
-        print(priority)
-        raise SystemExit(0)
-
-raise SystemExit("no available ALB listener rule priorities")
-PY
+  RULES_JSON="$rules_json" python3 "$REPO_ROOT/python/aws/pick_listener_rule_priority.py" "$version_seed"
 }
 
 write_shared_listener_rule_inputs() {
   local target_group_arn="$1"
 
-  ECS_LISTENER_TARGET_GROUP_ARN="$target_group_arn" python3 \
-    - "$tmpdir/shared-listener-conditions.json" \
-      "$tmpdir/shared-listener-actions.json" \
-      "$tmpdir/shared-listener-transforms.json" <<'PY'
-import json
-import os
-import sys
-
-conditions_path, actions_path, transforms_path = sys.argv[1:]
-
-conditions = [{
-    "Field": "path-pattern",
-    "PathPatternConfig": {"Values": [os.environ["ECS_ALB_RULE_PATH_PATTERN"]]},
-}]
-actions = [{
-    "Type": "forward",
-    "TargetGroupArn": os.environ["ECS_LISTENER_TARGET_GROUP_ARN"],
-}]
-transforms = [{
-    "Type": "url-rewrite",
-    "UrlRewriteConfig": {
-        "Rewrites": [{
-            "Regex": os.environ["ECS_ALB_RULE_REWRITE_REGEX"],
-            "Replace": os.environ["ECS_ALB_RULE_REWRITE_REPLACE"],
-        }],
-    },
-}]
-
-json.dump(conditions, open(conditions_path, "w"))
-json.dump(actions, open(actions_path, "w"))
-json.dump(transforms, open(transforms_path, "w"))
-PY
+  ECS_LISTENER_TARGET_GROUP_ARN="$target_group_arn" python3 "$REPO_ROOT/python/aws/shared_listener_rule_payloads.py" "$tmpdir/shared-listener-conditions.json" "$tmpdir/shared-listener-actions.json" "$tmpdir/shared-listener-transforms.json"
 }
 
 write_shared_listener_default_action() {
-  python3 - "$tmpdir/shared-listener-default-action.json" <<'PY'
-import json
-import sys
-
-actions = [{
-    "Type": "fixed-response",
-    "FixedResponseConfig": {
-        "StatusCode": "404",
-        "ContentType": "text/plain",
-        "MessageBody": "preview version not found",
-    },
-}]
-json.dump(actions, open(sys.argv[1], "w"))
-PY
+  python3 "$REPO_ROOT/python/aws/shared_listener_default_action.py" "$tmpdir/shared-listener-default-action.json"
 }
 
 ensure_shared_listener_rule() {
@@ -744,12 +587,13 @@ cluster_arn_by_name() {
 }
 
 build_and_push_image() {
-  aws_cli ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || die "ECR repository not found; run scripts/aws/bootstrap.sh first"
-
   if [[ "$ECS_SKIP_DOCKER_BUILD" == "true" ]]; then
     printf 'skipping Docker build; using image: %s\n' "$IMAGE_URI"
     return
   fi
+
+  require_cmd docker
+  aws_cli ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 || die "ECR repository not found; run scripts/aws/bootstrap.sh first"
 
   if [[ "$ECS_SKIP_DOCKER_BUILD_IF_IMAGE_EXISTS" == "true" ]] \
     && aws_cli ecr describe-images \
@@ -982,87 +826,7 @@ register_task_definition() {
   local execution_role_arn="$1"
   local task_role_arn="$2"
 
-  python3 - "$tmpdir/task-definition.json" <<'PY'
-import json
-import os
-import sys
-
-env = [
-    {"name": "AWS_DEFAULT_REGION", "value": os.environ["AWS_REGION"]},
-    {"name": "AWS_REGION", "value": os.environ["AWS_REGION"]},
-    {"name": "GIT_CACHE_ALLOWED_UPSTREAM_HOSTS", "value": os.environ.get("ALLOWED_UPSTREAM_HOSTS", "github.com")},
-    {"name": "GIT_CACHE_BIND_ADDR", "value": "0.0.0.0:8080"},
-    {"name": "GIT_CACHE_DISK_MIN_FREE_BYTES", "value": os.environ["GIT_CACHE_DISK_MIN_FREE_BYTES"]},
-    {"name": "GIT_CACHE_DISK_QUOTA_BYTES", "value": os.environ["GIT_CACHE_DISK_QUOTA_BYTES"]},
-    {"name": "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "value": os.environ.get("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "10")},
-    {"name": "GIT_CACHE_COMPACTION_INLINE", "value": os.environ.get("GIT_CACHE_COMPACTION_INLINE", "false")},
-    {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
-    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
-    {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
-    {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "8589934592")},
-    {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
-    {"name": "GIT_CACHE_RATE_LIMIT_PER_MINUTE", "value": os.environ.get("GIT_CACHE_RATE_LIMIT_PER_MINUTE", "120")},
-    {"name": "GIT_CACHE_ROOT", "value": "/cache"},
-    {"name": "GIT_CACHE_S3_BUCKET", "value": os.environ["S3_BUCKET"]},
-    {"name": "GIT_CACHE_S3_PREFIX", "value": os.environ["S3_PREFIX"]},
-    {"name": "RUST_LOG", "value": os.environ.get("RUST_LOG", "info")},
-]
-if os.environ.get("S3_ENDPOINT"):
-    env.append({"name": "GIT_CACHE_S3_ENDPOINT", "value": os.environ["S3_ENDPOINT"]})
-secrets = []
-if os.environ.get("GITHUB_TOKEN_SECRET_ARN"):
-    env.append({"name": "GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV", "value": "GITHUB_TOKEN"})
-    secrets.append({"name": "GITHUB_TOKEN", "valueFrom": os.environ["GITHUB_TOKEN_SECRET_ARN"]})
-
-container = {
-    "name": os.environ["ECS_CONTAINER_NAME"],
-    "image": os.environ["IMAGE_URI"],
-    "essential": True,
-    "user": os.environ.get("ECS_CONTAINER_USER", "0"),
-    "stopTimeout": int(os.environ["ECS_CONTAINER_STOP_TIMEOUT_SECONDS"]),
-    "portMappings": [{
-        "containerPort": 8080,
-        "hostPort": 8080,
-        "protocol": "tcp",
-    }],
-    "environment": env,
-    "mountPoints": [{
-        "sourceVolume": os.environ["ECS_CACHE_VOLUME_NAME"],
-        "containerPath": "/cache",
-        "readOnly": False,
-    }],
-    "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-            "awslogs-group": os.environ["ECS_LOG_GROUP"],
-            "awslogs-region": os.environ["AWS_REGION"],
-            "awslogs-stream-prefix": os.environ.get("ECS_LOG_STREAM_PREFIX", "api"),
-        },
-    },
-}
-if secrets:
-    container["secrets"] = secrets
-
-task = {
-    "family": os.environ["ECS_TASK_FAMILY"],
-    "taskRoleArn": os.environ["ECS_TASK_ROLE_ARN"],
-    "executionRoleArn": os.environ["ECS_EXECUTION_ROLE_ARN"],
-    "networkMode": "host",
-    "requiresCompatibilities": ["EC2"],
-    "cpu": os.environ["ECS_CPU"],
-    "memory": os.environ["ECS_MEMORY"],
-    "runtimePlatform": {
-        "cpuArchitecture": os.environ["ECS_CPU_ARCHITECTURE"],
-        "operatingSystemFamily": "LINUX",
-    },
-    "containerDefinitions": [container],
-    "volumes": [{
-        "name": os.environ["ECS_CACHE_VOLUME_NAME"],
-        "host": {"sourcePath": "/cache"},
-    }],
-}
-json.dump(task, open(sys.argv[1], "w"))
-PY
+  python3 "$REPO_ROOT/python/aws/api_task_definition.py" "$tmpdir/task-definition.json"
 
   ECS_TASK_EXECUTION_ROLE_ARN="$execution_role_arn" ECS_TASK_ROLE_ARN="$task_role_arn" \
     aws_cli ecs register-task-definition \
@@ -1075,98 +839,7 @@ register_compaction_task_definition() {
   local execution_role_arn="$1"
   local task_role_arn="$2"
 
-  python3 - "$tmpdir/compaction-task-definition.json" <<'PY'
-import json
-import os
-import shlex
-import sys
-
-env = [
-    {"name": "AWS_DEFAULT_REGION", "value": os.environ["AWS_REGION"]},
-    {"name": "AWS_REGION", "value": os.environ["AWS_REGION"]},
-    {"name": "GIT_CACHE_ALLOWED_UPSTREAM_HOSTS", "value": os.environ.get("ALLOWED_UPSTREAM_HOSTS", "github.com")},
-    {"name": "GIT_CACHE_BIND_ADDR", "value": "0.0.0.0:8080"},
-    {"name": "GIT_CACHE_DISK_MIN_FREE_BYTES", "value": os.environ["GIT_CACHE_DISK_MIN_FREE_BYTES"]},
-    {"name": "GIT_CACHE_DISK_QUOTA_BYTES", "value": os.environ["GIT_CACHE_DISK_QUOTA_BYTES"]},
-    {"name": "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "value": os.environ.get("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "10")},
-    {"name": "GIT_CACHE_COMPACTION_INLINE", "value": os.environ.get("GIT_CACHE_COMPACTION_INLINE", "false")},
-    {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
-    {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
-    {"name": "GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GENERATION_VERIFICATIONS", "1")},
-    {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "8589934592")},
-    {"name": "GIT_CACHE_OBJECT_STORE_KIND", "value": "s3"},
-    {"name": "GIT_CACHE_RATE_LIMIT_PER_MINUTE", "value": os.environ.get("GIT_CACHE_RATE_LIMIT_PER_MINUTE", "120")},
-    {"name": "GIT_CACHE_ROOT", "value": "/cache"},
-    {"name": "GIT_CACHE_S3_BUCKET", "value": os.environ["S3_BUCKET"]},
-    {"name": "GIT_CACHE_S3_PREFIX", "value": os.environ["S3_PREFIX"]},
-    {"name": "RUST_LOG", "value": os.environ.get("RUST_LOG", "info")},
-]
-if os.environ.get("S3_ENDPOINT"):
-    env.append({"name": "GIT_CACHE_S3_ENDPOINT", "value": os.environ["S3_ENDPOINT"]})
-secrets = []
-if os.environ.get("GITHUB_TOKEN_SECRET_ARN"):
-    env.append({"name": "GIT_CACHE_UPSTREAM_AUTH_TOKEN_ENV", "value": "GITHUB_TOKEN"})
-    secrets.append({"name": "GITHUB_TOKEN", "valueFrom": os.environ["GITHUB_TOKEN_SECRET_ARN"]})
-
-lock_path = shlex.quote(os.environ["ECS_COMPACTION_LOCK_PATH"])
-script = (
-    f"if /usr/bin/flock -n -E 75 {lock_path} /usr/local/bin/git-cache compact --all; then "
-    "exit 0; "
-    "else status=$?; "
-    "if [ \"$status\" -eq 75 ]; then echo 'git-cache compaction already running; skipping'; exit 0; fi; "
-    "exit \"$status\"; "
-    "fi"
-)
-
-container = {
-    "name": os.environ["ECS_COMPACTION_CONTAINER_NAME"],
-    "image": os.environ["IMAGE_URI"],
-    "essential": True,
-    "user": os.environ.get("ECS_CONTAINER_USER", "0"),
-    "memoryReservation": int(os.environ["ECS_COMPACTION_MEMORY_RESERVATION"]),
-    "entryPoint": ["/bin/sh", "-c"],
-    "command": [script],
-    "environment": env,
-    "mountPoints": [{
-        "sourceVolume": os.environ["ECS_CACHE_VOLUME_NAME"],
-        "containerPath": "/cache",
-        "readOnly": False,
-    }],
-    "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-            "awslogs-group": os.environ["ECS_LOG_GROUP"],
-            "awslogs-region": os.environ["AWS_REGION"],
-            "awslogs-stream-prefix": os.environ["ECS_COMPACTION_LOG_STREAM_PREFIX"],
-        },
-    },
-}
-if secrets:
-    container["secrets"] = secrets
-
-task = {
-    "family": os.environ["ECS_COMPACTION_TASK_FAMILY"],
-    "taskRoleArn": os.environ["ECS_TASK_ROLE_ARN"],
-    "executionRoleArn": os.environ["ECS_EXECUTION_ROLE_ARN"],
-    "networkMode": "host",
-    "requiresCompatibilities": ["EC2"],
-    "runtimePlatform": {
-        "cpuArchitecture": os.environ["ECS_CPU_ARCHITECTURE"],
-        "operatingSystemFamily": "LINUX",
-    },
-    "containerDefinitions": [container],
-    "volumes": [{
-        "name": os.environ["ECS_CACHE_VOLUME_NAME"],
-        "host": {"sourcePath": "/cache"},
-    }],
-}
-if os.environ.get("ECS_COMPACTION_CPU"):
-    task["cpu"] = os.environ["ECS_COMPACTION_CPU"]
-if os.environ.get("ECS_COMPACTION_MEMORY"):
-    task["memory"] = os.environ["ECS_COMPACTION_MEMORY"]
-
-json.dump(task, open(sys.argv[1], "w"))
-PY
+  python3 "$REPO_ROOT/python/aws/compaction_task_definition.py" "$tmpdir/compaction-task-definition.json"
 
   ECS_TASK_EXECUTION_ROLE_ARN="$execution_role_arn" ECS_TASK_ROLE_ARN="$task_role_arn" \
     aws_cli ecs register-task-definition \
@@ -1186,39 +859,7 @@ JSON
 
   ensure_role "$ECS_COMPACTION_EVENTS_ROLE_NAME" "$tmpdir/events-trust.json" "EventBridge role for hourly gitmirrorcache compaction" >&2
 
-  ECS_COMPACTION_TASK_DEFINITION_ARN="$compaction_task_definition_arn" \
-  ECS_TASK_EXECUTION_ROLE_ARN="$execution_role_arn" \
-  ECS_TASK_ROLE_ARN="$task_role_arn" \
-  python3 - "$tmpdir/compaction-events-policy.json" <<'PY'
-import json
-import os
-import sys
-
-policy = {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": "ecs:RunTask",
-            "Resource": os.environ["ECS_COMPACTION_TASK_DEFINITION_ARN"],
-        },
-        {
-            "Effect": "Allow",
-            "Action": "iam:PassRole",
-            "Resource": [
-                os.environ["ECS_TASK_EXECUTION_ROLE_ARN"],
-                os.environ["ECS_TASK_ROLE_ARN"],
-            ],
-            "Condition": {
-                "StringEquals": {
-                    "iam:PassedToService": "ecs-tasks.amazonaws.com",
-                },
-            },
-        },
-    ],
-}
-json.dump(policy, open(sys.argv[1], "w"))
-PY
+  ECS_COMPACTION_TASK_DEFINITION_ARN="$compaction_task_definition_arn" ECS_TASK_EXECUTION_ROLE_ARN="$execution_role_arn" ECS_TASK_ROLE_ARN="$task_role_arn" python3 "$REPO_ROOT/python/aws/compaction_events_policy.py" "$tmpdir/compaction-events-policy.json"
 
   aws_cli iam put-role-policy \
     --role-name "$ECS_COMPACTION_EVENTS_ROLE_NAME" \
@@ -1240,31 +881,7 @@ ensure_compaction_schedule() {
     --state "$ECS_COMPACTION_SCHEDULE_STATE" \
     --description "Runs git-cache compact --all for $NAME_PREFIX" >/dev/null
 
-  ECS_COMPACTION_TASK_DEFINITION_ARN="$compaction_task_definition_arn" \
-  ECS_COMPACTION_EVENTS_ROLE_ARN="$compaction_events_role_arn" \
-  ECS_CLUSTER_ARN="$cluster_arn" \
-  python3 - "$tmpdir/compaction-targets.json" <<'PY'
-import json
-import os
-import sys
-
-target = {
-    "Id": os.environ["ECS_COMPACTION_TARGET_ID"],
-    "Arn": os.environ["ECS_CLUSTER_ARN"],
-    "RoleArn": os.environ["ECS_COMPACTION_EVENTS_ROLE_ARN"],
-    "EcsParameters": {
-        "TaskDefinitionArn": os.environ["ECS_COMPACTION_TASK_DEFINITION_ARN"],
-        "TaskCount": 1,
-        "LaunchType": "EC2",
-        "Group": os.environ.get("ECS_COMPACTION_TASK_GROUP", "git-cache-compaction"),
-        "PlacementConstraints": [{
-            "type": "memberOf",
-            "expression": "attribute:ecs.instance-type == " + os.environ["ECS_EC2_INSTANCE_TYPE"],
-        }],
-    },
-}
-json.dump([target], open(sys.argv[1], "w"))
-PY
+  ECS_COMPACTION_TASK_DEFINITION_ARN="$compaction_task_definition_arn" ECS_COMPACTION_EVENTS_ROLE_ARN="$compaction_events_role_arn" ECS_CLUSTER_ARN="$cluster_arn" python3 "$REPO_ROOT/python/aws/compaction_targets.py" "$tmpdir/compaction-targets.json"
 
   aws_cli events put-targets \
     --rule "$ECS_COMPACTION_RULE_NAME" \
@@ -1277,52 +894,7 @@ write_service_inputs() {
   local subnets_csv="$3"
   local target_group_arn="$4"
 
-  TASK_DEFINITION_ARN="$task_definition_arn" TARGET_GROUP_ARN="$target_group_arn" python3 - "$tmpdir/create-service.json" "$tmpdir/update-service.json" <<'PY'
-import json
-import os
-import sys
-
-load_balancers = [{
-    "containerName": os.environ["ECS_CONTAINER_NAME"],
-    "containerPort": 8080,
-    "targetGroupArn": os.environ["TARGET_GROUP_ARN"],
-}]
-base = {
-    "cluster": os.environ["ECS_CLUSTER_NAME"],
-    "serviceName": os.environ["ECS_SERVICE_NAME"],
-    "taskDefinition": os.environ["TASK_DEFINITION_ARN"],
-    "desiredCount": int(os.environ["ECS_DESIRED_COUNT"]),
-    "launchType": "EC2",
-    "loadBalancers": load_balancers,
-    "healthCheckGracePeriodSeconds": int(os.environ.get("ECS_HEALTH_CHECK_GRACE_PERIOD_SECONDS", "300")),
-    "deploymentConfiguration": {
-        "minimumHealthyPercent": int(os.environ.get("ECS_MIN_HEALTHY_PERCENT", "0")),
-        "maximumPercent": int(os.environ.get("ECS_MAX_PERCENT", "200")),
-    },
-    "placementConstraints": [{
-        "type": "memberOf",
-        "expression": "attribute:ecs.instance-type == " + os.environ["ECS_EC2_INSTANCE_TYPE"],
-    }],
-    "propagateTags": "SERVICE",
-    "tags": [
-        {"key": "App", "value": os.environ["APP_NAME"]},
-        {"key": "Environment", "value": os.environ["ENVIRONMENT"]},
-    ],
-}
-json.dump(base, open(sys.argv[1], "w"))
-
-update = {
-    "cluster": os.environ["ECS_CLUSTER_NAME"],
-    "service": os.environ["ECS_SERVICE_NAME"],
-    "taskDefinition": os.environ["TASK_DEFINITION_ARN"],
-    "desiredCount": int(os.environ["ECS_DESIRED_COUNT"]),
-    "forceNewDeployment": True,
-    "loadBalancers": load_balancers,
-    "healthCheckGracePeriodSeconds": base["healthCheckGracePeriodSeconds"],
-    "deploymentConfiguration": base["deploymentConfiguration"],
-}
-json.dump(update, open(sys.argv[2], "w"))
-PY
+  TASK_DEFINITION_ARN="$task_definition_arn" TARGET_GROUP_ARN="$target_group_arn" python3 "$REPO_ROOT/python/aws/ecs_service_payloads.py" "$tmpdir/create-service.json" "$tmpdir/update-service.json"
 }
 
 service_exists() {
@@ -1344,18 +916,7 @@ wait_for_ecs_service_stable() {
         --services "$ECS_SERVICE_NAME" \
         --query 'services[0]' \
         --output json |
-      python3 -c 'import json, sys
-service = json.load(sys.stdin) or {}
-deployments = service.get("deployments") or []
-primary = next((d for d in deployments if d.get("status") == "PRIMARY"), {})
-print(
-    service.get("status", "None"),
-    service.get("desiredCount", 0),
-    service.get("runningCount", 0),
-    service.get("pendingCount", 0),
-    len(deployments),
-    primary.get("rolloutState", "UNKNOWN"),
-)'
+      python3 "$REPO_ROOT/python/aws/ecs_service_rollout_status.py"
     )
 
     now="$(timing_now)"

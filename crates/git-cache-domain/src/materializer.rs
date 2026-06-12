@@ -38,7 +38,7 @@ mod repo;
 mod util;
 
 pub use direct_git::{
-    frame_ref_advertisement, synthesize_ref_advertisement, UpstreamRefComparison,
+    frame_ref_advertisement, synthesize_ref_advertisement, upload_pack_wants, UpstreamRefComparison,
 };
 pub use executor::MaterializerExecutor;
 pub use generations::{default_manifest_key, CompactionReport, GenerationSweepReport};

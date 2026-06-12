@@ -5,15 +5,18 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, CommitSha, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult,
-    UpstreamAuth,
+    AppConfig, BranchName, CommitSha, GitCacheError, MaterializeRequest, RepoKey,
+    Result as CoreResult, Selector, UpstreamAuth, UpstreamAuthorizationMode,
+    GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE, GIT_UPLOAD_PACK_PATH,
+    GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE,
+    GIT_UPLOAD_PACK_SERVICE,
 };
 use git_cache_disk::{AsyncDiskManager, AsyncReservation};
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, plan_upload_pack_tee, synthesize_ref_advertisement, AppState,
-    Materializer, PackDemux, UpstreamRefComparison,
+    frame_ref_advertisement, plan_upload_pack_tee, synthesize_ref_advertisement, upload_pack_wants,
+    AppState, Materializer, PackDemux, UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -29,6 +32,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 use tracing::{info, info_span, warn, Instrument};
@@ -48,9 +52,8 @@ pub fn app(config: AppConfig) -> Router {
 }
 
 pub fn app_result(config: AppConfig) -> CoreResult<Router> {
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new(config)?);
-    router(git_remote_enabled, state)
+    router(state)
 }
 
 pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
@@ -61,11 +64,10 @@ pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
 /// caller can flip during shutdown so `/healthz` starts failing and load
 /// balancers stop routing new traffic while in-flight requests drain.
 pub async fn app_with_shutdown_async(config: AppConfig) -> CoreResult<(Router, ReadinessGate)> {
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
     state.domain.git.ensure_supported_binary_version().await?;
     let gate = ReadinessGate(Arc::clone(&state.shutting_down));
-    Ok((router(git_remote_enabled, state)?, gate))
+    Ok((router(state)?, gate))
 }
 
 /// Handle that marks the server as shutting down; once flipped, `/healthz`
@@ -79,20 +81,17 @@ impl ReadinessGate {
     }
 }
 
-fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> {
+fn router(state: Arc<ApiState>) -> CoreResult<Router> {
     let git_body_limit = state.domain.config.max_git_output_bytes;
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/v1/materialize", post(materialize))
-        .route("/v1/resolve", post(resolve));
-
-    if git_remote_enabled {
-        router = router.route(
+        .route("/v1/resolve", post(resolve))
+        .route(
             "/git/{*repo_path}",
             any(git_repo).layer(DefaultBodyLimit::max(git_body_limit)),
         );
-    }
 
     Ok(router.with_state(state))
 }
@@ -190,11 +189,10 @@ fn spawn_repo_access_flusher(domain: &Arc<AppState>) {
 /// timeout, and finally any buffered repo access timestamps are flushed.
 pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> CoreResult<()> {
     let shutdown_config = config.shutdown.clone();
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
     let domain = state.domain.clone();
     let readiness = ReadinessGate(Arc::clone(&state.shutting_down));
-    let app = router(git_remote_enabled, state)?;
+    let app = router(state)?;
 
     let readiness_delay = Duration::from_secs(shutdown_config.readiness_delay_seconds);
     let drain_timeout = Duration::from_secs(shutdown_config.drain_timeout_seconds);
@@ -651,11 +649,10 @@ async fn run_domain_request(
                     );
                     Json(response).into_response()
                 } else {
-                    let queued = state.async_materialize_jobs.spawn(
-                        materializer.clone(),
-                        request,
-                        response.commit.clone(),
-                    );
+                    let queued = state
+                        .async_materialize_jobs
+                        .spawn(materializer.clone(), request, response.commit.clone())
+                        .is_some();
                     info!(
                         repo = %response.repo,
                         commit = %response.commit,
@@ -760,28 +757,99 @@ struct GitRepoRequest {
 }
 
 async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
-    let GitRepoRequest {
-        repo_path,
-        query,
-        headers,
-        method,
-        uri,
-        body,
-        request_id,
-    } = request;
-    let path = uri.path();
+    let request_type = git_request_type(&request);
+    let path = request.uri.path().to_string();
 
-    // Reject git-receive-pack (push) requests.
+    match request_type {
+        GitRequestType::ReceivePack => {
+            return ApiError::from(GitCacheError::Unsupported(
+                "git-receive-pack is disabled".into(),
+            ))
+            .into_response();
+        }
+        GitRequestType::Unsupported => {
+            return ApiError::from(GitCacheError::Unsupported(format!(
+                "unsupported git request: {} {path}",
+                request.method
+            )))
+            .into_response();
+        }
+        GitRequestType::UploadPackRefs | GitRequestType::UploadPack => {}
+    }
+
+    let started = Instant::now();
+    let auth = match direct_git_upstream_auth(&request.headers) {
+        Ok(auth) => auth,
+        Err(error) => return error.into_response(),
+    };
+
+    match request_type {
+        GitRequestType::UploadPackRefs => git_repo_get(state, request, started, auth).await,
+        GitRequestType::UploadPack => git_repo_post(state, request, started, auth).await,
+        GitRequestType::ReceivePack => ApiError::from(GitCacheError::Unsupported(
+            "git-receive-pack is disabled".into(),
+        ))
+        .into_response(),
+        GitRequestType::Unsupported => ApiError::from(GitCacheError::Unsupported(format!(
+            "unsupported git request: {} {path}",
+            request.method
+        )))
+        .into_response(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitRequestType {
+    UploadPackRefs,
+    UploadPack,
+    ReceivePack,
+    Unsupported,
+}
+
+fn git_request_type(request: &GitRepoRequest) -> GitRequestType {
+    let path = request.uri.path();
+
     if path.contains("git-receive-pack")
-        || query
+        || request
+            .query
             .get("service")
             .is_some_and(|s| s == "git-receive-pack")
     {
-        return ApiError::from(GitCacheError::Unsupported(
-            "git-receive-pack is disabled".into(),
-        ))
-        .into_response();
+        return GitRequestType::ReceivePack;
     }
+
+    if request.method == Method::GET
+        && path.ends_with("/info/refs")
+        && request
+            .query
+            .get("service")
+            .is_some_and(|s| s == GIT_UPLOAD_PACK_SERVICE)
+    {
+        return GitRequestType::UploadPackRefs;
+    }
+
+    if request.method == Method::POST && path.ends_with(GIT_UPLOAD_PACK_PATH) {
+        return GitRequestType::UploadPack;
+    }
+
+    GitRequestType::Unsupported
+}
+
+async fn git_repo_get(
+    state: Arc<ApiState>,
+    request: GitRepoRequest,
+    started: Instant,
+    auth: UpstreamAuth,
+) -> Response {
+    let GitRepoRequest {
+        repo_path,
+        query: _,
+        headers: _,
+        method: _,
+        uri: _,
+        body: _,
+        request_id,
+    } = request;
 
     let repo = match repo_from_git_path(&repo_path) {
         Ok(repo) => repo,
@@ -794,214 +862,220 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
         return ApiError::from(error).into_response();
     }
 
-    if method == Method::GET
-        && path.ends_with("/info/refs")
-        && query.get("service").is_some_and(|s| s == "git-upload-pack")
-    {
-        let started = Instant::now();
-        let auth = match direct_git_upstream_auth(&headers) {
-            Ok(auth) => auth,
+    info!(
+        request_id,
+        repo = %repo,
+        auth = auth_label(&auth),
+        "direct git ref advertisement started"
+    );
+    state
+        .metrics
+        .git_remote_refs_total
+        .fetch_add(1, Ordering::Relaxed);
+    let materializer = materializer.using_upstream_auth(&auth);
+
+    // Fetch upstream refs via ls-remote and synthesize the pkt-line
+    // response directly. No objects are fetched here; the repo may not
+    // even exist locally yet. The advertisement is a short-lived
+    // repo-access proof for the matching upload-pack POST. The POST path
+    // then performs the normal read-through availability work using the
+    // same request auth.
+    let refs_started = Instant::now();
+    let comparison = match materializer.upstream_refs(&repo).await {
+        Ok(c) => c,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    info!(
+        request_id,
+        repo = %repo,
+        refs_count = comparison.all_upstream.len(),
+        elapsed_ms = elapsed_ms(refs_started),
+        "direct git upstream refs fetched"
+    );
+    state
+        .direct_git_proofs
+        .insert(&repo, &auth, comparison.clone());
+
+    let output = synthesize_ref_advertisement(&comparison);
+    let response = git_response(
+        GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE,
+        frame_ref_advertisement(&output),
+    );
+    info!(
+        request_id,
+        repo = %repo,
+        auth = auth_label(&auth),
+        elapsed_ms = elapsed_ms(started),
+        status = %StatusCode::OK,
+        "direct git ref advertisement finished"
+    );
+    response
+}
+
+async fn git_repo_post(
+    state: Arc<ApiState>,
+    request: GitRepoRequest,
+    started: Instant,
+    auth: UpstreamAuth,
+) -> Response {
+    let GitRepoRequest {
+        repo_path,
+        query: _,
+        headers,
+        method: _,
+        uri: _,
+        body,
+        request_id,
+    } = request;
+
+    let repo = match repo_from_git_path(&repo_path) {
+        Ok(repo) => repo,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+
+    let materializer = Materializer::new(Arc::clone(&state.domain));
+
+    if let Err(error) = materializer.validate_host(&repo) {
+        return ApiError::from(error).into_response();
+    }
+
+    let body =
+        match decode_git_request_body(&headers, body, state.domain.config.max_git_output_bytes) {
+            Ok(body) => body,
             Err(error) => return error.into_response(),
         };
-        info!(
-            request_id,
-            repo = %repo,
-            auth = auth_label(&auth),
-            "direct git ref advertisement started"
-        );
-        state
-            .metrics
-            .git_remote_refs_total
-            .fetch_add(1, Ordering::Relaxed);
-        let materializer = materializer.using_upstream_auth(&auth);
-
-        // Fetch upstream refs via ls-remote and synthesize the pkt-line
-        // response directly. No objects are fetched here; the repo may not
-        // even exist locally yet. The advertisement is a short-lived
-        // repo-access proof for the matching upload-pack POST. The POST path
-        // then performs the normal read-through availability work using the
-        // same request auth.
-        let refs_started = Instant::now();
-        let comparison = match materializer.upstream_refs(&repo).await {
-            Ok(c) => c,
-            Err(error) => return ApiError::from(error).into_response(),
-        };
-        info!(
-            request_id,
-            repo = %repo,
-            refs_count = comparison.all_upstream.len(),
-            elapsed_ms = elapsed_ms(refs_started),
-            "direct git upstream refs fetched"
-        );
-        state
-            .direct_git_proofs
-            .insert(&repo, &auth, comparison.clone());
-
-        let output = synthesize_ref_advertisement(&comparison);
-        let response = git_response(
-            "application/x-git-upload-pack-advertisement",
-            frame_ref_advertisement(&output),
-        );
-        info!(
-            request_id,
-            repo = %repo,
-            auth = auth_label(&auth),
-            elapsed_ms = elapsed_ms(started),
-            status = %StatusCode::OK,
-            "direct git ref advertisement finished"
-        );
-        response
-    } else if method == Method::POST && path.ends_with("/git-upload-pack") {
-        let started = Instant::now();
-        let auth = match direct_git_upstream_auth(&headers) {
-            Ok(auth) => auth,
-            Err(error) => return error.into_response(),
-        };
-        let body =
-            match decode_git_request_body(&headers, body, state.domain.config.max_git_output_bytes)
-            {
-                Ok(body) => body,
-                Err(error) => return error.into_response(),
-            };
-        info!(
-            request_id,
-            repo = %repo,
-            auth = auth_label(&auth),
-            body_bytes = body.len(),
-            "direct git upload-pack started"
-        );
-        state
-            .metrics
-            .git_remote_upload_pack_total
-            .fetch_add(1, Ordering::Relaxed);
-        let cached_proof = state.direct_git_proofs.get(&repo, &auth);
-        let (auth, comparison) = match cached_proof {
-            Some((auth, comparison)) => {
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    "direct git upload-pack using cached repo proof"
-                );
-                (auth, Some(comparison))
-            }
-            None => {
-                // Direct Git POSTs can arrive without the matching GET, so
-                // fall back to the same lightweight ref proof used by GET.
-                // This proves repo access without fetching packs. The
-                // materializer then performs the same read-through
-                // availability work as main, using the request-scoped auth.
-                let auth_started = Instant::now();
-                let proof_materializer = materializer.using_upstream_auth(&auth);
-                let comparison = match proof_materializer.upstream_refs(&repo).await {
-                    Ok(comparison) => comparison,
-                    Err(error) => return ApiError::from(error).into_response(),
-                };
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    refs_count = comparison.all_upstream.len(),
-                    elapsed_ms = elapsed_ms(auth_started),
-                    "direct git upload-pack repo access proved"
-                );
-                state
-                    .direct_git_proofs
-                    .insert(&repo, &auth, comparison.clone());
-                (auth, Some(comparison))
-            }
-        };
-        let materializer = materializer.using_upstream_auth(&auth);
-
-        if !proxy_on_miss_disabled(
-            &headers,
-            state.domain.config.git_remote.proxy_on_miss_by_default,
-        ) {
-            let local_check_started = Instant::now();
-            let can_serve_locally = match materializer
-                .prepare_upload_pack_from_cache(&repo, &body)
-                .await
-            {
-                Ok(can_serve) => can_serve,
+    info!(
+        request_id,
+        repo = %repo,
+        auth = auth_label(&auth),
+        body_bytes = body.len(),
+        "direct git upload-pack started"
+    );
+    state
+        .metrics
+        .git_remote_upload_pack_total
+        .fetch_add(1, Ordering::Relaxed);
+    let cached_proof = state.direct_git_proofs.get(&repo, &auth);
+    let (auth, comparison) = match cached_proof {
+        Some((auth, comparison)) => {
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                "direct git upload-pack using cached repo proof"
+            );
+            (auth, Some(comparison))
+        }
+        None => {
+            // Direct Git POSTs can arrive without the matching GET, so
+            // fall back to the same lightweight ref proof used by GET.
+            // This proves repo access without fetching packs. The
+            // materializer then performs the same read-through
+            // availability work as main, using the request-scoped auth.
+            let auth_started = Instant::now();
+            let proof_materializer = materializer.using_upstream_auth(&auth);
+            let comparison = match proof_materializer.upstream_refs(&repo).await {
+                Ok(comparison) => comparison,
                 Err(error) => return ApiError::from(error).into_response(),
             };
             info!(
                 request_id,
                 repo = %repo,
                 auth = auth_label(&auth),
-                can_serve_locally,
-                elapsed_ms = elapsed_ms(local_check_started),
-                "direct git proxy-on-miss cache readiness checked"
+                refs_count = comparison.all_upstream.len(),
+                elapsed_ms = elapsed_ms(auth_started),
+                "direct git upload-pack repo access proved"
             );
+            state
+                .direct_git_proofs
+                .insert(&repo, &auth, comparison.clone());
+            (auth, Some(comparison))
+        }
+    };
+    let materializer = materializer.using_upstream_auth(&auth);
 
-            if !can_serve_locally {
-                match proxy_upload_pack_to_upstream(UploadPackProxyRequest {
-                    state: &state,
-                    materializer: &materializer,
-                    repo: &repo,
-                    auth: &auth,
-                    headers: &headers,
-                    body: body.clone(),
-                    comparison: comparison.clone(),
-                    request_id,
-                    request_started: started,
-                })
-                .await
-                {
-                    Ok(response) => return response,
-                    Err(ProxyFallback::UseLocal) => {
-                        info!(
-                            request_id,
-                            repo = %repo,
-                            auth = auth_label(&auth),
-                            "direct git proxy-on-miss unavailable; using local read-through"
-                        );
-                    }
-                    Err(ProxyFallback::Error(error)) => return error.into_response(),
+    if !proxy_on_miss_disabled(
+        &headers,
+        state.domain.config.git_remote.proxy_on_miss_by_default,
+    ) {
+        let local_check_started = Instant::now();
+        let can_serve_locally = match materializer
+            .prepare_upload_pack_from_cache(&repo, &body)
+            .await
+        {
+            Ok(can_serve) => can_serve,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
+        info!(
+            request_id,
+            repo = %repo,
+            auth = auth_label(&auth),
+            can_serve_locally,
+            elapsed_ms = elapsed_ms(local_check_started),
+            "direct git proxy-on-miss cache readiness checked"
+        );
+
+        if !can_serve_locally {
+            match proxy_upload_pack_to_upstream(UploadPackProxyRequest {
+                state: &state,
+                materializer: &materializer,
+                repo: &repo,
+                auth: &auth,
+                headers: &headers,
+                body: body.clone(),
+                comparison: comparison.clone(),
+                request_id,
+                request_started: started,
+            })
+            .await
+            {
+                Ok(response) => return response,
+                Err(ProxyFallback::UseLocal) => {
+                    info!(
+                        request_id,
+                        repo = %repo,
+                        auth = auth_label(&auth),
+                        "direct git proxy-on-miss unavailable; using local read-through"
+                    );
                 }
-            } else {
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    "direct git proxy-on-miss cache hit; serving local upload-pack"
-                );
+                Err(ProxyFallback::Error(error)) => return error.into_response(),
             }
+        } else {
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                "direct git proxy-on-miss cache hit; serving local upload-pack"
+            );
         }
+    }
 
-        let result =
-            Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await;
+    let result = Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await;
 
-        match result {
-            Ok(process) => {
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    elapsed_ms = elapsed_ms(started),
-                    status = %StatusCode::OK,
-                    "direct git upload-pack process spawned"
-                );
-                stream_upload_pack_response(&state, process)
-            }
-            Err(error) => {
-                let error = ApiError::from(error);
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    elapsed_ms = elapsed_ms(started),
-                    status = %error.status,
-                    "direct git upload-pack failed"
-                );
-                error.into_response()
-            }
+    match result {
+        Ok(process) => {
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                elapsed_ms = elapsed_ms(started),
+                status = %StatusCode::OK,
+                "direct git upload-pack process spawned"
+            );
+            stream_upload_pack_response(&state, process)
         }
-    } else {
-        ApiError::from(GitCacheError::Unsupported(format!(
-            "unsupported git request: {method} {path}"
-        )))
-        .into_response()
+        Err(error) => {
+            let error = ApiError::from(error);
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                elapsed_ms = elapsed_ms(started),
+                status = %error.status,
+                "direct git upload-pack failed"
+            );
+            error.into_response()
+        }
     }
 }
 
@@ -1074,7 +1148,7 @@ async fn proxy_upload_pack_to_upstream(
         .post(upload_pack_url)
         .header(
             header::CONTENT_TYPE.as_str(),
-            "application/x-git-upload-pack-request",
+            GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE,
         )
         .header(header::CACHE_CONTROL.as_str(), "no-cache")
         .body(body.clone());
@@ -1131,6 +1205,15 @@ async fn proxy_upload_pack_to_upstream(
     } else {
         None
     };
+    let generation_task = direct_git_generation_task(
+        state,
+        materializer,
+        repo,
+        auth,
+        &body,
+        comparison.as_ref(),
+        request_id,
+    );
     let warm_task = DirectGitWarmTask {
         imports: Arc::clone(&state.direct_git_background_imports),
         materializer: materializer.clone(),
@@ -1138,6 +1221,7 @@ async fn proxy_upload_pack_to_upstream(
         body,
         comparison,
         request_id,
+        generation_task,
     };
     let stream = UpstreamProxyStream {
         inner: Box::pin(response.bytes_stream()),
@@ -1158,7 +1242,7 @@ async fn proxy_upload_pack_to_upstream(
     );
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .expect("git upload-pack proxy response"))
@@ -1169,8 +1253,9 @@ fn upload_pack_endpoint(upstream_url: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{}/git-upload-pack",
-        upstream_url.trim_end_matches('/')
+        "{}{}",
+        upstream_url.trim_end_matches('/'),
+        GIT_UPLOAD_PACK_PATH
     ))
 }
 
@@ -1244,15 +1329,16 @@ struct DirectGitWarmTask {
     body: Bytes,
     comparison: Option<UpstreamRefComparison>,
     request_id: u64,
+    generation_task: Option<DirectGitGenerationTask>,
 }
 
 impl DirectGitWarmTask {
-    fn spawn(self) {
+    fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
             let task_started = Instant::now();
             let body_bytes = self.body.len();
             let cached_ref_proof = self.comparison.is_some();
-            let permit = match self.imports.acquire_owned().await {
+            let permit = match Arc::clone(&self.imports).acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
                     warn!(
@@ -1279,7 +1365,7 @@ impl DirectGitWarmTask {
             ))
             .await;
             drop(permit);
-            match result {
+            match &result {
                 Ok(()) => info!(
                     request_id = self.request_id,
                     repo = %self.repo,
@@ -1300,8 +1386,174 @@ impl DirectGitWarmTask {
                     "direct git proxy-on-miss cache warm failed"
                 ),
             }
-        });
+            if result.is_ok() {
+                self.run_generation_materialize("warm").await;
+            }
+        })
     }
+
+    async fn run_generation_materialize(&self, trigger: &'static str) {
+        if let Some(task) = &self.generation_task {
+            task.run(trigger).await;
+        }
+    }
+}
+
+struct DirectGitGenerationTask {
+    jobs: Arc<AsyncMaterializeJobs>,
+    materializer: Materializer,
+    requests: Vec<(MaterializeRequest, CommitSha)>,
+    request_id: u64,
+}
+
+impl DirectGitGenerationTask {
+    /// Run the queued jobs one at a time: concurrent generation publishes for
+    /// the same repo conflict on shared commit manifests.
+    async fn run(&self, trigger: &'static str) {
+        for (request, commit) in &self.requests {
+            let handle =
+                self.jobs
+                    .spawn(self.materializer.clone(), request.clone(), commit.clone());
+            info!(
+                request_id = self.request_id,
+                repo = %request.repo,
+                commit = %commit,
+                trigger,
+                queued = handle.is_some(),
+                "direct git proxy-on-miss async materialize queued"
+            );
+            if let Some(handle) = handle {
+                let _ = handle.await;
+            }
+            self.ensure_served_want_published(request, commit, trigger)
+                .await;
+        }
+    }
+
+    /// Branch selectors re-resolve the tip at job time, so a branch that moved
+    /// after the client was served can leave the served commit unpublished.
+    /// Fall back to an exact-commit publish when that happens.
+    async fn ensure_served_want_published(
+        &self,
+        request: &MaterializeRequest,
+        commit: &CommitSha,
+        trigger: &'static str,
+    ) {
+        if matches!(request.selector, Selector::Commit(_)) {
+            return;
+        }
+        match self
+            .materializer
+            .get_commit_manifest(&request.repo, commit)
+            .await
+        {
+            Ok(Some(manifest)) if manifest.complete => return,
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    request_id = self.request_id,
+                    repo = %request.repo,
+                    commit = %commit,
+                    trigger,
+                    %error,
+                    "direct git proxy-on-miss async materialize fallback check failed"
+                );
+                return;
+            }
+        }
+        let fallback = MaterializeRequest {
+            repo: request.repo.clone(),
+            selector: Selector::Commit(commit.clone()),
+            upstream_authorization: request.upstream_authorization,
+        };
+        let handle = self
+            .jobs
+            .spawn(self.materializer.clone(), fallback, commit.clone());
+        info!(
+            request_id = self.request_id,
+            repo = %request.repo,
+            commit = %commit,
+            trigger,
+            queued = handle.is_some(),
+            "direct git proxy-on-miss async materialize fallback to served commit"
+        );
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+}
+
+fn direct_git_generation_task(
+    state: &Arc<ApiState>,
+    materializer: &Materializer,
+    repo: &RepoKey,
+    auth: &UpstreamAuth,
+    body: &[u8],
+    comparison: Option<&UpstreamRefComparison>,
+    request_id: u64,
+) -> Option<DirectGitGenerationTask> {
+    let comparison = comparison?;
+    let wants = match upload_pack_wants(body) {
+        Ok(wants) => wants,
+        Err(error) => {
+            warn!(
+                request_id,
+                repo = %repo,
+                %error,
+                "direct git proxy-on-miss async materialize skipped: upload-pack wants did not parse"
+            );
+            return None;
+        }
+    };
+    let upstream_authorization = if auth.is_authenticated() {
+        UpstreamAuthorizationMode::Required
+    } else {
+        UpstreamAuthorizationMode::Anonymous
+    };
+    let mut seen = HashSet::new();
+    let mut requests = Vec::new();
+    for want in wants {
+        let Some(branch) = comparison.branch_for_commit(&want) else {
+            continue;
+        };
+        if !seen.insert(want.clone()) {
+            continue;
+        }
+        let selector = if comparison.default_branch.as_deref() == Some(branch) {
+            Selector::DefaultBranch
+        } else {
+            match BranchName::parse(branch) {
+                Ok(branch) => Selector::Branch(branch),
+                Err(error) => {
+                    warn!(
+                        request_id,
+                        repo = %repo,
+                        branch,
+                        %error,
+                        "direct git proxy-on-miss async materialize skipped: advertised branch did not parse"
+                    );
+                    continue;
+                }
+            }
+        };
+        requests.push((
+            MaterializeRequest {
+                repo: repo.clone(),
+                selector,
+                upstream_authorization,
+            },
+            want,
+        ));
+    }
+    if requests.is_empty() {
+        return None;
+    }
+    Some(DirectGitGenerationTask {
+        jobs: Arc::clone(&state.async_materialize_jobs),
+        materializer: materializer.clone(),
+        requests,
+        request_id,
+    })
 }
 
 enum TeeSpoolMsg {
@@ -1410,12 +1662,12 @@ fn spawn_tee_import(
         let output = match writer.await {
             Ok(Some(output)) => output,
             Ok(None) => {
-                warm.spawn();
+                drop(warm.spawn());
                 return;
             }
             Err(error) => {
                 warn!(request_id = warm.request_id, %error, "tee spool writer task panicked");
-                warm.spawn();
+                drop(warm.spawn());
                 return;
             }
         };
@@ -1440,13 +1692,16 @@ fn spawn_tee_import(
         drop(permit);
         release_reservations(output.reservations).await;
         match result {
-            Ok(()) => info!(
-                request_id = warm.request_id,
-                repo = %warm.repo,
-                pack_bytes = output.bytes,
-                import_elapsed_ms = elapsed_ms(import_started),
-                "tee import of proxied upload-pack response finished"
-            ),
+            Ok(()) => {
+                info!(
+                    request_id = warm.request_id,
+                    repo = %warm.repo,
+                    pack_bytes = output.bytes,
+                    import_elapsed_ms = elapsed_ms(import_started),
+                    "tee import of proxied upload-pack response finished"
+                );
+                warm.run_generation_materialize("tee_import").await;
+            }
             Err(error) => {
                 warn!(
                     request_id = warm.request_id,
@@ -1456,7 +1711,7 @@ fn spawn_tee_import(
                     import_elapsed_ms = elapsed_ms(import_started),
                     "tee import failed; falling back to warm refetch"
                 );
-                warm.spawn();
+                drop(warm.spawn());
             }
         }
     });
@@ -1477,14 +1732,15 @@ impl AsyncMaterializeJobs {
         }
     }
 
-    /// Queues a background materialize for the resolved commit. Returns false
-    /// when an equivalent job is already in flight.
+    /// Queues a background materialize for the resolved commit. Returns the
+    /// job's join handle, or `None` when an equivalent job is already in
+    /// flight.
     fn spawn(
         self: &Arc<Self>,
         materializer: Materializer,
         request: MaterializeRequest,
         commit: CommitSha,
-    ) -> bool {
+    ) -> Option<JoinHandle<()>> {
         let key = (request.repo.clone(), commit);
         {
             let Ok(mut inflight) = self.inflight.lock() else {
@@ -1493,14 +1749,14 @@ impl AsyncMaterializeJobs {
                     commit = %key.1,
                     "async materialize in-flight lock poisoned"
                 );
-                return false;
+                return None;
             };
             if !inflight.insert(key.clone()) {
-                return false;
+                return None;
             }
         }
         let jobs = Arc::clone(self);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let started = Instant::now();
             let result = match jobs.permits.acquire().await {
                 Ok(_permit) => materializer.materialize(request).await.map(|_| ()),
@@ -1527,7 +1783,7 @@ impl AsyncMaterializeJobs {
                 inflight.remove(&key);
             }
         });
-        true
+        Some(handle)
     }
 }
 
@@ -1605,7 +1861,7 @@ impl Stream for UpstreamProxyStream {
                 }
                 if !tee_spawned {
                     if let Some(task) = this.warm_task.take() {
-                        task.spawn();
+                        drop(task.spawn());
                     }
                 }
                 Poll::Ready(None)
@@ -1624,7 +1880,7 @@ impl Drop for UpstreamProxyStream {
     fn drop(&mut self) {
         if let Some(task) = self.warm_task.take() {
             if tokio::runtime::Handle::try_current().is_ok() {
-                task.spawn();
+                drop(task.spawn());
             }
         }
     }
@@ -1648,7 +1904,7 @@ fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackPro
     };
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(guarded))
         .expect("git upload-pack response")
@@ -1849,401 +2105,4 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::StreamExt;
-    use git_cache_core::{
-        MaterializeRequest, ObjectStoreConfig, RepoKey, Selector, UpstreamAuthorizationMode,
-    };
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
-    use std::process::Stdio;
-    use tempfile::TempDir;
-    use tokio::io::duplex;
-    use tokio::process::Command;
-
-    fn gzip_compress(data: &[u8]) -> Bytes {
-        use std::io::Write;
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(data).unwrap();
-        Bytes::from(encoder.finish().unwrap())
-    }
-
-    #[test]
-    fn decode_git_request_body_passes_through_without_encoding() {
-        let body = Bytes::from_static(b"0032want abc\n00000009done\n");
-        let decoded = decode_git_request_body(&HeaderMap::new(), body.clone(), 1024).unwrap();
-        assert_eq!(decoded, body);
-    }
-
-    #[test]
-    fn decode_git_request_body_inflates_gzip() {
-        let plain = b"0032want abcdef0123456789\n00000009done\n";
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
-        let decoded = decode_git_request_body(&headers, gzip_compress(plain), 1024).unwrap();
-        assert_eq!(decoded.as_ref(), plain);
-    }
-
-    #[test]
-    fn decode_git_request_body_bounds_inflated_size() {
-        let plain = vec![b'a'; 4096];
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
-        let error = decode_git_request_body(&headers, gzip_compress(&plain), 1024).unwrap_err();
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn decode_git_request_body_rejects_invalid_gzip() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
-        let error =
-            decode_git_request_body(&headers, Bytes::from_static(b"not gzip"), 1024).unwrap_err();
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn decode_git_request_body_rejects_unknown_encoding() {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_ENCODING, "br".parse().unwrap());
-        let error =
-            decode_git_request_body(&headers, Bytes::from_static(b"data"), 1024).unwrap_err();
-        assert_eq!(error.status, StatusCode::METHOD_NOT_ALLOWED);
-    }
-
-    #[test]
-    fn rate_limiter_blocks_after_limit() {
-        let limiter = RateLimiter::new(2);
-        assert!(limiter.check());
-        assert!(limiter.check());
-        assert!(!limiter.check());
-    }
-
-    #[test]
-    fn direct_git_proof_cache_does_not_downshift_basic_auth_to_public_proof() {
-        let cache = DirectGitProofCache::new(Duration::from_secs(30));
-        let repo = RepoKey::parse("github.com/org/repo").unwrap();
-        let auth = UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap();
-        let comparison = UpstreamRefComparison {
-            default_branch: Some("main".into()),
-            all_upstream: HashMap::from([("main".into(), "a".repeat(40))]),
-        };
-
-        cache.insert(&repo, &UpstreamAuth::Anonymous, comparison.clone());
-
-        assert!(
-            cache.get(&repo, &auth).is_none(),
-            "token-present POSTs must use token-scoped proof"
-        );
-        let (effective_auth, cached) = cache
-            .get(&repo, &UpstreamAuth::Anonymous)
-            .expect("anonymous POST should reuse anonymous proof");
-        assert_eq!(effective_auth, UpstreamAuth::Anonymous);
-        assert_eq!(cached.default_branch, comparison.default_branch);
-        assert_eq!(cached.all_upstream, comparison.all_upstream);
-    }
-
-    #[test]
-    fn direct_git_proof_cache_keeps_authenticated_proof_scoped() {
-        let cache = DirectGitProofCache::new(Duration::from_secs(30));
-        let repo = RepoKey::parse("github.com/org/private").unwrap();
-        let auth = UpstreamAuth::parse_header("Basic dXNlcjp0b2tlbg==").unwrap();
-        let comparison = UpstreamRefComparison {
-            default_branch: Some("main".into()),
-            all_upstream: HashMap::from([("main".into(), "b".repeat(40))]),
-        };
-
-        cache.insert(&repo, &auth, comparison.clone());
-
-        assert!(
-            cache.get(&repo, &UpstreamAuth::Anonymous).is_none(),
-            "authenticated proof must not satisfy anonymous POSTs"
-        );
-        let (effective_auth, cached) = cache
-            .get(&repo, &auth)
-            .expect("same Basic auth should reuse proof");
-        assert_eq!(effective_auth, auth);
-        assert_eq!(cached.all_upstream, comparison.all_upstream);
-    }
-
-    #[test]
-    fn direct_git_proof_cache_expires_entries() {
-        let cache = DirectGitProofCache::new(Duration::from_millis(1));
-        let repo = RepoKey::parse("github.com/org/repo").unwrap();
-        let comparison = UpstreamRefComparison {
-            default_branch: None,
-            all_upstream: HashMap::from([("main".into(), "c".repeat(40))]),
-        };
-
-        cache.insert(&repo, &UpstreamAuth::Anonymous, comparison);
-        std::thread::sleep(Duration::from_millis(2));
-
-        assert!(cache.get(&repo, &UpstreamAuth::Anonymous).is_none());
-    }
-
-    #[test]
-    fn upload_pack_endpoint_is_only_for_http_origins() {
-        assert_eq!(
-            upload_pack_endpoint("https://github.com/org/repo.git").as_deref(),
-            Some("https://github.com/org/repo.git/git-upload-pack")
-        );
-        assert_eq!(
-            upload_pack_endpoint("http://git.example.com/org/repo.git/").as_deref(),
-            Some("http://git.example.com/org/repo.git/git-upload-pack")
-        );
-        assert_eq!(upload_pack_endpoint("/tmp/upstreams/org/repo.git"), None);
-    }
-
-    #[test]
-    fn proxy_on_miss_header_overrides_configured_default() {
-        let mut headers = HeaderMap::new();
-        assert!(proxy_on_miss_disabled(&headers, false));
-        assert!(!proxy_on_miss_disabled(&headers, true));
-
-        headers.insert(PROXY_ON_MISS_HEADER, "1".parse().unwrap());
-        assert!(!proxy_on_miss_disabled(&headers, false));
-
-        for opt_out in ["0", "false", "no", "off", " Off "] {
-            headers.insert(PROXY_ON_MISS_HEADER, opt_out.parse().unwrap());
-            assert!(
-                proxy_on_miss_disabled(&headers, true),
-                "{opt_out} should opt out"
-            );
-        }
-    }
-
-    #[test]
-    fn upstream_api_auth_ignores_gateway_bearer_authorization() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            "Bearer gateway-token".parse().unwrap(),
-        );
-
-        let auth = upstream_api_auth(&headers).unwrap();
-
-        assert_eq!(auth, UpstreamAuth::Anonymous);
-    }
-
-    #[tokio::test]
-    async fn authenticated_resolve_is_rate_limited_before_upstream_work() {
-        let tmp = TempDir::new().unwrap();
-        let config = AppConfig {
-            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            cache_root: tmp.path().join("cache"),
-            upstream_root: Some(tmp.path().join("upstreams")),
-            git_binary: PathBuf::from("git"),
-            git_timeout_seconds: 60,
-            max_git_output_bytes: 16 * 1024 * 1024,
-            object_store: ObjectStoreConfig::Local {
-                root: tmp.path().join("objects"),
-            },
-            upstream_auth_token_env: None,
-            rate_limit_per_minute: 1,
-            allowed_upstream_hosts: vec!["github.com".into()],
-            disk: git_cache_core::DiskConfig {
-                quota_bytes: 1024 * 1024 * 1024,
-                min_free_bytes: 0,
-                access_flush_interval_secs: 60,
-            },
-            git_remote: Default::default(),
-            compaction: Default::default(),
-            shutdown: Default::default(),
-            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
-            use_gitoxide: true,
-        };
-        let state = Arc::new(ApiState::try_new(config).unwrap());
-        assert!(state.rate_limiter.check(), "first request consumes quota");
-
-        let request = MaterializeRequest {
-            repo: RepoKey::parse("evil.com/org/repo").unwrap(),
-            selector: Selector::DefaultBranch,
-            upstream_authorization: UpstreamAuthorizationMode::Required,
-        };
-        let auth = UpstreamAuth::parse_header("Basic dXNlcjpwYXNz").unwrap();
-
-        let result =
-            handle_checked_materialize_request(&state, MaterializeEndpoint::Resolve, request, auth)
-                .await;
-
-        match result {
-            Err(error) => assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS),
-            Ok(_) => panic!("rate-limited authenticated resolve should not succeed"),
-        }
-    }
-
-    #[tokio::test]
-    async fn healthz_fails_after_shutdown_begins() {
-        let tmp = TempDir::new().unwrap();
-        let config = AppConfig {
-            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-            cache_root: tmp.path().join("cache"),
-            upstream_root: None,
-            git_binary: PathBuf::from("git"),
-            git_timeout_seconds: 60,
-            max_git_output_bytes: 16 * 1024 * 1024,
-            object_store: ObjectStoreConfig::Local {
-                root: tmp.path().join("objects"),
-            },
-            upstream_auth_token_env: None,
-            rate_limit_per_minute: 0,
-            allowed_upstream_hosts: vec!["github.com".into()],
-            disk: git_cache_core::DiskConfig {
-                quota_bytes: 1024 * 1024 * 1024,
-                min_free_bytes: 0,
-                access_flush_interval_secs: 60,
-            },
-            git_remote: Default::default(),
-            compaction: Default::default(),
-            shutdown: Default::default(),
-            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
-            async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
-            use_gitoxide: true,
-        };
-        let state = Arc::new(ApiState::try_new(config).unwrap());
-        let gate = ReadinessGate(Arc::clone(&state.shutting_down));
-
-        let response = healthz(State(Arc::clone(&state))).await;
-        assert_eq!(response.status(), StatusCode::OK);
-
-        gate.begin_shutdown();
-
-        let response = healthz(State(state)).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    /// Starts `run_until_shutdown` on an ephemeral port with a single `/slow`
-    /// route that sleeps for `handler_delay` before responding. Returns the
-    /// bound address, the shutdown flag readable by the test, a sender that
-    /// triggers shutdown, and the server task handle.
-    async fn spawn_drain_server(
-        handler_delay: Duration,
-        drain_timeout: Duration,
-    ) -> (
-        SocketAddr,
-        Arc<AtomicBool>,
-        tokio::sync::oneshot::Sender<()>,
-        tokio::task::JoinHandle<CoreResult<()>>,
-    ) {
-        let shutting_down = Arc::new(AtomicBool::new(false));
-        let gate = ReadinessGate(Arc::clone(&shutting_down));
-        let app = Router::new().route(
-            "/slow",
-            get(move || async move {
-                tokio::time::sleep(handler_delay).await;
-                "done"
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(run_until_shutdown(
-            listener,
-            app,
-            gate,
-            Duration::ZERO,
-            drain_timeout,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
-        (addr, shutting_down, shutdown_tx, server)
-    }
-
-    #[tokio::test]
-    async fn graceful_shutdown_lets_in_flight_request_finish_within_drain_timeout() {
-        let (addr, shutting_down, shutdown_tx, server) =
-            spawn_drain_server(Duration::from_millis(300), Duration::from_secs(5)).await;
-
-        let request =
-            tokio::spawn(async move { reqwest::get(format!("http://{addr}/slow")).await });
-
-        // Let the request reach the handler, then trigger shutdown mid-flight.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown_tx.send(()).unwrap();
-
-        let response = tokio::time::timeout(Duration::from_secs(3), request)
-            .await
-            .expect("request should finish well before the drain timeout")
-            .unwrap()
-            .expect("in-flight request must not be killed by graceful shutdown");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.text().await.unwrap(), "done");
-        assert!(shutting_down.load(Ordering::SeqCst));
-
-        tokio::time::timeout(Duration::from_secs(3), server)
-            .await
-            .expect("server should stop promptly once the request drains")
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn graceful_shutdown_kills_request_still_in_flight_after_drain_timeout() {
-        let (addr, shutting_down, shutdown_tx, server) =
-            spawn_drain_server(Duration::from_secs(60), Duration::from_millis(200)).await;
-
-        let request =
-            tokio::spawn(async move { reqwest::get(format!("http://{addr}/slow")).await });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown_tx.send(()).unwrap();
-
-        // The server must exit once the drain timeout elapses, without waiting
-        // for the 60s handler.
-        tokio::time::timeout(Duration::from_secs(3), server)
-            .await
-            .expect("server should force-exit at the drain deadline")
-            .unwrap()
-            .unwrap();
-        assert!(shutting_down.load(Ordering::SeqCst));
-
-        // In production the process exits at this point, cutting the request.
-        // In-process we can only assert the server gave up on it: the request
-        // is still in flight when run_until_shutdown returns.
-        assert!(
-            !request.is_finished(),
-            "request should still be in flight when the server force-exits"
-        );
-        request.abort();
-    }
-
-    #[tokio::test]
-    async fn upload_pack_stream_times_out_when_reader_stays_pending() {
-        let (reader, _writer) = duplex(64);
-        let child = Command::new("sleep")
-            .arg("60")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn sleep child");
-        let timeout_duration = Duration::from_millis(10);
-        let mut stream = ChildGuardStream {
-            inner: ReaderStream::new(reader),
-            child,
-            bytes_sent: 0,
-            max_bytes: 1024,
-            timeout: Box::pin(tokio::time::sleep(timeout_duration)),
-            timeout_duration,
-            timed_out: false,
-            _permit: None,
-        };
-
-        let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("stream should wake on timeout")
-            .expect("stream should yield timeout error");
-        let error = item.expect_err("silent stream should time out");
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(
-            error
-                .to_string()
-                .contains("git upload-pack response exceeded timeout"),
-            "unexpected timeout error: {error}"
-        );
-    }
-}
+mod tests;

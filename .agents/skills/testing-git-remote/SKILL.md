@@ -51,11 +51,6 @@ root = "/tmp/gitcache-test/object-store"
 [disk]
 quota_bytes = 10737418240
 min_free_bytes = 1073741824
-
-[git_remote]
-enabled = true
-branch_ref_check = "always"
-commit_read_through = true
 ```
 
 ### 2. Start the server

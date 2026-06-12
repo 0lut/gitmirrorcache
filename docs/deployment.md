@@ -6,8 +6,8 @@ A Helm chart for deploying to any Kubernetes cluster lives at
 [`deploy/helm/gitmirrorcache`](../deploy/helm/gitmirrorcache/README.md). It runs
 the server as a StatefulSet with a persistent `/cache` volume, an hourly
 `git-cache compact --all` CronJob, and S3 (or any S3-compatible store) as the
-durable source. Container images are published to
-`ghcr.io/0lut/gitmirrorcache` by the `Publish Docker Image` workflow.
+durable source. The `Publish Release Artifacts` workflow publishes container
+images to GHCR and release Helm charts to the configured OCI chart repository.
 
 ## Current AWS Deployment Path
 
@@ -132,12 +132,72 @@ is served from `repos-v3`.
 The ECS deploy script grants task IAM access to that runtime prefix while still
 passing the base prefix to the container.
 
+## Production Target
+
+The production target is a thin wrapper around the ECS/EC2/EBS deploy path. It
+uses the published GHCR image for this repository instead of building and
+pushing an ECR image:
+
+```sh
+AWS_REGION=us-west-2 scripts/aws/deploy-prod.sh
+```
+
+Defaults:
+
+- `ENVIRONMENT=prod`
+- `NAME_PREFIX=gitmirrorcache-prod`
+- `IMAGE_URI=ghcr.io/0lut/gitmirrorcache:latest`
+- `S3_PREFIX=repos`
+- `ECS_SKIP_DOCKER_BUILD=true`
+- `BOOTSTRAP_SKIP_ECR=true`
+- `ECS_EBS_DELETE_ON_TERMINATION=false`
+- `ECS_COMPACTION_ENABLED=true`
+
+Set `IMAGE_TAG` to pin a published tag, or set `IMAGE_URI` to deploy a specific
+digest:
+
+```sh
+IMAGE_URI=ghcr.io/0lut/gitmirrorcache@sha256:<digest> scripts/aws/deploy-prod.sh
+```
+
+The public front door is a Cloudflare Worker with static assets. It serves the
+landing page from `site/` and proxies `/git/*`, `/v1/*`, `/healthz`, and
+`/metrics` to the production ALB, so clients use the apex hostname for Git:
+
+```sh
+AWS_REGION=us-west-2 \
+scripts/cloudflare/deploy-static-site.sh
+```
+
+The deploy helper resolves `gitmirrorcache-prod-ec2-alb` from AWS and injects it
+as `API_ORIGIN=http://<alb-dns-name>` for the Worker deployment. The Worker is
+configured with custom domains for `gitcache.sh` and `www.gitcache.sh`.
+
+```sh
+git clone https://gitcache.sh/git/github.com/org/repo.git
+```
+
+For an optional direct API hostname, create an API token with DNS edit access
+for the zone and run:
+
+```sh
+CLOUDFLARE_API_TOKEN=... \
+AWS_REGION=us-west-2 \
+scripts/cloudflare/upsert-alb-cname.sh
+```
+
+The DNS helper defaults to `CF_RECORD_NAME=api.gitcache.sh` and points that CNAME
+at the production ALB.
+
 ## Preview Commit Stacks
 
 Use preview stacks to deploy any branch, tag, or commit without touching the
-production `main` stack. Production keeps using `NAME_PREFIX=gitmirrorcache-arm`
+long-lived production target. Production uses `NAME_PREFIX=gitmirrorcache-prod`
 and `S3_PREFIX=repos`; every preview gets a derived stack name, an isolated S3
-prefix, and a versioned route on the shared preview ALB.
+prefix, and a versioned route on the shared preview ALB. Preview shared
+infrastructure still defaults to `PREVIEW_SHARED_NAME_PREFIX=gitmirrorcache-arm`
+for compatibility with the existing preview bucket, ECR repository, and ALB;
+override that value when migrating preview shared infrastructure.
 
 ### Local CLI
 

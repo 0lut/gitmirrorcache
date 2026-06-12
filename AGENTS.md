@@ -45,6 +45,13 @@ and tests over ad-hoc operational steps.
   where supported, and test rejected leading-dash/NUL input plus any
   helper-specific constraints.
 
+## Test Layout
+
+- Keep tests out of regular module bodies. Put `#[test]` and `#[tokio::test]`
+  functions in dedicated test modules: use `#[cfg(test)] mod tests;` with
+  sibling `tests.rs`/`tests/` files, or integration tests under `tests/`. Do not
+  add inline `mod tests { ... }` blocks to regular source files.
+
 ## Current Cache Contract
 
 - `MaterializeRequest` is intentionally small: `repo`, `selector`, and optional
@@ -70,8 +77,10 @@ and tests over ad-hoc operational steps.
   the `git-cache-use-proxy-on-miss` header is the only per-request override
   (falsey values opt out). Proxy only
   HTTP(S) upstreams, enforce streamed byte limits, forward auth only to upstream,
-  then queue a bounded background warm. The proxy readiness/background warm
-  paths should not hydrate generation manifests.
+  then queue bounded background cache work. Proxy readiness and local warm paths
+  should not hydrate generation manifests inline; after a branch-tip proxy miss
+  finishes, queue async materialization so durable generation manifests are
+  published outside the client response path.
 - IMPORTANT testing caveat: because proxying is on by default, any test or
   benchmark that means to exercise the local read-through (cache-fill) path
   against an HTTP(S) upstream MUST opt out explicitly — set
