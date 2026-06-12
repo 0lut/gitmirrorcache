@@ -24,7 +24,6 @@ const ENV_KEYS: &[&str] = &[
     "GIT_CACHE_ALLOWED_UPSTREAM_HOSTS",
     "GIT_CACHE_DISK_QUOTA_BYTES",
     "GIT_CACHE_DISK_MIN_FREE_BYTES",
-    "GIT_CACHE_GIT_REMOTE_ENABLED",
     "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
     "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
     "GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT",
@@ -140,7 +139,6 @@ fn compaction_config_default_values() {
 #[test]
 fn git_remote_config_default_values() {
     let config = GitRemoteConfig::default();
-    assert!(config.enabled);
     assert!(config.commit_read_through);
     assert_eq!(config.background_import_concurrency, 1);
     assert!(config.proxy_on_miss_by_default);
@@ -150,7 +148,6 @@ fn git_remote_config_default_values() {
 #[test]
 fn git_remote_config_serde_round_trip() {
     let config = GitRemoteConfig {
-        enabled: false,
         commit_read_through: false,
         background_import_concurrency: 2,
         proxy_on_miss_by_default: false,
@@ -171,7 +168,6 @@ fn from_env_configures_s3_object_store_and_git_remote() {
         ("GIT_CACHE_S3_PREFIX", "prod"),
         ("GIT_CACHE_S3_ENDPOINT", "https://s3.example.com"),
         ("GIT_CACHE_ALLOWED_UPSTREAM_HOSTS", "github.com, gitlab.com"),
-        ("GIT_CACHE_GIT_REMOTE_ENABLED", "off"),
         ("GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "off"),
         ("GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY", "4"),
         ("GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT", "off"),
@@ -188,7 +184,6 @@ fn from_env_configures_s3_object_store_and_git_remote() {
         config.allowed_upstream_hosts,
         vec!["github.com".to_string(), "gitlab.com".to_string()]
     );
-    assert!(!config.git_remote.enabled);
     assert!(!config.git_remote.commit_read_through);
     assert_eq!(config.git_remote.background_import_concurrency, 4);
     assert!(!config.git_remote.proxy_on_miss_by_default);

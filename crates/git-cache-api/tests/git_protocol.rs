@@ -10,6 +10,11 @@ mod tests {
     use super::support;
 
     use git_cache_api::app;
+    use git_cache_core::{
+        GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE, GIT_UPLOAD_PACK_PATH,
+        GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE,
+        GIT_UPLOAD_PACK_SERVICE,
+    };
     use std::net::SocketAddr;
     use std::path::Path;
     use std::process::Command;
@@ -70,13 +75,16 @@ mod tests {
 
         fn refs_url(&self, repo: &str) -> String {
             format!(
-                "http://{}/git/{}.git/info/refs?service=git-upload-pack",
-                self.addr, repo
+                "http://{}/git/{}.git/info/refs?service={}",
+                self.addr, repo, GIT_UPLOAD_PACK_SERVICE
             )
         }
 
         fn upload_pack_url(&self, repo: &str) -> String {
-            format!("http://{}/git/{}.git/git-upload-pack", self.addr, repo)
+            format!(
+                "http://{}/git/{}.git{}",
+                self.addr, repo, GIT_UPLOAD_PACK_PATH
+            )
         }
     }
 
@@ -129,7 +137,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "application/x-git-upload-pack-advertisement"
+            GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE
         );
     }
 
@@ -143,9 +151,9 @@ mod tests {
             .await
             .unwrap();
 
-        let prefix = b"001e# service=git-upload-pack\n0000";
+        let prefix = upload_pack_service_preamble();
         assert!(
-            body.starts_with(prefix),
+            body.starts_with(&prefix),
             "body does not start with service preamble: {:?}",
             &body[..std::cmp::min(40, body.len())]
         );
@@ -213,9 +221,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Skip the service preamble (001e# service=git-upload-pack\n0000).
-        let after_preamble = &body[34..];
+        let preamble = upload_pack_service_preamble();
+        let after_preamble = &body[preamble.len()..];
         validate_pkt_lines(after_preamble);
+    }
+
+    fn upload_pack_service_preamble() -> Vec<u8> {
+        let service_line = format!("# service={GIT_UPLOAD_PACK_SERVICE}\n");
+        format!("{:04x}{service_line}0000", 4 + service_line.len()).into_bytes()
     }
 
     fn validate_pkt_lines(data: &[u8]) {
@@ -291,7 +304,7 @@ mod tests {
         let client = reqwest::Client::new();
         let resp = client
             .post(server.upload_pack_url("github.com/org/repo"))
-            .header("Content-Type", "application/x-git-upload-pack-request")
+            .header("Content-Type", GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE)
             .body(body)
             .send()
             .await
@@ -305,7 +318,7 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert_eq!(ct, "application/x-git-upload-pack-result");
+        assert_eq!(ct, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE);
 
         let resp_body = resp.bytes().await.unwrap();
         let has_nak = resp_body.windows(3).any(|w| w == b"NAK");
@@ -398,8 +411,8 @@ mod tests {
     async fn invalid_repo_path_returns_error() {
         let server = TestServer::start().await;
         let url = format!(
-            "http://{}/git/not-a-valid-repo.git/info/refs?service=git-upload-pack",
-            server.addr
+            "http://{}/git/not-a-valid-repo.git/info/refs?service={}",
+            server.addr, GIT_UPLOAD_PACK_SERVICE
         );
         let resp = reqwest::get(&url).await.unwrap();
         assert!(
@@ -413,8 +426,8 @@ mod tests {
     async fn disallowed_host_returns_400() {
         let server = TestServer::start().await;
         let url = format!(
-            "http://{}/git/evil.com/org/repo.git/info/refs?service=git-upload-pack",
-            server.addr
+            "http://{}/git/evil.com/org/repo.git/info/refs?service={}",
+            server.addr, GIT_UPLOAD_PACK_SERVICE
         );
         let resp = reqwest::get(&url).await.unwrap();
         assert_eq!(resp.status(), 400);

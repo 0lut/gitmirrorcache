@@ -111,9 +111,6 @@ config:
   disk:
     quotaBytes: 107374182400 # 100 GiB; keep below the persistence size
     minFreeBytes: 10737418240 # 10 GiB
-  gitRemote:
-    # Serve git clone/fetch directly via /git/{host}/{owner}/{repo}.git
-    enabled: true
   compaction:
     chainDepthThreshold: 10
     inline: false

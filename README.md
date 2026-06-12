@@ -119,7 +119,6 @@ from the file.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `GIT_CACHE_GIT_REMOTE_ENABLED` | `true` | Serve the read-through Git remote at `/git/{host}/{owner}/{repo}.git`. |
 | `GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH` | `true` | Fetch missing commits from upstream during a client request instead of failing. |
 | `GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT` | `true` | On a cold miss, proxy upstream's upload-pack response to the client immediately and warm the cache in the background. |
 | `GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT` | `true` | While proxying a cold miss, tee the response into the local cache instead of re-fetching upstream afterwards. |

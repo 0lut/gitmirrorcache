@@ -57,7 +57,7 @@ RUN_GITHUB_INTEGRATION=1 python3 -m unittest -v integration_tests.test_git_remot
 
 What the tests do:
 
-- build and start `git-cache-api` with `git_remote.enabled = true`
+- build and start `git-cache-api` with the always-on `/git/` remote
 - for each high-commit repo (`torvalds/linux`, `llvm/llvm-project`, `gcc-mirror/gcc`, `astral-sh/uv`):
   - `git ls-remote` via the cache and compare to the upstream HEAD
   - `git clone --depth 1` via the cache and verify the cloned HEAD matches upstream

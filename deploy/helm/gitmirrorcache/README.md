@@ -130,7 +130,6 @@ upstreamAuth:
 | `config.objectStore.kind` | `s3` | `s3` or `local` (testing only) |
 | `config.objectStore.s3.bucket` | – | Required for `s3` |
 | `config.allowedUpstreamHosts` | `[github.com]` | Upstream allowlist |
-| `config.gitRemote.enabled` | `true` | Serve `/git/{host}/{owner}/{repo}.git` |
 | `config.disk.quotaBytes` | 100 GiB | Hot-cache disk quota |
 | `persistence.size` | `100Gi` | PVC size (keep ≥ disk quota) |
 | `persistence.storageClass` | `""` | PVC StorageClass; empty uses the cluster default. Use `gp3` on EKS. |

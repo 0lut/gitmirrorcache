@@ -97,7 +97,6 @@ impl AppConfig {
                 )?,
             },
             git_remote: GitRemoteConfig {
-                enabled: parse_bool_env("GIT_CACHE_GIT_REMOTE_ENABLED", true)?,
                 commit_read_through: parse_bool_env(
                     "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
                     true,
@@ -271,8 +270,6 @@ fn default_compaction_retention_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRemoteConfig {
     #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_true")]
     pub commit_read_through: bool,
     #[serde(default = "default_background_import_concurrency")]
     pub background_import_concurrency: usize,
@@ -288,7 +285,6 @@ pub struct GitRemoteConfig {
 impl Default for GitRemoteConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             commit_read_through: true,
             background_import_concurrency: default_background_import_concurrency(),
             proxy_on_miss_by_default: true,

@@ -7,6 +7,9 @@ use futures::Stream;
 use git_cache_core::{
     AppConfig, BranchName, CommitSha, GitCacheError, MaterializeRequest, RepoKey,
     Result as CoreResult, Selector, UpstreamAuth, UpstreamAuthorizationMode,
+    GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE, GIT_UPLOAD_PACK_PATH,
+    GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE,
+    GIT_UPLOAD_PACK_SERVICE,
 };
 use git_cache_disk::{AsyncDiskManager, AsyncReservation};
 use git_cache_domain::materializer::repo_from_git_path;
@@ -49,9 +52,8 @@ pub fn app(config: AppConfig) -> Router {
 }
 
 pub fn app_result(config: AppConfig) -> CoreResult<Router> {
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new(config)?);
-    router(git_remote_enabled, state)
+    router(state)
 }
 
 pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
@@ -62,10 +64,9 @@ pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
 /// caller can flip during shutdown so `/healthz` starts failing and load
 /// balancers stop routing new traffic while in-flight requests drain.
 pub async fn app_with_shutdown_async(config: AppConfig) -> CoreResult<(Router, ReadinessGate)> {
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
     let gate = ReadinessGate(Arc::clone(&state.shutting_down));
-    Ok((router(git_remote_enabled, state)?, gate))
+    Ok((router(state)?, gate))
 }
 
 /// Handle that marks the server as shutting down; once flipped, `/healthz`
@@ -79,20 +80,17 @@ impl ReadinessGate {
     }
 }
 
-fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> {
+fn router(state: Arc<ApiState>) -> CoreResult<Router> {
     let git_body_limit = state.domain.config.max_git_output_bytes;
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/v1/materialize", post(materialize))
-        .route("/v1/resolve", post(resolve));
-
-    if git_remote_enabled {
-        router = router.route(
+        .route("/v1/resolve", post(resolve))
+        .route(
             "/git/{*repo_path}",
             any(git_repo).layer(DefaultBodyLimit::max(git_body_limit)),
         );
-    }
 
     Ok(router.with_state(state))
 }
@@ -190,11 +188,10 @@ fn spawn_repo_access_flusher(domain: &Arc<AppState>) {
 /// timeout, and finally any buffered repo access timestamps are flushed.
 pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> CoreResult<()> {
     let shutdown_config = config.shutdown.clone();
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
     let domain = state.domain.clone();
     let readiness = ReadinessGate(Arc::clone(&state.shutting_down));
-    let app = router(git_remote_enabled, state)?;
+    let app = router(state)?;
 
     let readiness_delay = Duration::from_secs(shutdown_config.readiness_delay_seconds);
     let drain_timeout = Duration::from_secs(shutdown_config.drain_timeout_seconds);
@@ -759,28 +756,99 @@ struct GitRepoRequest {
 }
 
 async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
-    let GitRepoRequest {
-        repo_path,
-        query,
-        headers,
-        method,
-        uri,
-        body,
-        request_id,
-    } = request;
-    let path = uri.path();
+    let request_type = git_request_type(&request);
+    let path = request.uri.path().to_string();
 
-    // Reject git-receive-pack (push) requests.
+    match request_type {
+        GitRequestType::ReceivePack => {
+            return ApiError::from(GitCacheError::Unsupported(
+                "git-receive-pack is disabled".into(),
+            ))
+            .into_response();
+        }
+        GitRequestType::Unsupported => {
+            return ApiError::from(GitCacheError::Unsupported(format!(
+                "unsupported git request: {} {path}",
+                request.method
+            )))
+            .into_response();
+        }
+        GitRequestType::UploadPackRefs | GitRequestType::UploadPack => {}
+    }
+
+    let started = Instant::now();
+    let auth = match direct_git_upstream_auth(&request.headers) {
+        Ok(auth) => auth,
+        Err(error) => return error.into_response(),
+    };
+
+    match request_type {
+        GitRequestType::UploadPackRefs => git_repo_get(state, request, started, auth).await,
+        GitRequestType::UploadPack => git_repo_post(state, request, started, auth).await,
+        GitRequestType::ReceivePack => ApiError::from(GitCacheError::Unsupported(
+            "git-receive-pack is disabled".into(),
+        ))
+        .into_response(),
+        GitRequestType::Unsupported => ApiError::from(GitCacheError::Unsupported(format!(
+            "unsupported git request: {} {path}",
+            request.method
+        )))
+        .into_response(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitRequestType {
+    UploadPackRefs,
+    UploadPack,
+    ReceivePack,
+    Unsupported,
+}
+
+fn git_request_type(request: &GitRepoRequest) -> GitRequestType {
+    let path = request.uri.path();
+
     if path.contains("git-receive-pack")
-        || query
+        || request
+            .query
             .get("service")
             .is_some_and(|s| s == "git-receive-pack")
     {
-        return ApiError::from(GitCacheError::Unsupported(
-            "git-receive-pack is disabled".into(),
-        ))
-        .into_response();
+        return GitRequestType::ReceivePack;
     }
+
+    if request.method == Method::GET
+        && path.ends_with("/info/refs")
+        && request
+            .query
+            .get("service")
+            .is_some_and(|s| s == GIT_UPLOAD_PACK_SERVICE)
+    {
+        return GitRequestType::UploadPackRefs;
+    }
+
+    if request.method == Method::POST && path.ends_with(GIT_UPLOAD_PACK_PATH) {
+        return GitRequestType::UploadPack;
+    }
+
+    GitRequestType::Unsupported
+}
+
+async fn git_repo_get(
+    state: Arc<ApiState>,
+    request: GitRepoRequest,
+    started: Instant,
+    auth: UpstreamAuth,
+) -> Response {
+    let GitRepoRequest {
+        repo_path,
+        query: _,
+        headers: _,
+        method: _,
+        uri: _,
+        body: _,
+        request_id,
+    } = request;
 
     let repo = match repo_from_git_path(&repo_path) {
         Ok(repo) => repo,
@@ -793,214 +861,220 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
         return ApiError::from(error).into_response();
     }
 
-    if method == Method::GET
-        && path.ends_with("/info/refs")
-        && query.get("service").is_some_and(|s| s == "git-upload-pack")
-    {
-        let started = Instant::now();
-        let auth = match direct_git_upstream_auth(&headers) {
-            Ok(auth) => auth,
+    info!(
+        request_id,
+        repo = %repo,
+        auth = auth_label(&auth),
+        "direct git ref advertisement started"
+    );
+    state
+        .metrics
+        .git_remote_refs_total
+        .fetch_add(1, Ordering::Relaxed);
+    let materializer = materializer.using_upstream_auth(&auth);
+
+    // Fetch upstream refs via ls-remote and synthesize the pkt-line
+    // response directly. No objects are fetched here; the repo may not
+    // even exist locally yet. The advertisement is a short-lived
+    // repo-access proof for the matching upload-pack POST. The POST path
+    // then performs the normal read-through availability work using the
+    // same request auth.
+    let refs_started = Instant::now();
+    let comparison = match materializer.upstream_refs(&repo).await {
+        Ok(c) => c,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    info!(
+        request_id,
+        repo = %repo,
+        refs_count = comparison.all_upstream.len(),
+        elapsed_ms = elapsed_ms(refs_started),
+        "direct git upstream refs fetched"
+    );
+    state
+        .direct_git_proofs
+        .insert(&repo, &auth, comparison.clone());
+
+    let output = synthesize_ref_advertisement(&comparison);
+    let response = git_response(
+        GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE,
+        frame_ref_advertisement(&output),
+    );
+    info!(
+        request_id,
+        repo = %repo,
+        auth = auth_label(&auth),
+        elapsed_ms = elapsed_ms(started),
+        status = %StatusCode::OK,
+        "direct git ref advertisement finished"
+    );
+    response
+}
+
+async fn git_repo_post(
+    state: Arc<ApiState>,
+    request: GitRepoRequest,
+    started: Instant,
+    auth: UpstreamAuth,
+) -> Response {
+    let GitRepoRequest {
+        repo_path,
+        query: _,
+        headers,
+        method: _,
+        uri: _,
+        body,
+        request_id,
+    } = request;
+
+    let repo = match repo_from_git_path(&repo_path) {
+        Ok(repo) => repo,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+
+    let materializer = Materializer::new(Arc::clone(&state.domain));
+
+    if let Err(error) = materializer.validate_host(&repo) {
+        return ApiError::from(error).into_response();
+    }
+
+    let body =
+        match decode_git_request_body(&headers, body, state.domain.config.max_git_output_bytes) {
+            Ok(body) => body,
             Err(error) => return error.into_response(),
         };
-        info!(
-            request_id,
-            repo = %repo,
-            auth = auth_label(&auth),
-            "direct git ref advertisement started"
-        );
-        state
-            .metrics
-            .git_remote_refs_total
-            .fetch_add(1, Ordering::Relaxed);
-        let materializer = materializer.using_upstream_auth(&auth);
-
-        // Fetch upstream refs via ls-remote and synthesize the pkt-line
-        // response directly. No objects are fetched here; the repo may not
-        // even exist locally yet. The advertisement is a short-lived
-        // repo-access proof for the matching upload-pack POST. The POST path
-        // then performs the normal read-through availability work using the
-        // same request auth.
-        let refs_started = Instant::now();
-        let comparison = match materializer.upstream_refs(&repo).await {
-            Ok(c) => c,
-            Err(error) => return ApiError::from(error).into_response(),
-        };
-        info!(
-            request_id,
-            repo = %repo,
-            refs_count = comparison.all_upstream.len(),
-            elapsed_ms = elapsed_ms(refs_started),
-            "direct git upstream refs fetched"
-        );
-        state
-            .direct_git_proofs
-            .insert(&repo, &auth, comparison.clone());
-
-        let output = synthesize_ref_advertisement(&comparison);
-        let response = git_response(
-            "application/x-git-upload-pack-advertisement",
-            frame_ref_advertisement(&output),
-        );
-        info!(
-            request_id,
-            repo = %repo,
-            auth = auth_label(&auth),
-            elapsed_ms = elapsed_ms(started),
-            status = %StatusCode::OK,
-            "direct git ref advertisement finished"
-        );
-        response
-    } else if method == Method::POST && path.ends_with("/git-upload-pack") {
-        let started = Instant::now();
-        let auth = match direct_git_upstream_auth(&headers) {
-            Ok(auth) => auth,
-            Err(error) => return error.into_response(),
-        };
-        let body =
-            match decode_git_request_body(&headers, body, state.domain.config.max_git_output_bytes)
-            {
-                Ok(body) => body,
-                Err(error) => return error.into_response(),
-            };
-        info!(
-            request_id,
-            repo = %repo,
-            auth = auth_label(&auth),
-            body_bytes = body.len(),
-            "direct git upload-pack started"
-        );
-        state
-            .metrics
-            .git_remote_upload_pack_total
-            .fetch_add(1, Ordering::Relaxed);
-        let cached_proof = state.direct_git_proofs.get(&repo, &auth);
-        let (auth, comparison) = match cached_proof {
-            Some((auth, comparison)) => {
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    "direct git upload-pack using cached repo proof"
-                );
-                (auth, Some(comparison))
-            }
-            None => {
-                // Direct Git POSTs can arrive without the matching GET, so
-                // fall back to the same lightweight ref proof used by GET.
-                // This proves repo access without fetching packs. The
-                // materializer then performs the same read-through
-                // availability work as main, using the request-scoped auth.
-                let auth_started = Instant::now();
-                let proof_materializer = materializer.using_upstream_auth(&auth);
-                let comparison = match proof_materializer.upstream_refs(&repo).await {
-                    Ok(comparison) => comparison,
-                    Err(error) => return ApiError::from(error).into_response(),
-                };
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    refs_count = comparison.all_upstream.len(),
-                    elapsed_ms = elapsed_ms(auth_started),
-                    "direct git upload-pack repo access proved"
-                );
-                state
-                    .direct_git_proofs
-                    .insert(&repo, &auth, comparison.clone());
-                (auth, Some(comparison))
-            }
-        };
-        let materializer = materializer.using_upstream_auth(&auth);
-
-        if !proxy_on_miss_disabled(
-            &headers,
-            state.domain.config.git_remote.proxy_on_miss_by_default,
-        ) {
-            let local_check_started = Instant::now();
-            let can_serve_locally = match materializer
-                .prepare_upload_pack_from_cache(&repo, &body)
-                .await
-            {
-                Ok(can_serve) => can_serve,
+    info!(
+        request_id,
+        repo = %repo,
+        auth = auth_label(&auth),
+        body_bytes = body.len(),
+        "direct git upload-pack started"
+    );
+    state
+        .metrics
+        .git_remote_upload_pack_total
+        .fetch_add(1, Ordering::Relaxed);
+    let cached_proof = state.direct_git_proofs.get(&repo, &auth);
+    let (auth, comparison) = match cached_proof {
+        Some((auth, comparison)) => {
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                "direct git upload-pack using cached repo proof"
+            );
+            (auth, Some(comparison))
+        }
+        None => {
+            // Direct Git POSTs can arrive without the matching GET, so
+            // fall back to the same lightweight ref proof used by GET.
+            // This proves repo access without fetching packs. The
+            // materializer then performs the same read-through
+            // availability work as main, using the request-scoped auth.
+            let auth_started = Instant::now();
+            let proof_materializer = materializer.using_upstream_auth(&auth);
+            let comparison = match proof_materializer.upstream_refs(&repo).await {
+                Ok(comparison) => comparison,
                 Err(error) => return ApiError::from(error).into_response(),
             };
             info!(
                 request_id,
                 repo = %repo,
                 auth = auth_label(&auth),
-                can_serve_locally,
-                elapsed_ms = elapsed_ms(local_check_started),
-                "direct git proxy-on-miss cache readiness checked"
+                refs_count = comparison.all_upstream.len(),
+                elapsed_ms = elapsed_ms(auth_started),
+                "direct git upload-pack repo access proved"
             );
+            state
+                .direct_git_proofs
+                .insert(&repo, &auth, comparison.clone());
+            (auth, Some(comparison))
+        }
+    };
+    let materializer = materializer.using_upstream_auth(&auth);
 
-            if !can_serve_locally {
-                match proxy_upload_pack_to_upstream(UploadPackProxyRequest {
-                    state: &state,
-                    materializer: &materializer,
-                    repo: &repo,
-                    auth: &auth,
-                    headers: &headers,
-                    body: body.clone(),
-                    comparison: comparison.clone(),
-                    request_id,
-                    request_started: started,
-                })
-                .await
-                {
-                    Ok(response) => return response,
-                    Err(ProxyFallback::UseLocal) => {
-                        info!(
-                            request_id,
-                            repo = %repo,
-                            auth = auth_label(&auth),
-                            "direct git proxy-on-miss unavailable; using local read-through"
-                        );
-                    }
-                    Err(ProxyFallback::Error(error)) => return error.into_response(),
+    if !proxy_on_miss_disabled(
+        &headers,
+        state.domain.config.git_remote.proxy_on_miss_by_default,
+    ) {
+        let local_check_started = Instant::now();
+        let can_serve_locally = match materializer
+            .prepare_upload_pack_from_cache(&repo, &body)
+            .await
+        {
+            Ok(can_serve) => can_serve,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
+        info!(
+            request_id,
+            repo = %repo,
+            auth = auth_label(&auth),
+            can_serve_locally,
+            elapsed_ms = elapsed_ms(local_check_started),
+            "direct git proxy-on-miss cache readiness checked"
+        );
+
+        if !can_serve_locally {
+            match proxy_upload_pack_to_upstream(UploadPackProxyRequest {
+                state: &state,
+                materializer: &materializer,
+                repo: &repo,
+                auth: &auth,
+                headers: &headers,
+                body: body.clone(),
+                comparison: comparison.clone(),
+                request_id,
+                request_started: started,
+            })
+            .await
+            {
+                Ok(response) => return response,
+                Err(ProxyFallback::UseLocal) => {
+                    info!(
+                        request_id,
+                        repo = %repo,
+                        auth = auth_label(&auth),
+                        "direct git proxy-on-miss unavailable; using local read-through"
+                    );
                 }
-            } else {
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    "direct git proxy-on-miss cache hit; serving local upload-pack"
-                );
+                Err(ProxyFallback::Error(error)) => return error.into_response(),
             }
+        } else {
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                "direct git proxy-on-miss cache hit; serving local upload-pack"
+            );
         }
+    }
 
-        let result =
-            Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await;
+    let result = Box::pin(materializer.handle_upload_pack(&repo, &body, comparison.as_ref())).await;
 
-        match result {
-            Ok(process) => {
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    elapsed_ms = elapsed_ms(started),
-                    status = %StatusCode::OK,
-                    "direct git upload-pack process spawned"
-                );
-                stream_upload_pack_response(&state, process)
-            }
-            Err(error) => {
-                let error = ApiError::from(error);
-                info!(
-                    request_id,
-                    repo = %repo,
-                    auth = auth_label(&auth),
-                    elapsed_ms = elapsed_ms(started),
-                    status = %error.status,
-                    "direct git upload-pack failed"
-                );
-                error.into_response()
-            }
+    match result {
+        Ok(process) => {
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                elapsed_ms = elapsed_ms(started),
+                status = %StatusCode::OK,
+                "direct git upload-pack process spawned"
+            );
+            stream_upload_pack_response(&state, process)
         }
-    } else {
-        ApiError::from(GitCacheError::Unsupported(format!(
-            "unsupported git request: {method} {path}"
-        )))
-        .into_response()
+        Err(error) => {
+            let error = ApiError::from(error);
+            info!(
+                request_id,
+                repo = %repo,
+                auth = auth_label(&auth),
+                elapsed_ms = elapsed_ms(started),
+                status = %error.status,
+                "direct git upload-pack failed"
+            );
+            error.into_response()
+        }
     }
 }
 
@@ -1073,7 +1147,7 @@ async fn proxy_upload_pack_to_upstream(
         .post(upload_pack_url)
         .header(
             header::CONTENT_TYPE.as_str(),
-            "application/x-git-upload-pack-request",
+            GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE,
         )
         .header(header::CACHE_CONTROL.as_str(), "no-cache")
         .body(body.clone());
@@ -1167,7 +1241,7 @@ async fn proxy_upload_pack_to_upstream(
     );
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .expect("git upload-pack proxy response"))
@@ -1178,8 +1252,9 @@ fn upload_pack_endpoint(upstream_url: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{}/git-upload-pack",
-        upstream_url.trim_end_matches('/')
+        "{}{}",
+        upstream_url.trim_end_matches('/'),
+        GIT_UPLOAD_PACK_PATH
     ))
 }
 
@@ -1828,7 +1903,7 @@ fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackPro
     };
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(guarded))
         .expect("git upload-pack response")
