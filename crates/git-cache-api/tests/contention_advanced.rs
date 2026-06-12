@@ -132,8 +132,7 @@ mod tests {
     /// Multi-repo test server that creates multiple upstream repos.
     struct MultiRepoTestServer {
         addr: std::net::SocketAddr,
-        #[allow(dead_code)]
-        tmp: TempDir,
+        _tmp: TempDir,
         repos: Vec<RepoInfo>,
     }
 
@@ -209,16 +208,15 @@ mod tests {
                 axum::serve(listener, router).await.unwrap();
             });
 
-            Self { addr, tmp, repos }
+            Self {
+                addr,
+                _tmp: tmp,
+                repos,
+            }
         }
 
         fn materialize_url(&self) -> String {
             format!("http://{}/v1/materialize", self.addr)
-        }
-
-        #[allow(dead_code)]
-        fn git_url(&self, repo_name: &str) -> String {
-            format!("http://{}/git/github.com/org/{}.git", self.addr, repo_name)
         }
 
         fn head_commit(&self, idx: usize) -> String {

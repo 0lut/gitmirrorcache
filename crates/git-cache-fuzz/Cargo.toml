@@ -12,7 +12,6 @@ fastrand = "2"
 
 [dev-dependencies]
 async-trait.workspace = true
-futures.workspace = true
 git-cache-core = { path = "../git-cache-core" }
 git-cache-disk = { path = "../git-cache-disk" }
 git-cache-domain = { path = "../git-cache-domain" }

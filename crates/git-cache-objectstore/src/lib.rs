@@ -128,4 +128,5 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+#[path = "tests.rs"]
+mod objectstore_tests;
