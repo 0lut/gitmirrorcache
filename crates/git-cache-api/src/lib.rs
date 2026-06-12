@@ -1349,6 +1349,60 @@ impl DirectGitGenerationTask {
             if let Some(handle) = handle {
                 let _ = handle.await;
             }
+            self.ensure_served_want_published(request, commit, trigger)
+                .await;
+        }
+    }
+
+    /// Branch selectors re-resolve the tip at job time, so a branch that moved
+    /// after the client was served can leave the served commit unpublished.
+    /// Fall back to an exact-commit publish when that happens.
+    async fn ensure_served_want_published(
+        &self,
+        request: &MaterializeRequest,
+        commit: &CommitSha,
+        trigger: &'static str,
+    ) {
+        if matches!(request.selector, Selector::Commit(_)) {
+            return;
+        }
+        match self
+            .materializer
+            .get_commit_manifest(&request.repo, commit)
+            .await
+        {
+            Ok(Some(manifest)) if manifest.complete => return,
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    request_id = self.request_id,
+                    repo = %request.repo,
+                    commit = %commit,
+                    trigger,
+                    %error,
+                    "direct git proxy-on-miss async materialize fallback check failed"
+                );
+                return;
+            }
+        }
+        let fallback = MaterializeRequest {
+            repo: request.repo.clone(),
+            selector: Selector::Commit(commit.clone()),
+            upstream_authorization: request.upstream_authorization,
+        };
+        let handle = self
+            .jobs
+            .spawn(self.materializer.clone(), fallback, commit.clone());
+        info!(
+            request_id = self.request_id,
+            repo = %request.repo,
+            commit = %commit,
+            trigger,
+            queued = handle.is_some(),
+            "direct git proxy-on-miss async materialize fallback to served commit"
+        );
+        if let Some(handle) = handle {
+            let _ = handle.await;
         }
     }
 }
@@ -2292,6 +2346,116 @@ mod tests {
         assert!(
             generation_head.exists(),
             "proxy warm did not publish the generation head manifest"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_warm_task_publishes_served_commit_when_branch_moves() {
+        let tmp = TempDir::new().unwrap();
+        let upstream_bare = tmp.path().join("upstreams/github.com/org/repo.git");
+        let upstream_work = tmp.path().join("work");
+        fs::create_dir_all(upstream_bare.parent().unwrap()).unwrap();
+        fs::create_dir_all(&upstream_work).unwrap();
+
+        run_git(
+            tmp.path(),
+            &["init", "--bare", upstream_bare.to_str().unwrap()],
+        );
+        run_git(&upstream_work, &["init"]);
+        run_git(
+            &upstream_work,
+            &["config", "user.email", "test@example.com"],
+        );
+        run_git(&upstream_work, &["config", "user.name", "Test"]);
+        fs::write(upstream_work.join("README.md"), "initial\n").unwrap();
+        run_git(&upstream_work, &["add", "README.md"]);
+        run_git(&upstream_work, &["commit", "-m", "initial"]);
+        run_git(&upstream_work, &["branch", "-M", "main"]);
+        run_git(
+            &upstream_work,
+            &["remote", "add", "origin", upstream_bare.to_str().unwrap()],
+        );
+        run_git(&upstream_work, &["push", "origin", "main"]);
+        run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        let served_commit =
+            CommitSha::parse(git_stdout(&upstream_work, &["rev-parse", "HEAD"])).unwrap();
+        let repo = RepoKey::parse("github.com/org/repo").unwrap();
+        let object_root = tmp.path().join("objects-v3");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            cache_root: tmp.path().join("cache"),
+            upstream_root: Some(tmp.path().join("upstreams")),
+            git_binary: PathBuf::from("git"),
+            git_timeout_seconds: 60,
+            max_git_output_bytes: 16 * 1024 * 1024,
+            object_store: ObjectStoreConfig::Local {
+                root: object_root.clone(),
+            },
+            upstream_auth_token_env: None,
+            rate_limit_per_minute: 0,
+            allowed_upstream_hosts: vec!["github.com".into()],
+            disk: git_cache_core::DiskConfig {
+                quota_bytes: 1024 * 1024 * 1024,
+                min_free_bytes: 0,
+                access_flush_interval_secs: 60,
+            },
+            git_remote: Default::default(),
+            compaction: Default::default(),
+            shutdown: Default::default(),
+            max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
+            async_materialize_concurrency: 1,
+            use_gitoxide: true,
+        };
+        let state = Arc::new(ApiState::try_new(config).unwrap());
+        let materializer = Materializer::new(Arc::clone(&state.domain));
+        let body = upload_pack_body(&[format!("want {served_commit} multi_ack thin-pack\n")]);
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".into()),
+            all_upstream: std::collections::HashMap::from([(
+                "main".into(),
+                served_commit.to_string(),
+            )]),
+        };
+        let generation_task = direct_git_generation_task(
+            &state,
+            &materializer,
+            &repo,
+            &UpstreamAuth::Anonymous,
+            &body,
+            Some(&comparison),
+            42,
+        )
+        .expect("advertised branch want should queue generation materialize");
+
+        // Branch moves upstream after the client was served `served_commit`.
+        fs::write(upstream_work.join("README.md"), "moved\n").unwrap();
+        run_git(&upstream_work, &["add", "README.md"]);
+        run_git(&upstream_work, &["commit", "-m", "moved"]);
+        run_git(&upstream_work, &["push", "origin", "main"]);
+        let moved_commit =
+            CommitSha::parse(git_stdout(&upstream_work, &["rev-parse", "HEAD"])).unwrap();
+        assert_ne!(served_commit, moved_commit);
+
+        let warm_task = DirectGitWarmTask {
+            imports: Arc::new(Semaphore::new(1)),
+            materializer: materializer.clone(),
+            repo: repo.clone(),
+            body,
+            comparison: Some(comparison),
+            request_id: 42,
+            generation_task: Some(generation_task),
+        };
+
+        warm_task.spawn().await.unwrap();
+
+        let manifest = materializer
+            .get_commit_manifest(&repo, &served_commit)
+            .await
+            .unwrap();
+        assert!(
+            manifest.is_some_and(|manifest| manifest.complete),
+            "served commit must have a complete commit manifest even after the branch moved"
         );
     }
 

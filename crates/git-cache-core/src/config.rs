@@ -330,7 +330,7 @@ pub fn default_max_concurrent_git_processes() -> usize {
 }
 
 pub fn default_async_materialize_concurrency() -> usize {
-    2
+    8
 }
 
 pub fn default_use_gitoxide() -> bool {
@@ -517,7 +517,7 @@ min_free_bytes = 100000
         assert_eq!(config.max_git_output_bytes, 16 * 1024 * 1024);
         assert_eq!(config.git_remote, GitRemoteConfig::default());
         assert_eq!(config.compaction, CompactionConfig::default());
-        assert_eq!(config.async_materialize_concurrency, 2);
+        assert_eq!(config.async_materialize_concurrency, 8);
     }
 
     #[test]
