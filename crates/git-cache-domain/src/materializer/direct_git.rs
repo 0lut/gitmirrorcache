@@ -1,4 +1,5 @@
 use super::*;
+use git_cache_core::GIT_UPLOAD_PACK_SERVICE;
 
 const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v2";
 /// Marker recording that the bare repo was hydrated with a filtered
@@ -1067,8 +1068,10 @@ fn pkt_line(out: &mut Vec<u8>, data: &str) {
 
 /// Frame a ref advertisement with the Git smart-HTTP service header.
 pub fn frame_ref_advertisement(refs_output: &[u8]) -> Vec<u8> {
-    let mut framed = Vec::with_capacity(refs_output.len() + 34);
-    framed.extend_from_slice(b"001e# service=git-upload-pack\n0000");
+    let service_line = format!("# service={GIT_UPLOAD_PACK_SERVICE}\n");
+    let mut framed = Vec::with_capacity(refs_output.len() + 4 + service_line.len() + 4);
+    pkt_line(&mut framed, &service_line);
+    framed.extend_from_slice(b"0000");
     framed.extend_from_slice(refs_output);
     framed
 }

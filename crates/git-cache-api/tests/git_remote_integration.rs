@@ -9,6 +9,7 @@ mod tests {
     use super::support;
 
     use git_cache_api::app;
+    use git_cache_core::GIT_UPLOAD_PACK_SERVICE;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -203,8 +204,8 @@ mod tests {
         std::fs::remove_dir_all(&repo_dir).unwrap();
 
         let url = format!(
-            "http://{}/git/github.com/org/repo.git/info/refs?service=git-upload-pack",
-            server.addr
+            "http://{}/git/github.com/org/repo.git/info/refs?service={}",
+            server.addr, GIT_UPLOAD_PACK_SERVICE
         );
         let response = reqwest::get(&url).await.unwrap();
 
