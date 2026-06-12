@@ -1,6 +1,6 @@
 ---
 name: gitmirrorcache-deploy
-description: Deploy gitmirrorcache to AWS ECS/EC2/EBS and recover stale ECS containers safely
+description: Deploy gitmirrorcache to AWS ECS/EC2 and recover stale ECS containers safely
 triggers:
   - user
   - model
