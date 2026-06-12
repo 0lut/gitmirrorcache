@@ -1,6 +1,7 @@
 use super::access::RepoAccessContext;
 use super::generations::push_unique_commit;
 use super::*;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 struct MaterializePlan {
@@ -749,36 +750,8 @@ impl Materializer {
                 default_branch,
             )
             .await?;
-            if self
-                .get_commit_manifest(repo, upstream_commit)
-                .await?
-                .is_some_and(|manifest| manifest.complete)
-            {
-                self.record_verified_branch_manifests(
-                    repo,
-                    branch,
-                    upstream_commit,
-                    default_branch,
-                )
+            self.ensure_branch_manifests(repo, &repo_dir, branch, upstream_commit, default_branch)
                 .await?;
-            } else {
-                let publish_started = Instant::now();
-                self.publish_generation(
-                    repo,
-                    &repo_dir,
-                    upstream_commit,
-                    Some(branch.clone()),
-                    default_branch,
-                )
-                .await?;
-                info!(
-                    %repo,
-                    %branch,
-                    commit = %upstream_commit,
-                    elapsed_ms = elapsed_ms(publish_started),
-                    "published hot branch generation"
-                );
-            }
             info!(
                 %repo,
                 %branch,
@@ -873,31 +846,48 @@ impl Materializer {
         Ok(commit)
     }
 
-    async fn record_verified_branch_manifests(
+    /// Record durable branch manifests for a commit the local repo can
+    /// already serve. When the commit has a complete cached manifest this
+    /// only writes the ref (and default) manifests; otherwise it publishes a
+    /// full generation so the object store gains durable metadata for repos
+    /// warmed outside the generation-publish path (e.g. proxy-on-miss).
+    async fn ensure_branch_manifests(
         &self,
         repo: &RepoKey,
+        repo_dir: &Path,
         branch: &BranchName,
         commit: &CommitSha,
         default_branch: bool,
     ) -> CoreResult<()> {
-        let Some(commit_manifest) = self.get_commit_manifest(repo, commit).await? else {
-            return Ok(());
-        };
-        if !commit_manifest.complete {
+        if let Some(commit_manifest) = self
+            .get_commit_manifest(repo, commit)
+            .await?
+            .filter(|manifest| manifest.complete)
+        {
+            let ref_manifest = RefManifest {
+                repo: repo.clone(),
+                ref_name: branch.ref_name(),
+                commit: commit.clone(),
+                generation: commit_manifest.generation,
+                verified_at: Utc::now(),
+            };
+            self.manifests().write_ref(&ref_manifest).await?;
+            if default_branch {
+                self.put_default_manifest(repo, commit).await?;
+            }
             return Ok(());
         }
 
-        let ref_manifest = RefManifest {
-            repo: repo.clone(),
-            ref_name: branch.ref_name(),
-            commit: commit.clone(),
-            generation: commit_manifest.generation,
-            verified_at: Utc::now(),
-        };
-        self.manifests().write_ref(&ref_manifest).await?;
-        if default_branch {
-            self.put_default_manifest(repo, commit).await?;
-        }
+        let publish_started = Instant::now();
+        self.publish_generation(repo, repo_dir, commit, Some(branch.clone()), default_branch)
+            .await?;
+        info!(
+            %repo,
+            %branch,
+            commit = %commit,
+            elapsed_ms = elapsed_ms(publish_started),
+            "published hot branch generation"
+        );
         Ok(())
     }
 

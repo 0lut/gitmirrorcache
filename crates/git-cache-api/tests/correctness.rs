@@ -224,6 +224,62 @@ mod tests {
         );
     }
 
+    /// End-to-end regression test for the proxy-on-miss durability gap: a
+    /// cold clone served by proxying an HTTP(S) upstream must still publish
+    /// durable generation metadata to the object store, asynchronously, after
+    /// the client response completes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_on_miss_clone_publishes_generation_asynchronously() {
+        // Upstream tier: serves the filesystem fixture repo over Git HTTP.
+        let upstream_server = TestServer::start().await;
+
+        // Cache tier under test: HTTP upstream, proxy-on-miss enabled.
+        let tmp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = support::test_config_with_upstream(
+            addr,
+            tmp.path(),
+            format!("http://{}/git", upstream_server.addr),
+        );
+        config.git_remote.proxy_on_miss_by_default = true;
+        let router = app(config);
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let clone_dir = tmp.path().join("clone");
+        run_git(
+            tmp.path(),
+            &[
+                "clone",
+                &format!("http://{addr}/git/github.com/org/repo.git"),
+                clone_dir.to_str().unwrap(),
+            ],
+        );
+        assert!(clone_dir.join("README.md").exists());
+
+        let store_root = tmp.path().join("objects-v3/repos/github.com/org/repo");
+        let generation_root = store_root.join("generations");
+        let generation_head = store_root.join("manifests/generation-head.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let has_generation_manifest = std::fs::read_dir(&generation_root)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .any(|entry| entry.path().join("manifest.json").exists());
+            if has_generation_manifest && generation_head.exists() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "proxy-on-miss clone did not publish durable generation metadata"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn materialize_invalid_repo_key_returns_error() {
         let server = TestServer::start().await;

@@ -5,8 +5,8 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use git_cache_core::{
-    AppConfig, CommitSha, GitCacheError, MaterializeRequest, RepoKey, Result as CoreResult,
-    Selector, UpstreamAuth, UpstreamAuthorizationMode,
+    AppConfig, BranchName, CommitSha, GitCacheError, MaterializeRequest, RepoKey,
+    Result as CoreResult, Selector, UpstreamAuth, UpstreamAuthorizationMode,
 };
 use git_cache_disk::{AsyncDiskManager, AsyncReservation};
 use git_cache_domain::materializer::repo_from_git_path;
@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 use tokio_util::io::ReaderStream;
 use tracing::{info, info_span, warn, Instrument};
@@ -650,11 +651,10 @@ async fn run_domain_request(
                     );
                     Json(response).into_response()
                 } else {
-                    let queued = state.async_materialize_jobs.spawn(
-                        materializer.clone(),
-                        request,
-                        response.commit.clone(),
-                    );
+                    let queued = state
+                        .async_materialize_jobs
+                        .spawn(materializer.clone(), request, response.commit.clone())
+                        .is_some();
                     info!(
                         repo = %response.repo,
                         commit = %response.commit,
@@ -1257,7 +1257,7 @@ struct DirectGitWarmTask {
 }
 
 impl DirectGitWarmTask {
-    fn spawn(self) {
+    fn spawn(self) -> JoinHandle<()> {
         tokio::spawn(async move {
             let task_started = Instant::now();
             let body_bytes = self.body.len();
@@ -1311,41 +1311,50 @@ impl DirectGitWarmTask {
                 ),
             }
             if result.is_ok() {
-                self.spawn_generation_materialize("warm");
+                await_generation_jobs(self.spawn_generation_materialize("warm")).await;
             }
-        });
+        })
     }
 
-    fn spawn_generation_materialize(&self, trigger: &'static str) {
-        if let Some(task) = &self.generation_task {
-            task.spawn(trigger);
+    fn spawn_generation_materialize(&self, trigger: &'static str) -> Vec<JoinHandle<()>> {
+        match &self.generation_task {
+            Some(task) => task.spawn(trigger),
+            None => Vec::new(),
         }
+    }
+}
+
+async fn await_generation_jobs(handles: Vec<JoinHandle<()>>) {
+    for handle in handles {
+        let _ = handle.await;
     }
 }
 
 struct DirectGitGenerationTask {
     jobs: Arc<AsyncMaterializeJobs>,
     materializer: Materializer,
-    request: MaterializeRequest,
-    commit: CommitSha,
+    requests: Vec<(MaterializeRequest, CommitSha)>,
     request_id: u64,
 }
 
 impl DirectGitGenerationTask {
-    fn spawn(&self, trigger: &'static str) {
-        let queued = self.jobs.spawn(
-            self.materializer.clone(),
-            self.request.clone(),
-            self.commit.clone(),
-        );
-        info!(
-            request_id = self.request_id,
-            repo = %self.request.repo,
-            commit = %self.commit,
-            trigger,
-            queued,
-            "direct git proxy-on-miss async materialize queued"
-        );
+    fn spawn(&self, trigger: &'static str) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::new();
+        for (request, commit) in &self.requests {
+            let handle =
+                self.jobs
+                    .spawn(self.materializer.clone(), request.clone(), commit.clone());
+            info!(
+                request_id = self.request_id,
+                repo = %request.repo,
+                commit = %commit,
+                trigger,
+                queued = handle.is_some(),
+                "direct git proxy-on-miss async materialize queued"
+            );
+            handles.extend(handle);
+        }
+        handles
     }
 }
 
@@ -1371,23 +1380,53 @@ fn direct_git_generation_task(
             return None;
         }
     };
-    let commit = wants
-        .into_iter()
-        .find(|want| comparison.branch_for_commit(want).is_some())?;
     let upstream_authorization = if auth.is_authenticated() {
         UpstreamAuthorizationMode::Required
     } else {
         UpstreamAuthorizationMode::Anonymous
     };
+    let mut seen = HashSet::new();
+    let mut requests = Vec::new();
+    for want in wants {
+        let Some(branch) = comparison.branch_for_commit(&want) else {
+            continue;
+        };
+        if !seen.insert(want.clone()) {
+            continue;
+        }
+        let selector = if comparison.default_branch.as_deref() == Some(branch) {
+            Selector::DefaultBranch
+        } else {
+            match BranchName::parse(branch) {
+                Ok(branch) => Selector::Branch(branch),
+                Err(error) => {
+                    warn!(
+                        request_id,
+                        repo = %repo,
+                        branch,
+                        %error,
+                        "direct git proxy-on-miss async materialize skipped: advertised branch did not parse"
+                    );
+                    continue;
+                }
+            }
+        };
+        requests.push((
+            MaterializeRequest {
+                repo: repo.clone(),
+                selector,
+                upstream_authorization,
+            },
+            want,
+        ));
+    }
+    if requests.is_empty() {
+        return None;
+    }
     Some(DirectGitGenerationTask {
         jobs: Arc::clone(&state.async_materialize_jobs),
         materializer: materializer.clone(),
-        request: MaterializeRequest {
-            repo: repo.clone(),
-            selector: Selector::Commit(commit.clone()),
-            upstream_authorization,
-        },
-        commit,
+        requests,
         request_id,
     })
 }
@@ -1498,12 +1537,12 @@ fn spawn_tee_import(
         let output = match writer.await {
             Ok(Some(output)) => output,
             Ok(None) => {
-                warm.spawn();
+                drop(warm.spawn());
                 return;
             }
             Err(error) => {
                 warn!(request_id = warm.request_id, %error, "tee spool writer task panicked");
-                warm.spawn();
+                drop(warm.spawn());
                 return;
             }
         };
@@ -1536,7 +1575,7 @@ fn spawn_tee_import(
                     import_elapsed_ms = elapsed_ms(import_started),
                     "tee import of proxied upload-pack response finished"
                 );
-                warm.spawn_generation_materialize("tee_import");
+                await_generation_jobs(warm.spawn_generation_materialize("tee_import")).await;
             }
             Err(error) => {
                 warn!(
@@ -1547,7 +1586,7 @@ fn spawn_tee_import(
                     import_elapsed_ms = elapsed_ms(import_started),
                     "tee import failed; falling back to warm refetch"
                 );
-                warm.spawn();
+                drop(warm.spawn());
             }
         }
     });
@@ -1568,14 +1607,15 @@ impl AsyncMaterializeJobs {
         }
     }
 
-    /// Queues a background materialize for the resolved commit. Returns false
-    /// when an equivalent job is already in flight.
+    /// Queues a background materialize for the resolved commit. Returns the
+    /// job's join handle, or `None` when an equivalent job is already in
+    /// flight.
     fn spawn(
         self: &Arc<Self>,
         materializer: Materializer,
         request: MaterializeRequest,
         commit: CommitSha,
-    ) -> bool {
+    ) -> Option<JoinHandle<()>> {
         let key = (request.repo.clone(), commit);
         {
             let Ok(mut inflight) = self.inflight.lock() else {
@@ -1584,14 +1624,14 @@ impl AsyncMaterializeJobs {
                     commit = %key.1,
                     "async materialize in-flight lock poisoned"
                 );
-                return false;
+                return None;
             };
             if !inflight.insert(key.clone()) {
-                return false;
+                return None;
             }
         }
         let jobs = Arc::clone(self);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let started = Instant::now();
             let result = match jobs.permits.acquire().await {
                 Ok(_permit) => materializer.materialize(request).await.map(|_| ()),
@@ -1618,7 +1658,7 @@ impl AsyncMaterializeJobs {
                 inflight.remove(&key);
             }
         });
-        true
+        Some(handle)
     }
 }
 
@@ -1696,7 +1736,7 @@ impl Stream for UpstreamProxyStream {
                 }
                 if !tee_spawned {
                     if let Some(task) = this.warm_task.take() {
-                        task.spawn();
+                        drop(task.spawn());
                     }
                 }
                 Poll::Ready(None)
@@ -1715,7 +1755,7 @@ impl Drop for UpstreamProxyStream {
     fn drop(&mut self) {
         if let Some(task) = self.warm_task.take() {
             if tokio::runtime::Handle::try_current().is_ok() {
-                task.spawn();
+                drop(task.spawn());
             }
         }
     }
@@ -2179,7 +2219,7 @@ mod tests {
         run_git(&upstream_work, &["push", "origin", "main"]);
         run_git(&upstream_bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
-        let commit = CommitSha::parse(&git_stdout(&upstream_work, &["rev-parse", "HEAD"])).unwrap();
+        let commit = CommitSha::parse(git_stdout(&upstream_work, &["rev-parse", "HEAD"])).unwrap();
         let repo = RepoKey::parse("github.com/org/repo").unwrap();
         let object_root = tmp.path().join("objects-v3");
         let config = AppConfig {
@@ -2224,6 +2264,12 @@ mod tests {
             42,
         )
         .expect("advertised branch want should queue generation materialize");
+        assert_eq!(generation_task.requests.len(), 1);
+        assert_eq!(
+            generation_task.requests[0].0.selector,
+            Selector::DefaultBranch
+        );
+        assert_eq!(generation_task.requests[0].1, commit);
         let warm_task = DirectGitWarmTask {
             imports: Arc::new(Semaphore::new(1)),
             materializer,
@@ -2234,27 +2280,24 @@ mod tests {
             generation_task: Some(generation_task),
         };
 
-        warm_task.spawn();
+        warm_task.spawn().await.unwrap();
 
         let generation_root = object_root.join("repos/github.com/org/repo/generations");
         let generation_head =
             object_root.join("repos/github.com/org/repo/manifests/generation-head.json");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let has_generation_manifest = fs::read_dir(&generation_root)
-                .ok()
-                .into_iter()
-                .flat_map(|entries| entries.filter_map(Result::ok))
-                .any(|entry| entry.path().join("manifest.json").exists());
-            if has_generation_manifest && generation_head.exists() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "proxy warm did not publish generation manifests asynchronously"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        let has_generation_manifest = fs::read_dir(&generation_root)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .any(|entry| entry.path().join("manifest.json").exists());
+        assert!(
+            has_generation_manifest,
+            "proxy warm did not publish a generation manifest"
+        );
+        assert!(
+            generation_head.exists(),
+            "proxy warm did not publish the generation head manifest"
+        );
     }
 
     #[test]
