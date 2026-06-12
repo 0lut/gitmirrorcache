@@ -19,7 +19,10 @@ fn parse_git_version_with_platform_suffix() {
         parse_git_version("git version 2.47.0.windows.1"),
         Some((2, 47, 0))
     );
-    assert_eq!(parse_git_version("git version 2.46.0-rc1"), Some((2, 46, 0)));
+    assert_eq!(
+        parse_git_version("git version 2.46.0-rc1"),
+        Some((2, 46, 0))
+    );
 }
 
 #[test]
