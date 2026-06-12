@@ -97,7 +97,6 @@ impl AppConfig {
                 )?,
             },
             git_remote: GitRemoteConfig {
-                enabled: parse_bool_env("GIT_CACHE_GIT_REMOTE_ENABLED", true)?,
                 commit_read_through: parse_bool_env(
                     "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
                     true,
@@ -271,8 +270,6 @@ fn default_compaction_retention_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRemoteConfig {
     #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_true")]
     pub commit_read_through: bool,
     #[serde(default = "default_background_import_concurrency")]
     pub background_import_concurrency: usize,
@@ -288,7 +285,6 @@ pub struct GitRemoteConfig {
 impl Default for GitRemoteConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             commit_read_through: true,
             background_import_concurrency: default_background_import_concurrency(),
             proxy_on_miss_by_default: true,
@@ -415,7 +411,6 @@ mod tests {
         "GIT_CACHE_ALLOWED_UPSTREAM_HOSTS",
         "GIT_CACHE_DISK_QUOTA_BYTES",
         "GIT_CACHE_DISK_MIN_FREE_BYTES",
-        "GIT_CACHE_GIT_REMOTE_ENABLED",
         "GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH",
         "GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY",
         "GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT",
@@ -531,7 +526,6 @@ min_free_bytes = 100000
     #[test]
     fn git_remote_config_default_values() {
         let config = GitRemoteConfig::default();
-        assert!(config.enabled);
         assert!(config.commit_read_through);
         assert_eq!(config.background_import_concurrency, 1);
         assert!(config.proxy_on_miss_by_default);
@@ -541,7 +535,6 @@ min_free_bytes = 100000
     #[test]
     fn git_remote_config_serde_round_trip() {
         let config = GitRemoteConfig {
-            enabled: false,
             commit_read_through: false,
             background_import_concurrency: 2,
             proxy_on_miss_by_default: false,
@@ -562,7 +555,6 @@ min_free_bytes = 100000
             ("GIT_CACHE_S3_PREFIX", "prod"),
             ("GIT_CACHE_S3_ENDPOINT", "https://s3.example.com"),
             ("GIT_CACHE_ALLOWED_UPSTREAM_HOSTS", "github.com, gitlab.com"),
-            ("GIT_CACHE_GIT_REMOTE_ENABLED", "off"),
             ("GIT_CACHE_GIT_REMOTE_COMMIT_READ_THROUGH", "off"),
             ("GIT_CACHE_GIT_REMOTE_BACKGROUND_IMPORT_CONCURRENCY", "4"),
             ("GIT_CACHE_GIT_REMOTE_PROXY_ON_MISS_BY_DEFAULT", "off"),
@@ -579,7 +571,6 @@ min_free_bytes = 100000
             config.allowed_upstream_hosts,
             vec!["github.com".to_string(), "gitlab.com".to_string()]
         );
-        assert!(!config.git_remote.enabled);
         assert!(!config.git_remote.commit_read_through);
         assert_eq!(config.git_remote.background_import_concurrency, 4);
         assert!(!config.git_remote.proxy_on_miss_by_default);

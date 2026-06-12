@@ -52,9 +52,8 @@ pub fn app(config: AppConfig) -> Router {
 }
 
 pub fn app_result(config: AppConfig) -> CoreResult<Router> {
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new(config)?);
-    router(git_remote_enabled, state)
+    router(state)
 }
 
 pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
@@ -65,10 +64,9 @@ pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
 /// caller can flip during shutdown so `/healthz` starts failing and load
 /// balancers stop routing new traffic while in-flight requests drain.
 pub async fn app_with_shutdown_async(config: AppConfig) -> CoreResult<(Router, ReadinessGate)> {
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
     let gate = ReadinessGate(Arc::clone(&state.shutting_down));
-    Ok((router(git_remote_enabled, state)?, gate))
+    Ok((router(state)?, gate))
 }
 
 /// Handle that marks the server as shutting down; once flipped, `/healthz`
@@ -82,20 +80,17 @@ impl ReadinessGate {
     }
 }
 
-fn router(git_remote_enabled: bool, state: Arc<ApiState>) -> CoreResult<Router> {
+fn router(state: Arc<ApiState>) -> CoreResult<Router> {
     let git_body_limit = state.domain.config.max_git_output_bytes;
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/v1/materialize", post(materialize))
-        .route("/v1/resolve", post(resolve));
-
-    if git_remote_enabled {
-        router = router.route(
+        .route("/v1/resolve", post(resolve))
+        .route(
             "/git/{*repo_path}",
             any(git_repo).layer(DefaultBodyLimit::max(git_body_limit)),
         );
-    }
 
     Ok(router.with_state(state))
 }
@@ -193,11 +188,10 @@ fn spawn_repo_access_flusher(domain: &Arc<AppState>) {
 /// timeout, and finally any buffered repo access timestamps are flushed.
 pub async fn serve(listener: tokio::net::TcpListener, config: AppConfig) -> CoreResult<()> {
     let shutdown_config = config.shutdown.clone();
-    let git_remote_enabled = config.git_remote.enabled;
     let state = Arc::new(ApiState::try_new_async(config).await?);
     let domain = state.domain.clone();
     let readiness = ReadinessGate(Arc::clone(&state.shutting_down));
-    let app = router(git_remote_enabled, state)?;
+    let app = router(state)?;
 
     let readiness_delay = Duration::from_secs(shutdown_config.readiness_delay_seconds);
     let drain_timeout = Duration::from_secs(shutdown_config.drain_timeout_seconds);

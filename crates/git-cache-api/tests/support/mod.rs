@@ -30,7 +30,6 @@ pub fn test_config_with_upstream(
             access_flush_interval_secs: 60,
         },
         git_remote: GitRemoteConfig {
-            enabled: true,
             // Keep tests on the local read-through path regardless of the
             // production proxy-on-miss default.
             proxy_on_miss_by_default: false,

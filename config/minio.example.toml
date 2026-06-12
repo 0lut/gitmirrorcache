@@ -21,7 +21,6 @@ quota_bytes = 10737418240
 min_free_bytes = 1073741824
 
 [git_remote]
-enabled = true
 commit_read_through = true
 
 [compaction]

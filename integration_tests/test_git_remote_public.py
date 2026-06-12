@@ -155,7 +155,6 @@ quota_bytes = 10737418240
 min_free_bytes = 0
 
 [git_remote]
-enabled = true
 commit_read_through = true
 """
         )
