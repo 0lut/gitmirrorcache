@@ -1311,22 +1311,15 @@ impl DirectGitWarmTask {
                 ),
             }
             if result.is_ok() {
-                await_generation_jobs(self.spawn_generation_materialize("warm")).await;
+                self.run_generation_materialize("warm").await;
             }
         })
     }
 
-    fn spawn_generation_materialize(&self, trigger: &'static str) -> Vec<JoinHandle<()>> {
-        match &self.generation_task {
-            Some(task) => task.spawn(trigger),
-            None => Vec::new(),
+    async fn run_generation_materialize(&self, trigger: &'static str) {
+        if let Some(task) = &self.generation_task {
+            task.run(trigger).await;
         }
-    }
-}
-
-async fn await_generation_jobs(handles: Vec<JoinHandle<()>>) {
-    for handle in handles {
-        let _ = handle.await;
     }
 }
 
@@ -1338,8 +1331,9 @@ struct DirectGitGenerationTask {
 }
 
 impl DirectGitGenerationTask {
-    fn spawn(&self, trigger: &'static str) -> Vec<JoinHandle<()>> {
-        let mut handles = Vec::new();
+    /// Run the queued jobs one at a time: concurrent generation publishes for
+    /// the same repo conflict on shared commit manifests.
+    async fn run(&self, trigger: &'static str) {
         for (request, commit) in &self.requests {
             let handle =
                 self.jobs
@@ -1352,9 +1346,10 @@ impl DirectGitGenerationTask {
                 queued = handle.is_some(),
                 "direct git proxy-on-miss async materialize queued"
             );
-            handles.extend(handle);
+            if let Some(handle) = handle {
+                let _ = handle.await;
+            }
         }
-        handles
     }
 }
 
@@ -1575,7 +1570,7 @@ fn spawn_tee_import(
                     import_elapsed_ms = elapsed_ms(import_started),
                     "tee import of proxied upload-pack response finished"
                 );
-                await_generation_jobs(warm.spawn_generation_materialize("tee_import")).await;
+                warm.run_generation_materialize("tee_import").await;
             }
             Err(error) => {
                 warn!(
