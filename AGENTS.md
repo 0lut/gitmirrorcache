@@ -45,6 +45,13 @@ and tests over ad-hoc operational steps.
   where supported, and test rejected leading-dash/NUL input plus any
   helper-specific constraints.
 
+## Test Layout
+
+- Keep tests out of regular module bodies. Put `#[test]` and `#[tokio::test]`
+  functions in dedicated test modules: use `#[cfg(test)] mod tests;` with
+  sibling `tests.rs`/`tests/` files, or integration tests under `tests/`. Do not
+  add inline `mod tests { ... }` blocks to regular source files.
+
 ## Current Cache Contract
 
 - `MaterializeRequest` is intentionally small: `repo`, `selector`, and optional
