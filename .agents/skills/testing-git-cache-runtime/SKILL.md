@@ -38,7 +38,6 @@ Create a local config file with:
 - `[object_store] kind = "local"` with `root` pointing at the isolated object-store directory
 - `allowed_upstream_hosts = ["github.com"]`
 - `[disk] min_free_bytes = 0` for small local test fixtures
-- `[git_remote] enabled = true` if testing HTTP git routes
 - `[compaction] chain_depth_threshold = 2` when you need a three-pack generation head to compact quickly (the threshold counts packs referenced by the head generation manifest)
 - `[compaction] inline = false` unless inline compaction itself is the feature under test
 

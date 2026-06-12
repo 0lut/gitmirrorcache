@@ -98,8 +98,6 @@ mounts the ConfigMap) opts into it.
   value: {{ .Values.config.disk.quotaBytes | int64 | quote }}
 - name: GIT_CACHE_DISK_MIN_FREE_BYTES
   value: {{ .Values.config.disk.minFreeBytes | int64 | quote }}
-- name: GIT_CACHE_GIT_REMOTE_ENABLED
-  value: {{ .Values.config.gitRemote.enabled | quote }}
 - name: GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD
   value: {{ .Values.config.compaction.chainDepthThreshold | int64 | quote }}
 - name: GIT_CACHE_COMPACTION_INLINE
