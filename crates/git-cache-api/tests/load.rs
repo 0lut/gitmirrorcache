@@ -10,6 +10,7 @@ mod tests {
     use super::support;
 
     use git_cache_api::app;
+    use git_cache_core::GIT_UPLOAD_PACK_SERVICE;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
@@ -311,7 +312,7 @@ mod tests {
         let ref_name = "refs/heads/main";
 
         // Verify the branch ref is advertised via info/refs.
-        let refs_url = format!("{git_url}/info/refs?service=git-upload-pack");
+        let refs_url = format!("{git_url}/info/refs?service={GIT_UPLOAD_PACK_SERVICE}");
         let refs_resp = client.get(&refs_url).send().await.unwrap();
         assert_eq!(refs_resp.status().as_u16(), 200);
         let refs_body = refs_resp.text().await.unwrap();

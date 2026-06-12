@@ -7,6 +7,9 @@ use futures::Stream;
 use git_cache_core::{
     AppConfig, BranchName, CommitSha, GitCacheError, MaterializeRequest, RepoKey,
     Result as CoreResult, Selector, UpstreamAuth, UpstreamAuthorizationMode,
+    GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE, GIT_UPLOAD_PACK_PATH,
+    GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE,
+    GIT_UPLOAD_PACK_SERVICE,
 };
 use git_cache_disk::{AsyncDiskManager, AsyncReservation};
 use git_cache_domain::materializer::repo_from_git_path;
@@ -795,7 +798,9 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
 
     if method == Method::GET
         && path.ends_with("/info/refs")
-        && query.get("service").is_some_and(|s| s == "git-upload-pack")
+        && query
+            .get("service")
+            .is_some_and(|s| s == GIT_UPLOAD_PACK_SERVICE)
     {
         let started = Instant::now();
         let auth = match direct_git_upstream_auth(&headers) {
@@ -838,7 +843,7 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
 
         let output = synthesize_ref_advertisement(&comparison);
         let response = git_response(
-            "application/x-git-upload-pack-advertisement",
+            GIT_UPLOAD_PACK_ADVERTISEMENT_CONTENT_TYPE,
             frame_ref_advertisement(&output),
         );
         info!(
@@ -850,7 +855,7 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
             "direct git ref advertisement finished"
         );
         response
-    } else if method == Method::POST && path.ends_with("/git-upload-pack") {
+    } else if method == Method::POST && path.ends_with(GIT_UPLOAD_PACK_PATH) {
         let started = Instant::now();
         let auth = match direct_git_upstream_auth(&headers) {
             Ok(auth) => auth,
@@ -1073,7 +1078,7 @@ async fn proxy_upload_pack_to_upstream(
         .post(upload_pack_url)
         .header(
             header::CONTENT_TYPE.as_str(),
-            "application/x-git-upload-pack-request",
+            GIT_UPLOAD_PACK_REQUEST_CONTENT_TYPE,
         )
         .header(header::CACHE_CONTROL.as_str(), "no-cache")
         .body(body.clone());
@@ -1167,7 +1172,7 @@ async fn proxy_upload_pack_to_upstream(
     );
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .expect("git upload-pack proxy response"))
@@ -1178,8 +1183,9 @@ fn upload_pack_endpoint(upstream_url: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{}/git-upload-pack",
-        upstream_url.trim_end_matches('/')
+        "{}{}",
+        upstream_url.trim_end_matches('/'),
+        GIT_UPLOAD_PACK_PATH
     ))
 }
 
@@ -1828,7 +1834,7 @@ fn stream_upload_pack_response(state: &Arc<ApiState>, mut process: UploadPackPro
     };
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CONTENT_TYPE, GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE)
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(guarded))
         .expect("git upload-pack response")
@@ -2210,13 +2216,16 @@ mod tests {
 
     #[test]
     fn upload_pack_endpoint_is_only_for_http_origins() {
+        let https_endpoint = format!("https://github.com/org/repo.git{GIT_UPLOAD_PACK_PATH}");
+        let http_endpoint = format!("http://git.example.com/org/repo.git{GIT_UPLOAD_PACK_PATH}");
+
         assert_eq!(
-            upload_pack_endpoint("https://github.com/org/repo.git").as_deref(),
-            Some("https://github.com/org/repo.git/git-upload-pack")
+            upload_pack_endpoint("https://github.com/org/repo.git"),
+            Some(https_endpoint)
         );
         assert_eq!(
-            upload_pack_endpoint("http://git.example.com/org/repo.git/").as_deref(),
-            Some("http://git.example.com/org/repo.git/git-upload-pack")
+            upload_pack_endpoint("http://git.example.com/org/repo.git/"),
+            Some(http_endpoint)
         );
         assert_eq!(upload_pack_endpoint("/tmp/upstreams/org/repo.git"), None);
     }

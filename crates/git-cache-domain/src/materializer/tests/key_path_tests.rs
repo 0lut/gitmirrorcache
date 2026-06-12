@@ -1,5 +1,6 @@
 mod tests {
     use super::super::*;
+    use git_cache_core::GIT_UPLOAD_PACK_PATH;
 
     #[test]
     fn object_keys_are_stable() {
@@ -35,7 +36,8 @@ mod tests {
 
     #[test]
     fn repo_from_git_path_with_upload_pack_suffix() {
-        let key = repo_from_git_path("github.com/org/repo.git/git-upload-pack").unwrap();
+        let key =
+            repo_from_git_path(&format!("github.com/org/repo.git{GIT_UPLOAD_PACK_PATH}")).unwrap();
         assert_eq!(key.as_str(), "github.com/org/repo");
     }
 
@@ -128,9 +130,11 @@ mod tests {
             "github.com/astral-sh/uv"
         );
         assert_eq!(
-            repo_from_git_path("github.com/astral-sh/uv.git/git-upload-pack")
-                .unwrap()
-                .as_str(),
+            repo_from_git_path(&format!(
+                "github.com/astral-sh/uv.git{GIT_UPLOAD_PACK_PATH}"
+            ))
+            .unwrap()
+            .as_str(),
             "github.com/astral-sh/uv"
         );
     }
