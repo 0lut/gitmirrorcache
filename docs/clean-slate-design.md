@@ -143,7 +143,7 @@ publishing never mutates an existing object.
 The chain design *requires* compaction (unbounded chain depth = unbounded hydrate
 cost). With flat packs, a snapshot with 50 small delta packs still hydrates in one
 parallel download wave. "Compaction" degrades to an optional background
-`git repack -a -d --write-bitmap-index` (which #74 already runs for serving!) whose
+`git repack -a -d` (the same consolidation pass used for serving maintenance) whose
 output pack is published as a new single-pack snapshot. Garbage collection = delete
 packs not referenced by any snapshot newer than a retention horizon, plus snapshots
 older than the horizon — safe because snapshots are immutable and HEAD only moves
@@ -169,14 +169,14 @@ deployments are single-node — the in-process repo lock already serializes writ
 
 #### Interaction with #74 and bundle-uri (c)
 
-- #74's post-hydration `repack --write-bitmap-index` output is exactly the artifact
+- The post-hydration `repack` output is exactly the artifact
   to publish as a compacted base pack — serving maintenance and storage compaction
   become the same job.
 - The bundle-uri base bundle is the base pack + its ref list wrapped in bundle
   framing; produce one artifact, serve it both ways (S3/CDN for bundle-uri,
   same bytes for hydration).
-- Net effect post-#74: this is **not** needed for serving performance (bitmaps fix
-  that); its remaining value is ops simplification (no compaction machinery),
+- Net effect post-#74: this is **not** needed for serving performance; its
+  remaining value is ops simplification (no compaction machinery),
   parallel cold hydration, and cross-snapshot dedupe. It is an S3-format fork —
   migration needs dual-read (read chains, write snapshots) for one retention cycle,
   or a one-shot backfill job that hydrates each repo from chains and republishes as

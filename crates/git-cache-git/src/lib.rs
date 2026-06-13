@@ -426,7 +426,7 @@ impl Git {
     pub async fn repack_for_serving(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(
             Some(repo_dir),
-            ["repack", "-a", "-d", "--write-bitmap-index"],
+            ["-c", "repack.writeBitmaps=false", "repack", "-a", "-d"],
         )
         .await
     }

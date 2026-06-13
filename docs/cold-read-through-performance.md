@@ -21,10 +21,10 @@ The proxy-off read-through path is strictly **fetch-then-serve**:
    client pack from scratch.
 
 Step 2 is expensive on the very first serve because the freshly fetched repo
-has **no bitmaps and no commit-graph** — serving maintenance (repack with
-bitmaps + commit-graph) only runs ~60s later in the background, so it never
+has **no consolidated serving pack and no commit-graph** — serving maintenance
+(repack + commit-graph) only runs ~60s later in the background, so it never
 helps the cold request itself. For llvm-sized repos, `pack-objects` walks
-millions of objects with no reuse machinery, roughly doubling the request.
+millions of objects with little reuse machinery, roughly doubling the request.
 
 The default proxy-on-miss lane hid the client-visible latency (the client
 streams upstream's bytes directly) but the background warm then performed a
@@ -96,6 +96,10 @@ Caveats, which is why this is not implemented yet:
   maintenance completes. It mainly helps serves between first fetch and
   maintenance, plus all later serves — expect ~20-40% off the serve half,
   not the 2x needed to match direct GitHub.
+- **Correctness must be revalidated.** Direct upload-pack currently disables
+  bitmap traversal, and serving maintenance avoids writing bitmap indexes.
+  Re-enabling bitmap-based reuse needs a dedicated correctness pass around
+  hidden cache refs and synthetic served refs.
 
 With option 1 in place, the cold-miss path no longer regenerates packs at
 all, which further reduces the urgency of option 2.

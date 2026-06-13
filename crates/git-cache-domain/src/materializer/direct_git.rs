@@ -1,7 +1,7 @@
 use super::*;
 use git_cache_core::GIT_UPLOAD_PACK_SERVICE;
 
-const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v3";
+const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v4";
 /// Marker recording that the bare repo was hydrated with a filtered
 /// (blobless) fetch and therefore cannot serve full-object clone shapes
 /// until an unfiltered `--refetch` completes.
@@ -18,7 +18,7 @@ pub(super) const SERVED_REPO_CONFIG: &[(&str, &str)] = &[
     ("uploadpack.hideRefs", "refs/cache"),
     ("transfer.hideRefs", "refs/cache"),
     ("pack.useBitmaps", "false"),
-    ("repack.writeBitmaps", "true"),
+    ("repack.writeBitmaps", "false"),
     ("pack.writeReverseIndex", "true"),
     ("pack.threads", "0"),
     ("pack.deltaCacheSize", "256m"),
@@ -667,10 +667,11 @@ impl Materializer {
     }
 
     /// Debounced background maintenance that keeps served repos compact: a
-    /// full `git repack -a -d --write-bitmap-index` plus a commit-graph
-    /// rewrite after hydration. Direct upload-pack disables bitmap traversal
-    /// for correctness, but repacking still collapses incremental fetch packs
-    /// into one local pack and writes reverse indexes for efficient reads.
+    /// full `git repack -a -d` plus a commit-graph rewrite after hydration.
+    /// Direct upload-pack disables bitmap traversal for correctness, so
+    /// maintenance skips bitmap generation while still collapsing incremental
+    /// fetch packs into one local pack and writing reverse indexes for
+    /// efficient reads.
     /// At most one maintenance run per repo is queued or running at a time.
     pub(super) fn enqueue_serving_maintenance(&self, repo: RepoKey, repo_dir: PathBuf) {
         {

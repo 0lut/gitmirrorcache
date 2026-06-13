@@ -41,5 +41,5 @@ docker exec "$container_id" /usr/local/bin/git-cache optimize "$repo"
 
 echo '--- after count-objects ---'
 docker exec "$container_id" git -C "$repo_dir" count-objects -vH
-echo '--- bitmap indexes ---'
-docker exec "$container_id" /bin/sh -c "ls -lh '$repo_dir'/objects/pack/*.bitmap"
+echo '--- pack files ---'
+docker exec "$container_id" /bin/sh -c "ls -lh '$repo_dir'/objects/pack"

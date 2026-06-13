@@ -3,10 +3,14 @@ mod tests {
     use crate::materializer::direct_git::SERVED_REPO_CONFIG;
 
     #[test]
-    fn served_repo_config_disables_bitmap_traversal() {
+    fn served_repo_config_disables_bitmap_traversal_and_writes() {
         assert!(
             SERVED_REPO_CONFIG.contains(&("pack.useBitmaps", "false")),
             "direct upload-pack must not use bitmap traversal"
+        );
+        assert!(
+            SERVED_REPO_CONFIG.contains(&("repack.writeBitmaps", "false")),
+            "serving maintenance should not write bitmap indexes that upload-pack will not use"
         );
     }
 

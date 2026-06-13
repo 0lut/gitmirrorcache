@@ -34,7 +34,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repack_for_serving_writes_bitmap_index() {
+    async fn repack_for_serving_does_not_write_bitmap_index() {
         let temp = TempTree::new("repack-serving");
         let (source_repo, _) = create_source_repo(&temp.path);
         let cache_repo = temp.path.join("cache.git");
@@ -55,20 +55,9 @@ mod tests {
             .await
             .expect("repack repo for serving");
 
-        let pack_dir = cache_repo.join("objects/pack");
-        let has_bitmap = std::fs::read_dir(&pack_dir)
-            .expect("read pack dir")
-            .any(|entry| {
-                entry
-                    .expect("pack dir entry")
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "bitmap")
-            });
         assert!(
-            has_bitmap,
-            "expected a bitmap index in {}",
-            pack_dir.display()
+            !pack_dir_has_bitmap(&cache_repo),
+            "serving repack should avoid bitmap indexes because upload-pack disables bitmap traversal"
         );
     }
 
@@ -98,10 +87,10 @@ mod tests {
             .set_config(&cache_repo, "pack.useBitmaps", "true")
             .await
             .expect("enable bitmap traversal in repo config");
-        setup_git
-            .repack_for_serving(&cache_repo)
-            .await
-            .expect("repack repo for serving");
+        run_git(
+            Some(&cache_repo),
+            ["repack", "-a", "-d", "--write-bitmap-index"],
+        );
         assert!(
             pack_dir_has_bitmap(&cache_repo),
             "test fixture must contain a bitmap index"
