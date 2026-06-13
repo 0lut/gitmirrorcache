@@ -738,46 +738,71 @@ impl Materializer {
         let repo_dir = self.ensure_repo_dir(repo).await?;
         let local_ref = format!("refs/cache/upstream/heads/{}", branch.as_str());
 
-        if self
-            .commit_ready_for_serving(&repo_dir, upstream_commit)
-            .await
-        {
-            self.record_verified_branch_refs(
-                repo,
-                &repo_dir,
-                branch,
-                upstream_commit,
-                default_branch,
-            )
-            .await?;
-            self.ensure_branch_manifests(repo, &repo_dir, branch, upstream_commit, default_branch)
+        let local_tip_ready = self
+            .commit_ready_for_serving_no_lazy(&repo_dir, upstream_commit)
+            .await;
+        if local_tip_ready {
+            if self
+                .commit_history_complete_no_lazy(&repo_dir, upstream_commit)
+                .await?
+            {
+                self.record_verified_branch_refs(
+                    repo,
+                    &repo_dir,
+                    branch,
+                    upstream_commit,
+                    default_branch,
+                )
                 .await?;
+                self.ensure_branch_manifests(
+                    repo,
+                    &repo_dir,
+                    branch,
+                    upstream_commit,
+                    default_branch,
+                )
+                .await?;
+                info!(
+                    %repo,
+                    %branch,
+                    upstream_commit = %upstream_commit,
+                    elapsed_ms = elapsed_ms(started),
+                    "ensured branch from local ready commit"
+                );
+                return Ok(upstream_commit.clone());
+            }
             info!(
                 %repo,
                 %branch,
                 upstream_commit = %upstream_commit,
-                elapsed_ms = elapsed_ms(started),
-                "ensured branch from local ready commit"
+                "local branch tip is present but full-history closure is incomplete; fetching before publish"
             );
-            return Ok(upstream_commit.clone());
         }
 
         let _repo_lock = self.lock_repo(repo).await?;
         let upstream_url = self.upstream_url(repo)?;
         let fetch_started = Instant::now();
         let refspec = git_cache_git::branch_cache_refspec(branch.as_str())?;
+        let repo_is_shallow = fs::try_exists(repo_dir.join("shallow")).await?;
+        let fetch_options = git_cache_git::FetchOptions {
+            refetch: local_tip_ready && !repo_is_shallow,
+            unshallow: repo_is_shallow,
+            ..Default::default()
+        };
         self.upstream_git(&upstream_url)?
             .fetch_refspecs(
                 &repo_dir,
                 &upstream_url,
                 std::slice::from_ref(&refspec),
-                git_cache_git::FetchOptions::default(),
+                fetch_options,
             )
             .await?;
         info!(
             %repo,
             %branch,
             upstream_commit = %upstream_commit,
+            refetch = fetch_options.refetch,
+            unshallow = fetch_options.unshallow,
             elapsed_ms = elapsed_ms(fetch_started),
             "fetched branch from upstream"
         );
@@ -793,6 +818,20 @@ impl Materializer {
             return Err(GitCacheError::Conflict(format!(
                 "upstream branch `{branch}` moved during fetch: ls-remote={upstream_commit}, fetched={commit}"
             )));
+        }
+
+        if !self
+            .commit_history_complete_no_lazy(&repo_dir, &commit)
+            .await?
+        {
+            return Err(GitCacheError::Internal(format!(
+                "branch `{branch}` fetched commit `{commit}` without complete full-history closure"
+            )));
+        }
+        if fetch_options.refetch {
+            fs::remove_file(repo_dir.join(super::direct_git::PARTIAL_HYDRATION_MARKER))
+                .await
+                .ok();
         }
 
         if default_branch {

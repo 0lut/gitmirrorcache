@@ -111,6 +111,17 @@ impl Materializer {
         Ok(true)
     }
 
+    pub(super) async fn commit_history_complete_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+    ) -> CoreResult<bool> {
+        self.state
+            .git
+            .commit_history_complete_no_lazy(repo_dir, commit)
+            .await
+    }
+
     pub(super) async fn commit_ready_for_serving_no_lazy(
         &self,
         repo_dir: &FsPath,

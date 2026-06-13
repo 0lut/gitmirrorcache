@@ -123,6 +123,10 @@ impl DirectFetchOptions {
         self.filter == Some(BLOBLESS_FETCH_FILTER)
     }
 
+    fn needs_full_object_history(self) -> bool {
+        self.filter.is_none() && self.depth.is_none()
+    }
+
     fn without_manifest_hydration(mut self) -> Self {
         self.hydrate_manifests = false;
         self
@@ -337,6 +341,8 @@ impl Materializer {
         let mut fetched_commits = 0usize;
         let mut fetched_non_commit_wants = 0usize;
         let mut pending: Vec<CommitSha> = Vec::new();
+        let mut pending_requires_refetch = force_refetch;
+        let mut verified_hydrated_generations: HashSet<GenerationId> = HashSet::new();
 
         for object_id in object_ids {
             if let Some(object_type) = object_types.get(object_id) {
@@ -360,9 +366,25 @@ impl Materializer {
                     if manifest.complete {
                         match Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await {
                             Ok(()) => {
-                                self.expose_served_commit(&repo_dir, object_id).await?;
-                                hydrated_commits += 1;
-                                continue;
+                                if !fetch_options.needs_full_object_history()
+                                    || verified_hydrated_generations
+                                        .contains(&manifest.generation)
+                                    || self
+                                        .commit_history_complete_no_lazy(&repo_dir, object_id)
+                                        .await?
+                                {
+                                    verified_hydrated_generations.insert(manifest.generation);
+                                    self.expose_served_commit(&repo_dir, object_id).await?;
+                                    hydrated_commits += 1;
+                                    continue;
+                                }
+                                pending_requires_refetch = true;
+                                warn!(
+                                    %repo,
+                                    commit = %object_id,
+                                    generation = %manifest.generation,
+                                    "commit manifest hydrated incomplete full-history closure; falling back to read-through fetch"
+                                );
                             }
                             // A commit manifest can point at a generation that
                             // was swept or repointed by another node; fall
@@ -397,6 +419,14 @@ impl Materializer {
         }
 
         if !pending.is_empty() {
+            let fetch_options = if pending_requires_refetch
+                && fetch_options.needs_full_object_history()
+                && !needs_unshallow
+            {
+                fetch_options.with_refetch()
+            } else {
+                fetch_options
+            };
             // A fresh clone wants the tip of every advertised ref, so missing
             // wants must be fetched in batched upstream invocations: one fetch
             // for all advertised refspecs plus one for raw SHAs, instead of one

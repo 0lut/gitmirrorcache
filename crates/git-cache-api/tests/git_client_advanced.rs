@@ -104,6 +104,14 @@ mod tests {
             format!("http://{}/git/{}", self.addr, repo)
         }
 
+        fn materialize_url(&self) -> String {
+            format!("http://{}/v1/materialize", self.addr)
+        }
+
+        fn cache_repo_dir(&self) -> PathBuf {
+            self.tmp.path().join("cache/repos/github.com/org/repo.git")
+        }
+
         fn head_commit(&self) -> String {
             git_stdout(&self.upstream_work, &["rev-parse", "HEAD"])
         }
@@ -226,6 +234,26 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn materialize_branch(server: &TestServer, branch: &str) {
+        let client = reqwest::Client::new();
+        let response = client
+            .post(server.materialize_url())
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "repo": "github.com/org/repo",
+                "selector": {"branch": branch}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "materialize response body: {}",
+            response.text().await.unwrap_or_default()
+        );
     }
 
     fn simple_checksum(data: &[u8]) -> u64 {
@@ -511,6 +539,91 @@ mod tests {
         let after = git_stdout_async(&clone_dir, &["rev-list", "--count", "HEAD"]).await;
         assert_eq!(after, "4", "fetch --deepen=3 should add three commits");
         git_stdout_async(&clone_dir, &["rev-parse", "--verify", "HEAD~3^{commit}"]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_clone_succeeds_after_shallow_generation_hydrates_cold_cache() {
+        let server = TestServer::start_with_file_url_upstream(true).await;
+
+        for message in [
+            "second shallow generation",
+            "third shallow generation",
+            "fourth shallow generation",
+            "fifth shallow generation",
+        ] {
+            std::fs::write(
+                server.upstream_work.join("README.md"),
+                format!("{message}\n"),
+            )
+            .unwrap();
+            run_git(&server.upstream_work, &["add", "README.md"]);
+            run_git(&server.upstream_work, &["commit", "-m", message]);
+        }
+        run_git(&server.upstream_work, &["push", "origin", "main"]);
+
+        let url = server.git_url("github.com/org/repo");
+        let shallow_dir = server.tmp.path().join("shallow_generation_seed");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--depth=1",
+                "--branch",
+                "main",
+                "--no-checkout",
+                &url,
+                shallow_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        let cache_repo = server.cache_repo_dir();
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "depth-limited direct Git hydration should leave the cache repo shallow"
+        );
+
+        materialize_branch(&server, "main").await;
+        std::fs::remove_dir_all(&cache_repo).unwrap();
+
+        let full_dir = server.tmp.path().join("full_after_shallow_generation");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--branch",
+                "main",
+                &url,
+                full_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        let is_shallow =
+            git_stdout_async(&full_dir, &["rev-parse", "--is-shallow-repository"]).await;
+        assert_eq!(is_shallow, "false");
+        let count = git_stdout_async(&full_dir, &["rev-list", "--count", "HEAD"]).await;
+        assert_eq!(count, "5", "full clone should include all upstream commits");
+        git_stdout_async(&full_dir, &["log", "--oneline", "--all"]).await;
+
+        let cache_repo = server.cache_repo_dir();
+        assert!(
+            !cache_repo.join("shallow").exists(),
+            "full-history clone should not leave the rehydrated cache repo shallow"
+        );
+        let missing = git_stdout_async(
+            &cache_repo,
+            &["rev-list", "--objects", "--missing=print", "--all"],
+        )
+        .await;
+        let missing: Vec<&str> = missing
+            .lines()
+            .filter(|line| line.starts_with('?'))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "cache repo is missing objects after cold generation hydrate: {missing:?}"
+        );
     }
 
     // ── ls-remote --heads ───────────────────────────────────────────────────

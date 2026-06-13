@@ -283,6 +283,38 @@ impl Git {
         Ok(!text.lines().any(|line| line.starts_with('?')))
     }
 
+    /// Check, without lazy promisor fetches, that the full object closure
+    /// reachable from `commit` is present locally. This is the safety check
+    /// for publishing or serving full-history commit wants: a shallow or
+    /// partially imported repo can have the tip commit and tree while still
+    /// missing parents or older trees/blobs.
+    pub async fn commit_history_complete_no_lazy(
+        &self,
+        repo_dir: &Path,
+        commit: &CommitSha,
+    ) -> Result<bool> {
+        reject_revision_arg(commit.as_str())?;
+        let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
+        let output = match git
+            .run(
+                Some(repo_dir),
+                [
+                    "rev-list",
+                    "--objects",
+                    "--no-object-names",
+                    "--missing=print",
+                    commit.as_str(),
+                ],
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(_) => return Ok(false),
+        };
+        let text = output.stdout_utf8("rev-list")?;
+        Ok(!text.lines().any(|line| line.starts_with('?')))
+    }
+
     pub async fn cat_file_batch_types(
         &self,
         repo_dir: &Path,
