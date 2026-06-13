@@ -1,5 +1,14 @@
 mod tests {
     use super::super::*;
+    use crate::materializer::direct_git::SERVED_REPO_CONFIG;
+
+    #[test]
+    fn served_repo_config_disables_bitmap_traversal() {
+        assert!(
+            SERVED_REPO_CONFIG.contains(&("pack.useBitmaps", "false")),
+            "direct upload-pack must not use bitmap traversal"
+        );
+    }
 
     #[test]
     fn synthesize_ref_advertisement_contains_head_and_refs() {

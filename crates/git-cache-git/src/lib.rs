@@ -557,7 +557,17 @@ impl Git {
 
         let mut command = Command::new(&self.binary);
         command
-            .args(["upload-pack", "--stateless-rpc", "."])
+            // Bitmap pack reuse is unsafe for the direct-cache serving shape:
+            // the advertised refs come from upstream, while the local repo has
+            // hidden cache refs and synthetic served refs. Prefer a full
+            // traversal over a fast but incomplete pack.
+            .args([
+                "-c",
+                "pack.useBitmaps=false",
+                "upload-pack",
+                "--stateless-rpc",
+                ".",
+            ])
             .env_clear()
             // Serving must never trigger promisor lazy fetches: a single
             // pack-objects run over a partial repo can otherwise storm

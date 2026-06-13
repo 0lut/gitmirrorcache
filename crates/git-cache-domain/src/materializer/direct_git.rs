@@ -1,7 +1,7 @@
 use super::*;
 use git_cache_core::GIT_UPLOAD_PACK_SERVICE;
 
-const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v2";
+const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v3";
 /// Marker recording that the bare repo was hydrated with a filtered
 /// (blobless) fetch and therefore cannot serve full-object clone shapes
 /// until an unfiltered `--refetch` completes.
@@ -11,13 +11,13 @@ const BLOBLESS_FETCH_FILTER: &str = "blob:none";
 /// Local git config applied to every served bare repo. Marker-gated by
 /// `SERVED_REPO_CONFIG_MARKER`; bump the marker version when changing this
 /// set so existing repos pick up the new configuration.
-const SERVED_REPO_CONFIG: &[(&str, &str)] = &[
+pub(super) const SERVED_REPO_CONFIG: &[(&str, &str)] = &[
     ("uploadpack.allowAnySHA1InWant", "true"),
     ("uploadpack.allowFilter", "true"),
     ("uploadpack.allowReachableSHA1InWant", "true"),
     ("uploadpack.hideRefs", "refs/cache"),
     ("transfer.hideRefs", "refs/cache"),
-    ("pack.useBitmaps", "true"),
+    ("pack.useBitmaps", "false"),
     ("repack.writeBitmaps", "true"),
     ("pack.writeReverseIndex", "true"),
     ("pack.threads", "0"),
@@ -666,11 +666,12 @@ impl Materializer {
         });
     }
 
-    /// Debounced background maintenance that keeps served repos fast: a full
-    /// `git repack -a -d --write-bitmap-index` plus a commit-graph rewrite
-    /// after hydration, so server-side pack-objects can reuse pack bytes and
-    /// bitmaps instead of recomputing deltas over millions of objects. At
-    /// most one maintenance run per repo is queued or running at a time.
+    /// Debounced background maintenance that keeps served repos compact: a
+    /// full `git repack -a -d --write-bitmap-index` plus a commit-graph
+    /// rewrite after hydration. Direct upload-pack disables bitmap traversal
+    /// for correctness, but repacking still collapses incremental fetch packs
+    /// into one local pack and writes reverse indexes for efficient reads.
+    /// At most one maintenance run per repo is queued or running at a time.
     pub(super) fn enqueue_serving_maintenance(&self, repo: RepoKey, repo_dir: PathBuf) {
         {
             let Ok(mut inflight) = self.state.serving_maintenance_inflight.lock() else {
