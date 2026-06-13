@@ -115,6 +115,23 @@ mod tests {
     }
 
     #[test]
+    fn upload_pack_intent_detects_deepen_of_existing_shallow_boundary() {
+        let sha = "a".repeat(40);
+        let shallow = "b".repeat(40);
+        let mut body = make_upload_pack_pkt_line(&format!("want {sha} multi_ack thin-pack\n"));
+        body.extend(make_upload_pack_pkt_line(&format!("shallow {shallow}\n")));
+        body.extend(make_upload_pack_pkt_line("deepen 3\n"));
+        body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        body.extend(make_upload_pack_pkt_line("done\n"));
+
+        let intent = super::super::direct_git::parse_upload_pack_intent(&body).unwrap();
+
+        assert!(intent.deepens_existing_shallow_boundary());
+        assert_eq!(intent.shallow, vec![CommitSha::parse(&shallow).unwrap()]);
+        assert_eq!(intent.depth, Some(3));
+    }
+
+    #[test]
     fn upload_pack_intent_parser_ignores_unsupported_filters() {
         let sha = "b".repeat(40);
         let mut body = make_upload_pack_pkt_line(&format!("want {sha}\n"));

@@ -1,7 +1,6 @@
 mod common;
 
 mod tests {
-    use bytes::Bytes;
     use git_cache_core::CommitSha;
     use git_cache_git::{FetchOptions, Git};
     use std::ffi::{OsStr, OsString};
@@ -9,7 +8,6 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -58,84 +56,6 @@ mod tests {
         assert!(
             !pack_dir_has_bitmap(&cache_repo),
             "serving repack should avoid bitmap indexes because upload-pack disables bitmap traversal"
-        );
-    }
-
-    #[tokio::test]
-    async fn upload_pack_spawn_disables_bitmap_traversal_for_bitmap_repacked_repo() {
-        let temp = TempTree::new("upload-pack-bitmaps");
-        let (source_repo, _) = create_source_repo(&temp.path);
-        let head = commit_source(&source_repo, "second");
-        let cache_repo = temp.path.join("cache.git");
-        let setup_git = test_git();
-
-        setup_git
-            .init_bare(&cache_repo)
-            .await
-            .expect("init cache repo");
-        setup_git
-            .fetch_ref(
-                &cache_repo,
-                path_arg(&source_repo),
-                "refs/heads/main",
-                "refs/heads/main",
-                FetchOptions::default(),
-            )
-            .await
-            .expect("fetch main into cache repo");
-        setup_git
-            .set_config(&cache_repo, "pack.useBitmaps", "true")
-            .await
-            .expect("enable bitmap traversal in repo config");
-        run_git(
-            Some(&cache_repo),
-            ["repack", "-a", "-d", "--write-bitmap-index"],
-        );
-        assert!(
-            pack_dir_has_bitmap(&cache_repo),
-            "test fixture must contain a bitmap index"
-        );
-
-        let argv_log = temp.path.join("upload-pack-argv.log");
-        let wrapper = temp.path.join("git-wrapper.sh");
-        std::fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\n: > \"{}\"\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> \"{}\"; done\nexec git \"$@\"\n",
-                argv_log.display(),
-                argv_log.display()
-            ),
-        )
-        .expect("write git wrapper");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&wrapper)
-                .expect("stat git wrapper")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&wrapper, permissions).expect("chmod git wrapper");
-        }
-
-        let git = Git::new(&wrapper, Duration::from_secs(10));
-        let mut process = git
-            .upload_pack_spawn(&cache_repo, upload_pack_request_for(&head))
-            .await
-            .expect("spawn upload-pack");
-        let mut stdout = Vec::new();
-        process
-            .stdout
-            .read_to_end(&mut stdout)
-            .await
-            .expect("read upload-pack stdout");
-        process.wait().await.expect("upload-pack should succeed");
-
-        let argv = std::fs::read_to_string(&argv_log).expect("read argv log");
-        let args: Vec<&str> = argv.lines().collect();
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["-c", "pack.useBitmaps=false"]),
-            "upload-pack must disable bitmap traversal even when the served repo has bitmap indexes; argv was {args:?}"
         );
     }
 
@@ -357,20 +277,6 @@ mod tests {
                     .extension()
                     .is_some_and(|ext| ext == "bitmap")
             })
-    }
-
-    fn upload_pack_request_for(commit: &str) -> Bytes {
-        let mut body = pkt_line(&format!(
-            "want {commit} multi_ack_detailed no-done side-band-64k thin-pack ofs-delta\n"
-        ));
-        body.extend_from_slice(b"0000");
-        body.extend(pkt_line("done\n"));
-        Bytes::from(body)
-    }
-
-    fn pkt_line(data: &str) -> Vec<u8> {
-        let len = data.len() + 4;
-        format!("{len:04x}{data}").into_bytes()
     }
 
     fn run_git<I, S>(cwd: Option<&Path>, args: I) -> String

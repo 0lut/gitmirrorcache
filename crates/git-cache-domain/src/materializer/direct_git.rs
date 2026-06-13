@@ -58,10 +58,18 @@ pub(super) struct UploadPackIntent {
     pub(super) shallow: Vec<CommitSha>,
 }
 
+impl UploadPackIntent {
+    pub(super) fn deepens_existing_shallow_boundary(&self) -> bool {
+        !self.shallow.is_empty()
+            && (self.depth.is_some() || self.deepen_since.is_some() || !self.deepen_not.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DirectFetchOptions {
     filter: Option<&'static str>,
     depth: Option<u32>,
+    deepen_existing_shallow: bool,
     hydrate_manifests: bool,
     refetch: bool,
     unshallow: bool,
@@ -72,6 +80,7 @@ impl Default for DirectFetchOptions {
         Self {
             filter: None,
             depth: None,
+            deepen_existing_shallow: false,
             hydrate_manifests: true,
             refetch: false,
             unshallow: false,
@@ -87,6 +96,7 @@ impl DirectFetchOptions {
                 None => None,
             },
             depth: intent.depth,
+            deepen_existing_shallow: intent.deepens_existing_shallow_boundary(),
             // Filtered (blobless) intents skip per-want manifest hydration:
             // their wants are commits the batched fetch hydrates directly, or
             // lazy-fetched blobs (tens of thousands per checkout) for which a
@@ -102,6 +112,7 @@ impl DirectFetchOptions {
         Self {
             filter: blobless_fetch.then_some(BLOBLESS_FETCH_FILTER),
             depth: None,
+            deepen_existing_shallow: false,
             hydrate_manifests: !blobless_fetch,
             refetch: false,
             unshallow: false,
@@ -123,6 +134,7 @@ impl DirectFetchOptions {
     }
 
     fn with_unshallow(mut self) -> Self {
+        self.depth = None;
         self.unshallow = true;
         self
     }
@@ -288,19 +300,23 @@ impl Materializer {
                 "repo partially hydrated (blobless); forcing full refetch of wants"
             );
         }
-        // A repo hydrated only by depth-limited fetches is shallow: serving a
+        // A repo hydrated only by depth-limited fetches is shallow. Serving a
         // full-history intent from it would stream a pack whose commit
         // parents stop at the shallow boundary while the client repo is not
-        // marked shallow — a silently corrupt clone. Force the batched fetch
-        // to unshallow the cache repo before serving such intents. Lazy
-        // exact-oid fetches are unaffected (`fetch_objects` never
+        // marked shallow. A later `fetch --deepen=N` has the opposite shape:
+        // the client is marked shallow, but the cache must still have commits
+        // beyond its own boundary to extend the client's history. Force the
+        // batched fetch to unshallow the cache repo before serving either
+        // shape. Lazy exact-oid fetches are unaffected (`fetch_objects` never
         // unshallows), so blobless checkout blob storms stay cheap.
-        let needs_unshallow =
-            fetch_options.depth.is_none() && fs::try_exists(repo_dir.join("shallow")).await?;
+        let cache_repo_is_shallow = fs::try_exists(repo_dir.join("shallow")).await?;
+        let needs_unshallow = cache_repo_is_shallow
+            && (fetch_options.depth.is_none() || fetch_options.deepen_existing_shallow);
         let fetch_options = if needs_unshallow {
             info!(
                 %repo,
-                "cache repo is shallow; forcing unshallow fetch for full-history wants"
+                deepen_existing_shallow = fetch_options.deepen_existing_shallow,
+                "cache repo is shallow; forcing unshallow fetch before serving upload-pack wants"
             );
             fetch_options.with_unshallow()
         } else {
@@ -802,8 +818,8 @@ impl Materializer {
         // full-history commit wants: the pack would stop at the shallow
         // boundary while the client repo is not marked shallow — a silently
         // corrupt clone. Lazy exact-oid (blob/tree) fetches are unaffected.
-        let full_history_on_shallow_repo =
-            intent.depth.is_none() && fs::try_exists(repo_dir.join("shallow")).await?;
+        let shallow_repo_cannot_serve_locally = fs::try_exists(repo_dir.join("shallow")).await?
+            && (intent.depth.is_none() || intent.deepens_existing_shallow_boundary());
 
         let _repo_lock = self.lock_repo(repo).await?;
         let object_types = self
@@ -820,12 +836,13 @@ impl Materializer {
                     served_non_commit_wants += 1;
                     continue;
                 }
-                if full_history_on_shallow_repo {
+                if shallow_repo_cannot_serve_locally {
                     info!(
                         %repo,
                         commit = %object_id,
                         wants_count,
-                        "direct git cache prepare declined: repo is shallow, commit want needs full history"
+                        deepen_existing_shallow = intent.deepens_existing_shallow_boundary(),
+                        "direct git cache prepare declined: repo is shallow, commit want needs more history"
                     );
                     return Ok(false);
                 }
