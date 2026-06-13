@@ -830,52 +830,18 @@ impl Git {
             .collect();
         debug!(?cwd, ?args, "running git command");
 
-        let mut command = Command::new(&self.binary);
-        command
-            .args(&args)
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_ASKPASS", "/bin/false")
-            .env("SSH_ASKPASS", "/bin/false")
-            .env("HOME", "/nonexistent")
-            .stdin(if stdin.is_some() {
+        let mut command = self.command(
+            cwd,
+            &args,
+            if stdin.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
-        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            command.env("TMPDIR", tmpdir);
-        }
-
-        let mut git_config_entries = git_config_entries_from_extra_env(&self.extra_env);
-        if apply_upstream_auth {
-            if let Some(auth_env) = &self.upstream_auth_env {
-                git_config_entries.retain(|(key, _)| key != &auth_env.config_key);
-                git_config_entries.push((
-                    auth_env.config_key.clone(),
-                    OsString::from(auth_env.config_value.clone()),
-                ));
-            }
-        }
-        for (key, value) in &self.extra_env {
-            if !is_git_config_env_key(key) {
-                command.env(key, value);
-            }
-        }
-        apply_git_config_entries(&mut command, &git_config_entries);
-
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
+            },
+            Stdio::piped(),
+            Stdio::piped(),
+            apply_upstream_auth,
+        );
 
         let mut child = command.spawn()?;
         let mut child_stdin = child.stdin.take();
@@ -969,6 +935,61 @@ impl Git {
         git.run(cwd, args).await
     }
 
+    fn command(
+        &self,
+        cwd: Option<&Path>,
+        args: &[OsString],
+        stdin: Stdio,
+        stdout: Stdio,
+        stderr: Stdio,
+        apply_upstream_auth: bool,
+    ) -> Command {
+        let mut command = Command::new(&self.binary);
+        command
+            .args(args)
+            .env_clear()
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false")
+            .env("HOME", "/nonexistent")
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .kill_on_drop(true);
+
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", tmpdir);
+        }
+
+        let mut git_config_entries = git_config_entries_from_extra_env(&self.extra_env);
+        if apply_upstream_auth {
+            if let Some(auth_env) = &self.upstream_auth_env {
+                git_config_entries.retain(|(key, _)| key != &auth_env.config_key);
+                git_config_entries.push((
+                    auth_env.config_key.clone(),
+                    OsString::from(auth_env.config_value.clone()),
+                ));
+            }
+        }
+        for (key, value) in &self.extra_env {
+            if !is_git_config_env_key(key) {
+                command.env(key, value);
+            }
+        }
+        apply_git_config_entries(&mut command, &git_config_entries);
+
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+
+        command
+    }
+
     async fn rev_list_objects_has_missing_no_lazy(
         &self,
         repo_dir: &Path,
@@ -993,36 +1014,14 @@ impl Git {
         .collect();
         debug!(cwd = ?repo_dir, ?args, "running git command");
 
-        let mut command = Command::new(&self.binary);
-        command
-            .args(&args)
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_ASKPASS", "/bin/false")
-            .env("SSH_ASKPASS", "/bin/false")
-            .env("HOME", "/nonexistent")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .current_dir(repo_dir);
-
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
-        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            command.env("TMPDIR", tmpdir);
-        }
-
-        let git_config_entries = git_config_entries_from_extra_env(&self.extra_env);
-        for (key, value) in &self.extra_env {
-            if !is_git_config_env_key(key) {
-                command.env(key, value);
-            }
-        }
-        apply_git_config_entries(&mut command, &git_config_entries);
+        let mut command = self.command(
+            Some(repo_dir),
+            &args,
+            Stdio::null(),
+            Stdio::piped(),
+            Stdio::piped(),
+            false,
+        );
 
         let mut child = command.spawn()?;
         let stdout = child
