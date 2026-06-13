@@ -1,5 +1,20 @@
 mod tests {
     use super::super::*;
+    use crate::materializer::direct_git::SERVED_REPO_CONFIG;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn served_repo_config_disables_bitmap_traversal_and_writes() {
+        assert!(
+            SERVED_REPO_CONFIG.contains(&("pack.useBitmaps", "false")),
+            "direct upload-pack must not use bitmap traversal"
+        );
+        assert!(
+            SERVED_REPO_CONFIG.contains(&("repack.writeBitmaps", "false")),
+            "serving maintenance should not write bitmap indexes that upload-pack will not use"
+        );
+    }
 
     #[test]
     fn synthesize_ref_advertisement_contains_head_and_refs() {
@@ -99,6 +114,23 @@ mod tests {
             Some(super::super::direct_git::UploadPackFilter::BlobNone)
         );
         assert_eq!(intent.depth, Some(1));
+    }
+
+    #[test]
+    fn upload_pack_intent_detects_deepen_of_existing_shallow_boundary() {
+        let sha = "a".repeat(40);
+        let shallow = "b".repeat(40);
+        let mut body = make_upload_pack_pkt_line(&format!("want {sha} multi_ack thin-pack\n"));
+        body.extend(make_upload_pack_pkt_line(&format!("shallow {shallow}\n")));
+        body.extend(make_upload_pack_pkt_line("deepen 3\n"));
+        body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        body.extend(make_upload_pack_pkt_line("done\n"));
+
+        let intent = super::super::direct_git::parse_upload_pack_intent(&body).unwrap();
+
+        assert!(intent.deepens_existing_shallow_boundary());
+        assert_eq!(intent.shallow, vec![CommitSha::parse(&shallow).unwrap()]);
+        assert_eq!(intent.depth, Some(3));
     }
 
     #[test]
@@ -766,11 +798,144 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn full_history_want_repairs_hot_commit_with_missing_parent_closure() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let parent = fixture.head_commit();
+        let commit = fixture.commit_and_push("second partial hot cache");
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let tree = git_stdout(
+            &fixture.work_path(),
+            ["rev-parse", &format!("{commit}^{{tree}}")],
+        );
+
+        copy_git_object(&fixture.work_path(), &repo_dir, "commit", commit.as_str());
+        copy_git_object(&fixture.work_path(), &repo_dir, "tree", &tree);
+        run_git(
+            &repo_dir,
+            ["update-ref", "refs/heads/main", commit.as_str()],
+        );
+        assert!(
+            materializer
+                .commit_ready_for_serving_no_lazy(&repo_dir, &commit)
+                .await,
+            "test setup should leave the tip commit and root tree present"
+        );
+        assert!(
+            !state
+                .git
+                .commit_history_complete_no_lazy(&repo_dir, &commit)
+                .await
+                .unwrap(),
+            "test setup should leave parent/blob history incomplete"
+        );
+        assert!(
+            !materializer.commit_exists(&repo_dir, &parent).await,
+            "test setup should not copy the parent commit into the cache repo"
+        );
+        stdfs::write(
+            repo_dir.join(super::super::direct_git::INCOMPLETE_CLOSURE_MARKER),
+            b"incomplete\n",
+        )
+        .unwrap();
+
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+        materializer
+            .ensure_wants_available_from_comparison(
+                &fixture.repo,
+                &[commit.to_string()],
+                &comparison,
+                false,
+            )
+            .await
+            .expect("full-history want should repair incomplete hot local closure");
+
+        assert!(
+            state
+                .git
+                .commit_history_complete_no_lazy(&repo_dir, &commit)
+                .await
+                .unwrap(),
+            "full-history local hot path must not serve until the commit closure is complete"
+        );
+        assert!(
+            materializer.commit_exists(&repo_dir, &parent).await,
+            "repair should fetch the missing parent history"
+        );
+        assert!(
+            !repo_dir
+                .join(super::super::direct_git::INCOMPLETE_CLOSURE_MARKER)
+                .exists(),
+            "successful repair should clear the suspect closure marker"
+        );
+    }
+
     fn make_full_body(commit: &CommitSha) -> Vec<u8> {
         let mut body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
         body.extend_from_slice(b"0000");
         body.extend(make_upload_pack_pkt_line("done\n"));
         body
+    }
+
+    fn copy_git_object(
+        source_repo: &FsPath,
+        target_repo: &FsPath,
+        object_type: &str,
+        object: &str,
+    ) {
+        let bytes = git_output(source_repo, ["cat-file", object_type, object]);
+        let written = run_git_with_stdin(
+            target_repo,
+            ["hash-object", "-w", "-t", object_type, "--stdin"],
+            &bytes,
+        );
+        assert_eq!(String::from_utf8(written).unwrap().trim(), object);
+    }
+
+    fn git_output<I, S>(cwd: &FsPath, args: I) -> Vec<u8>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn run_git_with_stdin<I, S>(cwd: &FsPath, args: I, stdin: &[u8]) -> Vec<u8>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let mut child = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
     }
 
     #[tokio::test]

@@ -283,6 +283,33 @@ impl Git {
         Ok(!text.lines().any(|line| line.starts_with('?')))
     }
 
+    /// Check, without lazy promisor fetches, that the full object closure
+    /// reachable from `commit` is present locally. This is the safety check
+    /// for publishing or serving full-history commit wants: a shallow or
+    /// partially imported repo can have the tip commit and tree while still
+    /// missing parents or older trees/blobs.
+    pub async fn commit_history_complete_no_lazy(
+        &self,
+        repo_dir: &Path,
+        commit: &CommitSha,
+    ) -> Result<bool> {
+        reject_revision_arg(commit.as_str())?;
+        // `rev-list --missing=print` respects shallow graft boundaries and
+        // would otherwise report a depth-limited repo as complete.
+        if repo_dir.join("shallow").exists() {
+            return Ok(false);
+        }
+        let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
+        let has_missing = match git
+            .rev_list_objects_has_missing_no_lazy(repo_dir, commit)
+            .await
+        {
+            Ok(has_missing) => has_missing,
+            Err(_) => return Ok(false),
+        };
+        Ok(!has_missing)
+    }
+
     pub async fn cat_file_batch_types(
         &self,
         repo_dir: &Path,
@@ -426,7 +453,7 @@ impl Git {
     pub async fn repack_for_serving(&self, repo_dir: &Path) -> Result<GitOutput> {
         self.run(
             Some(repo_dir),
-            ["repack", "-a", "-d", "--write-bitmap-index"],
+            ["-c", "repack.writeBitmaps=false", "repack", "-a", "-d"],
         )
         .await
     }
@@ -557,7 +584,17 @@ impl Git {
 
         let mut command = Command::new(&self.binary);
         command
-            .args(["upload-pack", "--stateless-rpc", "."])
+            // Bitmap pack reuse is unsafe for the direct-cache serving shape:
+            // the advertised refs come from upstream, while the local repo has
+            // hidden cache refs and synthetic served refs. Prefer a full
+            // traversal over a fast but incomplete pack.
+            .args([
+                "-c",
+                "pack.useBitmaps=false",
+                "upload-pack",
+                "--stateless-rpc",
+                ".",
+            ])
             .env_clear()
             // Serving must never trigger promisor lazy fetches: a single
             // pack-objects run over a partial repo can otherwise storm
@@ -793,52 +830,18 @@ impl Git {
             .collect();
         debug!(?cwd, ?args, "running git command");
 
-        let mut command = Command::new(&self.binary);
-        command
-            .args(&args)
-            .env_clear()
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_ASKPASS", "/bin/false")
-            .env("SSH_ASKPASS", "/bin/false")
-            .env("HOME", "/nonexistent")
-            .stdin(if stdin.is_some() {
+        let mut command = self.command(
+            cwd,
+            &args,
+            if stdin.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
-        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
-            command.env("TMPDIR", tmpdir);
-        }
-
-        let mut git_config_entries = git_config_entries_from_extra_env(&self.extra_env);
-        if apply_upstream_auth {
-            if let Some(auth_env) = &self.upstream_auth_env {
-                git_config_entries.retain(|(key, _)| key != &auth_env.config_key);
-                git_config_entries.push((
-                    auth_env.config_key.clone(),
-                    OsString::from(auth_env.config_value.clone()),
-                ));
-            }
-        }
-        for (key, value) in &self.extra_env {
-            if !is_git_config_env_key(key) {
-                command.env(key, value);
-            }
-        }
-        apply_git_config_entries(&mut command, &git_config_entries);
-
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
-        }
+            },
+            Stdio::piped(),
+            Stdio::piped(),
+            apply_upstream_auth,
+        );
 
         let mut child = command.spawn()?;
         let mut child_stdin = child.stdin.take();
@@ -930,6 +933,166 @@ impl Git {
     {
         let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
         git.run(cwd, args).await
+    }
+
+    fn command(
+        &self,
+        cwd: Option<&Path>,
+        args: &[OsString],
+        stdin: Stdio,
+        stdout: Stdio,
+        stderr: Stdio,
+        apply_upstream_auth: bool,
+    ) -> Command {
+        let mut command = Command::new(&self.binary);
+        command
+            .args(args)
+            .env_clear()
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false")
+            .env("HOME", "/nonexistent")
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .kill_on_drop(true);
+
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", tmpdir);
+        }
+
+        let mut git_config_entries = git_config_entries_from_extra_env(&self.extra_env);
+        if apply_upstream_auth {
+            if let Some(auth_env) = &self.upstream_auth_env {
+                git_config_entries.retain(|(key, _)| key != &auth_env.config_key);
+                git_config_entries.push((
+                    auth_env.config_key.clone(),
+                    OsString::from(auth_env.config_value.clone()),
+                ));
+            }
+        }
+        for (key, value) in &self.extra_env {
+            if !is_git_config_env_key(key) {
+                command.env(key, value);
+            }
+        }
+        apply_git_config_entries(&mut command, &git_config_entries);
+
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+
+        command
+    }
+
+    async fn rev_list_objects_has_missing_no_lazy(
+        &self,
+        repo_dir: &Path,
+        commit: &CommitSha,
+    ) -> Result<bool> {
+        let _permit = self
+            .process_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
+
+        let args: Vec<OsString> = [
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            "--missing=print",
+            commit.as_str(),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        debug!(cwd = ?repo_dir, ?args, "running git command");
+
+        let mut command = self.command(
+            Some(repo_dir),
+            &args,
+            Stdio::null(),
+            Stdio::piped(),
+            Stdio::piped(),
+            false,
+        );
+
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GitCacheError::Validation("failed to capture git stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| GitCacheError::Validation("failed to capture git stderr".to_string()))?;
+
+        let run = async move {
+            let read_stdout = async move {
+                let mut stdout = stdout;
+                let mut buffer = [0_u8; 8192];
+                let mut at_line_start = true;
+                let mut has_missing = false;
+                loop {
+                    let bytes_read = stdout.read(&mut buffer).await?;
+                    if bytes_read == 0 {
+                        return Ok(has_missing);
+                    }
+                    for byte in &buffer[..bytes_read] {
+                        if at_line_start && *byte == b'?' {
+                            has_missing = true;
+                        }
+                        at_line_start = *byte == b'\n';
+                    }
+                }
+            };
+            let read_stderr = read_bounded(stderr, self.output_limit, "stderr");
+            let wait_child = async move { child.wait().await.map_err(GitCacheError::from) };
+
+            let (has_missing, stderr, status) =
+                tokio::try_join!(read_stdout, read_stderr, wait_child)?;
+            Ok::<_, GitCacheError>((has_missing, stderr, status))
+        };
+
+        let started = Instant::now();
+        let (has_missing, stderr, status) = timeout(self.timeout, run).await.map_err(|_| {
+            GitCacheError::Timeout(format!("git command exceeded {:?}", self.timeout))
+        })??;
+
+        let status_code = status.code().unwrap_or(-1);
+        let elapsed = started.elapsed();
+        if !status.success() {
+            if elapsed >= Duration::from_secs(1) {
+                info!(
+                    cwd = ?repo_dir,
+                    ?args,
+                    status_code,
+                    elapsed_ms = elapsed.as_millis(),
+                    "git command failed"
+                );
+            }
+            let stderr = String::from_utf8_lossy(&stderr);
+            return Err(GitCacheError::Validation(format!(
+                "git exited with status {status_code}: {stderr}"
+            )));
+        }
+        if elapsed >= Duration::from_secs(1) {
+            info!(
+                cwd = ?repo_dir,
+                ?args,
+                status_code,
+                elapsed_ms = elapsed.as_millis(),
+                "git command finished"
+            );
+        }
+
+        Ok(has_missing)
     }
 
     fn map_upstream_git_error(&self, error: GitCacheError) -> GitCacheError {

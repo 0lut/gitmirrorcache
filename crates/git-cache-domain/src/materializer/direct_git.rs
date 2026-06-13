@@ -1,24 +1,28 @@
 use super::*;
 use git_cache_core::GIT_UPLOAD_PACK_SERVICE;
 
-const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v2";
+const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v4";
 /// Marker recording that the bare repo was hydrated with a filtered
 /// (blobless) fetch and therefore cannot serve full-object clone shapes
 /// until an unfiltered `--refetch` completes.
 pub(super) const PARTIAL_HYDRATION_MARKER: &str = "git-cache-partial-hydration";
+/// Marker recording that a previous full-history closure check failed after
+/// the tip commit/tree were already present locally. Full-history hot-path
+/// service must re-check and repair before exposing commits while this exists.
+pub(super) const INCOMPLETE_CLOSURE_MARKER: &str = "git-cache-incomplete-full-closure";
 const BLOBLESS_FETCH_FILTER: &str = "blob:none";
 
 /// Local git config applied to every served bare repo. Marker-gated by
 /// `SERVED_REPO_CONFIG_MARKER`; bump the marker version when changing this
 /// set so existing repos pick up the new configuration.
-const SERVED_REPO_CONFIG: &[(&str, &str)] = &[
+pub(super) const SERVED_REPO_CONFIG: &[(&str, &str)] = &[
     ("uploadpack.allowAnySHA1InWant", "true"),
     ("uploadpack.allowFilter", "true"),
     ("uploadpack.allowReachableSHA1InWant", "true"),
     ("uploadpack.hideRefs", "refs/cache"),
     ("transfer.hideRefs", "refs/cache"),
-    ("pack.useBitmaps", "true"),
-    ("repack.writeBitmaps", "true"),
+    ("pack.useBitmaps", "false"),
+    ("repack.writeBitmaps", "false"),
     ("pack.writeReverseIndex", "true"),
     ("pack.threads", "0"),
     ("pack.deltaCacheSize", "256m"),
@@ -58,10 +62,18 @@ pub(super) struct UploadPackIntent {
     pub(super) shallow: Vec<CommitSha>,
 }
 
+impl UploadPackIntent {
+    pub(super) fn deepens_existing_shallow_boundary(&self) -> bool {
+        !self.shallow.is_empty()
+            && (self.depth.is_some() || self.deepen_since.is_some() || !self.deepen_not.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DirectFetchOptions {
     filter: Option<&'static str>,
     depth: Option<u32>,
+    deepen_existing_shallow: bool,
     hydrate_manifests: bool,
     refetch: bool,
     unshallow: bool,
@@ -72,6 +84,7 @@ impl Default for DirectFetchOptions {
         Self {
             filter: None,
             depth: None,
+            deepen_existing_shallow: false,
             hydrate_manifests: true,
             refetch: false,
             unshallow: false,
@@ -87,6 +100,7 @@ impl DirectFetchOptions {
                 None => None,
             },
             depth: intent.depth,
+            deepen_existing_shallow: intent.deepens_existing_shallow_boundary(),
             // Filtered (blobless) intents skip per-want manifest hydration:
             // their wants are commits the batched fetch hydrates directly, or
             // lazy-fetched blobs (tens of thousands per checkout) for which a
@@ -102,6 +116,7 @@ impl DirectFetchOptions {
         Self {
             filter: blobless_fetch.then_some(BLOBLESS_FETCH_FILTER),
             depth: None,
+            deepen_existing_shallow: false,
             hydrate_manifests: !blobless_fetch,
             refetch: false,
             unshallow: false,
@@ -110,6 +125,10 @@ impl DirectFetchOptions {
 
     fn blobless_fetch(self) -> bool {
         self.filter == Some(BLOBLESS_FETCH_FILTER)
+    }
+
+    fn needs_full_object_history(self) -> bool {
+        self.filter.is_none() && self.depth.is_none()
     }
 
     fn without_manifest_hydration(mut self) -> Self {
@@ -123,6 +142,7 @@ impl DirectFetchOptions {
     }
 
     fn with_unshallow(mut self) -> Self {
+        self.depth = None;
         self.unshallow = true;
         self
     }
@@ -253,8 +273,11 @@ impl Materializer {
         // pack-objects mid-stream. Force a `--refetch` covering every want so
         // git re-downloads full objects despite the local (partial) haves.
         let partial_marker = repo_dir.join(PARTIAL_HYDRATION_MARKER);
+        let closure_marker = repo_dir.join(INCOMPLETE_CLOSURE_MARKER);
         let mut force_refetch =
             !fetch_options.blobless_fetch() && fs::try_exists(&partial_marker).await?;
+        let closure_marker_present =
+            fetch_options.needs_full_object_history() && fs::try_exists(&closure_marker).await?;
         // A blobless hydration followed by client checkout blob storms often
         // leaves the depth-1 snapshot of a tip fully present locally even
         // though the repo as a whole is partial. For single-commit-deep
@@ -288,19 +311,23 @@ impl Materializer {
                 "repo partially hydrated (blobless); forcing full refetch of wants"
             );
         }
-        // A repo hydrated only by depth-limited fetches is shallow: serving a
+        // A repo hydrated only by depth-limited fetches is shallow. Serving a
         // full-history intent from it would stream a pack whose commit
         // parents stop at the shallow boundary while the client repo is not
-        // marked shallow — a silently corrupt clone. Force the batched fetch
-        // to unshallow the cache repo before serving such intents. Lazy
-        // exact-oid fetches are unaffected (`fetch_objects` never
+        // marked shallow. A later `fetch --deepen=N` has the opposite shape:
+        // the client is marked shallow, but the cache must still have commits
+        // beyond its own boundary to extend the client's history. Force the
+        // batched fetch to unshallow the cache repo before serving either
+        // shape. Lazy exact-oid fetches are unaffected (`fetch_objects` never
         // unshallows), so blobless checkout blob storms stay cheap.
-        let needs_unshallow =
-            fetch_options.depth.is_none() && fs::try_exists(repo_dir.join("shallow")).await?;
+        let cache_repo_is_shallow = fs::try_exists(repo_dir.join("shallow")).await?;
+        let needs_unshallow = cache_repo_is_shallow
+            && (fetch_options.depth.is_none() || fetch_options.deepen_existing_shallow);
         let fetch_options = if needs_unshallow {
             info!(
                 %repo,
-                "cache repo is shallow; forcing unshallow fetch for full-history wants"
+                deepen_existing_shallow = fetch_options.deepen_existing_shallow,
+                "cache repo is shallow; forcing unshallow fetch before serving upload-pack wants"
             );
             fetch_options.with_unshallow()
         } else {
@@ -321,6 +348,11 @@ impl Materializer {
         let mut fetched_commits = 0usize;
         let mut fetched_non_commit_wants = 0usize;
         let mut pending: Vec<CommitSha> = Vec::new();
+        let mut pending_requires_refetch = force_refetch;
+        let mut pending_needs_closure_verify = closure_marker_present;
+        let mut checked_suspect_hot_closure = false;
+        let mut suspect_hot_closure_complete = true;
+        let mut verified_hydrated_generations: HashSet<GenerationId> = HashSet::new();
 
         for object_id in object_ids {
             if let Some(object_type) = object_types.get(object_id) {
@@ -333,6 +365,24 @@ impl Materializer {
                     && !needs_unshallow
                     && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
                 {
+                    if closure_marker_present && fetch_options.needs_full_object_history() {
+                        checked_suspect_hot_closure = true;
+                        if !self
+                            .commit_history_complete_no_lazy(&repo_dir, object_id)
+                            .await?
+                        {
+                            suspect_hot_closure_complete = false;
+                            pending_requires_refetch = true;
+                            pending_needs_closure_verify = true;
+                            pending.push(object_id.clone());
+                            warn!(
+                                %repo,
+                                commit = %object_id,
+                                "marked suspect hot commit has incomplete full-history closure; falling back to read-through fetch"
+                            );
+                            continue;
+                        }
+                    }
                     self.expose_served_commit(&repo_dir, object_id).await?;
                     served_commits += 1;
                     continue;
@@ -344,9 +394,27 @@ impl Materializer {
                     if manifest.complete {
                         match Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await {
                             Ok(()) => {
-                                self.expose_served_commit(&repo_dir, object_id).await?;
-                                hydrated_commits += 1;
-                                continue;
+                                if !fetch_options.needs_full_object_history()
+                                    || verified_hydrated_generations
+                                        .contains(&manifest.generation)
+                                    || self
+                                        .commit_history_complete_no_lazy(&repo_dir, object_id)
+                                        .await?
+                                {
+                                    verified_hydrated_generations.insert(manifest.generation);
+                                    self.expose_served_commit(&repo_dir, object_id).await?;
+                                    hydrated_commits += 1;
+                                    continue;
+                                }
+                                fs::write(&closure_marker, b"incomplete\n").await?;
+                                pending_needs_closure_verify = true;
+                                pending_requires_refetch = true;
+                                warn!(
+                                    %repo,
+                                    commit = %object_id,
+                                    generation = %manifest.generation,
+                                    "commit manifest hydrated incomplete full-history closure; falling back to read-through fetch"
+                                );
                             }
                             // A commit manifest can point at a generation that
                             // was swept or repointed by another node; fall
@@ -381,12 +449,21 @@ impl Materializer {
         }
 
         if !pending.is_empty() {
+            let fetch_options = if pending_requires_refetch
+                && fetch_options.needs_full_object_history()
+                && !needs_unshallow
+            {
+                fetch_options.with_refetch()
+            } else {
+                fetch_options
+            };
             // A fresh clone wants the tip of every advertised ref, so missing
             // wants must be fetched in batched upstream invocations: one fetch
             // for all advertised refspecs plus one for raw SHAs, instead of one
             // subprocess per want.
             let upstream_url = self.upstream_url(repo)?;
             let upstream_git = self.upstream_git(&upstream_url)?;
+            let mut fetched_commit_wants: Vec<CommitSha> = Vec::new();
 
             let fetched_all_heads = self
                 .batched_read_through_fetch(
@@ -403,7 +480,10 @@ impl Materializer {
             let mut missing: Vec<CommitSha> = Vec::new();
             for object_id in &pending {
                 match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
-                    Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
+                    Ok(DirectFetchedWantKind::Commit) => {
+                        fetched_commits += 1;
+                        fetched_commit_wants.push(object_id.clone());
+                    }
                     Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
                     Err(_) => missing.push(object_id.clone()),
                 }
@@ -444,7 +524,10 @@ impl Materializer {
                 }
                 for object_id in &missing {
                     match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
-                        Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
+                        Ok(DirectFetchedWantKind::Commit) => {
+                            fetched_commits += 1;
+                            fetched_commit_wants.push(object_id.clone());
+                        }
                         Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
                         Err(err) => {
                             return Err(GitCacheError::NotFound(format!(
@@ -452,6 +535,27 @@ impl Materializer {
                             )));
                         }
                     }
+                }
+            }
+
+            let mut verified_full_closure = true;
+            if pending_needs_closure_verify && fetch_options.needs_full_object_history() {
+                for object_id in &fetched_commit_wants {
+                    if !self
+                        .commit_history_complete_no_lazy(&repo_dir, object_id)
+                        .await?
+                    {
+                        verified_full_closure = false;
+                        break;
+                    }
+                }
+                if verified_full_closure {
+                    fs::remove_file(&closure_marker).await.ok();
+                } else {
+                    fs::write(&closure_marker, b"incomplete\n").await?;
+                    return Err(GitCacheError::Internal(
+                        "fetched full-history wants without complete object closure".into(),
+                    ));
                 }
             }
 
@@ -472,6 +576,10 @@ impl Materializer {
                 }
                 self.enqueue_serving_maintenance(repo.clone(), repo_dir.to_path_buf());
             }
+        }
+
+        if checked_suspect_hot_closure && suspect_hot_closure_complete {
+            fs::remove_file(&closure_marker).await.ok();
         }
 
         info!(
@@ -666,11 +774,13 @@ impl Materializer {
         });
     }
 
-    /// Debounced background maintenance that keeps served repos fast: a full
-    /// `git repack -a -d --write-bitmap-index` plus a commit-graph rewrite
-    /// after hydration, so server-side pack-objects can reuse pack bytes and
-    /// bitmaps instead of recomputing deltas over millions of objects. At
-    /// most one maintenance run per repo is queued or running at a time.
+    /// Debounced background maintenance that keeps served repos compact: a
+    /// full `git repack -a -d` plus a commit-graph rewrite after hydration.
+    /// Direct upload-pack disables bitmap traversal for correctness, so
+    /// maintenance skips bitmap generation while still collapsing incremental
+    /// fetch packs into one local pack and writing reverse indexes for
+    /// efficient reads.
+    /// At most one maintenance run per repo is queued or running at a time.
     pub(super) fn enqueue_serving_maintenance(&self, repo: RepoKey, repo_dir: PathBuf) {
         {
             let Ok(mut inflight) = self.state.serving_maintenance_inflight.lock() else {
@@ -800,8 +910,8 @@ impl Materializer {
         // full-history commit wants: the pack would stop at the shallow
         // boundary while the client repo is not marked shallow — a silently
         // corrupt clone. Lazy exact-oid (blob/tree) fetches are unaffected.
-        let full_history_on_shallow_repo =
-            intent.depth.is_none() && fs::try_exists(repo_dir.join("shallow")).await?;
+        let shallow_repo_cannot_serve_locally = fs::try_exists(repo_dir.join("shallow")).await?
+            && (intent.depth.is_none() || intent.deepens_existing_shallow_boundary());
 
         let _repo_lock = self.lock_repo(repo).await?;
         let object_types = self
@@ -818,12 +928,13 @@ impl Materializer {
                     served_non_commit_wants += 1;
                     continue;
                 }
-                if full_history_on_shallow_repo {
+                if shallow_repo_cannot_serve_locally {
                     info!(
                         %repo,
                         commit = %object_id,
                         wants_count,
-                        "direct git cache prepare declined: repo is shallow, commit want needs full history"
+                        deepen_existing_shallow = intent.deepens_existing_shallow_boundary(),
+                        "direct git cache prepare declined: repo is shallow, commit want needs more history"
                     );
                     return Ok(false);
                 }

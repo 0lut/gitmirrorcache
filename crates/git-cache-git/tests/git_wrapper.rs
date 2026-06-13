@@ -32,7 +32,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repack_for_serving_writes_bitmap_index() {
+    async fn repack_for_serving_does_not_write_bitmap_index() {
         let temp = TempTree::new("repack-serving");
         let (source_repo, _) = create_source_repo(&temp.path);
         let cache_repo = temp.path.join("cache.git");
@@ -53,20 +53,9 @@ mod tests {
             .await
             .expect("repack repo for serving");
 
-        let pack_dir = cache_repo.join("objects/pack");
-        let has_bitmap = std::fs::read_dir(&pack_dir)
-            .expect("read pack dir")
-            .any(|entry| {
-                entry
-                    .expect("pack dir entry")
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "bitmap")
-            });
         assert!(
-            has_bitmap,
-            "expected a bitmap index in {}",
-            pack_dir.display()
+            !pack_dir_has_bitmap(&cache_repo),
+            "serving repack should avoid bitmap indexes because upload-pack disables bitmap traversal"
         );
     }
 
@@ -113,6 +102,40 @@ mod tests {
             .is_ancestor(&cache_repo, &second, &first)
             .await
             .expect("check second not ancestor of first"));
+    }
+
+    #[tokio::test]
+    async fn commit_history_complete_no_lazy_treats_shallow_repo_as_incomplete() {
+        let temp = TempTree::new("history-complete-shallow");
+        let (source_repo, _) = create_source_repo(&temp.path);
+        let cache_repo = temp.path.join("cache.git");
+        let git = test_git();
+
+        let tip_sha = commit_source(&source_repo, "second");
+        git.init_bare(&cache_repo).await.expect("init cache repo");
+        git.fetch_ref(
+            &cache_repo,
+            &format!("file://{}", path_arg(&source_repo)),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions {
+                depth: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fetch shallow main");
+
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "test setup should leave the bare cache repo shallow"
+        );
+        assert!(
+            !git.commit_history_complete_no_lazy(&cache_repo, &CommitSha::parse(&tip_sha).unwrap())
+                .await
+                .expect("check history completeness"),
+            "a shallow repo is missing parent history even when rev-list would stop at the boundary"
+        );
     }
 
     #[tokio::test]
@@ -276,6 +299,18 @@ mod tests {
         run_git(Some(source_repo), ["add", "README.md"]);
         run_git(Some(source_repo), ["commit", "-m", contents]);
         run_git(Some(source_repo), ["rev-parse", "HEAD"])
+    }
+
+    fn pack_dir_has_bitmap(repo: &Path) -> bool {
+        std::fs::read_dir(repo.join("objects/pack"))
+            .expect("read pack dir")
+            .any(|entry| {
+                entry
+                    .expect("pack dir entry")
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "bitmap")
+            })
     }
 
     fn run_git<I, S>(cwd: Option<&Path>, args: I) -> String

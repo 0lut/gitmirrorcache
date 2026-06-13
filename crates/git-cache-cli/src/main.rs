@@ -28,7 +28,7 @@ enum Command {
         /// Selector: a branch name, commit SHA, short commit, or "HEAD" for default branch
         selector: String,
     },
-    /// Repack a local cached repo with bitmap indexes for faster upload-pack.
+    /// Repack a local cached repo and rewrite its commit graph for serving.
     Optimize {
         /// Repository key, e.g. github.com/org/repo
         repo: String,
