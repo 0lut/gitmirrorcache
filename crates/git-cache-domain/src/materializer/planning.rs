@@ -784,11 +784,15 @@ impl Materializer {
         let fetch_started = Instant::now();
         let refspec = git_cache_git::branch_cache_refspec(branch.as_str())?;
         let repo_is_shallow = fs::try_exists(repo_dir.join("shallow")).await?;
+        let partial_marker = repo_dir.join(super::direct_git::PARTIAL_HYDRATION_MARKER);
+        let incomplete_closure_marker = repo_dir.join(super::direct_git::INCOMPLETE_CLOSURE_MARKER);
+        let repo_is_partially_hydrated = fs::try_exists(&partial_marker).await?;
         let fetch_options = git_cache_git::FetchOptions {
             refetch: local_tip_ready && !repo_is_shallow,
             unshallow: repo_is_shallow,
             ..Default::default()
         };
+        let mut ran_full_refetch = fetch_options.refetch;
         self.upstream_git(&upstream_url)?
             .fetch_refspecs(
                 &repo_dir,
@@ -807,7 +811,7 @@ impl Materializer {
             "fetched branch from upstream"
         );
 
-        let commit = self
+        let mut commit = self
             .state
             .git
             .rev_parse(&repo_dir, &local_ref)
@@ -820,18 +824,56 @@ impl Materializer {
             )));
         }
 
-        if !self
+        let mut history_complete = self
             .commit_history_complete_no_lazy(&repo_dir, &commit)
-            .await?
-        {
+            .await?;
+        if !history_complete && repo_is_shallow && repo_is_partially_hydrated && local_tip_ready {
+            let refetch_started = Instant::now();
+            let refetch_options = git_cache_git::FetchOptions {
+                refetch: true,
+                ..Default::default()
+            };
+            self.upstream_git(&upstream_url)?
+                .fetch_refspecs(
+                    &repo_dir,
+                    &upstream_url,
+                    std::slice::from_ref(&refspec),
+                    refetch_options,
+                )
+                .await?;
+            ran_full_refetch = true;
+            info!(
+                %repo,
+                %branch,
+                upstream_commit = %upstream_commit,
+                elapsed_ms = elapsed_ms(refetch_started),
+                "refetched branch after unshallowing partially hydrated repo"
+            );
+            commit = self
+                .state
+                .git
+                .rev_parse(&repo_dir, &local_ref)
+                .await
+                .and_then(CommitSha::parse)?;
+            if commit != *upstream_commit {
+                return Err(GitCacheError::Conflict(format!(
+                    "upstream branch `{branch}` moved during refetch: ls-remote={upstream_commit}, fetched={commit}"
+                )));
+            }
+            history_complete = self
+                .commit_history_complete_no_lazy(&repo_dir, &commit)
+                .await?;
+        }
+
+        if !history_complete {
+            fs::write(&incomplete_closure_marker, b"incomplete\n").await?;
             return Err(GitCacheError::Internal(format!(
                 "branch `{branch}` fetched commit `{commit}` without complete full-history closure"
             )));
         }
-        if fetch_options.refetch {
-            fs::remove_file(repo_dir.join(super::direct_git::PARTIAL_HYDRATION_MARKER))
-                .await
-                .ok();
+        fs::remove_file(&incomplete_closure_marker).await.ok();
+        if ran_full_refetch {
+            fs::remove_file(&partial_marker).await.ok();
         }
 
         if default_branch {

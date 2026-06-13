@@ -835,6 +835,11 @@ mod tests {
             !materializer.commit_exists(&repo_dir, &parent).await,
             "test setup should not copy the parent commit into the cache repo"
         );
+        stdfs::write(
+            repo_dir.join(super::super::direct_git::INCOMPLETE_CLOSURE_MARKER),
+            b"incomplete\n",
+        )
+        .unwrap();
 
         let comparison = UpstreamRefComparison {
             default_branch: Some("main".to_string()),
@@ -861,6 +866,12 @@ mod tests {
         assert!(
             materializer.commit_exists(&repo_dir, &parent).await,
             "repair should fetch the missing parent history"
+        );
+        assert!(
+            !repo_dir
+                .join(super::super::direct_git::INCOMPLETE_CLOSURE_MARKER)
+                .exists(),
+            "successful repair should clear the suspect closure marker"
         );
     }
 

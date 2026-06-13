@@ -6,6 +6,10 @@ const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v4";
 /// (blobless) fetch and therefore cannot serve full-object clone shapes
 /// until an unfiltered `--refetch` completes.
 pub(super) const PARTIAL_HYDRATION_MARKER: &str = "git-cache-partial-hydration";
+/// Marker recording that a previous full-history closure check failed after
+/// the tip commit/tree were already present locally. Full-history hot-path
+/// service must re-check and repair before exposing commits while this exists.
+pub(super) const INCOMPLETE_CLOSURE_MARKER: &str = "git-cache-incomplete-full-closure";
 const BLOBLESS_FETCH_FILTER: &str = "blob:none";
 
 /// Local git config applied to every served bare repo. Marker-gated by
@@ -269,8 +273,11 @@ impl Materializer {
         // pack-objects mid-stream. Force a `--refetch` covering every want so
         // git re-downloads full objects despite the local (partial) haves.
         let partial_marker = repo_dir.join(PARTIAL_HYDRATION_MARKER);
+        let closure_marker = repo_dir.join(INCOMPLETE_CLOSURE_MARKER);
         let mut force_refetch =
             !fetch_options.blobless_fetch() && fs::try_exists(&partial_marker).await?;
+        let closure_marker_present =
+            fetch_options.needs_full_object_history() && fs::try_exists(&closure_marker).await?;
         // A blobless hydration followed by client checkout blob storms often
         // leaves the depth-1 snapshot of a tip fully present locally even
         // though the repo as a whole is partial. For single-commit-deep
@@ -342,6 +349,9 @@ impl Materializer {
         let mut fetched_non_commit_wants = 0usize;
         let mut pending: Vec<CommitSha> = Vec::new();
         let mut pending_requires_refetch = force_refetch;
+        let mut pending_needs_closure_verify = closure_marker_present;
+        let mut checked_suspect_hot_closure = false;
+        let mut suspect_hot_closure_complete = true;
         let mut verified_hydrated_generations: HashSet<GenerationId> = HashSet::new();
 
         for object_id in object_ids {
@@ -355,6 +365,24 @@ impl Materializer {
                     && !needs_unshallow
                     && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
                 {
+                    if closure_marker_present && fetch_options.needs_full_object_history() {
+                        checked_suspect_hot_closure = true;
+                        if !self
+                            .commit_history_complete_no_lazy(&repo_dir, object_id)
+                            .await?
+                        {
+                            suspect_hot_closure_complete = false;
+                            pending_requires_refetch = true;
+                            pending_needs_closure_verify = true;
+                            pending.push(object_id.clone());
+                            warn!(
+                                %repo,
+                                commit = %object_id,
+                                "marked suspect hot commit has incomplete full-history closure; falling back to read-through fetch"
+                            );
+                            continue;
+                        }
+                    }
                     self.expose_served_commit(&repo_dir, object_id).await?;
                     served_commits += 1;
                     continue;
@@ -378,6 +406,8 @@ impl Materializer {
                                     hydrated_commits += 1;
                                     continue;
                                 }
+                                fs::write(&closure_marker, b"incomplete\n").await?;
+                                pending_needs_closure_verify = true;
                                 pending_requires_refetch = true;
                                 warn!(
                                     %repo,
@@ -433,6 +463,7 @@ impl Materializer {
             // subprocess per want.
             let upstream_url = self.upstream_url(repo)?;
             let upstream_git = self.upstream_git(&upstream_url)?;
+            let mut fetched_commit_wants: Vec<CommitSha> = Vec::new();
 
             let fetched_all_heads = self
                 .batched_read_through_fetch(
@@ -449,7 +480,10 @@ impl Materializer {
             let mut missing: Vec<CommitSha> = Vec::new();
             for object_id in &pending {
                 match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
-                    Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
+                    Ok(DirectFetchedWantKind::Commit) => {
+                        fetched_commits += 1;
+                        fetched_commit_wants.push(object_id.clone());
+                    }
                     Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
                     Err(_) => missing.push(object_id.clone()),
                 }
@@ -490,7 +524,10 @@ impl Materializer {
                 }
                 for object_id in &missing {
                     match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
-                        Ok(DirectFetchedWantKind::Commit) => fetched_commits += 1,
+                        Ok(DirectFetchedWantKind::Commit) => {
+                            fetched_commits += 1;
+                            fetched_commit_wants.push(object_id.clone());
+                        }
                         Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
                         Err(err) => {
                             return Err(GitCacheError::NotFound(format!(
@@ -498,6 +535,27 @@ impl Materializer {
                             )));
                         }
                     }
+                }
+            }
+
+            let mut verified_full_closure = true;
+            if pending_needs_closure_verify && fetch_options.needs_full_object_history() {
+                for object_id in &fetched_commit_wants {
+                    if !self
+                        .commit_history_complete_no_lazy(&repo_dir, object_id)
+                        .await?
+                    {
+                        verified_full_closure = false;
+                        break;
+                    }
+                }
+                if verified_full_closure {
+                    fs::remove_file(&closure_marker).await.ok();
+                } else {
+                    fs::write(&closure_marker, b"incomplete\n").await?;
+                    return Err(GitCacheError::Internal(
+                        "fetched full-history wants without complete object closure".into(),
+                    ));
                 }
             }
 
@@ -518,6 +576,10 @@ impl Materializer {
                 }
                 self.enqueue_serving_maintenance(repo.clone(), repo_dir.to_path_buf());
             }
+        }
+
+        if checked_suspect_hot_closure && suspect_hot_closure_complete {
+            fs::remove_file(&closure_marker).await.ok();
         }
 
         info!(

@@ -300,24 +300,14 @@ impl Git {
             return Ok(false);
         }
         let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
-        let output = match git
-            .run(
-                Some(repo_dir),
-                [
-                    "rev-list",
-                    "--objects",
-                    "--no-object-names",
-                    "--missing=print",
-                    commit.as_str(),
-                ],
-            )
+        let has_missing = match git
+            .rev_list_objects_has_missing_no_lazy(repo_dir, commit)
             .await
         {
-            Ok(output) => output,
+            Ok(has_missing) => has_missing,
             Err(_) => return Ok(false),
         };
-        let text = output.stdout_utf8("rev-list")?;
-        Ok(!text.lines().any(|line| line.starts_with('?')))
+        Ok(!has_missing)
     }
 
     pub async fn cat_file_batch_types(
@@ -977,6 +967,133 @@ impl Git {
     {
         let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
         git.run(cwd, args).await
+    }
+
+    async fn rev_list_objects_has_missing_no_lazy(
+        &self,
+        repo_dir: &Path,
+        commit: &CommitSha,
+    ) -> Result<bool> {
+        let _permit = self
+            .process_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| GitCacheError::Internal("git process semaphore closed".into()))?;
+
+        let args: Vec<OsString> = [
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            "--missing=print",
+            commit.as_str(),
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        debug!(cwd = ?repo_dir, ?args, "running git command");
+
+        let mut command = Command::new(&self.binary);
+        command
+            .args(&args)
+            .env_clear()
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false")
+            .env("HOME", "/nonexistent")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .current_dir(repo_dir);
+
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", tmpdir);
+        }
+
+        let git_config_entries = git_config_entries_from_extra_env(&self.extra_env);
+        for (key, value) in &self.extra_env {
+            if !is_git_config_env_key(key) {
+                command.env(key, value);
+            }
+        }
+        apply_git_config_entries(&mut command, &git_config_entries);
+
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| GitCacheError::Validation("failed to capture git stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| GitCacheError::Validation("failed to capture git stderr".to_string()))?;
+
+        let run = async move {
+            let read_stdout = async move {
+                let mut stdout = stdout;
+                let mut buffer = [0_u8; 8192];
+                let mut at_line_start = true;
+                let mut has_missing = false;
+                loop {
+                    let bytes_read = stdout.read(&mut buffer).await?;
+                    if bytes_read == 0 {
+                        return Ok(has_missing);
+                    }
+                    for byte in &buffer[..bytes_read] {
+                        if at_line_start && *byte == b'?' {
+                            has_missing = true;
+                        }
+                        at_line_start = *byte == b'\n';
+                    }
+                }
+            };
+            let read_stderr = read_bounded(stderr, self.output_limit, "stderr");
+            let wait_child = async move { child.wait().await.map_err(GitCacheError::from) };
+
+            let (has_missing, stderr, status) =
+                tokio::try_join!(read_stdout, read_stderr, wait_child)?;
+            Ok::<_, GitCacheError>((has_missing, stderr, status))
+        };
+
+        let started = Instant::now();
+        let (has_missing, stderr, status) = timeout(self.timeout, run).await.map_err(|_| {
+            GitCacheError::Timeout(format!("git command exceeded {:?}", self.timeout))
+        })??;
+
+        let status_code = status.code().unwrap_or(-1);
+        let elapsed = started.elapsed();
+        if !status.success() {
+            if elapsed >= Duration::from_secs(1) {
+                info!(
+                    cwd = ?repo_dir,
+                    ?args,
+                    status_code,
+                    elapsed_ms = elapsed.as_millis(),
+                    "git command failed"
+                );
+            }
+            let stderr = String::from_utf8_lossy(&stderr);
+            return Err(GitCacheError::Validation(format!(
+                "git exited with status {status_code}: {stderr}"
+            )));
+        }
+        if elapsed >= Duration::from_secs(1) {
+            info!(
+                cwd = ?repo_dir,
+                ?args,
+                status_code,
+                elapsed_ms = elapsed.as_millis(),
+                "git command finished"
+            );
+        }
+
+        Ok(has_missing)
     }
 
     fn map_upstream_git_error(&self, error: GitCacheError) -> GitCacheError {
