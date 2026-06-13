@@ -1,6 +1,42 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ── parse_git_version tests ─────────────────────────────────────
+
+#[test]
+fn parse_git_version_plain() {
+    assert_eq!(parse_git_version("git version 2.47.3\n"), Some((2, 47, 3)));
+    assert_eq!(parse_git_version("git version 2.39.5"), Some((2, 39, 5)));
+}
+
+#[test]
+fn parse_git_version_with_platform_suffix() {
+    assert_eq!(
+        parse_git_version("git version 2.39.5 (Apple Git-154)\n"),
+        Some((2, 39, 5))
+    );
+    assert_eq!(
+        parse_git_version("git version 2.47.0.windows.1"),
+        Some((2, 47, 0))
+    );
+    assert_eq!(
+        parse_git_version("git version 2.46.0-rc1"),
+        Some((2, 46, 0))
+    );
+}
+
+#[test]
+fn parse_git_version_missing_patch() {
+    assert_eq!(parse_git_version("git version 2.45"), Some((2, 45, 0)));
+}
+
+#[test]
+fn parse_git_version_rejects_garbage() {
+    assert_eq!(parse_git_version(""), None);
+    assert_eq!(parse_git_version("not git"), None);
+    assert_eq!(parse_git_version("git version two.three"), None);
+}
+
 // ── reject_ref_arg tests ────────────────────────────────────────
 
 #[test]

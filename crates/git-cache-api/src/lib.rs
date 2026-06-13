@@ -65,6 +65,7 @@ pub async fn app_result_async(config: AppConfig) -> CoreResult<Router> {
 /// balancers stop routing new traffic while in-flight requests drain.
 pub async fn app_with_shutdown_async(config: AppConfig) -> CoreResult<(Router, ReadinessGate)> {
     let state = Arc::new(ApiState::try_new_async(config).await?);
+    state.domain.git.ensure_supported_binary_version().await?;
     let gate = ReadinessGate(Arc::clone(&state.shutting_down));
     Ok((router(state)?, gate))
 }
