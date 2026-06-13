@@ -462,6 +462,57 @@ mod tests {
         // If deepen fails, that's still valid cache behavior.
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deepen_after_cold_blobless_shallow_hydration_extends_history() {
+        let server = TestServer::start_with_file_url_upstream(true).await;
+        run_git(
+            &server.upstream_bare,
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+
+        for message in [
+            "second cold deepen",
+            "third cold deepen",
+            "fourth cold deepen",
+            "fifth cold deepen",
+        ] {
+            std::fs::write(
+                server.upstream_work.join("README.md"),
+                format!("{message}\n"),
+            )
+            .unwrap();
+            run_git(&server.upstream_work, &["add", "README.md"]);
+            run_git(&server.upstream_work, &["commit", "-m", message]);
+        }
+        run_git(&server.upstream_work, &["push", "origin", "main"]);
+
+        let url = server.git_url("github.com/org/repo");
+        let clone_dir = server.tmp.path().join("cold_blobless_deepen");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--depth=1",
+                "--branch",
+                "main",
+                "--no-checkout",
+                &url,
+                clone_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        let before = git_stdout_async(&clone_dir, &["rev-list", "--count", "HEAD"]).await;
+        assert_eq!(before, "1");
+
+        run_git_async(&clone_dir, &["fetch", "--deepen=3", "origin", "main"]).await;
+
+        let after = git_stdout_async(&clone_dir, &["rev-list", "--count", "HEAD"]).await;
+        assert_eq!(after, "4", "fetch --deepen=3 should add three commits");
+        git_stdout_async(&clone_dir, &["rev-parse", "--verify", "HEAD~3^{commit}"]).await;
+    }
+
     // ── ls-remote --heads ───────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
