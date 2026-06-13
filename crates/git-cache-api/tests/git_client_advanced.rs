@@ -584,6 +584,16 @@ mod tests {
         );
 
         materialize_branch(&server, "main").await;
+        assert!(
+            !cache_repo.join("shallow").exists(),
+            "branch materialize should unshallow before publishing a complete generation"
+        );
+        let cache_count =
+            git_stdout_async(&cache_repo, &["rev-list", "--count", "refs/heads/main"]).await;
+        assert_eq!(
+            cache_count, "5",
+            "published generation source should include the full branch history"
+        );
         std::fs::remove_dir_all(&cache_repo).unwrap();
 
         let full_dir = server.tmp.path().join("full_after_shallow_generation");

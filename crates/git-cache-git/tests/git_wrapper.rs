@@ -105,6 +105,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_history_complete_no_lazy_treats_shallow_repo_as_incomplete() {
+        let temp = TempTree::new("history-complete-shallow");
+        let (source_repo, _) = create_source_repo(&temp.path);
+        let cache_repo = temp.path.join("cache.git");
+        let git = test_git();
+
+        let tip_sha = commit_source(&source_repo, "second");
+        git.init_bare(&cache_repo).await.expect("init cache repo");
+        git.fetch_ref(
+            &cache_repo,
+            &format!("file://{}", path_arg(&source_repo)),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions {
+                depth: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fetch shallow main");
+
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "test setup should leave the bare cache repo shallow"
+        );
+        assert!(
+            !git.commit_history_complete_no_lazy(&cache_repo, &CommitSha::parse(&tip_sha).unwrap())
+                .await
+                .expect("check history completeness"),
+            "a shallow repo is missing parent history even when rev-list would stop at the boundary"
+        );
+    }
+
+    #[tokio::test]
     async fn for_each_ref_commits_lists_matching_refs() {
         let temp = TempTree::new("for-each-ref");
         let (source_repo, source_sha) = create_source_repo(&temp.path);

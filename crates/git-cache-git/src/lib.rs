@@ -294,6 +294,11 @@ impl Git {
         commit: &CommitSha,
     ) -> Result<bool> {
         reject_revision_arg(commit.as_str())?;
+        // `rev-list --missing=print` respects shallow graft boundaries and
+        // would otherwise report a depth-limited repo as complete.
+        if repo_dir.join("shallow").exists() {
+            return Ok(false);
+        }
         let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
         let output = match git
             .run(
