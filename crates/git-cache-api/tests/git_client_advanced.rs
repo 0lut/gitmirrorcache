@@ -449,6 +449,87 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn materialize_branch_succeeds_after_blobless_shallow_hydration() {
+        let server = TestServer::start_with_file_url_upstream(true).await;
+        run_git(
+            &server.upstream_bare,
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+
+        for message in [
+            "second blobless shallow materialize",
+            "third blobless shallow materialize",
+            "fourth blobless shallow materialize",
+        ] {
+            std::fs::write(
+                server.upstream_work.join("README.md"),
+                format!("{message}\n"),
+            )
+            .unwrap();
+            run_git(&server.upstream_work, &["add", "README.md"]);
+            run_git(&server.upstream_work, &["commit", "-m", message]);
+        }
+        run_git(&server.upstream_work, &["push", "origin", "main"]);
+
+        let url = server.git_url("github.com/org/repo");
+        let seed_dir = server.tmp.path().join("blobless_shallow_materialize_seed");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--depth=1",
+                "--branch",
+                "main",
+                "--no-checkout",
+                &url,
+                seed_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        let cache_repo = server.cache_repo_dir();
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "blobless depth-limited seed should leave the cache repo shallow"
+        );
+        assert!(
+            cache_repo.join("git-cache-partial-hydration").exists(),
+            "blobless seed should leave the cache repo marked partially hydrated"
+        );
+
+        materialize_branch(&server, "main").await;
+
+        assert!(
+            !cache_repo.join("shallow").exists(),
+            "materialize should remove the shallow boundary before publishing"
+        );
+        assert!(
+            !cache_repo.join("git-cache-partial-hydration").exists(),
+            "materialize should clear the partial marker after fetching full objects"
+        );
+        let missing = git_stdout_async(
+            &cache_repo,
+            &["rev-list", "--objects", "--missing=print", "--all"],
+        )
+        .await;
+        let missing: Vec<&str> = missing
+            .lines()
+            .filter(|line| line.starts_with('?'))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "materialized cache repo should not be missing objects: {missing:?}"
+        );
+        let count =
+            git_stdout_async(&cache_repo, &["rev-list", "--count", "refs/heads/main"]).await;
+        assert_eq!(
+            count, "4",
+            "materialize should keep the full branch history"
+        );
+    }
+
     // ── fetch --deepen=1 after shallow clone ────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
