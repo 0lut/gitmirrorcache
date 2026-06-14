@@ -160,6 +160,14 @@ impl Materializer {
                 .git
                 .commit_ancestry_window_no_lazy(repo_dir, boundary, depth)
                 .await?;
+            // `boundary` is present (checked above) and `depth >= 1`, so a
+            // healthy walk returns at least `[boundary]`. An empty window means
+            // `rev-list` itself failed — per the helper's contract, treat that
+            // as "cannot prove coverage" and deepen rather than fall through to
+            // the all-clear below.
+            if window.is_empty() {
+                return Ok(false);
+            }
             // The window holds `boundary` and its depth-1 nearest ancestors.
             // If any sits on the cache's shallow boundary, the cache cuts the
             // history inside the requested depth and must deepen further.

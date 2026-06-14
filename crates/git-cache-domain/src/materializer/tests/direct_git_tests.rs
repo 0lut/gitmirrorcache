@@ -582,6 +582,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deepen_boundary_satisfied_tracks_cache_depth() {
+        let fixture = GitFixture::new();
+        // Six commits upstream: initial + five.
+        for message in ["second", "third", "fourth", "fifth", "sixth"] {
+            fixture.commit_and_push(message);
+        }
+        let tip = fixture.head_commit();
+
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        // `file://` selects git's shallow-capable transport even for a local
+        // upstream; this only sets up cache state for the assertions below.
+        let upstream = format!(
+            "file://{}",
+            materializer.upstream_url(&fixture.repo).unwrap()
+        );
+
+        // Seed a depth-1 shallow cache: the tip is present but its parent is the
+        // shallow boundary, so no deepen is covered yet.
+        state
+            .git
+            .fetch_ref(
+                &repo_dir,
+                &upstream,
+                "refs/heads/main",
+                "refs/cache/upstream/heads/main",
+                git_cache_git::FetchOptions {
+                    depth: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            repo_dir.join("shallow").exists(),
+            "depth-1 fetch must leave the cache shallow"
+        );
+        let boundaries = [tip.clone()];
+        assert!(
+            !materializer
+                .deepen_boundary_satisfied(&repo_dir, &boundaries, 1)
+                .await
+                .unwrap(),
+            "a depth-1 cache cannot cover a deepen of 1"
+        );
+        assert!(
+            !materializer
+                .deepen_boundary_satisfied(&repo_dir, &boundaries, 2)
+                .await
+                .unwrap(),
+            "a depth-1 cache cannot cover a deepen of 2"
+        );
+
+        // Deepen the cache by two commits (now holds tip + two ancestors, with
+        // the new shallow boundary at distance 2 from the tip).
+        state
+            .git
+            .fetch_ref(
+                &repo_dir,
+                &upstream,
+                "refs/heads/main",
+                "refs/cache/upstream/heads/main",
+                git_cache_git::FetchOptions {
+                    deepen: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            repo_dir.join("shallow").exists(),
+            "a deepen short of full history must stay shallow"
+        );
+        // The off-by-one the guard hinges on: the post-deepen boundary sits at
+        // graph distance 2, which the `max-count=N` window excludes, so a deepen
+        // of 2 reads satisfied while a deepen of 3 still cuts history short.
+        assert!(
+            materializer
+                .deepen_boundary_satisfied(&repo_dir, &boundaries, 2)
+                .await
+                .unwrap(),
+            "after deepening by two, a deepen of 2 is already covered"
+        );
+        assert!(
+            !materializer
+                .deepen_boundary_satisfied(&repo_dir, &boundaries, 3)
+                .await
+                .unwrap(),
+            "the cache still cuts history inside a deepen of 3"
+        );
+
+        // A boundary commit the cache does not have is never satisfied, and an
+        // empty boundary set cannot prove coverage.
+        let absent = CommitSha::parse("0".repeat(40)).unwrap();
+        assert!(
+            !materializer
+                .deepen_boundary_satisfied(&repo_dir, &[absent], 1)
+                .await
+                .unwrap(),
+            "an unknown boundary commit forces a deepen"
+        );
+        assert!(
+            !materializer
+                .deepen_boundary_satisfied(&repo_dir, &[], 1)
+                .await
+                .unwrap(),
+            "no declared client boundary forces a deepen"
+        );
+    }
+
+    #[tokio::test]
     async fn blobless_hydrated_repo_refetches_full_objects_for_unfiltered_wants() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());

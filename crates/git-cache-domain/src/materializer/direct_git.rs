@@ -366,11 +366,14 @@ impl Materializer {
         //   asked for; in the production `proxy_on_miss` path the client is
         //   served by the upstream proxy and this fetch only warms the cache.
         //
-        // The bounded path is reserved for clean shallow caches: `--refetch`
-        // repos (partial/blobless) keep unshallowing, since their boundary and
-        // object-completeness reasoning is murkier, and deepen-since/deepen-not
-        // and `--unshallow`-equivalent (infinite depth) requests have no
-        // bounded commit count to deepen by. Lazy exact-oid fetches are
+        // The bounded path is reserved for clean shallow caches.
+        // `force_refetch` (a full-object client hitting a partial/blobless
+        // cache) keeps unshallowing, since its boundary and object-completeness
+        // reasoning is murkier; note a *blobless* deepen intent leaves
+        // `force_refetch` false and so still takes the bounded path, which is
+        // fine (blobless→blobless serving is self-consistent). deepen-since/
+        // deepen-not and `--unshallow`-equivalent (infinite depth) requests
+        // have no bounded commit count to deepen by. Lazy exact-oid fetches are
         // unaffected (`fetch_objects` never moves the boundary), so blobless
         // checkout blob storms stay cheap.
         let cache_repo_is_shallow = fs::try_exists(repo_dir.join("shallow")).await?;
@@ -379,12 +382,24 @@ impl Materializer {
         } else if fetch_options.depth.is_none() {
             Some(HistoryExtension::Unshallow)
         } else if fetch_options.deepen_existing_shallow {
+            // `--depth=M` and `--deepen=M` both arrive as `deepen M` on the
+            // wire (the parser ignores the `deepen-relative` capability), so an
+            // absolute `--depth=M` re-request from an already-shallow client
+            // also lands here and runs a *relative* `git fetch --deepen=M`. The
+            // cache may over-fetch by up to M, but its own upload-pack still
+            // serves the client's true (absolute or relative) depth semantics,
+            // so the served result stays correct either way.
             match fetch_options.depth {
                 Some(depth) if depth < GIT_INFINITE_DEPTH && !force_refetch => {
                     // A stateless deepen runs multiple upload-pack rounds; only
                     // deepen the cache on the round that actually needs more
                     // history, so the boundary advances by N once rather than
-                    // compounding to 2N, 3N, ... across rounds.
+                    // compounding to 2N, 3N, ... across rounds. The check is
+                    // all-or-nothing over `deepen_from`, while the deepen below
+                    // applies to every fetched refspec, so a request mixing a
+                    // covered branch with an under-covered one re-deepens the
+                    // covered branch by an extra N — bounded and convergent, not
+                    // corrupt.
                     if self
                         .deepen_boundary_satisfied(&repo_dir, deepen_from, depth)
                         .await?
