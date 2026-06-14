@@ -122,6 +122,57 @@ impl Materializer {
             .await
     }
 
+    /// Whether the cache already holds enough ancestry below every client
+    /// shallow `boundary` commit to serve a `--deepen=depth` request without
+    /// fetching from upstream.
+    ///
+    /// A stateless smart-HTTP deepen runs several upload-pack negotiation
+    /// rounds for one client `fetch --deepen=N`; without this guard each round
+    /// would re-run `git fetch --deepen=N` and compound the cache's boundary
+    /// (depth N, then 2N, ...), eventually unshallowing it. The deepen is
+    /// already satisfied for a boundary commit when none of its `depth` nearest
+    /// ancestors (the commits a `--deepen=depth` would reveal) coincide with
+    /// the cache's own shallow graft boundary — i.e. the cache holds those
+    /// commits' parents rather than cutting the history short. A boundary
+    /// commit the cache does not have at all is never satisfied. Never triggers
+    /// lazy promisor fetches.
+    pub(super) async fn deepen_boundary_satisfied(
+        &self,
+        repo_dir: &FsPath,
+        boundaries: &[CommitSha],
+        depth: u32,
+    ) -> CoreResult<bool> {
+        // No declared client boundary: cannot prove coverage, so deepen.
+        if boundaries.is_empty() {
+            return Ok(false);
+        }
+        let shallow_commits = read_shallow_commits(repo_dir).await?;
+        // A non-shallow cache holds full history and satisfies any deepen.
+        if shallow_commits.is_empty() {
+            return Ok(true);
+        }
+        for boundary in boundaries {
+            if !self.commit_exists_no_lazy(repo_dir, boundary).await {
+                return Ok(false);
+            }
+            let window = self
+                .state
+                .git
+                .commit_ancestry_window_no_lazy(repo_dir, boundary, depth)
+                .await?;
+            // The window holds `boundary` and its depth-1 nearest ancestors.
+            // If any sits on the cache's shallow boundary, the cache cuts the
+            // history inside the requested depth and must deepen further.
+            if window
+                .iter()
+                .any(|commit| shallow_commits.contains(commit.as_str()))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) async fn commit_ready_for_serving_no_lazy(
         &self,
         repo_dir: &FsPath,
@@ -464,6 +515,21 @@ impl Materializer {
             repo.owner(),
             repo.name()
         ))
+    }
+}
+
+/// Read a bare repo's `shallow` file into the set of shallow graft-boundary
+/// commit ids. An absent file (a complete repo) yields an empty set.
+async fn read_shallow_commits(repo_dir: &FsPath) -> CoreResult<HashSet<String>> {
+    match fs::read_to_string(repo_dir.join("shallow")).await {
+        Ok(contents) => Ok(contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(err) => Err(err.into()),
     }
 }
 

@@ -75,16 +75,28 @@ pub struct FetchOptions<'a> {
     /// only applied when the repo actually has a `shallow` file (git rejects
     /// `--unshallow` on a complete repository).
     pub unshallow: bool,
+    /// Pass `--deepen=<n>` so git extends an existing shallow boundary by `n`
+    /// commits instead of removing it. Used to serve a client `fetch
+    /// --deepen=N` from a shallow cache without streaming the entire upstream
+    /// history. Mutually exclusive with `depth` and `unshallow`, and only
+    /// applied when the repo is actually shallow (`--deepen` on a complete
+    /// repo would *introduce* a shallow boundary rather than extend one).
+    pub deepen: Option<u32>,
 }
 
 impl FetchOptions<'_> {
-    /// Drop `--unshallow` when the repo at `repo_dir` is not shallow; git
-    /// fails with "--unshallow on a complete repository" otherwise. An
-    /// earlier fetch in the same request may already have removed the
+    /// Drop shallow-boundary fetch flags that git would reject or misapply
+    /// when the repo at `repo_dir` is not actually shallow:
+    /// - `--unshallow` fails with "--unshallow on a complete repository";
+    /// - `--deepen` would *introduce* a shallow boundary on a complete repo
+    ///   rather than extend an existing one.
+    ///
+    /// An earlier fetch in the same request may already have removed the
     /// shallow boundary, so this is re-checked per fetch invocation.
-    fn resolve_unshallow(mut self, repo_dir: &Path) -> Self {
-        if self.unshallow && !repo_dir.join("shallow").exists() {
+    fn resolve_shallow_boundary(mut self, repo_dir: &Path) -> Self {
+        if !repo_dir.join("shallow").exists() {
             self.unshallow = false;
+            self.deepen = None;
         }
         self
     }
@@ -308,6 +320,46 @@ impl Git {
             Err(_) => return Ok(false),
         };
         Ok(!has_missing)
+    }
+
+    /// Return the first `max_count` commits of the ancestry walk from
+    /// `commit` (`rev-list --max-count=<n> <commit>`), nearest first, without
+    /// triggering lazy promisor fetches. The walk stops at shallow graft
+    /// boundaries (a shallow commit is reported, but its missing parent is
+    /// not). Returns an empty vec if `commit` itself is not present locally.
+    pub async fn commit_ancestry_window_no_lazy(
+        &self,
+        repo_dir: &Path,
+        commit: &CommitSha,
+        max_count: u32,
+    ) -> Result<Vec<CommitSha>> {
+        reject_revision_arg(commit.as_str())?;
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+        let output = match self
+            .run_no_lazy(
+                Some(repo_dir),
+                [
+                    "rev-list",
+                    &format!("--max-count={max_count}"),
+                    commit.as_str(),
+                ],
+            )
+            .await
+        {
+            Ok(output) => output,
+            // A missing commit (or any other walk failure) yields no window;
+            // callers treat that as "cannot prove coverage".
+            Err(_) => return Ok(Vec::new()),
+        };
+        output
+            .stdout_utf8("rev-list")?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(CommitSha::parse)
+            .collect()
     }
 
     pub async fn cat_file_batch_types(
@@ -664,9 +716,10 @@ impl Git {
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
         // Raw exact-oid fetches never need to move the shallow boundary;
-        // unshallowing is reserved for ref/all-heads fetches that hydrate
-        // commit ancestry.
+        // unshallowing and deepening are reserved for ref/all-heads fetches
+        // that hydrate commit ancestry.
         options.unshallow = false;
+        options.deepen = None;
         // Lazy blob fetches can carry tens of thousands of wanted objects;
         // pass them via `--stdin` (like git's own promisor fetch) so the
         // argv stays bounded regardless of want count.
@@ -702,7 +755,8 @@ impl Git {
         for refspec in refspecs {
             reject_refspec(refspec)?;
         }
-        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir), remote_url)?;
+        let mut args =
+            fetch_args_with_options(options.resolve_shallow_boundary(repo_dir), remote_url)?;
         args.push(OsString::from("--"));
         args.push(OsString::from(remote_url));
         args.extend(refspecs.iter().map(OsString::from));
@@ -716,7 +770,8 @@ impl Git {
         options: FetchOptions<'_>,
     ) -> Result<GitOutput> {
         reject_remote_url(remote_url)?;
-        let mut args = fetch_args_with_options(options.resolve_unshallow(repo_dir), remote_url)?;
+        let mut args =
+            fetch_args_with_options(options.resolve_shallow_boundary(repo_dir), remote_url)?;
         args.push(OsString::from("--prune"));
         args.extend([
             OsString::from("--"),
@@ -1257,6 +1312,15 @@ fn fetch_args_with_options(options: FetchOptions<'_>, remote_url: &str) -> Resul
         reject_fetch_depth(depth)?;
         args.push(OsString::from(format!("--depth={depth}")));
     }
+    if let Some(deepen) = options.deepen {
+        if options.depth.is_some() {
+            return Err(GitCacheError::Validation(
+                "fetch cannot combine --deepen with --depth".into(),
+            ));
+        }
+        reject_fetch_depth(deepen)?;
+        args.push(OsString::from(format!("--deepen={deepen}")));
+    }
     if let Some(filter) = options.filter {
         reject_fetch_filter(filter)?;
         args.push(OsString::from("--filter=blob:none"));
@@ -1268,6 +1332,11 @@ fn fetch_args_with_options(options: FetchOptions<'_>, remote_url: &str) -> Resul
         if options.depth.is_some() {
             return Err(GitCacheError::Validation(
                 "fetch cannot combine --unshallow with --depth".into(),
+            ));
+        }
+        if options.deepen.is_some() {
+            return Err(GitCacheError::Validation(
+                "fetch cannot combine --unshallow with --deepen".into(),
             ));
         }
         args.push(OsString::from("--unshallow"));

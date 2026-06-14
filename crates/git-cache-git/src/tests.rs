@@ -320,6 +320,7 @@ printf '\n' >> "$FAKE_ARGS_OUT"
             depth: Some(1),
             refetch: false,
             unshallow: false,
+            deepen: None,
         },
     )
     .await
@@ -379,6 +380,7 @@ printf '\n' >> "$FAKE_ARGS_OUT"
             depth: None,
             refetch: true,
             unshallow: false,
+            deepen: None,
         },
     )
     .await
@@ -401,6 +403,7 @@ fn filtered_fetch_args_do_not_clear_partial_clone_filter() {
             depth: Some(1),
             refetch: false,
             unshallow: false,
+            deepen: None,
         },
         "https://github.com/org/repo.git",
     )
@@ -409,6 +412,63 @@ fn filtered_fetch_args_do_not_clear_partial_clone_filter() {
     assert!(!args
         .iter()
         .any(|arg| arg.to_string_lossy().contains("partialclonefilter")));
+}
+
+#[test]
+fn deepen_fetch_args_emit_deepen_flag() {
+    let args = fetch_args_with_options(
+        FetchOptions {
+            deepen: Some(3),
+            ..Default::default()
+        },
+        "https://github.com/org/repo.git",
+    )
+    .unwrap();
+    assert!(args.iter().any(|arg| arg == "--deepen=3"), "{args:?}");
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("--depth")),
+        "deepen must not also emit --depth: {args:?}"
+    );
+}
+
+#[test]
+fn deepen_fetch_args_reject_zero() {
+    assert!(fetch_args_with_options(
+        FetchOptions {
+            deepen: Some(0),
+            ..Default::default()
+        },
+        "https://github.com/org/repo.git",
+    )
+    .is_err());
+}
+
+#[test]
+fn deepen_fetch_args_reject_combination_with_depth() {
+    assert!(fetch_args_with_options(
+        FetchOptions {
+            depth: Some(1),
+            deepen: Some(3),
+            ..Default::default()
+        },
+        "https://github.com/org/repo.git",
+    )
+    .is_err());
+}
+
+#[test]
+fn deepen_fetch_args_reject_combination_with_unshallow() {
+    assert!(fetch_args_with_options(
+        FetchOptions {
+            deepen: Some(3),
+            unshallow: true,
+            ..Default::default()
+        },
+        "https://github.com/org/repo.git",
+    )
+    .is_err());
 }
 
 // ── Public method rejection of dash-prefixed arguments ──────────
@@ -555,6 +615,7 @@ async fn fetch_objects_rejects_zero_depth() {
                 depth: Some(0),
                 refetch: false,
                 unshallow: false,
+                deepen: None,
             },
         )
         .await

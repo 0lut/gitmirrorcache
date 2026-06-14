@@ -139,6 +139,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_ancestry_window_stops_at_shallow_boundary() {
+        let temp = TempTree::new("ancestry-window");
+        let (source_repo, _) = create_source_repo(&temp.path);
+        let cache_repo = temp.path.join("cache.git");
+        let git = test_git();
+
+        for message in ["second", "third", "fourth"] {
+            commit_source(&source_repo, message);
+        }
+        let tip = CommitSha::parse(run_git(Some(&source_repo), ["rev-parse", "HEAD"])).unwrap();
+        let source_url = format!("file://{}", path_arg(&source_repo));
+
+        git.init_bare(&cache_repo).await.expect("init cache repo");
+        git.fetch_ref(
+            &cache_repo,
+            &source_url,
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions {
+                depth: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fetch shallow main");
+
+        // Cache holds two commits (tip + one parent); the parent is the
+        // shallow boundary. A window deeper than the boundary truncates there
+        // rather than lazily fetching the missing ancestors.
+        let window = git
+            .commit_ancestry_window_no_lazy(&cache_repo, &tip, 5)
+            .await
+            .expect("ancestry window");
+        assert_eq!(window.len(), 2, "window stops at the shallow boundary");
+        assert_eq!(window[0], tip);
+
+        // A window within the present history returns exactly that many.
+        let one = git
+            .commit_ancestry_window_no_lazy(&cache_repo, &tip, 1)
+            .await
+            .expect("ancestry window");
+        assert_eq!(one, vec![tip.clone()]);
+
+        // An absent commit yields no window instead of erroring.
+        let missing = CommitSha::parse("0000000000000000000000000000000000000000").unwrap();
+        assert!(git
+            .commit_ancestry_window_no_lazy(&cache_repo, &missing, 3)
+            .await
+            .expect("ancestry window for missing commit")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn deepen_extends_shallow_boundary_without_unshallowing() {
+        let temp = TempTree::new("deepen-extends");
+        let (source_repo, _) = create_source_repo(&temp.path);
+        let cache_repo = temp.path.join("cache.git");
+        let git = test_git();
+
+        // Five commits upstream; a depth-1 fetch then a --deepen=2 must leave
+        // the cache at three commits and still shallow (two commits short of
+        // the full history), proving the deepen did not silently unshallow.
+        for message in ["second", "third", "fourth", "fifth"] {
+            commit_source(&source_repo, message);
+        }
+        let source_url = format!("file://{}", path_arg(&source_repo));
+
+        git.init_bare(&cache_repo).await.expect("init cache repo");
+        git.fetch_ref(
+            &cache_repo,
+            &source_url,
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions {
+                depth: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fetch shallow main");
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "depth-1 fetch is shallow"
+        );
+        assert_eq!(
+            run_git(
+                Some(&cache_repo),
+                ["rev-list", "--count", "refs/cache/main"]
+            ),
+            "1"
+        );
+
+        git.fetch_ref(
+            &cache_repo,
+            &source_url,
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions {
+                deepen: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("deepen main");
+
+        assert_eq!(
+            run_git(
+                Some(&cache_repo),
+                ["rev-list", "--count", "refs/cache/main"]
+            ),
+            "3",
+            "--deepen=2 should extend the shallow boundary by two commits"
+        );
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "a bounded deepen short of full history must keep the cache shallow"
+        );
+    }
+
+    #[tokio::test]
     async fn for_each_ref_commits_lists_matching_refs() {
         let temp = TempTree::new("for-each-ref");
         let (source_repo, source_sha) = create_source_repo(&temp.path);

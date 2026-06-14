@@ -623,6 +623,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn deepen_after_shallow_clone_does_not_unshallow_cache() {
+        let server = TestServer::start_with_file_url_upstream(true).await;
+
+        // Six commits upstream (initial + five). A depth-1 seed then a
+        // client --deepen=2 must extend the cache by exactly two commits and
+        // leave it shallow, rather than streaming the full history via an
+        // --unshallow. This is the bounded-deepen optimization's payoff.
+        for message in [
+            "second bounded deepen",
+            "third bounded deepen",
+            "fourth bounded deepen",
+            "fifth bounded deepen",
+            "sixth bounded deepen",
+        ] {
+            std::fs::write(
+                server.upstream_work.join("README.md"),
+                format!("{message}\n"),
+            )
+            .unwrap();
+            run_git(&server.upstream_work, &["add", "README.md"]);
+            run_git(&server.upstream_work, &["commit", "-m", message]);
+        }
+        run_git(&server.upstream_work, &["push", "origin", "main"]);
+
+        // Drop the cache repo the server pre-warms at startup so the depth-1
+        // seed hydrates a clean shallow cache; a stale warmed ancestor would
+        // otherwise let a small deepen reach the root and unshallow.
+        let cache_repo = server.cache_repo_dir();
+        std::fs::remove_dir_all(&cache_repo).unwrap();
+
+        let url = server.git_url("github.com/org/repo");
+        let clone_dir = server.tmp.path().join("bounded_deepen_clone");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--depth=1",
+                "--branch",
+                "main",
+                "--no-checkout",
+                &url,
+                clone_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "depth-1 seed should leave the cache repo shallow"
+        );
+        assert_eq!(
+            git_stdout_async(&clone_dir, &["rev-list", "--count", "HEAD"]).await,
+            "1"
+        );
+
+        run_git_async(&clone_dir, &["fetch", "--deepen=2", "origin", "main"]).await;
+
+        let after = git_stdout_async(&clone_dir, &["rev-list", "--count", "HEAD"]).await;
+        assert_eq!(
+            after, "3",
+            "fetch --deepen=2 should add exactly two commits"
+        );
+
+        // The cache extended its boundary by two commits without unshallowing:
+        // the shallow marker remains and the served upstream ref holds three
+        // commits, not the full six-commit history a full --unshallow fetches.
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "a bounded deepen must not unshallow the cache repo"
+        );
+        assert_eq!(
+            git_stdout_async(
+                &cache_repo,
+                &["rev-list", "--count", "refs/cache/upstream/heads/main"],
+            )
+            .await,
+            "3",
+            "cache should hold only the deepened history, not the full six commits"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn full_clone_succeeds_after_shallow_generation_hydrates_cold_cache() {
         let server = TestServer::start_with_file_url_upstream(true).await;
 
