@@ -78,12 +78,6 @@ impl UploadPackIntent {
     }
 }
 
-/// Git's sentinel "infinite" depth, sent on the wire by `git fetch
-/// --unshallow` (`deepen 2147483647`). A client deepen at or above this is an
-/// unshallow in disguise and must extend the cache to full history rather than
-/// taking the bounded-deepen path.
-const GIT_INFINITE_DEPTH: u32 = 0x7fff_ffff;
-
 #[derive(Debug, Clone, Copy)]
 struct DirectFetchOptions {
     filter: Option<&'static str>,
@@ -390,11 +384,7 @@ impl Materializer {
             // serves the client's true (absolute or relative) depth semantics,
             // so the served result stays correct either way.
             match fetch_options.depth {
-                Some(depth)
-                    if depth < GIT_INFINITE_DEPTH
-                        && depth <= MAX_LOCAL_DEPTH_WINDOW_PROOF
-                        && !force_refetch =>
-                {
+                Some(depth) if depth <= MAX_LOCAL_DEPTH_WINDOW_PROOF && !force_refetch => {
                     // A stateless deepen runs multiple upload-pack rounds; only
                     // deepen the cache on the round that actually needs more
                     // history, so the boundary advances by N once rather than
