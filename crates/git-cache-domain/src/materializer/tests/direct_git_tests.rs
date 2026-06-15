@@ -821,6 +821,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_deepen_rechecks_cache_after_waiting_for_repo_mutation_lock() {
+        let fixture = GitFixture::new();
+        for message in ["second", "third", "fourth", "fifth", "sixth"] {
+            fixture.commit_and_push(message);
+        }
+        let tip = fixture.head_commit();
+        let duplicate_deepen_boundary =
+            CommitSha::parse(git_stdout(&fixture.work_path(), ["rev-parse", "HEAD~4"])).unwrap();
+
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let upstream = format!(
+            "file://{}",
+            materializer.upstream_url(&fixture.repo).unwrap()
+        );
+        state
+            .git
+            .fetch_ref(
+                &repo_dir,
+                &upstream,
+                "refs/heads/main",
+                "refs/cache/upstream/heads/main",
+                git_cache_git::FetchOptions {
+                    depth: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut body = make_upload_pack_pkt_line(&format!("want {tip} multi_ack\n"));
+        body.extend(make_upload_pack_pkt_line(&format!("shallow {tip}\n")));
+        body.extend(make_upload_pack_pkt_line("deepen 2\n"));
+        body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        body.extend(make_upload_pack_pkt_line("done\n"));
+        let intent = super::super::direct_git::parse_upload_pack_intent(&body).unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), tip.to_string())]),
+        };
+
+        let held_lock = materializer
+            .lock_repo_mutation(&fixture.repo)
+            .await
+            .unwrap();
+        let first_materializer = materializer.clone();
+        let first_repo = fixture.repo.clone();
+        let first_intent = intent.clone();
+        let first_comparison = comparison.clone();
+        let first = tokio::spawn(async move {
+            first_materializer
+                .ensure_upload_pack_intent_available_from_comparison(
+                    &first_repo,
+                    &first_intent,
+                    &first_comparison,
+                )
+                .await
+        });
+        let second_materializer = materializer.clone();
+        let second_repo = fixture.repo.clone();
+        let second_intent = intent.clone();
+        let second_comparison = comparison.clone();
+        let second = tokio::spawn(async move {
+            second_materializer
+                .ensure_upload_pack_intent_available_from_comparison(
+                    &second_repo,
+                    &second_intent,
+                    &second_comparison,
+                )
+                .await
+        });
+
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(
+            !first.is_finished() && !second.is_finished(),
+            "both deepen requests should be queued behind the held mutation lock"
+        );
+        drop(held_lock);
+
+        tokio::time::timeout(StdDuration::from_secs(5), first)
+            .await
+            .expect("first deepen request timed out")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(StdDuration::from_secs(5), second)
+            .await
+            .expect("second deepen request timed out")
+            .unwrap()
+            .unwrap();
+
+        let shallow = stdfs::read_to_string(repo_dir.join("shallow")).unwrap();
+        assert!(
+            materializer
+                .deepen_boundary_satisfied(&repo_dir, std::slice::from_ref(&tip), 2)
+                .await
+                .unwrap(),
+            "one deepen by two should leave the cache able to serve the client deepen"
+        );
+        assert!(
+            !shallow.contains(duplicate_deepen_boundary.as_str()),
+            "the second waiting request must not deepen again after the first request already covered it; shallow={shallow}"
+        );
+    }
+
+    #[tokio::test]
     async fn blobless_hydrated_repo_refetches_full_objects_for_unfiltered_wants() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());

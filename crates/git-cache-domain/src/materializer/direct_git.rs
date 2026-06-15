@@ -92,6 +92,14 @@ struct DirectFetchOptions {
     deepen: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DirectReadThroughPlan {
+    fetch_options: DirectFetchOptions,
+    force_refetch: bool,
+    closure_marker_present: bool,
+    needs_history_extension: bool,
+}
+
 impl Default for DirectFetchOptions {
     fn default() -> Self {
         Self {
@@ -288,24 +296,21 @@ impl Materializer {
         .await
     }
 
-    async fn ensure_wants_read_through(
+    async fn plan_direct_read_through(
         &self,
         repo: &RepoKey,
+        repo_dir: &FsPath,
         object_ids: &[CommitSha],
         deepen_from: &[CommitSha],
-        comparison: Option<&UpstreamRefComparison>,
         fetch_options: DirectFetchOptions,
-    ) -> CoreResult<()> {
-        let started = Instant::now();
-        let repo_dir = self.ensure_repo_dir(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
+    ) -> CoreResult<DirectReadThroughPlan> {
+        let partial_marker = repo_dir.join(PARTIAL_HYDRATION_MARKER);
+        let closure_marker = repo_dir.join(INCOMPLETE_CLOSURE_MARKER);
         // A repo hydrated only by filtered (blobless) fetches has commits and
         // trees but no blobs. Readiness checks cannot see blob completeness,
         // so full-object requests against such a repo would die in server
         // pack-objects mid-stream. Force a `--refetch` covering every want so
         // git re-downloads full objects despite the local (partial) haves.
-        let partial_marker = repo_dir.join(PARTIAL_HYDRATION_MARKER);
-        let closure_marker = repo_dir.join(INCOMPLETE_CLOSURE_MARKER);
         let mut force_refetch =
             !fetch_options.blobless_fetch() && fs::try_exists(&partial_marker).await?;
         let closure_marker_present =
@@ -321,7 +326,7 @@ impl Materializer {
         if force_refetch
             && fetch_options.depth == Some(1)
             && self
-                .depth1_snapshots_complete_no_lazy(&repo_dir, object_ids)
+                .depth1_snapshots_complete_no_lazy(repo_dir, object_ids)
                 .await?
         {
             force_refetch = false;
@@ -395,7 +400,7 @@ impl Materializer {
                     // covered branch by an extra N — bounded and convergent, not
                     // corrupt.
                     if self
-                        .deepen_boundary_satisfied(&repo_dir, deepen_from, depth)
+                        .deepen_boundary_satisfied(repo_dir, deepen_from, depth)
                         .await?
                     {
                         None
@@ -428,6 +433,41 @@ impl Materializer {
             }
             None => fetch_options,
         };
+
+        Ok(DirectReadThroughPlan {
+            fetch_options,
+            force_refetch,
+            closure_marker_present,
+            needs_history_extension,
+        })
+    }
+
+    async fn ensure_wants_read_through(
+        &self,
+        repo: &RepoKey,
+        object_ids: &[CommitSha],
+        deepen_from: &[CommitSha],
+        comparison: Option<&UpstreamRefComparison>,
+        fetch_options: DirectFetchOptions,
+    ) -> CoreResult<()> {
+        let started = Instant::now();
+        let repo_dir = self.ensure_repo_dir(repo).await?;
+        let _repo_lock = self.lock_repo(repo).await?;
+        let partial_marker = repo_dir.join(PARTIAL_HYDRATION_MARKER);
+        let closure_marker = repo_dir.join(INCOMPLETE_CLOSURE_MARKER);
+        let client_fetch_options = fetch_options;
+        let plan = self
+            .plan_direct_read_through(
+                repo,
+                &repo_dir,
+                object_ids,
+                deepen_from,
+                client_fetch_options,
+            )
+            .await?;
+        let mut fetch_options = plan.fetch_options;
+        let mut force_refetch = plan.force_refetch;
+        let mut needs_history_extension = plan.needs_history_extension;
         let object_count = object_ids.len();
         // Classification must never trigger promisor lazy fetches: in a
         // partially hydrated repo each missing object would otherwise spawn
@@ -443,8 +483,6 @@ impl Materializer {
         let mut fetched_commits = 0usize;
         let mut fetched_non_commit_wants = 0usize;
         let mut pending: Vec<CommitSha> = Vec::new();
-        let mut pending_requires_refetch = force_refetch;
-        let mut pending_needs_closure_verify = closure_marker_present;
         let mut checked_suspect_hot_closure = false;
         let mut suspect_hot_closure_complete = true;
         let mut verified_hydrated_generations: HashSet<GenerationId> = HashSet::new();
@@ -466,7 +504,6 @@ impl Materializer {
                                 .depth_window_ready_for_serving_no_lazy(&repo_dir, object_id, depth)
                                 .await?
                         {
-                            pending_requires_refetch = true;
                             pending.push(object_id.clone());
                             info!(
                                 %repo,
@@ -477,15 +514,13 @@ impl Materializer {
                             continue;
                         }
                     }
-                    if closure_marker_present && fetch_options.needs_full_object_history() {
+                    if plan.closure_marker_present && fetch_options.needs_full_object_history() {
                         checked_suspect_hot_closure = true;
                         if !self
                             .commit_history_complete_no_lazy(&repo_dir, object_id)
                             .await?
                         {
                             suspect_hot_closure_complete = false;
-                            pending_requires_refetch = true;
-                            pending_needs_closure_verify = true;
                             pending.push(object_id.clone());
                             warn!(
                                 %repo,
@@ -511,7 +546,7 @@ impl Materializer {
                                         .contains(&manifest.generation)
                                     || self
                                         .commit_history_complete_no_lazy(&repo_dir, object_id)
-                                        .await?
+                                    .await?
                                 {
                                     verified_hydrated_generations.insert(manifest.generation);
                                     self.expose_served_commit(&repo_dir, object_id).await?;
@@ -519,8 +554,6 @@ impl Materializer {
                                     continue;
                                 }
                                 fs::write(&closure_marker, b"incomplete\n").await?;
-                                pending_needs_closure_verify = true;
-                                pending_requires_refetch = true;
                                 warn!(
                                     %repo,
                                     commit = %object_id,
@@ -562,129 +595,215 @@ impl Materializer {
 
         if !pending.is_empty() {
             let _mutation_lock = self.lock_repo_mutation(repo).await?;
-            let fetch_options = if pending_requires_refetch && !needs_history_extension {
-                fetch_options.with_refetch()
-            } else {
-                fetch_options
-            };
-            // A fresh clone wants the tip of every advertised ref, so missing
-            // wants must be fetched in batched upstream invocations: one fetch
-            // for all advertised refspecs plus one for raw SHAs, instead of one
-            // subprocess per want.
-            let upstream_url = self.upstream_url(repo)?;
-            let upstream_git = self.upstream_git(&upstream_url)?;
-            let mut fetched_commit_wants: Vec<CommitSha> = Vec::new();
-
-            let fetched_all_heads = self
-                .batched_read_through_fetch(
+            let locked_plan = self
+                .plan_direct_read_through(
                     repo,
                     &repo_dir,
-                    &upstream_url,
-                    &upstream_git,
-                    &pending,
-                    comparison,
-                    fetch_options,
+                    object_ids,
+                    deepen_from,
+                    client_fetch_options,
                 )
                 .await?;
+            fetch_options = locked_plan.fetch_options;
+            force_refetch = locked_plan.force_refetch;
+            needs_history_extension = locked_plan.needs_history_extension;
+            let mut pending_requires_refetch = force_refetch;
+            let mut pending_needs_closure_verify = locked_plan.closure_marker_present;
 
-            let mut missing: Vec<CommitSha> = Vec::new();
-            for object_id in &pending {
-                match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
-                    Ok(DirectFetchedWantKind::Commit) => {
-                        fetched_commits += 1;
-                        fetched_commit_wants.push(object_id.clone());
-                    }
-                    Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
-                    Err(_) => missing.push(object_id.clone()),
+            let pending_before_recheck = pending.len();
+            let object_types = self
+                .state
+                .git
+                .cat_file_batch_types_no_lazy(&repo_dir, &pending)
+                .await?;
+            let mut still_pending: Vec<CommitSha> = Vec::new();
+            for object_id in std::mem::take(&mut pending) {
+                let Some(object_type) = object_types.get(&object_id).map(String::as_str) else {
+                    still_pending.push(object_id);
+                    continue;
+                };
+                if object_type != "commit" {
+                    continue;
                 }
+
+                if !force_refetch
+                    && !needs_history_extension
+                    && self.commit_tree_exists_no_lazy(&repo_dir, &object_id).await
+                {
+                    if let Some(depth) = fetch_options.depth {
+                        if depth > 1
+                            && !self
+                                .depth_window_ready_for_serving_no_lazy(
+                                    &repo_dir, &object_id, depth,
+                                )
+                                .await?
+                        {
+                            pending_requires_refetch = true;
+                            still_pending.push(object_id);
+                            continue;
+                        }
+                    }
+                    if locked_plan.closure_marker_present
+                        && fetch_options.needs_full_object_history()
+                    {
+                        checked_suspect_hot_closure = true;
+                        if !self
+                            .commit_history_complete_no_lazy(&repo_dir, &object_id)
+                            .await?
+                        {
+                            suspect_hot_closure_complete = false;
+                            pending_requires_refetch = true;
+                            pending_needs_closure_verify = true;
+                            still_pending.push(object_id);
+                            continue;
+                        }
+                    }
+                    self.expose_served_commit(&repo_dir, &object_id).await?;
+                    served_commits += 1;
+                    continue;
+                }
+
+                still_pending.push(object_id);
+            }
+            pending = still_pending;
+            if pending.len() < pending_before_recheck {
+                info!(
+                    %repo,
+                    pending_before = pending_before_recheck,
+                    pending_after = pending.len(),
+                    "direct git pending wants satisfied while waiting for repo mutation lock"
+                );
             }
 
-            if !missing.is_empty() {
-                // Wants the batched fetch did not cover (e.g. an advertised
-                // branch moved between the GET advertisement and this POST)
-                // are retried as exact-SHA fetches, then as an all-heads fetch.
-                warn!(
-                    %repo,
-                    missing_count = missing.len(),
-                    "direct git batched fetch did not cover all wants; retrying as exact-SHA fetch"
-                );
-                if let Err(err) = upstream_git
-                    .fetch_objects(
+            if !pending.is_empty() {
+                let fetch_options = if pending_requires_refetch && !needs_history_extension {
+                    fetch_options.with_refetch()
+                } else {
+                    fetch_options
+                };
+                // A fresh clone wants the tip of every advertised ref, so missing
+                // wants must be fetched in batched upstream invocations: one fetch
+                // for all advertised refspecs plus one for raw SHAs, instead of one
+                // subprocess per want.
+                let upstream_url = self.upstream_url(repo)?;
+                let upstream_git = self.upstream_git(&upstream_url)?;
+                let mut fetched_commit_wants: Vec<CommitSha> = Vec::new();
+
+                let fetched_all_heads = self
+                    .batched_read_through_fetch(
+                        repo,
                         &repo_dir,
                         &upstream_url,
-                        &missing,
-                        fetch_options.git_options(),
+                        &upstream_git,
+                        &pending,
+                        comparison,
+                        fetch_options,
                     )
-                    .await
-                {
-                    if fetched_all_heads {
-                        return Err(GitCacheError::NotFound(format!(
-                            "objects could not be fetched from upstream: {err}"
-                        )));
-                    }
-                    warn!(
-                        %repo,
-                        missing_count = missing.len(),
-                        %err,
-                        "direct git exact-SHA retry fetch failed; falling back to all-heads fetch"
-                    );
-                    upstream_git
-                        .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
-                        .await?;
-                }
-                for object_id in &missing {
+                    .await?;
+
+                let mut missing: Vec<CommitSha> = Vec::new();
+                for object_id in &pending {
                     match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
                         Ok(DirectFetchedWantKind::Commit) => {
                             fetched_commits += 1;
                             fetched_commit_wants.push(object_id.clone());
                         }
                         Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
-                        Err(err) => {
+                        Err(_) => missing.push(object_id.clone()),
+                    }
+                }
+
+                if !missing.is_empty() {
+                    // Wants the batched fetch did not cover (e.g. an advertised
+                    // branch moved between the GET advertisement and this POST)
+                    // are retried as exact-SHA fetches, then as an all-heads fetch.
+                    warn!(
+                        %repo,
+                        missing_count = missing.len(),
+                        "direct git batched fetch did not cover all wants; retrying as exact-SHA fetch"
+                    );
+                    if let Err(err) = upstream_git
+                        .fetch_objects(
+                            &repo_dir,
+                            &upstream_url,
+                            &missing,
+                            fetch_options.git_options(),
+                        )
+                        .await
+                    {
+                        if fetched_all_heads {
                             return Err(GitCacheError::NotFound(format!(
+                                "objects could not be fetched from upstream: {err}"
+                            )));
+                        }
+                        warn!(
+                            %repo,
+                            missing_count = missing.len(),
+                            %err,
+                            "direct git exact-SHA retry fetch failed; falling back to all-heads fetch"
+                        );
+                        upstream_git
+                            .fetch_all_heads(&repo_dir, &upstream_url, fetch_options.git_options())
+                            .await?;
+                    }
+                    for object_id in &missing {
+                        match self.prepare_fetched_direct_want(&repo_dir, object_id).await {
+                            Ok(DirectFetchedWantKind::Commit) => {
+                                fetched_commits += 1;
+                                fetched_commit_wants.push(object_id.clone());
+                            }
+                            Ok(DirectFetchedWantKind::NonCommit) => fetched_non_commit_wants += 1,
+                            Err(err) => {
+                                return Err(GitCacheError::NotFound(format!(
                                 "object `{object_id}` could not be fetched from upstream: {err}"
                             )));
+                            }
                         }
                     }
                 }
-            }
 
-            let mut verified_full_closure = true;
-            if pending_needs_closure_verify && fetch_options.needs_full_object_history() {
-                for object_id in &fetched_commit_wants {
-                    if !self
-                        .commit_history_complete_no_lazy(&repo_dir, object_id)
-                        .await?
-                    {
-                        verified_full_closure = false;
-                        break;
+                let mut verified_full_closure = true;
+                if pending_needs_closure_verify && fetch_options.needs_full_object_history() {
+                    for object_id in &fetched_commit_wants {
+                        if !self
+                            .commit_history_complete_no_lazy(&repo_dir, object_id)
+                            .await?
+                        {
+                            verified_full_closure = false;
+                            break;
+                        }
+                    }
+                    if verified_full_closure {
+                        fs::remove_file(&closure_marker).await.ok();
+                    } else {
+                        fs::write(&closure_marker, b"incomplete\n").await?;
+                        return Err(GitCacheError::Internal(
+                            "fetched full-history wants without complete object closure".into(),
+                        ));
                     }
                 }
-                if verified_full_closure {
-                    fs::remove_file(&closure_marker).await.ok();
-                } else {
-                    fs::write(&closure_marker, b"incomplete\n").await?;
-                    return Err(GitCacheError::Internal(
-                        "fetched full-history wants without complete object closure".into(),
-                    ));
-                }
-            }
 
-            if fetch_options.blobless_fetch() {
-                fs::write(&partial_marker, b"blobless\n").await?;
-            } else if force_refetch && fetch_options.depth.is_none() {
-                // An unfiltered, undepthed refetch re-downloads full objects
-                // for every requested want; the repo can serve full-object
-                // shapes again.
-                fs::remove_file(&partial_marker).await.ok();
-                info!(%repo, "cleared partial hydration marker after full refetch");
-            }
-
-            // One repo-wide fsck covers every commit fetched by this request.
-            if fetched_commits > 0 || fetched_non_commit_wants > 0 {
-                if let Some(first) = pending.first() {
-                    self.enqueue_direct_fsck(repo.clone(), repo_dir.to_path_buf(), first.clone());
+                if fetch_options.blobless_fetch() {
+                    fs::write(&partial_marker, b"blobless\n").await?;
+                } else if force_refetch && fetch_options.depth.is_none() {
+                    // An unfiltered, undepthed refetch re-downloads full objects
+                    // for every requested want; the repo can serve full-object
+                    // shapes again.
+                    fs::remove_file(&partial_marker).await.ok();
+                    info!(%repo, "cleared partial hydration marker after full refetch");
                 }
-                self.enqueue_serving_maintenance(repo.clone(), repo_dir.to_path_buf());
+
+                // One repo-wide fsck covers every commit fetched by this request.
+                if fetched_commits > 0 || fetched_non_commit_wants > 0 {
+                    if let Some(first) = pending.first() {
+                        self.enqueue_direct_fsck(
+                            repo.clone(),
+                            repo_dir.to_path_buf(),
+                            first.clone(),
+                        );
+                    }
+                    self.enqueue_serving_maintenance(repo.clone(), repo_dir.to_path_buf());
+                }
             }
         }
 
