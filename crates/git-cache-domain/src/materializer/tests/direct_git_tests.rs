@@ -982,6 +982,128 @@ mod tests {
         );
     }
 
+    /// Reproduces a false-positive depth-window readiness on merge history.
+    ///
+    /// `depth_window_ready_for_serving_no_lazy` builds its window with
+    /// `rev-list --max-count=N`, which yields the N most-recent commits *by
+    /// date* rather than every commit within `N-1` edges of the tip. At a
+    /// merge whose second-parent branch carries older commit dates, the
+    /// date-ordered window can fill up from the recent first-parent branch and
+    /// never visit the older branch, so a commit a real `--depth=N` clone
+    /// requires goes unchecked. With that commit absent from a partially
+    /// hydrated *non-shallow* cache, the predicate wrongly proves a window it
+    /// cannot actually serve, and the cache exposes an unservable snapshot.
+    ///
+    /// Graph (edge distance from the merge `m`):
+    ///   `m`=0; parents `{a3, q}`=1; `{a2, r}`=2; `{a1, base}`=3+
+    /// The `a*` commits are recent; the `q -> r` branch is old. `r` (edge 2,
+    /// required by `--depth=3`) is the only object withheld from the cache.
+    ///
+    /// The linear-history sibling test above passes only because the missing
+    /// commit is an *immediate* parent, which `rev-list` must parse for
+    /// date-ordering and thus errors on. The merge case removes that accident.
+    #[tokio::test]
+    async fn partial_hot_repo_declines_depth_window_when_older_merge_parent_branch_is_missing() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let work = fixture.work_path();
+        let base = fixture.head_commit();
+
+        // Older, low-date second-parent branch: base -> r -> q.
+        run_git(&work, ["checkout", "-q", "-b", "oldline", base.as_str()]);
+        let r = commit_dated(&work, "old.txt", "r", "old r", "2001-01-01T00:00:00 +0000");
+        let q = commit_dated(&work, "old.txt", "q", "old q", "2001-01-02T00:00:00 +0000");
+
+        // Recent first-parent branch on main: base -> a1 -> a2 -> a3.
+        run_git(&work, ["checkout", "-q", "main"]);
+        let _a1 = commit_dated(&work, "README.md", "a1", "recent a1", "2026-06-01T00:00:00 +0000");
+        let _a2 = commit_dated(&work, "README.md", "a2", "recent a2", "2026-06-02T00:00:00 +0000");
+        let a3 = commit_dated(&work, "README.md", "a3", "recent a3", "2026-06-03T00:00:00 +0000");
+
+        // Merge the old branch into the recent tip => m (recent date).
+        run_git_dated(
+            &work,
+            "2026-06-04T00:00:00 +0000",
+            ["merge", "-q", "--no-ff", "-m", "merge oldline", "oldline"],
+        );
+        let m = fixture.head_commit();
+
+        // Document why a real --depth=3 needs r: m -> q -> r is two edges.
+        let merge_parents = git_stdout(&work, ["rev-list", "--parents", "-1", m.as_str()]);
+        assert!(
+            merge_parents.contains(a3.as_str()) && merge_parents.contains(q.as_str()),
+            "merge tip must have the recent branch (a3) and the older branch (q) as parents"
+        );
+        assert!(
+            git_stdout(&work, ["rev-list", "--parents", "-1", q.as_str()]).contains(r.as_str()),
+            "r must be q's parent (edge distance 2 from the tip, required by --depth=3)"
+        );
+
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        // Hydrate every object reachable from m EXCEPT r: a non-shallow repo
+        // whose only gap is one commit on the older merge-parent branch.
+        for commit in git_stdout(&work, ["rev-list", m.as_str()]).lines() {
+            if commit == r.as_str() {
+                continue;
+            }
+            let tree = git_stdout(&work, ["rev-parse", &format!("{commit}^{{tree}}")]);
+            copy_git_object(&work, &repo_dir, "commit", commit);
+            copy_git_object(&work, &repo_dir, "tree", &tree);
+        }
+        stdfs::write(repo_dir.join("git-cache-partial-hydration"), b"blobless\n").unwrap();
+
+        assert!(
+            !repo_dir.join("shallow").exists(),
+            "regression models a non-shallow repo with a partial merge-parent branch"
+        );
+        assert!(
+            !materializer.commit_exists(&repo_dir, &r).await,
+            "setup must leave the depth-3 window genuinely incomplete (r withheld)"
+        );
+        assert!(
+            materializer.commit_tree_exists_no_lazy(&repo_dir, &m).await,
+            "the merge tip and its tree must be present"
+        );
+
+        // Positive control: r sits at edge distance 2, so --depth=2 (edges
+        // 0..=1 = {m, a3, q}, all present) is genuinely serveable. This proves
+        // the predicate is not just trivially declining everything.
+        assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &m, 2)
+                .await
+                .unwrap(),
+            "depth-2 window is fully present and must be reported serveable"
+        );
+
+        // The bug: --depth=3 requires r (absent), but the date-ordered window
+        // [m, a3, a2] never visits the old branch, so the predicate proves a
+        // window the cache cannot serve without a lazy/read-through fetch.
+        assert!(
+            !materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &m, 3)
+                .await
+                .unwrap(),
+            "depth-3 window is missing r and must NOT be reported serveable"
+        );
+
+        // End-to-end: cache prepare must decline the depth-3 want instead of
+        // exposing an unservable shallow snapshot to upload-pack.
+        let mut depth3_body = make_upload_pack_pkt_line(&format!("want {m} multi_ack\n"));
+        depth3_body.extend_from_slice(b"0000");
+        depth3_body.extend(make_upload_pack_pkt_line("deepen 3\n"));
+        depth3_body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        depth3_body.extend(make_upload_pack_pkt_line("done\n"));
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(depth3_body))
+                .await
+                .unwrap(),
+            "cache prepare must decline a finite-depth request whose window needs a missing merge-parent commit"
+        );
+    }
+
     #[tokio::test]
     async fn shallow_hydrated_repo_unshallows_for_full_history_wants() {
         let fixture = GitFixture::new();
@@ -1190,6 +1312,36 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    /// Run a git command with a fixed author/committer date so tests can build
+    /// history whose `rev-list` (commit-date) ordering is deterministic.
+    fn run_git_dated<I, S>(cwd: &FsPath, date: &str, args: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Stage `contents` into `file` and commit it on the current branch with a
+    /// fixed date, returning the new commit.
+    fn commit_dated(work: &FsPath, file: &str, contents: &str, msg: &str, date: &str) -> CommitSha {
+        stdfs::write(work.join(file), format!("{contents}\n")).unwrap();
+        run_git(work, ["add", file]);
+        run_git_dated(work, date, ["commit", "-m", msg]);
+        CommitSha::parse(git_stdout(work, ["rev-parse", "HEAD"])).unwrap()
     }
 
     #[tokio::test]
