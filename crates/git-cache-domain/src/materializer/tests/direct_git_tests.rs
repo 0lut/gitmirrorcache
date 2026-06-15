@@ -821,7 +821,39 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "reproduces prod stale shallow.lock failure before recovery fix"]
+    async fn clear_stale_repo_locks_removes_known_orphaned_locks() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+
+        // Seed each repo-global lock a killed mutation could orphan.
+        let locks = [
+            repo_dir.join("shallow.lock"),
+            repo_dir.join("objects/info/commit-graph.lock"),
+            repo_dir.join("packed-refs.lock"),
+        ];
+        for lock in &locks {
+            if let Some(parent) = lock.parent() {
+                stdfs::create_dir_all(parent).unwrap();
+            }
+            stdfs::write(lock, b"orphaned").unwrap();
+        }
+
+        materializer.clear_stale_repo_locks(&fixture.repo).await;
+        for lock in &locks {
+            assert!(
+                !lock.exists(),
+                "stale lock should be cleared: {}",
+                lock.display()
+            );
+        }
+
+        // Idempotent: clearing when nothing is present must not panic or error.
+        materializer.clear_stale_repo_locks(&fixture.repo).await;
+    }
+
+    #[tokio::test]
     async fn direct_git_deepen_recovers_from_stale_shallow_lock() {
         let fixture = GitFixture::new();
         for message in ["second", "third", "fourth", "fifth", "sixth"] {

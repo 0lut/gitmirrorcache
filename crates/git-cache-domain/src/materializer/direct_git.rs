@@ -856,6 +856,18 @@ impl Materializer {
     }
 
     pub(super) fn enqueue_direct_fsck(&self, repo: RepoKey, repo_dir: PathBuf, commit: CommitSha) {
+        {
+            let Ok(mut inflight) = self.state.direct_fsck_inflight.lock() else {
+                warn!(%repo, "direct fsck in-flight lock poisoned; skipping");
+                return;
+            };
+            if !inflight.insert(repo_dir.clone()) {
+                // A connectivity fsck for this repo is already queued or
+                // running; enqueuing another would only stampede duplicate
+                // IO/CPU over the same objects on a large repo.
+                return;
+            }
+        }
         let materializer = self.clone();
         info!(
             %repo,
@@ -866,8 +878,19 @@ impl Materializer {
         tokio::spawn(async move {
             tokio::time::sleep(DIRECT_FSCK_DELAY).await;
             let started = Instant::now();
-            match materializer.state.git.fsck(&repo_dir).await {
-                Ok(_) => info!(
+            // Serialize the connectivity check with fetch/repack/commit-graph
+            // through the per-repo mutation lock: an fsck racing a shallow
+            // boundary rewrite wastes work and competes for IO, and acquiring
+            // the guard also clears any stale lock left by a prior crash before
+            // fsck walks the object graph.
+            let result = async {
+                let _mutation_lock = materializer.lock_repo_mutation(&repo).await?;
+                materializer.state.git.fsck(&repo_dir).await?;
+                CoreResult::Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => info!(
                     %repo,
                     %commit,
                     elapsed_ms = elapsed_ms(started),
@@ -880,6 +903,9 @@ impl Materializer {
                     elapsed_ms = elapsed_ms(started),
                     "direct git background fsck failed"
                 ),
+            }
+            if let Ok(mut inflight) = materializer.state.direct_fsck_inflight.lock() {
+                inflight.remove(&repo_dir);
             }
         });
     }

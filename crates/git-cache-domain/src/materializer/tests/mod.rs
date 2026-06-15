@@ -171,6 +171,7 @@ impl GitFixture {
             serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            direct_fsck_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             repo_mutation_locks: Arc::new(
                 tokio::sync::Mutex::new(std::collections::HashMap::new()),
             ),
