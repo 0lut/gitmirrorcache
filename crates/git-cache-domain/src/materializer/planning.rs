@@ -901,8 +901,10 @@ impl Materializer {
             }
         }
 
-        // Release the per-repo mutation gate before publish_generation, which
-        // re-acquires it.
+        // The mutation gate only guards the fetch/ref-update mutations above
+        // (which collide on git lock files like shallow.lock); publish_generation
+        // packs and writes manifests without it, so release the gate early to
+        // avoid blocking other operations on this repo during publish.
         drop(mutation_lock);
 
         let publish_started = Instant::now();
