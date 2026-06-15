@@ -14,12 +14,13 @@ use git_cache_git::Git;
 #[cfg(feature = "s3")]
 use git_cache_objectstore::S3ObjectStore;
 use git_cache_objectstore::{LocalObjectStore, ObjectStore};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "s3")]
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 
 /// Shared with `scripts/aws/deploy-ecs-ec2-ebs.sh` via the sibling
@@ -36,6 +37,12 @@ pub struct AppState {
     /// Repo dirs with a queued or running background serving-maintenance
     /// task (repack + commit-graph), to dedupe bursts of hydrating requests.
     pub serving_maintenance_inflight: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Per-worker, per-repo gates for operations that mutate a bare repo.
+    /// The disk `RepoLock` only protects eviction; this prevents concurrent
+    /// fetch/import/repack operations in the same worker from colliding on
+    /// Git's own lock files (for example `shallow.lock`) without serializing
+    /// unrelated repos or long upload-pack response streaming.
+    pub repo_mutation_locks: Arc<AsyncMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>>,
 }
 
 impl AppState {
@@ -134,6 +141,7 @@ impl AppState {
             git,
             disk: AsyncDiskManager::new(disk),
             serving_maintenance_inflight: Arc::new(Mutex::new(HashSet::new())),
+            repo_mutation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         })
     }
 }

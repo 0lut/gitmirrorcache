@@ -790,11 +790,6 @@ impl Materializer {
         threshold: usize,
         dry_run: bool,
     ) -> CoreResult<Option<CompactionReport>> {
-        let outer_repo_lock = if dry_run {
-            None
-        } else {
-            Some(self.lock_repo(repo).await?)
-        };
         let Some((head, head_version)) = self.manifests().repo_head_versioned(repo).await? else {
             return Ok(None);
         };
@@ -832,8 +827,11 @@ impl Materializer {
             }));
         }
 
-        let _repo_lock = outer_repo_lock;
         let repo_dir = self.ensure_repo_dir(repo).await?;
+        let outer_mutation_lock = self.lock_repo_mutation(repo).await?;
+        let outer_repo_lock = self.lock_repo(repo).await?;
+        let _repo_lock = outer_repo_lock;
+        let _mutation_lock = outer_mutation_lock;
         Box::pin(self.hydrate_generation(repo, &repo_dir, head.generation)).await?;
         self.state.git.repack_for_serving(&repo_dir).await?;
 

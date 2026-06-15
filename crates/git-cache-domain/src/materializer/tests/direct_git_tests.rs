@@ -16,6 +16,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repo_mutation_lock_serializes_per_repo_only() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let first = materializer
+            .lock_repo_mutation(&fixture.repo)
+            .await
+            .unwrap();
+
+        let same_repo_materializer = materializer.clone();
+        let same_repo = fixture.repo.clone();
+        let (same_repo_tx, same_repo_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _lock = same_repo_materializer
+                .lock_repo_mutation(&same_repo)
+                .await
+                .unwrap();
+            let _ = same_repo_tx.send(());
+        });
+
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), same_repo_rx)
+                .await
+                .is_err(),
+            "same-repo mutation locks should serialize"
+        );
+
+        let other_repo = RepoKey::parse("github.com/org/other").unwrap();
+        let other_lock = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            materializer.lock_repo_mutation(&other_repo),
+        )
+        .await
+        .expect("different repo lock should not wait behind the first repo")
+        .unwrap();
+        drop(other_lock);
+
+        drop(first);
+        waiter.await.unwrap();
+    }
+
     #[test]
     fn synthesize_ref_advertisement_contains_head_and_refs() {
         let comparison = UpstreamRefComparison {
@@ -440,6 +482,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_pack_cache_prepare_declines_over_cap_client_depth() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let cached = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        assert!(
+            !repo_dir.join("shallow").exists(),
+            "regression setup models the steady-state non-shallow cache"
+        );
+
+        let mut body =
+            make_upload_pack_pkt_line(&format!("want {} multi_ack thin-pack\n", cached.commit));
+        body.extend_from_slice(b"0000");
+        body.extend(make_upload_pack_pkt_line("deepen 2000000000\n"));
+        body.extend(make_upload_pack_pkt_line("done\n"));
+
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(body))
+                .await
+                .unwrap(),
+            "over-cap finite depths must decline instead of running a client-controlled local proof"
+        );
+    }
+
+    #[tokio::test]
     async fn warm_upload_pack_fetches_upstream_when_manifest_bundle_is_unavailable() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());
@@ -622,6 +699,20 @@ mod tests {
         );
         let boundaries = [tip.clone()];
         assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 1)
+                .await
+                .unwrap(),
+            "a depth-1 cache can serve a depth-1 pack"
+        );
+        assert!(
+            !materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 2)
+                .await
+                .unwrap(),
+            "a depth-1 cache must not claim it can serve a deeper fresh clone"
+        );
+        assert!(
             !materializer
                 .deepen_boundary_satisfied(&repo_dir, &boundaries, 1)
                 .await
@@ -667,11 +758,47 @@ mod tests {
             "after deepening by two, a deepen of 2 is already covered"
         );
         assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 3)
+                .await
+                .unwrap(),
+            "a cache holding tip plus two ancestors can serve a fresh depth-3 clone"
+        );
+        assert!(
+            !materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 4)
+                .await
+                .unwrap(),
+            "the shallow boundary still cuts off a fresh depth-4 clone"
+        );
+        assert!(
+            !materializer
+                .depth_window_ready_for_serving_no_lazy(
+                    &repo_dir,
+                    &tip,
+                    MAX_LOCAL_DEPTH_WINDOW_PROOF + 1,
+                )
+                .await
+                .unwrap(),
+            "over-cap client depths must decline instead of running an unbounded local proof"
+        );
+        assert!(
             !materializer
                 .deepen_boundary_satisfied(&repo_dir, &boundaries, 3)
                 .await
                 .unwrap(),
             "the cache still cuts history inside a deepen of 3"
+        );
+        assert!(
+            !materializer
+                .deepen_boundary_satisfied(
+                    &repo_dir,
+                    &boundaries,
+                    MAX_LOCAL_DEPTH_WINDOW_PROOF + 1,
+                )
+                .await
+                .unwrap(),
+            "over-cap deepen requests must not run an unbounded local proof"
         );
 
         // A boundary commit the cache does not have is never satisfied, and an
@@ -837,6 +964,218 @@ mod tests {
         assert!(
             marker.exists(),
             "depth-1 service must not clear the partial hydration marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_hot_repo_declines_blobless_depth_when_ancestry_window_is_missing() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let parent = fixture.head_commit();
+        let commit = fixture.commit_and_push("second partial depth window");
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let tree = git_stdout(
+            &fixture.work_path(),
+            ["rev-parse", &format!("{commit}^{{tree}}")],
+        );
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+
+        copy_git_object(&fixture.work_path(), &repo_dir, "commit", commit.as_str());
+        copy_git_object(&fixture.work_path(), &repo_dir, "tree", &tree);
+        stdfs::write(repo_dir.join("git-cache-partial-hydration"), b"blobless\n").unwrap();
+        assert!(
+            materializer
+                .commit_ready_for_serving_no_lazy(&repo_dir, &commit)
+                .await,
+            "test setup should leave the tip commit and tree present"
+        );
+        assert!(
+            !materializer.commit_exists(&repo_dir, &parent).await,
+            "test setup should leave the requested depth window incomplete"
+        );
+        assert!(
+            !repo_dir.join("shallow").exists(),
+            "regression setup models a non-shallow repo with partial current-tip history"
+        );
+
+        let mut depth2_body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        depth2_body.extend_from_slice(b"0000");
+        depth2_body.extend(make_upload_pack_pkt_line("deepen 2\n"));
+        depth2_body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        depth2_body.extend(make_upload_pack_pkt_line("done\n"));
+
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(depth2_body.clone()))
+                .await
+                .unwrap(),
+            "cache prepare must decline when a finite-depth blobless request needs missing ancestors"
+        );
+
+        let intent = super::super::direct_git::parse_upload_pack_intent(&depth2_body).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &intent,
+                &comparison,
+            )
+            .await
+            .expect("read-through should fetch the missing finite-depth ancestry");
+
+        assert!(
+            materializer.commit_exists(&repo_dir, &parent).await,
+            "depth-2 read-through should fetch the missing parent before local upload-pack serves"
+        );
+        assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &commit, 2)
+                .await
+                .unwrap(),
+            "the local cache should now prove the requested depth window"
+        );
+    }
+
+    /// Reproduces a false-positive depth-window readiness on merge history.
+    ///
+    /// `depth_window_ready_for_serving_no_lazy` builds its window with
+    /// `rev-list --max-count=N`, which yields the N most-recent commits *by
+    /// date* rather than every commit within `N-1` edges of the tip. At a
+    /// merge whose second-parent branch carries older commit dates, the
+    /// date-ordered window can fill up from the recent first-parent branch and
+    /// never visit the older branch, so a commit a real `--depth=N` clone
+    /// requires goes unchecked. With that commit absent from a partially
+    /// hydrated *non-shallow* cache, the predicate wrongly proves a window it
+    /// cannot actually serve, and the cache exposes an unservable snapshot.
+    ///
+    /// Graph (edge distance from the merge `m`):
+    ///   `m`=0; parents `{a3, q}`=1; `{a2, r}`=2; `{a1, base}`=3+
+    /// The `a*` commits are recent; the `q -> r` branch is old. `r` (edge 2,
+    /// required by `--depth=3`) is the only object withheld from the cache.
+    ///
+    /// The linear-history sibling test above passes only because the missing
+    /// commit is an *immediate* parent, which `rev-list` must parse for
+    /// date-ordering and thus errors on. The merge case removes that accident.
+    #[tokio::test]
+    async fn partial_hot_repo_declines_depth_window_when_older_merge_parent_branch_is_missing() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let work = fixture.work_path();
+        let base = fixture.head_commit();
+
+        // Older, low-date second-parent branch: base -> r -> q.
+        run_git(&work, ["checkout", "-q", "-b", "oldline", base.as_str()]);
+        let r = commit_dated(&work, "old.txt", "r", "old r", "2001-01-01T00:00:00 +0000");
+        let q = commit_dated(&work, "old.txt", "q", "old q", "2001-01-02T00:00:00 +0000");
+
+        // Recent first-parent branch on main: base -> a1 -> a2 -> a3.
+        run_git(&work, ["checkout", "-q", "main"]);
+        let _a1 = commit_dated(
+            &work,
+            "README.md",
+            "a1",
+            "recent a1",
+            "2026-06-01T00:00:00 +0000",
+        );
+        let _a2 = commit_dated(
+            &work,
+            "README.md",
+            "a2",
+            "recent a2",
+            "2026-06-02T00:00:00 +0000",
+        );
+        let a3 = commit_dated(
+            &work,
+            "README.md",
+            "a3",
+            "recent a3",
+            "2026-06-03T00:00:00 +0000",
+        );
+
+        // Merge the old branch into the recent tip => m (recent date).
+        run_git_dated(
+            &work,
+            "2026-06-04T00:00:00 +0000",
+            ["merge", "-q", "--no-ff", "-m", "merge oldline", "oldline"],
+        );
+        let m = fixture.head_commit();
+
+        // Document why a real --depth=3 needs r: m -> q -> r is two edges.
+        let merge_parents = git_stdout(&work, ["rev-list", "--parents", "-1", m.as_str()]);
+        assert!(
+            merge_parents.contains(a3.as_str()) && merge_parents.contains(q.as_str()),
+            "merge tip must have the recent branch (a3) and the older branch (q) as parents"
+        );
+        assert!(
+            git_stdout(&work, ["rev-list", "--parents", "-1", q.as_str()]).contains(r.as_str()),
+            "r must be q's parent (edge distance 2 from the tip, required by --depth=3)"
+        );
+
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        // Hydrate every object reachable from m EXCEPT r: a non-shallow repo
+        // whose only gap is one commit on the older merge-parent branch.
+        for commit in git_stdout(&work, ["rev-list", m.as_str()]).lines() {
+            if commit == r.as_str() {
+                continue;
+            }
+            let tree = git_stdout(&work, ["rev-parse", &format!("{commit}^{{tree}}")]);
+            copy_git_object(&work, &repo_dir, "commit", commit);
+            copy_git_object(&work, &repo_dir, "tree", &tree);
+        }
+        stdfs::write(repo_dir.join("git-cache-partial-hydration"), b"blobless\n").unwrap();
+
+        assert!(
+            !repo_dir.join("shallow").exists(),
+            "regression models a non-shallow repo with a partial merge-parent branch"
+        );
+        assert!(
+            !materializer.commit_exists(&repo_dir, &r).await,
+            "setup must leave the depth-3 window genuinely incomplete (r withheld)"
+        );
+        assert!(
+            materializer.commit_tree_exists_no_lazy(&repo_dir, &m).await,
+            "the merge tip and its tree must be present"
+        );
+
+        // Positive control: r sits at edge distance 2, so --depth=2 (edges
+        // 0..=1 = {m, a3, q}, all present) is genuinely serveable. This proves
+        // the predicate is not just trivially declining everything.
+        assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &m, 2)
+                .await
+                .unwrap(),
+            "depth-2 window is fully present and must be reported serveable"
+        );
+
+        // The bug: --depth=3 requires r (absent), but the date-ordered window
+        // [m, a3, a2] never visits the old branch, so the predicate proves a
+        // window the cache cannot serve without a lazy/read-through fetch.
+        assert!(
+            !materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &m, 3)
+                .await
+                .unwrap(),
+            "depth-3 window is missing r and must NOT be reported serveable"
+        );
+
+        // End-to-end: cache prepare must decline the depth-3 want instead of
+        // exposing an unservable shallow snapshot to upload-pack.
+        let mut depth3_body = make_upload_pack_pkt_line(&format!("want {m} multi_ack\n"));
+        depth3_body.extend_from_slice(b"0000");
+        depth3_body.extend(make_upload_pack_pkt_line("deepen 3\n"));
+        depth3_body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        depth3_body.extend(make_upload_pack_pkt_line("done\n"));
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(depth3_body))
+                .await
+                .unwrap(),
+            "cache prepare must decline a finite-depth request whose window needs a missing merge-parent commit"
         );
     }
 
@@ -1048,6 +1387,36 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    /// Run a git command with a fixed author/committer date so tests can build
+    /// history whose `rev-list` (commit-date) ordering is deterministic.
+    fn run_git_dated<I, S>(cwd: &FsPath, date: &str, args: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Stage `contents` into `file` and commit it on the current branch with a
+    /// fixed date, returning the new commit.
+    fn commit_dated(work: &FsPath, file: &str, contents: &str, msg: &str, date: &str) -> CommitSha {
+        stdfs::write(work.join(file), format!("{contents}\n")).unwrap();
+        run_git(work, ["add", file]);
+        run_git_dated(work, date, ["commit", "-m", msg]);
+        CommitSha::parse(git_stdout(work, ["rev-parse", "HEAD"])).unwrap()
     }
 
     #[tokio::test]
