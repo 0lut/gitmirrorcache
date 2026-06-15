@@ -15,8 +15,9 @@ use git_cache_disk::{AsyncDiskManager, AsyncReservation};
 use git_cache_domain::materializer::repo_from_git_path;
 pub use git_cache_domain::AppState as DomainAppState;
 use git_cache_domain::{
-    frame_ref_advertisement, plan_upload_pack_tee, synthesize_ref_advertisement, upload_pack_wants,
-    AppState, Materializer, PackDemux, UpstreamRefComparison,
+    frame_ref_advertisement, plan_upload_pack_tee, synthesize_ref_advertisement,
+    upload_pack_requests_shallow_history, upload_pack_wants, AppState, Materializer, PackDemux,
+    UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -1492,6 +1493,14 @@ fn direct_git_generation_task(
     request_id: u64,
 ) -> Option<DirectGitGenerationTask> {
     let comparison = comparison?;
+    if upload_pack_requests_shallow_history(body) {
+        info!(
+            request_id,
+            repo = %repo,
+            "direct git proxy-on-miss async materialize skipped: upload-pack request is shallow/deepen-limited"
+        );
+        return None;
+    }
     let wants = match upload_pack_wants(body) {
         Ok(wants) => wants,
         Err(error) => {

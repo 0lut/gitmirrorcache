@@ -265,11 +265,28 @@ async fn proxy_warm_task_queues_async_generation_materialize() {
     };
     let state = Arc::new(ApiState::try_new(config).unwrap());
     let materializer = Materializer::new(Arc::clone(&state.domain));
+    let shallow_body = upload_pack_body(&[
+        format!("want {commit} multi_ack thin-pack\n"),
+        "deepen 10\n".to_string(),
+    ]);
     let body = upload_pack_body(&[format!("want {commit} multi_ack thin-pack\n")]);
     let comparison = UpstreamRefComparison {
         default_branch: Some("main".into()),
         all_upstream: std::collections::HashMap::from([("main".into(), commit.to_string())]),
     };
+    assert!(
+        direct_git_generation_task(
+            &state,
+            &materializer,
+            &repo,
+            &UpstreamAuth::Anonymous,
+            &shallow_body,
+            Some(&comparison),
+            42,
+        )
+        .is_none(),
+        "shallow/deepen proxy requests should not queue full-history materialization"
+    );
     let generation_task = direct_git_generation_task(
         &state,
         &materializer,

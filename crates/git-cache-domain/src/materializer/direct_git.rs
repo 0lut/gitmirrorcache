@@ -1395,6 +1395,15 @@ pub fn upload_pack_wants(body: &[u8]) -> CoreResult<Vec<CommitSha>> {
     Ok(parse_upload_pack_intent(body)?.wants)
 }
 
+pub fn upload_pack_requests_shallow_history(body: &[u8]) -> bool {
+    parse_upload_pack_intent(body).is_ok_and(|intent| {
+        intent.depth.is_some()
+            || intent.deepen_since.is_some()
+            || !intent.deepen_not.is_empty()
+            || !intent.shallow.is_empty()
+    })
+}
+
 #[cfg(test)]
 fn parse_want_strings(wants: &[String]) -> CoreResult<Vec<CommitSha>> {
     wants
