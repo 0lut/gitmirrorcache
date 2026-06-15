@@ -158,21 +158,9 @@ inspect_hot_cache() {
   require_cmd python3
   init_aws_context
 
-  local script_file
-  script_file="$(mktemp)"
-  cat >"$script_file" <<'SCRIPT'
-container_id="$(docker ps \
-  --filter "label=com.amazonaws.ecs.task-definition-family=$expected_family" \
-  --filter "label=com.amazonaws.ecs.container-name=$expected_container" \
-  --format '{{.ID}}' | head -n1)"
-if [ -z "$container_id" ]; then
-  echo "no running ECS API container found" >&2
-  docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}'
-  exit 20
-fi
-repo_dir="/cache/repos/${repo}.git"
-echo "CONTAINER=$container_id"
-docker exec -e GIT_CACHE_REPO="$repo" "$container_id" sh -s <<'INNER'
+  local script_file inner_script_b64
+  inner_script_b64="$(
+    cat <<'INNER' | base64 | tr -d '\n'
 set -eu
 repo_dir="/cache/repos/${GIT_CACHE_REPO}.git"
 echo "REPO=$repo_dir"
@@ -204,7 +192,25 @@ fi
 echo SHOW_REF_TAIL
 git --git-dir="$repo_dir" show-ref | tail -30 || true
 INNER
+  )"
+  script_file="$(mktemp)"
+  {
+    printf "inner_script_b64='%s'\n" "$inner_script_b64"
+    cat <<'SCRIPT'
+container_id="$(docker ps \
+  --filter "label=com.amazonaws.ecs.task-definition-family=$expected_family" \
+  --filter "label=com.amazonaws.ecs.container-name=$expected_container" \
+  --format '{{.ID}}' | head -n1)"
+if [ -z "$container_id" ]; then
+  echo "no running ECS API container found" >&2
+  docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}'
+  exit 20
+fi
+repo_dir="/cache/repos/${repo}.git"
+echo "CONTAINER=$container_id"
+printf '%s' "$inner_script_b64" | base64 -d | docker exec -i -e GIT_CACHE_REPO="$repo" "$container_id" sh
 SCRIPT
+  } >"$script_file"
   send_ssm_script "$script_file" 600
   rm -f "$script_file"
 }

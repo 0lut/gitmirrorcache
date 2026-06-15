@@ -622,6 +622,20 @@ mod tests {
         );
         let boundaries = [tip.clone()];
         assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 1)
+                .await
+                .unwrap(),
+            "a depth-1 cache can serve a depth-1 pack"
+        );
+        assert!(
+            !materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 2)
+                .await
+                .unwrap(),
+            "a depth-1 cache must not claim it can serve a deeper fresh clone"
+        );
+        assert!(
             !materializer
                 .deepen_boundary_satisfied(&repo_dir, &boundaries, 1)
                 .await
@@ -665,6 +679,20 @@ mod tests {
                 .await
                 .unwrap(),
             "after deepening by two, a deepen of 2 is already covered"
+        );
+        assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 3)
+                .await
+                .unwrap(),
+            "a cache holding tip plus two ancestors can serve a fresh depth-3 clone"
+        );
+        assert!(
+            !materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 4)
+                .await
+                .unwrap(),
+            "the shallow boundary still cuts off a fresh depth-4 clone"
         );
         assert!(
             !materializer

@@ -132,6 +132,14 @@ impl Materializer {
         if window.is_empty() {
             return Ok(false);
         }
+        let shallow_commits = read_shallow_commits(repo_dir).await?;
+        if window.len() < depth as usize
+            && window
+                .last()
+                .is_some_and(|commit| shallow_commits.contains(commit.as_str()))
+        {
+            return Ok(false);
+        }
         for ancestor in &window {
             if !self.commit_tree_exists_no_lazy(repo_dir, ancestor).await {
                 return Ok(false);

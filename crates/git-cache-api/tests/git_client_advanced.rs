@@ -669,6 +669,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn fresh_blobless_depth_clone_expands_after_depth1_cache_warm() {
+        let server = TestServer::start_with_file_url_upstream(true).await;
+        run_git(
+            &server.upstream_bare,
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+
+        for message in [
+            "second depth expand",
+            "third depth expand",
+            "fourth depth expand",
+        ] {
+            std::fs::write(
+                server.upstream_work.join("README.md"),
+                format!("{message}\n"),
+            )
+            .unwrap();
+            run_git(&server.upstream_work, &["add", "README.md"]);
+            run_git(&server.upstream_work, &["commit", "-m", message]);
+        }
+        run_git(&server.upstream_work, &["push", "origin", "main"]);
+
+        let cache_repo = server.cache_repo_dir();
+        std::fs::remove_dir_all(&cache_repo).unwrap();
+
+        let url = server.git_url("github.com/org/repo");
+        let depth1_dir = server.tmp.path().join("depth1_cache_warm");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--depth=1",
+                "--branch",
+                "main",
+                "--no-checkout",
+                &url,
+                depth1_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            git_stdout_async(&depth1_dir, &["rev-list", "--count", "HEAD"]).await,
+            "1"
+        );
+        assert!(
+            cache_repo.join("shallow").exists(),
+            "depth-1 warm should leave the cache shallow"
+        );
+
+        let depth2_dir = server.tmp.path().join("depth2_after_depth1_cache");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--depth=2",
+                "--branch",
+                "main",
+                "--no-checkout",
+                &url,
+                depth2_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            git_stdout_async(&depth2_dir, &["rev-list", "--count", "HEAD"]).await,
+            "2",
+            "fresh depth-2 clone should expand the shallow cache beyond the depth-1 warm"
+        );
+        git_stdout_async(&depth2_dir, &["rev-parse", "--verify", "HEAD~1^{commit}"]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn blobless_depth_clone_succeeds_after_partial_non_shallow_hot_cache() {
         let server = TestServer::start_with_file_url_upstream(true).await;
         run_git(
