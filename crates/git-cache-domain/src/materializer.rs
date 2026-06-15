@@ -19,7 +19,7 @@ use git_cache_objectstore::{
     PublishManifests,
 };
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};

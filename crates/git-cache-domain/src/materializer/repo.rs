@@ -138,12 +138,15 @@ impl Materializer {
             return Ok(false);
         }
         let shallow_commits = read_shallow_commits(repo_dir).await?;
-        if window.len() < depth as usize
-            && window
-                .last()
-                .is_some_and(|commit| shallow_commits.contains(commit.as_str()))
-        {
-            return Ok(false);
+        if !shallow_commits.is_empty() {
+            if let Some(boundary_depth) = self
+                .nearest_shallow_boundary_depth_no_lazy(repo_dir, commit, &shallow_commits)
+                .await?
+            {
+                if boundary_depth.saturating_add(1) < depth {
+                    return Ok(false);
+                }
+            }
         }
         for ancestor in &window {
             if !self.commit_tree_exists_no_lazy(repo_dir, ancestor).await {
@@ -151,6 +154,53 @@ impl Materializer {
             }
         }
         Ok(true)
+    }
+
+    async fn nearest_shallow_boundary_depth_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+        shallow_commits: &HashSet<String>,
+    ) -> CoreResult<Option<u32>> {
+        let output = match self
+            .state
+            .git
+            .run_no_lazy(Some(repo_dir), ["rev-list", "--parents", commit.as_str()])
+            .await
+        {
+            Ok(output) => output,
+            Err(_) => return Ok(None),
+        };
+        let text = output.stdout_utf8("rev-list --parents")?;
+        let mut parents_by_commit: HashMap<CommitSha, Vec<CommitSha>> = HashMap::new();
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let mut parts = line.split_whitespace();
+            let Some(commit) = parts.next() else {
+                continue;
+            };
+            let commit = CommitSha::parse(commit)?;
+            let parents = parts
+                .map(CommitSha::parse)
+                .collect::<CoreResult<Vec<_>>>()?;
+            parents_by_commit.insert(commit, parents);
+        }
+
+        let mut queue = VecDeque::from([(commit.clone(), 0u32)]);
+        let mut seen = HashSet::new();
+        while let Some((current, depth)) = queue.pop_front() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if shallow_commits.contains(current.as_str()) {
+                return Ok(Some(depth));
+            }
+            if let Some(parents) = parents_by_commit.get(&current) {
+                for parent in parents {
+                    queue.push_back((parent.clone(), depth.saturating_add(1)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub(super) async fn commit_history_complete_no_lazy(
