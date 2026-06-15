@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+use tokio::sync::OwnedMutexGuard;
 use tracing::{debug, info, warn};
 
 mod access;
@@ -38,12 +39,19 @@ mod repo;
 mod util;
 
 pub use direct_git::{
-    frame_ref_advertisement, synthesize_ref_advertisement, upload_pack_wants, UpstreamRefComparison,
+    frame_ref_advertisement, synthesize_ref_advertisement, upload_pack_requests_shallow_history,
+    upload_pack_wants, UpstreamRefComparison,
 };
 pub use executor::MaterializerExecutor;
 pub use generations::{default_manifest_key, CompactionReport, GenerationSweepReport};
 pub use proxy_tee::{plan_upload_pack_tee, PackDemux, UploadPackTeePlan};
 pub use repo::repo_from_git_path;
+
+/// Maximum finite client depth we will prove locally with an all-parent BFS.
+/// Larger values are treated as effectively full-history requests and routed
+/// through fetch/unshallow paths instead of running client-controlled numbers
+/// of local graph-walk subprocess batches.
+pub(super) const MAX_LOCAL_DEPTH_WINDOW_PROOF: u32 = 1024;
 
 #[derive(Clone)]
 pub struct Materializer {

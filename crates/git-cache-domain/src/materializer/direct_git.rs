@@ -78,12 +78,6 @@ impl UploadPackIntent {
     }
 }
 
-/// Git's sentinel "infinite" depth, sent on the wire by `git fetch
-/// --unshallow` (`deepen 2147483647`). A client deepen at or above this is an
-/// unshallow in disguise and must extend the cache to full history rather than
-/// taking the bounded-deepen path.
-const GIT_INFINITE_DEPTH: u32 = 0x7fff_ffff;
-
 #[derive(Debug, Clone, Copy)]
 struct DirectFetchOptions {
     filter: Option<&'static str>,
@@ -390,7 +384,7 @@ impl Materializer {
             // serves the client's true (absolute or relative) depth semantics,
             // so the served result stays correct either way.
             match fetch_options.depth {
-                Some(depth) if depth < GIT_INFINITE_DEPTH && !force_refetch => {
+                Some(depth) if depth <= MAX_LOCAL_DEPTH_WINDOW_PROOF && !force_refetch => {
                     // A stateless deepen runs multiple upload-pack rounds; only
                     // deepen the cache on the round that actually needs more
                     // history, so the boundary advances by N once rather than
@@ -466,6 +460,23 @@ impl Materializer {
                     && !needs_history_extension
                     && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
                 {
+                    if let Some(depth) = fetch_options.depth {
+                        if depth > 1
+                            && !self
+                                .depth_window_ready_for_serving_no_lazy(&repo_dir, object_id, depth)
+                                .await?
+                        {
+                            pending_requires_refetch = true;
+                            pending.push(object_id.clone());
+                            info!(
+                                %repo,
+                                commit = %object_id,
+                                depth,
+                                "direct git hot commit lacks requested depth window; falling back to read-through fetch"
+                            );
+                            continue;
+                        }
+                    }
                     if closure_marker_present && fetch_options.needs_full_object_history() {
                         checked_suspect_hot_closure = true;
                         if !self
@@ -550,10 +561,8 @@ impl Materializer {
         }
 
         if !pending.is_empty() {
-            let fetch_options = if pending_requires_refetch
-                && fetch_options.needs_full_object_history()
-                && !needs_history_extension
-            {
+            let _mutation_lock = self.lock_repo_mutation(repo).await?;
+            let fetch_options = if pending_requires_refetch && !needs_history_extension {
                 fetch_options.with_refetch()
             } else {
                 fetch_options
@@ -902,6 +911,7 @@ impl Materializer {
             tokio::time::sleep(SERVING_MAINTENANCE_DELAY).await;
             let started = Instant::now();
             let result = async {
+                let _mutation_lock = materializer.lock_repo_mutation(&repo).await?;
                 materializer.state.git.repack_for_serving(&repo_dir).await?;
                 materializer.state.git.commit_graph_write(&repo_dir).await?;
                 CoreResult::Ok(())
@@ -953,6 +963,7 @@ impl Materializer {
 
     pub async fn optimize_repo_for_serving(&self, repo: &RepoKey) -> CoreResult<()> {
         let repo_dir = self.ensure_repo_dir(repo).await?;
+        let _mutation_lock = self.lock_repo_mutation(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
         self.configure_served_repo(&repo_dir).await?;
         self.state.git.repack_for_serving(&repo_dir).await?;
@@ -1038,6 +1049,22 @@ impl Materializer {
                         "direct git cache prepare declined: repo is shallow, commit want needs more history"
                     );
                     return Ok(false);
+                }
+                if let Some(depth) = intent.depth {
+                    if depth > 1
+                        && !self
+                            .depth_window_ready_for_serving_no_lazy(&repo_dir, object_id, depth)
+                            .await?
+                    {
+                        info!(
+                            %repo,
+                            commit = %object_id,
+                            wants_count,
+                            depth,
+                            "direct git cache prepare declined: commit want lacks requested depth window"
+                        );
+                        return Ok(false);
+                    }
                 }
                 if self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
                     self.expose_served_commit(&repo_dir, object_id).await?;
@@ -1360,6 +1387,15 @@ pub(super) fn parse_upload_pack_intent(body: &[u8]) -> CoreResult<UploadPackInte
 
 pub fn upload_pack_wants(body: &[u8]) -> CoreResult<Vec<CommitSha>> {
     Ok(parse_upload_pack_intent(body)?.wants)
+}
+
+pub fn upload_pack_requests_shallow_history(body: &[u8]) -> bool {
+    parse_upload_pack_intent(body).is_ok_and(|intent| {
+        intent.depth.is_some()
+            || intent.deepen_since.is_some()
+            || !intent.deepen_not.is_empty()
+            || !intent.shallow.is_empty()
+    })
 }
 
 #[cfg(test)]
