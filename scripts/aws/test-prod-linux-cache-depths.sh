@@ -7,6 +7,7 @@ source "$SCRIPT_DIR/common.sh"
 BASE_URL="${BASE_URL:-https://gitcache.sh}"
 GIT_REPO_PATH="${GIT_REPO_PATH:-github.com/torvalds/linux}"
 DEPTHS="${DEPTHS:-1 10 50}"
+MODES="${MODES:-default proxy-off}"
 RUN_REPEATS="${RUN_REPEATS:-true}"
 AWS_INSPECT="${AWS_INSPECT:-true}"
 AWS_LOG_TAIL="${AWS_LOG_TAIL:-true}"
@@ -35,6 +36,7 @@ require_cmd curl
 printf 'WORKDIR=%s\n' "$WORKDIR"
 printf 'REMOTE_URL=%s\n' "$REMOTE_URL"
 printf 'DEPTHS=%s\n' "$DEPTHS"
+printf 'MODES=%s\n' "$MODES"
 
 metrics() {
   local label="$1"
@@ -54,18 +56,25 @@ clone_one() {
   rm -rf "$dir"
   started="$(date +%s)"
   set +e
-  if [[ "$mode" == "proxy-off" ]]; then
-    git \
-      -c protocol.version=2 \
-      -c 'http.extraHeader=git-cache-use-proxy-on-miss: false' \
-      clone --quiet --single-branch --no-tags --filter=blob:none \
-      --no-checkout --depth "$depth" "$REMOTE_URL" "$dir" 2>"$err"
-  else
-    git \
-      -c protocol.version=2 \
-      clone --quiet --single-branch --no-tags --filter=blob:none \
-      --no-checkout --depth "$depth" "$REMOTE_URL" "$dir" 2>"$err"
-  fi
+  case "$mode" in
+    proxy-off)
+      git \
+        -c protocol.version=2 \
+        -c 'http.extraHeader=git-cache-use-proxy-on-miss: false' \
+        clone --quiet --single-branch --no-tags --filter=blob:none \
+        --no-checkout --depth "$depth" "$REMOTE_URL" "$dir" 2>"$err"
+      ;;
+    default)
+      git \
+        -c protocol.version=2 \
+        clone --quiet --single-branch --no-tags --filter=blob:none \
+        --no-checkout --depth "$depth" "$REMOTE_URL" "$dir" 2>"$err"
+      ;;
+    *)
+      printf 'invalid mode: %s\n' "$mode" >&2
+      exit 2
+      ;;
+  esac
   exit_code=$?
   set -e
   finished="$(date +%s)"
@@ -87,10 +96,12 @@ clone_one() {
 
 run_matrix() {
   local phase="$1"
-  local depth
+  local depth mode mode_label
   for depth in $DEPTHS; do
-    clone_one "${phase}_default_depth${depth}" default "$depth"
-    clone_one "${phase}_proxy_off_depth${depth}" proxy-off "$depth"
+    for mode in $MODES; do
+      mode_label="${mode//-/_}"
+      clone_one "${phase}_${mode_label}_depth${depth}" "$mode" "$depth"
+    done
   done
 }
 
