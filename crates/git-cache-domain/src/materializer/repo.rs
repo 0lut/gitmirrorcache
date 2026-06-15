@@ -128,7 +128,7 @@ impl Materializer {
         commit: &CommitSha,
         depth: u32,
     ) -> CoreResult<bool> {
-        if depth == 0 {
+        if depth == 0 || depth > MAX_LOCAL_DEPTH_WINDOW_PROOF {
             return Ok(false);
         }
         let window = self
@@ -166,7 +166,7 @@ impl Materializer {
         commit: &CommitSha,
         depth: u32,
     ) -> CoreResult<Vec<(CommitSha, u32)>> {
-        if depth == 0 {
+        if depth == 0 || depth > MAX_LOCAL_DEPTH_WINDOW_PROOF {
             return Ok(Vec::new());
         }
 
@@ -241,6 +241,9 @@ impl Materializer {
     ) -> CoreResult<bool> {
         // No declared client boundary: cannot prove coverage, so deepen.
         if boundaries.is_empty() {
+            return Ok(false);
+        }
+        if depth > MAX_LOCAL_DEPTH_WINDOW_PROOF {
             return Ok(false);
         }
         let shallow_commits = read_shallow_commits(repo_dir).await?;

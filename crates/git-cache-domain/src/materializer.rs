@@ -47,6 +47,12 @@ pub use generations::{default_manifest_key, CompactionReport, GenerationSweepRep
 pub use proxy_tee::{plan_upload_pack_tee, PackDemux, UploadPackTeePlan};
 pub use repo::repo_from_git_path;
 
+/// Maximum finite client depth we will prove locally with an all-parent BFS.
+/// Larger values are treated as effectively full-history requests and routed
+/// through fetch/unshallow paths instead of running client-controlled numbers
+/// of local graph-walk subprocess batches.
+pub(super) const MAX_LOCAL_DEPTH_WINDOW_PROOF: u32 = 1024;
+
 #[derive(Clone)]
 pub struct Materializer {
     state: Arc<AppState>,

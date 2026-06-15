@@ -482,6 +482,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_pack_cache_prepare_declines_over_cap_client_depth() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+
+        let cached = materializer
+            .materialize(MaterializeRequest {
+                repo: fixture.repo.clone(),
+                selector: Selector::Branch(BranchName::parse("main").unwrap()),
+                upstream_authorization: Default::default(),
+            })
+            .await
+            .unwrap();
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        assert!(
+            !repo_dir.join("shallow").exists(),
+            "regression setup models the steady-state non-shallow cache"
+        );
+
+        let mut body =
+            make_upload_pack_pkt_line(&format!("want {} multi_ack thin-pack\n", cached.commit));
+        body.extend_from_slice(b"0000");
+        body.extend(make_upload_pack_pkt_line("deepen 2000000000\n"));
+        body.extend(make_upload_pack_pkt_line("done\n"));
+
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(body))
+                .await
+                .unwrap(),
+            "over-cap finite depths must decline instead of running a client-controlled local proof"
+        );
+    }
+
+    #[tokio::test]
     async fn warm_upload_pack_fetches_upstream_when_manifest_bundle_is_unavailable() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());
@@ -738,10 +773,32 @@ mod tests {
         );
         assert!(
             !materializer
+                .depth_window_ready_for_serving_no_lazy(
+                    &repo_dir,
+                    &tip,
+                    MAX_LOCAL_DEPTH_WINDOW_PROOF + 1,
+                )
+                .await
+                .unwrap(),
+            "over-cap client depths must decline instead of running an unbounded local proof"
+        );
+        assert!(
+            !materializer
                 .deepen_boundary_satisfied(&repo_dir, &boundaries, 3)
                 .await
                 .unwrap(),
             "the cache still cuts history inside a deepen of 3"
+        );
+        assert!(
+            !materializer
+                .deepen_boundary_satisfied(
+                    &repo_dir,
+                    &boundaries,
+                    MAX_LOCAL_DEPTH_WINDOW_PROOF + 1,
+                )
+                .await
+                .unwrap(),
+            "over-cap deepen requests must not run an unbounded local proof"
         );
 
         // A boundary commit the cache does not have is never satisfied, and an
