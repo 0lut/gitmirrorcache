@@ -607,7 +607,57 @@ impl Materializer {
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
             )
         };
-        Ok(lock.lock_owned().await)
+        let guard = lock.lock_owned().await;
+        // Now that we hold the per-repo mutation guard, no other in-worker
+        // mutation is touching this repo, so any repo-global Git lock file left
+        // on disk is orphaned from a fetch/repack/commit-graph child that was
+        // killed mid-write (timeout, dropped future, OOM). Clear it before the
+        // caller's mutation runs, otherwise Git fails the operation with
+        // `Unable to create '...': File exists` and the repo stays poisoned
+        // until a human removes the file.
+        self.clear_stale_repo_locks(repo).await;
+        Ok(guard)
+    }
+
+    /// Best-effort removal of orphaned repo-global Git lock files.
+    ///
+    /// These are single, repo-wide locks that only a *mutation* ever holds:
+    /// `shallow.lock` guards shallow-boundary rewrites (`--depth`/`--deepen`),
+    /// `commit-graph.lock` guards commit-graph writes, and `packed-refs.lock`
+    /// guards `pack-refs`. Upload-pack reads never create them. Callers must
+    /// only invoke this while holding the per-repo mutation guard (it is called
+    /// from `lock_repo_mutation` for exactly that reason), which — for the
+    /// single-worker production deployment — guarantees no live Git child holds
+    /// any of these, so removing a present one is safe recovery, not a race.
+    ///
+    /// Missing dir, missing lock, and concurrent removal all collapse to a
+    /// no-op; a removal error is logged but never fails the mutation, since the
+    /// subsequent Git command will surface the real problem if the lock truly
+    /// could not be cleared.
+    pub(super) async fn clear_stale_repo_locks(&self, repo: &RepoKey) {
+        const STALE_REPO_LOCK_FILES: [&str; 3] = [
+            "shallow.lock",
+            "objects/info/commit-graph.lock",
+            "packed-refs.lock",
+        ];
+        let repo_dir = self.repo_dir(repo);
+        for rel in STALE_REPO_LOCK_FILES {
+            let lock_path = repo_dir.join(rel);
+            match fs::remove_file(&lock_path).await {
+                Ok(()) => warn!(
+                    %repo,
+                    lock = rel,
+                    "removed stale git lock file before repo mutation"
+                ),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => warn!(
+                    %repo,
+                    lock = rel,
+                    %err,
+                    "failed to remove stale git lock file; mutation may fail"
+                ),
+            }
+        }
     }
 
     pub(super) async fn reset_invalid_repo_cache(&self, repo: &RepoKey) -> CoreResult<()> {

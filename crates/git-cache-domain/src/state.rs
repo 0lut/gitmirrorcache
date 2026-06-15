@@ -37,6 +37,11 @@ pub struct AppState {
     /// Repo dirs with a queued or running background serving-maintenance
     /// task (repack + commit-graph), to dedupe bursts of hydrating requests.
     pub serving_maintenance_inflight: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Repo dirs with a queued or running background connectivity `fsck`, to
+    /// dedupe bursts of hydrating requests. Without this, every served commit
+    /// could enqueue another `git fsck`, stampeding several long-running
+    /// connectivity checks over the same objects on a large repo.
+    pub direct_fsck_inflight: Arc<Mutex<HashSet<PathBuf>>>,
     /// Per-worker, per-repo gates for operations that mutate a bare repo.
     /// The disk `RepoLock` only protects eviction; this prevents concurrent
     /// fetch/import/repack operations in the same worker from colliding on
@@ -141,6 +146,7 @@ impl AppState {
             git,
             disk: AsyncDiskManager::new(disk),
             serving_maintenance_inflight: Arc::new(Mutex::new(HashSet::new())),
+            direct_fsck_inflight: Arc::new(Mutex::new(HashSet::new())),
             repo_mutation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         })
     }
