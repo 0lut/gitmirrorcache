@@ -821,6 +821,94 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "reproduces prod stale shallow.lock failure before recovery fix"]
+    async fn direct_git_deepen_recovers_from_stale_shallow_lock() {
+        let fixture = GitFixture::new();
+        for message in ["second", "third", "fourth", "fifth", "sixth"] {
+            fixture.commit_and_push(message);
+        }
+        let tip = fixture.head_commit();
+
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), tip.to_string())]),
+        };
+
+        let mut depth1_body = make_upload_pack_pkt_line(&format!("want {tip} multi_ack\n"));
+        depth1_body.extend_from_slice(b"0000");
+        depth1_body.extend(make_upload_pack_pkt_line("deepen 1\n"));
+        depth1_body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        depth1_body.extend(make_upload_pack_pkt_line("done\n"));
+        let depth1_intent =
+            super::super::direct_git::parse_upload_pack_intent(&depth1_body).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &depth1_intent,
+                &comparison,
+            )
+            .await
+            .expect("depth-1 read-through should seed a shallow cache repo");
+
+        let shallow_file = repo_dir.join("shallow");
+        assert!(
+            shallow_file.exists(),
+            "regression setup must leave the cache repo shallow"
+        );
+        assert!(
+            !materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 2)
+                .await
+                .unwrap(),
+            "regression setup must not already cover the deepen request"
+        );
+
+        let shallow_lock = repo_dir.join("shallow.lock");
+        let shallow_contents = stdfs::read(&shallow_file).unwrap();
+        stdfs::write(&shallow_lock, shallow_contents).unwrap();
+
+        let mut deepen_body = make_upload_pack_pkt_line(&format!("want {tip} multi_ack\n"));
+        deepen_body.extend_from_slice(b"0000");
+        deepen_body.extend(make_upload_pack_pkt_line(&format!("shallow {tip}\n")));
+        deepen_body.extend(make_upload_pack_pkt_line("deepen 2\n"));
+        deepen_body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        deepen_body.extend(make_upload_pack_pkt_line("done\n"));
+        let deepen_intent =
+            super::super::direct_git::parse_upload_pack_intent(&deepen_body).unwrap();
+        assert!(
+            deepen_intent.deepens_existing_shallow_boundary(),
+            "regression must exercise the existing-shallow-client deepen path"
+        );
+
+        let result = materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &deepen_intent,
+                &comparison,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "stale shallow.lock should be recovered before bounded deepen, not surfaced as read-through failure: {result:?}"
+        );
+        assert!(
+            !shallow_lock.exists(),
+            "successful recovery should clear the stale shallow.lock"
+        );
+        assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &tip, 3)
+                .await
+                .unwrap(),
+            "bounded deepen should extend the cache enough for the client's request"
+        );
+    }
+
+    #[tokio::test]
     async fn blobless_hydrated_repo_refetches_full_objects_for_unfiltered_wants() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());
