@@ -841,6 +841,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_hot_repo_declines_blobless_depth_when_ancestry_window_is_missing() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let parent = fixture.head_commit();
+        let commit = fixture.commit_and_push("second partial depth window");
+        let repo_dir = materializer.ensure_repo_dir(&fixture.repo).await.unwrap();
+        let tree = git_stdout(
+            &fixture.work_path(),
+            ["rev-parse", &format!("{commit}^{{tree}}")],
+        );
+        let comparison = UpstreamRefComparison {
+            default_branch: Some("main".to_string()),
+            all_upstream: HashMap::from([("main".to_string(), commit.to_string())]),
+        };
+
+        copy_git_object(&fixture.work_path(), &repo_dir, "commit", commit.as_str());
+        copy_git_object(&fixture.work_path(), &repo_dir, "tree", &tree);
+        stdfs::write(repo_dir.join("git-cache-partial-hydration"), b"blobless\n").unwrap();
+        assert!(
+            materializer
+                .commit_ready_for_serving_no_lazy(&repo_dir, &commit)
+                .await,
+            "test setup should leave the tip commit and tree present"
+        );
+        assert!(
+            !materializer.commit_exists(&repo_dir, &parent).await,
+            "test setup should leave the requested depth window incomplete"
+        );
+        assert!(
+            !repo_dir.join("shallow").exists(),
+            "regression setup models a non-shallow repo with partial current-tip history"
+        );
+
+        let mut depth2_body = make_upload_pack_pkt_line(&format!("want {commit} multi_ack\n"));
+        depth2_body.extend_from_slice(b"0000");
+        depth2_body.extend(make_upload_pack_pkt_line("deepen 2\n"));
+        depth2_body.extend(make_upload_pack_pkt_line("filter blob:none\n"));
+        depth2_body.extend(make_upload_pack_pkt_line("done\n"));
+
+        assert!(
+            !materializer
+                .prepare_upload_pack_from_cache(&fixture.repo, &Bytes::from(depth2_body.clone()))
+                .await
+                .unwrap(),
+            "cache prepare must decline when a finite-depth blobless request needs missing ancestors"
+        );
+
+        let intent = super::super::direct_git::parse_upload_pack_intent(&depth2_body).unwrap();
+        materializer
+            .ensure_upload_pack_intent_available_from_comparison(
+                &fixture.repo,
+                &intent,
+                &comparison,
+            )
+            .await
+            .expect("read-through should fetch the missing finite-depth ancestry");
+
+        assert!(
+            materializer.commit_exists(&repo_dir, &parent).await,
+            "depth-2 read-through should fetch the missing parent before local upload-pack serves"
+        );
+        assert!(
+            materializer
+                .depth_window_ready_for_serving_no_lazy(&repo_dir, &commit, 2)
+                .await
+                .unwrap(),
+            "the local cache should now prove the requested depth window"
+        );
+    }
+
+    #[tokio::test]
     async fn shallow_hydrated_repo_unshallows_for_full_history_wants() {
         let fixture = GitFixture::new();
         let state = Arc::new(fixture.state());

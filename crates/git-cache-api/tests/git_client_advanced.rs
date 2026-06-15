@@ -10,9 +10,10 @@ mod tests {
     use super::support;
 
     use git_cache_api::app;
+    use std::io::Write;
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use tempfile::TempDir;
     use tokio::net::TcpListener;
 
@@ -179,6 +180,51 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn git_output(cwd: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn run_git_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+        let mut child = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn copy_git_object(source_repo: &Path, target_repo: &Path, object_type: &str, object: &str) {
+        let bytes = git_output(source_repo, &["cat-file", object_type, object]);
+        let written = run_git_with_stdin(
+            target_repo,
+            &["hash-object", "-w", "-t", object_type, "--stdin"],
+            &bytes,
+        );
+        assert_eq!(String::from_utf8(written).unwrap().trim(), object);
     }
 
     async fn run_git_async(cwd: &Path, args: &[&str]) {
@@ -620,6 +666,97 @@ mod tests {
         let after = git_stdout_async(&clone_dir, &["rev-list", "--count", "HEAD"]).await;
         assert_eq!(after, "4", "fetch --deepen=3 should add three commits");
         git_stdout_async(&clone_dir, &["rev-parse", "--verify", "HEAD~3^{commit}"]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blobless_depth_clone_succeeds_after_partial_non_shallow_hot_cache() {
+        let server = TestServer::start_with_file_url_upstream(true).await;
+        run_git(
+            &server.upstream_bare,
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+
+        // The server startup warmed the initial commit into a complete,
+        // non-shallow cache. Advance upstream without the helper that rewarms
+        // all heads, matching prod's "old complete cache + newer partial tip"
+        // state.
+        for message in [
+            "second partial hot",
+            "third partial hot",
+            "fourth partial hot",
+        ] {
+            std::fs::write(
+                server.upstream_work.join("README.md"),
+                format!("{message}\n"),
+            )
+            .unwrap();
+            run_git(&server.upstream_work, &["add", "README.md"]);
+            run_git(&server.upstream_work, &["commit", "-m", message]);
+        }
+        run_git(&server.upstream_work, &["push", "origin", "main"]);
+
+        let cache_repo = server.cache_repo_dir();
+        let current = git_stdout(&server.upstream_work, &["rev-parse", "HEAD"]);
+        let parent = git_stdout(&server.upstream_work, &["rev-parse", "HEAD^"]);
+        let tree = git_stdout(&server.upstream_work, &["rev-parse", "HEAD^{tree}"]);
+        copy_git_object(&server.upstream_work, &cache_repo, "commit", &current);
+        copy_git_object(&server.upstream_work, &cache_repo, "tree", &tree);
+        run_git(
+            &cache_repo,
+            &["update-ref", "refs/cache/upstream/heads/main", &current],
+        );
+        std::fs::write(
+            cache_repo.join("git-cache-partial-hydration"),
+            b"blobless\n",
+        )
+        .unwrap();
+
+        assert!(
+            !cache_repo.join("shallow").exists(),
+            "old complete cache plus new blobless tip should be non-shallow"
+        );
+        assert!(
+            cache_repo.join("git-cache-partial-hydration").exists(),
+            "test setup should leave a partial hydration marker"
+        );
+        assert_eq!(
+            git_stdout(&cache_repo, &["cat-file", "-t", &current]),
+            "commit",
+            "test setup should leave the current tip commit hot"
+        );
+        assert!(
+            !Command::new("git")
+                .current_dir(&cache_repo)
+                .args(["cat-file", "-e", &format!("{parent}^{{commit}}")])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "test setup should leave the parent missing from the hot cache"
+        );
+
+        let url = server.git_url("github.com/org/repo");
+        let depth2_dir = server.tmp.path().join("partial_hot_depth2_clone");
+        run_git_async(
+            server.tmp.path(),
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--depth=2",
+                "--branch",
+                "main",
+                "--no-checkout",
+                &url,
+                depth2_dir.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert_eq!(
+            git_stdout_async(&depth2_dir, &["rev-list", "--count", "HEAD"]).await,
+            "2",
+            "depth-2 blobless clone should fetch the missing parent before serving locally"
+        );
+        git_stdout_async(&depth2_dir, &["rev-parse", "--verify", "HEAD~1^{commit}"]).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

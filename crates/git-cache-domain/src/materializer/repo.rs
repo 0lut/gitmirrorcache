@@ -111,6 +111,35 @@ impl Materializer {
         Ok(true)
     }
 
+    /// Whether a depth-limited pack for `commit` can be served from the local
+    /// cache without lazy promisor fetches. This proves that Git can walk the
+    /// requested finite ancestry window and that every commit in that window
+    /// has its tree locally available.
+    pub(super) async fn depth_window_ready_for_serving_no_lazy(
+        &self,
+        repo_dir: &FsPath,
+        commit: &CommitSha,
+        depth: u32,
+    ) -> CoreResult<bool> {
+        if depth == 0 {
+            return Ok(false);
+        }
+        let window = self
+            .state
+            .git
+            .commit_ancestry_window_no_lazy(repo_dir, commit, depth)
+            .await?;
+        if window.is_empty() {
+            return Ok(false);
+        }
+        for ancestor in &window {
+            if !self.commit_tree_exists_no_lazy(repo_dir, ancestor).await {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) async fn commit_history_complete_no_lazy(
         &self,
         repo_dir: &FsPath,

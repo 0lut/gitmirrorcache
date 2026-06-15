@@ -466,6 +466,23 @@ impl Materializer {
                     && !needs_history_extension
                     && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
                 {
+                    if let Some(depth) = fetch_options.depth {
+                        if depth > 1
+                            && !self
+                                .depth_window_ready_for_serving_no_lazy(&repo_dir, object_id, depth)
+                                .await?
+                        {
+                            pending_requires_refetch = true;
+                            pending.push(object_id.clone());
+                            info!(
+                                %repo,
+                                commit = %object_id,
+                                depth,
+                                "direct git hot commit lacks requested depth window; falling back to read-through fetch"
+                            );
+                            continue;
+                        }
+                    }
                     if closure_marker_present && fetch_options.needs_full_object_history() {
                         checked_suspect_hot_closure = true;
                         if !self
@@ -550,10 +567,7 @@ impl Materializer {
         }
 
         if !pending.is_empty() {
-            let fetch_options = if pending_requires_refetch
-                && fetch_options.needs_full_object_history()
-                && !needs_history_extension
-            {
+            let fetch_options = if pending_requires_refetch && !needs_history_extension {
                 fetch_options.with_refetch()
             } else {
                 fetch_options
@@ -1038,6 +1052,22 @@ impl Materializer {
                         "direct git cache prepare declined: repo is shallow, commit want needs more history"
                     );
                     return Ok(false);
+                }
+                if let Some(depth) = intent.depth {
+                    if depth > 1
+                        && !self
+                            .depth_window_ready_for_serving_no_lazy(&repo_dir, object_id, depth)
+                            .await?
+                    {
+                        info!(
+                            %repo,
+                            commit = %object_id,
+                            wants_count,
+                            depth,
+                            "direct git cache prepare declined: commit want lacks requested depth window"
+                        );
+                        return Ok(false);
+                    }
                 }
                 if self.commit_tree_exists_no_lazy(&repo_dir, object_id).await {
                     self.expose_served_commit(&repo_dir, object_id).await?;
