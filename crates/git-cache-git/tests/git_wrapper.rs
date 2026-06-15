@@ -192,6 +192,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_parent_map_no_lazy_reports_direct_parents() {
+        let temp = TempTree::new("parent-map");
+        let (source_repo, first_sha) = create_source_repo(&temp.path);
+        let cache_repo = temp.path.join("cache.git");
+        let git = test_git();
+
+        let second_sha = commit_source(&source_repo, "second");
+        let third_sha = commit_source(&source_repo, "third");
+        git.init_bare(&cache_repo).await.expect("init cache repo");
+        git.fetch_ref(
+            &cache_repo,
+            path_arg(&source_repo),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions::default(),
+        )
+        .await
+        .expect("fetch main");
+
+        let first = CommitSha::parse(first_sha).unwrap();
+        let second = CommitSha::parse(second_sha).unwrap();
+        let third = CommitSha::parse(third_sha).unwrap();
+        let missing = CommitSha::parse("0".repeat(40)).unwrap();
+        let parents = git
+            .commit_parent_map_no_lazy(
+                &cache_repo,
+                &[
+                    first.clone(),
+                    second.clone(),
+                    third.clone(),
+                    missing.clone(),
+                ],
+            )
+            .await
+            .expect("read parent map");
+
+        assert_eq!(parents.get(&first), Some(&Vec::new()));
+        assert_eq!(parents.get(&second), Some(&vec![first]));
+        assert_eq!(parents.get(&third), Some(&vec![second]));
+        assert!(
+            !parents.contains_key(&missing),
+            "missing commits should be omitted"
+        );
+    }
+
+    #[tokio::test]
     async fn deepen_extends_shallow_boundary_without_unshallowing() {
         let temp = TempTree::new("deepen-extends");
         let (source_repo, _) = create_source_repo(&temp.path);

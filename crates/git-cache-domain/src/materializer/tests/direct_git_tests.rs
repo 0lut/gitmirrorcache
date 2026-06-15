@@ -1017,9 +1017,27 @@ mod tests {
 
         // Recent first-parent branch on main: base -> a1 -> a2 -> a3.
         run_git(&work, ["checkout", "-q", "main"]);
-        let _a1 = commit_dated(&work, "README.md", "a1", "recent a1", "2026-06-01T00:00:00 +0000");
-        let _a2 = commit_dated(&work, "README.md", "a2", "recent a2", "2026-06-02T00:00:00 +0000");
-        let a3 = commit_dated(&work, "README.md", "a3", "recent a3", "2026-06-03T00:00:00 +0000");
+        let _a1 = commit_dated(
+            &work,
+            "README.md",
+            "a1",
+            "recent a1",
+            "2026-06-01T00:00:00 +0000",
+        );
+        let _a2 = commit_dated(
+            &work,
+            "README.md",
+            "a2",
+            "recent a2",
+            "2026-06-02T00:00:00 +0000",
+        );
+        let a3 = commit_dated(
+            &work,
+            "README.md",
+            "a3",
+            "recent a3",
+            "2026-06-03T00:00:00 +0000",
+        );
 
         // Merge the old branch into the recent tip => m (recent date).
         run_git_dated(

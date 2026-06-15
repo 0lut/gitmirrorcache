@@ -1,5 +1,7 @@
 use super::*;
 
+const REPO_MUTATION_LOCK_GC_THRESHOLD: usize = 4096;
+
 impl Materializer {
     pub(super) fn upstream_git(&self, remote_url: &str) -> CoreResult<git_cache_git::Git> {
         self.state
@@ -118,8 +120,8 @@ impl Materializer {
 
     /// Whether a depth-limited pack for `commit` can be served from the local
     /// cache without lazy promisor fetches. This proves that Git can walk the
-    /// requested finite ancestry window and that every commit in that window
-    /// has its tree locally available.
+    /// true all-parent, depth-bounded ancestry window and that every commit in
+    /// that window has its tree locally available.
     pub(super) async fn depth_window_ready_for_serving_no_lazy(
         &self,
         repo_dir: &FsPath,
@@ -130,25 +132,18 @@ impl Materializer {
             return Ok(false);
         }
         let window = self
-            .state
-            .git
-            .commit_ancestry_window_no_lazy(repo_dir, commit, depth)
+            .depth_bounded_ancestry_window_no_lazy(repo_dir, commit, depth)
             .await?;
         if window.is_empty() {
             return Ok(false);
         }
         let shallow_commits = read_shallow_commits(repo_dir).await?;
-        if !shallow_commits.is_empty() {
-            if let Some(boundary_depth) = self
-                .nearest_shallow_boundary_depth_no_lazy(repo_dir, commit, &shallow_commits)
-                .await?
+        for (ancestor, ancestor_depth) in &window {
+            if shallow_commits.contains(ancestor.as_str())
+                && ancestor_depth.saturating_add(1) < depth
             {
-                if boundary_depth.saturating_add(1) < depth {
-                    return Ok(false);
-                }
+                return Ok(false);
             }
-        }
-        for ancestor in &window {
             if !self.commit_tree_exists_no_lazy(repo_dir, ancestor).await {
                 return Ok(false);
             }
@@ -156,51 +151,52 @@ impl Materializer {
         Ok(true)
     }
 
-    async fn nearest_shallow_boundary_depth_no_lazy(
+    async fn depth_bounded_ancestry_window_no_lazy(
         &self,
         repo_dir: &FsPath,
         commit: &CommitSha,
-        shallow_commits: &HashSet<String>,
-    ) -> CoreResult<Option<u32>> {
-        let output = match self
-            .state
-            .git
-            .run_no_lazy(Some(repo_dir), ["rev-list", "--parents", commit.as_str()])
-            .await
-        {
-            Ok(output) => output,
-            Err(_) => return Ok(None),
-        };
-        let text = output.stdout_utf8("rev-list --parents")?;
-        let mut parents_by_commit: HashMap<CommitSha, Vec<CommitSha>> = HashMap::new();
-        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            let mut parts = line.split_whitespace();
-            let Some(commit) = parts.next() else {
-                continue;
-            };
-            let commit = CommitSha::parse(commit)?;
-            let parents = parts
-                .map(CommitSha::parse)
-                .collect::<CoreResult<Vec<_>>>()?;
-            parents_by_commit.insert(commit, parents);
+        depth: u32,
+    ) -> CoreResult<Vec<(CommitSha, u32)>> {
+        if depth == 0 {
+            return Ok(Vec::new());
         }
 
-        let mut queue = VecDeque::from([(commit.clone(), 0u32)]);
+        let mut window = Vec::new();
         let mut seen = HashSet::new();
-        while let Some((current, depth)) = queue.pop_front() {
-            if !seen.insert(current.clone()) {
-                continue;
-            }
-            if shallow_commits.contains(current.as_str()) {
-                return Ok(Some(depth));
-            }
-            if let Some(parents) = parents_by_commit.get(&current) {
+        let mut frontier = vec![commit.clone()];
+        for ancestor_depth in 0..depth {
+            let parents_by_commit = self
+                .state
+                .git
+                .commit_parent_map_no_lazy(repo_dir, &frontier)
+                .await?;
+            let mut next_frontier = Vec::new();
+            let mut queued_next = HashSet::new();
+
+            for current in frontier {
+                if !seen.insert(current.clone()) {
+                    continue;
+                }
+                let Some(parents) = parents_by_commit.get(&current) else {
+                    return Ok(Vec::new());
+                };
+                window.push((current, ancestor_depth));
+                if ancestor_depth.saturating_add(1) >= depth {
+                    continue;
+                }
                 for parent in parents {
-                    queue.push_back((parent.clone(), depth.saturating_add(1)));
+                    if !seen.contains(parent) && queued_next.insert(parent.clone()) {
+                        next_frontier.push(parent.clone());
+                    }
                 }
             }
+
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
         }
-        Ok(None)
+        Ok(window)
     }
 
     pub(super) async fn commit_history_complete_no_lazy(
@@ -248,15 +244,12 @@ impl Materializer {
                 return Ok(false);
             }
             let window = self
-                .state
-                .git
-                .commit_ancestry_window_no_lazy(repo_dir, boundary, depth)
+                .depth_bounded_ancestry_window_no_lazy(repo_dir, boundary, depth)
                 .await?;
             // `boundary` is present (checked above) and `depth >= 1`, so a
             // healthy walk returns at least `[boundary]`. An empty window means
-            // `rev-list` itself failed — per the helper's contract, treat that
-            // as "cannot prove coverage" and deepen rather than fall through to
-            // the all-clear below.
+            // the walk could not prove local coverage; deepen rather than fall
+            // through to the all-clear below.
             if window.is_empty() {
                 return Ok(false);
             }
@@ -265,7 +258,7 @@ impl Materializer {
             // history inside the requested depth and must deepen further.
             if window
                 .iter()
-                .any(|commit| shallow_commits.contains(commit.as_str()))
+                .any(|(commit, _)| shallow_commits.contains(commit.as_str()))
             {
                 return Ok(false);
             }
@@ -585,9 +578,17 @@ impl Materializer {
         &self,
         repo: &RepoKey,
     ) -> CoreResult<OwnedMutexGuard<()>> {
+        // This lock is intentionally per worker and per repo. It is not
+        // re-entrant: callers must not call another mutation-locking helper
+        // for the same repo while holding the guard. Create or validate the
+        // repo dir before acquiring it, because cold `ensure_repo_dir` also
+        // takes this lock.
         let repo_path = self.repo_disk_path(repo);
         let lock = {
             let mut locks = self.state.repo_mutation_locks.lock().await;
+            if locks.len() >= REPO_MUTATION_LOCK_GC_THRESHOLD {
+                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
             Arc::clone(
                 locks
                     .entry(repo_path)

@@ -779,9 +779,9 @@ impl Materializer {
             );
         }
 
+        let _repo_lock = self.lock_repo(repo).await?;
         let commit = {
             let _mutation_lock = self.lock_repo_mutation(repo).await?;
-            let _repo_lock = self.lock_repo(repo).await?;
             let upstream_url = self.upstream_url(repo)?;
             let fetch_started = Instant::now();
             let refspec = git_cache_git::branch_cache_refspec(branch.as_str())?;
