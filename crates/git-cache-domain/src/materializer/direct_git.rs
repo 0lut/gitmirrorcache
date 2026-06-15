@@ -47,6 +47,15 @@ pub(super) enum DirectFetchedWantKind {
     NonCommit,
 }
 
+/// How a shallow cache repo must be extended before it can serve a want.
+#[derive(Debug, Clone, Copy)]
+enum HistoryExtension {
+    /// Remove the shallow boundary entirely (full-history serving).
+    Unshallow,
+    /// Extend the shallow boundary by N commits (bounded `--deepen=N`).
+    Deepen(u32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UploadPackFilter {
     BlobNone,
@@ -69,6 +78,12 @@ impl UploadPackIntent {
     }
 }
 
+/// Git's sentinel "infinite" depth, sent on the wire by `git fetch
+/// --unshallow` (`deepen 2147483647`). A client deepen at or above this is an
+/// unshallow in disguise and must extend the cache to full history rather than
+/// taking the bounded-deepen path.
+const GIT_INFINITE_DEPTH: u32 = 0x7fff_ffff;
+
 #[derive(Debug, Clone, Copy)]
 struct DirectFetchOptions {
     filter: Option<&'static str>,
@@ -77,6 +92,10 @@ struct DirectFetchOptions {
     hydrate_manifests: bool,
     refetch: bool,
     unshallow: bool,
+    /// Relative `--deepen=N`: extend an existing shallow boundary by `N`
+    /// commits. Set only on the bounded-deepen serving path; mutually
+    /// exclusive with `depth` and `unshallow`.
+    deepen: Option<u32>,
 }
 
 impl Default for DirectFetchOptions {
@@ -88,6 +107,7 @@ impl Default for DirectFetchOptions {
             hydrate_manifests: true,
             refetch: false,
             unshallow: false,
+            deepen: None,
         }
     }
 }
@@ -108,6 +128,7 @@ impl DirectFetchOptions {
             hydrate_manifests: intent.filter.is_none(),
             refetch: false,
             unshallow: false,
+            deepen: None,
         }
     }
 
@@ -120,6 +141,7 @@ impl DirectFetchOptions {
             hydrate_manifests: !blobless_fetch,
             refetch: false,
             unshallow: false,
+            deepen: None,
         }
     }
 
@@ -128,7 +150,7 @@ impl DirectFetchOptions {
     }
 
     fn needs_full_object_history(self) -> bool {
-        self.filter.is_none() && self.depth.is_none()
+        self.filter.is_none() && self.depth.is_none() && self.deepen.is_none()
     }
 
     fn without_manifest_hydration(mut self) -> Self {
@@ -143,7 +165,17 @@ impl DirectFetchOptions {
 
     fn with_unshallow(mut self) -> Self {
         self.depth = None;
+        self.deepen = None;
         self.unshallow = true;
+        self
+    }
+
+    /// Switch to a bounded `--deepen=N` fetch: extend the cache's existing
+    /// shallow boundary by `depth` commits instead of unshallowing it.
+    fn with_bounded_deepen(mut self, depth: u32) -> Self {
+        self.depth = None;
+        self.unshallow = false;
+        self.deepen = Some(depth);
         self
     }
 
@@ -153,6 +185,7 @@ impl DirectFetchOptions {
             depth: self.depth,
             refetch: self.refetch,
             unshallow: self.unshallow,
+            deepen: self.deepen,
         }
     }
 }
@@ -204,6 +237,7 @@ impl Materializer {
         Box::pin(self.ensure_wants_read_through(
             repo,
             &object_ids,
+            &[],
             None,
             DirectFetchOptions::default(),
         ))
@@ -222,6 +256,7 @@ impl Materializer {
         Box::pin(self.ensure_wants_read_through(
             repo,
             &object_ids,
+            &[],
             Some(comparison),
             DirectFetchOptions::from_blobless(blobless_fetch),
         ))
@@ -237,6 +272,7 @@ impl Materializer {
         Box::pin(self.ensure_wants_read_through(
             repo,
             &intent.wants,
+            &intent.shallow,
             Some(comparison),
             DirectFetchOptions::from_intent(intent),
         ))
@@ -251,6 +287,7 @@ impl Materializer {
         Box::pin(self.ensure_wants_read_through(
             repo,
             &intent.wants,
+            &intent.shallow,
             None,
             DirectFetchOptions::from_intent(intent),
         ))
@@ -261,6 +298,7 @@ impl Materializer {
         &self,
         repo: &RepoKey,
         object_ids: &[CommitSha],
+        deepen_from: &[CommitSha],
         comparison: Option<&UpstreamRefComparison>,
         fetch_options: DirectFetchOptions,
     ) -> CoreResult<()> {
@@ -311,27 +349,90 @@ impl Materializer {
                 "repo partially hydrated (blobless); forcing full refetch of wants"
             );
         }
-        // A repo hydrated only by depth-limited fetches is shallow. Serving a
-        // full-history intent from it would stream a pack whose commit
-        // parents stop at the shallow boundary while the client repo is not
-        // marked shallow. A later `fetch --deepen=N` has the opposite shape:
-        // the client is marked shallow, but the cache must still have commits
-        // beyond its own boundary to extend the client's history. Force the
-        // batched fetch to unshallow the cache repo before serving either
-        // shape. Lazy exact-oid fetches are unaffected (`fetch_objects` never
-        // unshallows), so blobless checkout blob storms stay cheap.
+        // A repo hydrated only by depth-limited fetches is shallow and cannot
+        // serve more history than it holds. The batched fetch must extend the
+        // cache before serving, in one of two shapes:
+        //
+        // - Full-history want (no client depth): the served pack would
+        //   otherwise stop at the cache's shallow boundary while the client
+        //   repo is not marked shallow — a silently corrupt clone. Unshallow.
+        // - `fetch --deepen=N` over an existing client shallow boundary: the
+        //   client stays shallow, so the cache only needs N more commits of
+        //   ancestry, not the whole history. A bounded `--deepen=N` avoids
+        //   streaming an entire LLVM/Linux-sized history for a small deepen.
+        //   A shallow→shallow deepen is always self-consistent (upload-pack
+        //   reports the served boundary back to the client), so the only cost
+        //   of under-deepening is a client whose history is shorter than it
+        //   asked for; in the production `proxy_on_miss` path the client is
+        //   served by the upstream proxy and this fetch only warms the cache.
+        //
+        // The bounded path is reserved for clean shallow caches.
+        // `force_refetch` (a full-object client hitting a partial/blobless
+        // cache) keeps unshallowing, since its boundary and object-completeness
+        // reasoning is murkier; note a *blobless* deepen intent leaves
+        // `force_refetch` false and so still takes the bounded path, which is
+        // fine (blobless→blobless serving is self-consistent). deepen-since/
+        // deepen-not and `--unshallow`-equivalent (infinite depth) requests
+        // have no bounded commit count to deepen by. Lazy exact-oid fetches are
+        // unaffected (`fetch_objects` never moves the boundary), so blobless
+        // checkout blob storms stay cheap.
         let cache_repo_is_shallow = fs::try_exists(repo_dir.join("shallow")).await?;
-        let needs_unshallow = cache_repo_is_shallow
-            && (fetch_options.depth.is_none() || fetch_options.deepen_existing_shallow);
-        let fetch_options = if needs_unshallow {
-            info!(
-                %repo,
-                deepen_existing_shallow = fetch_options.deepen_existing_shallow,
-                "cache repo is shallow; forcing unshallow fetch before serving upload-pack wants"
-            );
-            fetch_options.with_unshallow()
+        let history_extension = if !cache_repo_is_shallow {
+            None
+        } else if fetch_options.depth.is_none() {
+            Some(HistoryExtension::Unshallow)
+        } else if fetch_options.deepen_existing_shallow {
+            // `--depth=M` and `--deepen=M` both arrive as `deepen M` on the
+            // wire (the parser ignores the `deepen-relative` capability), so an
+            // absolute `--depth=M` re-request from an already-shallow client
+            // also lands here and runs a *relative* `git fetch --deepen=M`. The
+            // cache may over-fetch by up to M, but its own upload-pack still
+            // serves the client's true (absolute or relative) depth semantics,
+            // so the served result stays correct either way.
+            match fetch_options.depth {
+                Some(depth) if depth < GIT_INFINITE_DEPTH && !force_refetch => {
+                    // A stateless deepen runs multiple upload-pack rounds; only
+                    // deepen the cache on the round that actually needs more
+                    // history, so the boundary advances by N once rather than
+                    // compounding to 2N, 3N, ... across rounds. The check is
+                    // all-or-nothing over `deepen_from`, while the deepen below
+                    // applies to every fetched refspec, so a request mixing a
+                    // covered branch with an under-covered one re-deepens the
+                    // covered branch by an extra N — bounded and convergent, not
+                    // corrupt.
+                    if self
+                        .deepen_boundary_satisfied(&repo_dir, deepen_from, depth)
+                        .await?
+                    {
+                        None
+                    } else {
+                        Some(HistoryExtension::Deepen(depth))
+                    }
+                }
+                _ => Some(HistoryExtension::Unshallow),
+            }
         } else {
-            fetch_options
+            None
+        };
+        let needs_history_extension = history_extension.is_some();
+        let fetch_options = match history_extension {
+            Some(HistoryExtension::Unshallow) => {
+                info!(
+                    %repo,
+                    deepen_existing_shallow = fetch_options.deepen_existing_shallow,
+                    "cache repo is shallow; forcing unshallow fetch before serving upload-pack wants"
+                );
+                fetch_options.with_unshallow()
+            }
+            Some(HistoryExtension::Deepen(depth)) => {
+                info!(
+                    %repo,
+                    depth,
+                    "cache repo is shallow; deepening cache by requested depth before serving deepen wants"
+                );
+                fetch_options.with_bounded_deepen(depth)
+            }
+            None => fetch_options,
         };
         let object_count = object_ids.len();
         // Classification must never trigger promisor lazy fetches: in a
@@ -362,7 +463,7 @@ impl Materializer {
                 }
 
                 if !force_refetch
-                    && !needs_unshallow
+                    && !needs_history_extension
                     && self.commit_tree_exists_no_lazy(&repo_dir, object_id).await
                 {
                     if closure_marker_present && fetch_options.needs_full_object_history() {
@@ -389,7 +490,7 @@ impl Materializer {
                 }
             }
 
-            if !force_refetch && !needs_unshallow && fetch_options.hydrate_manifests {
+            if !force_refetch && !needs_history_extension && fetch_options.hydrate_manifests {
                 if let Some(manifest) = self.get_commit_manifest(repo, object_id).await? {
                     if manifest.complete {
                         match Box::pin(self.hydrate_commit_in_repo(&repo_dir, &manifest)).await {
@@ -451,7 +552,7 @@ impl Materializer {
         if !pending.is_empty() {
             let fetch_options = if pending_requires_refetch
                 && fetch_options.needs_full_object_history()
-                && !needs_unshallow
+                && !needs_history_extension
             {
                 fetch_options.with_refetch()
             } else {
@@ -995,14 +1096,21 @@ impl Materializer {
                 Box::pin(self.ensure_wants_read_through(
                     repo,
                     &intent.wants,
+                    &intent.shallow,
                     Some(comparison),
                     fetch_options,
                 ))
                 .await
             }
             None => {
-                Box::pin(self.ensure_wants_read_through(repo, &intent.wants, None, fetch_options))
-                    .await
+                Box::pin(self.ensure_wants_read_through(
+                    repo,
+                    &intent.wants,
+                    &intent.shallow,
+                    None,
+                    fetch_options,
+                ))
+                .await
             }
         }
     }
