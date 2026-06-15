@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use git_cache_core::{CommitSha, GitCacheError, Result, UpstreamAuth};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -420,6 +420,42 @@ impl Git {
             parents.extend(parse_commit_parent_batch(&output.stdout)?);
         }
         Ok(parents)
+    }
+
+    /// Return commits whose root tree is present locally without triggering
+    /// promisor lazy fetches. Missing commits or missing trees are omitted.
+    pub async fn commit_trees_present_no_lazy(
+        &self,
+        repo_dir: &Path,
+        commits: &[CommitSha],
+    ) -> Result<HashSet<CommitSha>> {
+        for commit in commits {
+            reject_revision_arg(commit.as_str())?;
+        }
+        if commits.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let git = self.clone().with_env("GIT_NO_LAZY_FETCH", "1");
+        let mut present = HashSet::new();
+        for chunk in commits.chunks(COMMIT_PARENT_BATCH_CHUNK_SIZE) {
+            let mut stdin = Vec::with_capacity(chunk.len() * 48);
+            for commit in chunk {
+                stdin.extend_from_slice(commit.as_str().as_bytes());
+                stdin.extend_from_slice(b"^{tree}\n");
+            }
+            let output = git
+                .run_with_stdin_and_limits(
+                    Some(repo_dir),
+                    ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                    Some(&stdin),
+                    git.output_limit,
+                    git.output_limit,
+                )
+                .await?;
+            parse_commit_tree_batch(&output.stdout, chunk, &mut present)?;
+        }
+        Ok(present)
     }
 
     pub async fn fsck(&self, repo_dir: &Path) -> Result<GitOutput> {
@@ -1301,6 +1337,49 @@ fn parse_commit_parent_batch(stdout: &[u8]) -> Result<HashMap<CommitSha, Vec<Com
     }
 
     Ok(parents_by_commit)
+}
+
+fn parse_commit_tree_batch(
+    stdout: &[u8],
+    inputs: &[CommitSha],
+    present: &mut HashSet<CommitSha>,
+) -> Result<()> {
+    let text = std::str::from_utf8(stdout).map_err(|err| {
+        GitCacheError::Validation(format!("git cat-file returned non-utf8 tree batch: {err}"))
+    })?;
+    let mut lines = text.lines();
+    for commit in inputs {
+        let Some(line) = lines.next() else {
+            return Err(GitCacheError::Validation(
+                "git cat-file returned fewer tree lines than requested".into(),
+            ));
+        };
+        let mut parts = line.split_whitespace();
+        let _object_name = parts.next().ok_or_else(|| {
+            GitCacheError::Validation(format!("malformed git cat-file tree line: {line:?}"))
+        })?;
+        let object_type = parts.next().ok_or_else(|| {
+            GitCacheError::Validation(format!("malformed git cat-file tree line: {line:?}"))
+        })?;
+        match object_type {
+            "tree" => {
+                present.insert(commit.clone());
+            }
+            "missing" => {}
+            other => {
+                return Err(GitCacheError::Validation(format!(
+                    "expected tree object from git cat-file, got {other:?} for {}",
+                    commit.as_str()
+                )));
+            }
+        }
+    }
+    if lines.any(|line| !line.trim().is_empty()) {
+        return Err(GitCacheError::Validation(
+            "git cat-file returned more tree lines than requested".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn path_to_str(path: &Path) -> Result<&str> {

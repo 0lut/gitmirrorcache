@@ -138,13 +138,22 @@ impl Materializer {
             return Ok(false);
         }
         let shallow_commits = read_shallow_commits(repo_dir).await?;
+        let ancestors = window
+            .iter()
+            .map(|(ancestor, _)| ancestor.clone())
+            .collect::<Vec<_>>();
+        let ancestors_with_trees = self
+            .state
+            .git
+            .commit_trees_present_no_lazy(repo_dir, &ancestors)
+            .await?;
         for (ancestor, ancestor_depth) in &window {
             if shallow_commits.contains(ancestor.as_str())
                 && ancestor_depth.saturating_add(1) < depth
             {
                 return Ok(false);
             }
-            if !self.commit_tree_exists_no_lazy(repo_dir, ancestor).await {
+            if !ancestors_with_trees.contains(ancestor) {
                 return Ok(false);
             }
         }

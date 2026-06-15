@@ -229,11 +229,21 @@ mod tests {
             .expect("read parent map");
 
         assert_eq!(parents.get(&first), Some(&Vec::new()));
-        assert_eq!(parents.get(&second), Some(&vec![first]));
-        assert_eq!(parents.get(&third), Some(&vec![second]));
+        assert_eq!(parents.get(&second), Some(&vec![first.clone()]));
+        assert_eq!(parents.get(&third), Some(&vec![second.clone()]));
         assert!(
             !parents.contains_key(&missing),
             "missing commits should be omitted"
+        );
+
+        let trees = git
+            .commit_trees_present_no_lazy(&cache_repo, &[first.clone(), second, third, missing])
+            .await
+            .expect("read tree presence");
+        assert!(trees.contains(&first));
+        assert!(
+            !trees.contains(&CommitSha::parse("0".repeat(40)).unwrap()),
+            "missing commits should not report present trees"
         );
     }
 
