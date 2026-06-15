@@ -75,6 +75,9 @@ mod tests {
             serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            repo_mutation_locks: Arc::new(
+                tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
         });
         let materializer = Materializer::new(Arc::clone(&state));
 
@@ -187,6 +190,9 @@ mod tests {
                 disk: AsyncDiskManager::new(disk),
                 serving_maintenance_inflight: Arc::new(std::sync::Mutex::new(
                     std::collections::HashSet::new(),
+                )),
+                repo_mutation_locks: Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashMap::new(),
                 )),
             })
         };

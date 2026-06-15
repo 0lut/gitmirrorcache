@@ -10,6 +10,11 @@ impl Materializer {
     pub async fn ensure_repo_dir(&self, repo: &RepoKey) -> CoreResult<PathBuf> {
         let repo_dir = self.repo_dir(repo);
         if !repo_dir.join("config").exists() {
+            let _mutation_lock = self.lock_repo_mutation(repo).await?;
+            if repo_dir.join("config").exists() {
+                self.touch_repo_access(repo).await?;
+                return Ok(repo_dir);
+            }
             // Only a leftover partial directory needs invalidation; a wholly
             // absent repo dir must not go through invalidate_repo, which
             // conflicts with a repo lock the caller may already hold (e.g.
@@ -468,6 +473,7 @@ impl Materializer {
     }
 
     pub async fn fetch_all_refs(&self, repo: &RepoKey, repo_dir: &FsPath) -> CoreResult<()> {
+        let _mutation_lock = self.lock_repo_mutation(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
         let remote = self.upstream_url(repo)?;
         self.upstream_git(&remote)?
@@ -523,6 +529,22 @@ impl Materializer {
 
     pub(super) async fn lock_repo(&self, repo: &RepoKey) -> CoreResult<RepoLock> {
         self.state.disk.lock_repo(self.repo_disk_path(repo)).await
+    }
+
+    pub(super) async fn lock_repo_mutation(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<OwnedMutexGuard<()>> {
+        let repo_path = self.repo_disk_path(repo);
+        let lock = {
+            let mut locks = self.state.repo_mutation_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(repo_path)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        Ok(lock.lock_owned().await)
     }
 
     pub(super) async fn reset_invalid_repo_cache(&self, repo: &RepoKey) -> CoreResult<()> {

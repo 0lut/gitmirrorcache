@@ -16,6 +16,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repo_mutation_lock_serializes_per_repo_only() {
+        let fixture = GitFixture::new();
+        let state = Arc::new(fixture.state());
+        let materializer = Materializer::new(Arc::clone(&state));
+        let first = materializer
+            .lock_repo_mutation(&fixture.repo)
+            .await
+            .unwrap();
+
+        let same_repo_materializer = materializer.clone();
+        let same_repo = fixture.repo.clone();
+        let (same_repo_tx, same_repo_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _lock = same_repo_materializer
+                .lock_repo_mutation(&same_repo)
+                .await
+                .unwrap();
+            let _ = same_repo_tx.send(());
+        });
+
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), same_repo_rx)
+                .await
+                .is_err(),
+            "same-repo mutation locks should serialize"
+        );
+
+        let other_repo = RepoKey::parse("github.com/org/other").unwrap();
+        let other_lock = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            materializer.lock_repo_mutation(&other_repo),
+        )
+        .await
+        .expect("different repo lock should not wait behind the first repo")
+        .unwrap();
+        drop(other_lock);
+
+        drop(first);
+        waiter.await.unwrap();
+    }
+
     #[test]
     fn synthesize_ref_advertisement_contains_head_and_refs() {
         let comparison = UpstreamRefComparison {
