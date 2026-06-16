@@ -785,11 +785,55 @@ impl Materializer {
             let upstream_url = self.upstream_url(repo)?;
             let fetch_started = Instant::now();
             let refspec = git_cache_git::branch_cache_refspec(branch.as_str())?;
-            let repo_is_shallow = fs::try_exists(repo_dir.join("shallow")).await?;
+            let mut repo_is_shallow = fs::try_exists(repo_dir.join("shallow")).await?;
             let partial_marker = repo_dir.join(super::direct_git::PARTIAL_HYDRATION_MARKER);
             let incomplete_closure_marker =
                 repo_dir.join(super::direct_git::INCOMPLETE_CLOSURE_MARKER);
             let repo_is_partially_hydrated = fs::try_exists(&partial_marker).await?;
+            // Incremental materialize. The direct-git serving path leaves the
+            // shared bare repo shallow/blobless, which would otherwise force a
+            // full `--unshallow` of the entire upstream history below (minutes
+            // on a large repo, e.g. ~15m for torvalds/linux). If the object
+            // store already holds a complete prior generation, hydrate it (a
+            // fast parallel content-addressed pack download) and drop the now
+            // stale shallow boundary, so the fetch below transfers only the
+            // delta to the new tip and `publish_generation` packs only the new
+            // commits.
+            //
+            // Safety: a published generation is a verified full-history
+            // closure, so hydrating it makes the prior history genuinely
+            // complete (removing the shallow file is then correct). If
+            // hydration is unavailable or still leaves the closure incomplete,
+            // the `commit_history_complete_no_lazy` guard below falls back to
+            // the full unshallow/refetch path — so this can only save time, it
+            // can never publish an incomplete generation.
+            let mut hydrated_incremental = false;
+            if repo_is_shallow {
+                if let Some(head) = self.manifests().repo_head(repo).await? {
+                    match self
+                        .hydrate_generation(repo, &repo_dir, head.generation)
+                        .await
+                    {
+                        Ok(()) => {
+                            let _ = fs::remove_file(repo_dir.join("shallow")).await;
+                            repo_is_shallow = false;
+                            hydrated_incremental = true;
+                            info!(
+                                %repo,
+                                %branch,
+                                generation = %head.generation,
+                                "hydrated prior generation for incremental branch materialize"
+                            );
+                        }
+                        Err(err) => warn!(
+                            %repo,
+                            %branch,
+                            %err,
+                            "prior-generation hydrate failed; falling back to full unshallow fetch"
+                        ),
+                    }
+                }
+            }
             let fetch_options = git_cache_git::FetchOptions {
                 refetch: local_tip_ready && !repo_is_shallow,
                 unshallow: repo_is_shallow,
@@ -830,7 +874,9 @@ impl Materializer {
             let mut history_complete = self
                 .commit_history_complete_no_lazy(&repo_dir, &commit)
                 .await?;
-            if !history_complete && repo_is_shallow && repo_is_partially_hydrated && local_tip_ready
+            if !history_complete
+                && (hydrated_incremental
+                    || (repo_is_shallow && repo_is_partially_hydrated && local_tip_ready))
             {
                 let refetch_started = Instant::now();
                 let refetch_options = git_cache_git::FetchOptions {
