@@ -742,9 +742,32 @@ impl Materializer {
             .commit_ready_for_serving_no_lazy(&repo_dir, upstream_commit)
             .await;
         if local_tip_ready {
-            if self
-                .commit_history_complete_no_lazy(&repo_dir, upstream_commit)
-                .await?
+            // The full-history closure check below
+            // (`commit_history_complete_no_lazy` → `git rev-list --objects
+            // --missing=print` over the whole reachable graph) is O(repo
+            // history) — ~90s on torvalds/linux, right against the front-door
+            // timeout even for a warm no-op materialize. Skip it when a
+            // published generation already attests this commit's closure is
+            // complete: completeness was proven at publish time, objects are
+            // immutable, and the durable generation (not the disposable local
+            // repo) is the source of truth. The pack-presence guard inside
+            // `branch_tip_closure_attested` keeps it honest — only short-circuit
+            // when the generation's packs are actually present locally.
+            let attested = self
+                .branch_tip_closure_attested(repo, &repo_dir, upstream_commit)
+                .await?;
+            if attested {
+                info!(
+                    %repo,
+                    %branch,
+                    upstream_commit = %upstream_commit,
+                    "branch tip closure attested by complete generation manifest; skipping full-history completeness walk"
+                );
+            }
+            if attested
+                || self
+                    .commit_history_complete_no_lazy(&repo_dir, upstream_commit)
+                    .await?
             {
                 self.record_verified_branch_refs(
                     repo,
@@ -978,6 +1001,41 @@ impl Materializer {
             "ensured branch from upstream fetch"
         );
         Ok(commit)
+    }
+
+    /// Whether a published generation already attests this commit's full
+    /// closure is present and verified, letting the O(history) completeness
+    /// walk be skipped. True only when a `complete` commit manifest exists for
+    /// the commit *and* every pack of its generation is present locally — so we
+    /// never declare a branch served from an evicted or partially-hydrated repo.
+    /// A missing/incomplete manifest or a swept generation returns false,
+    /// falling back to the full walk.
+    async fn branch_tip_closure_attested(
+        &self,
+        repo: &RepoKey,
+        repo_dir: &Path,
+        commit: &CommitSha,
+    ) -> CoreResult<bool> {
+        let Some(manifest) = self.get_commit_manifest(repo, commit).await? else {
+            return Ok(false);
+        };
+        if !manifest.complete {
+            return Ok(false);
+        }
+        let Some(generation) = self
+            .get_generation_manifest(repo, manifest.generation)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let pack_dir = repo_dir.join("objects").join("pack");
+        for pack in &generation.packs {
+            let idx = pack_dir.join(format!("pack-{}.idx", pack.sha256));
+            if !fs::try_exists(&idx).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Record durable branch manifests for a commit the local repo can
