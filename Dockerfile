@@ -15,7 +15,10 @@ RUN --mount=type=cache,id=git-cache-cargo-registry-$TARGETARCH,target=/usr/local
 
 # Runtime needs git >= 2.45: serving and want-classification rely on
 # GIT_NO_LAZY_FETCH printing `missing` for absent promisor objects (older
-# gits die with `could not fetch ... from promisor remote` instead).
+# gits die with `could not fetch ... from promisor remote` instead). The
+# >= 2.45 floor also satisfies the git >= 2.32 needed by serving maintenance
+# (`repack --geometric`/`--write-midx`); on older git it falls back to a full
+# `repack -a -d`.
 FROM debian:trixie-slim
 
 RUN apt-get update \

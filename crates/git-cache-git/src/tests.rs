@@ -621,3 +621,54 @@ async fn fetch_objects_rejects_zero_depth() {
         .await
         .is_err());
 }
+
+// ── parse_git_version tests ─────────────────────────────────────
+
+#[test]
+fn parse_git_version_reads_major_minor() {
+    assert_eq!(parse_git_version("git version 2.54.0"), Some((2, 54)));
+    assert_eq!(parse_git_version("git version 2.54.0\n"), Some((2, 54)));
+}
+
+#[test]
+fn parse_git_version_ignores_vendor_suffix() {
+    assert_eq!(
+        parse_git_version("git version 2.39.5 (Apple Git-154)"),
+        Some((2, 39))
+    );
+    assert_eq!(parse_git_version("git version 2.32.0.rc0"), Some((2, 32)));
+}
+
+#[test]
+fn parse_git_version_rejects_unparseable() {
+    assert_eq!(parse_git_version(""), None);
+    assert_eq!(parse_git_version("not a version"), None);
+    assert_eq!(parse_git_version("git version 2"), None);
+    assert_eq!(parse_git_version("git version x.y"), None);
+}
+
+// ── parse_count_objects tests ───────────────────────────────────
+
+#[test]
+fn parse_count_objects_reads_loose_and_pack_counts() {
+    let output = "count: 42\nsize: 168\nin-pack: 1000\npacks: 3\nsize-pack: 4096\nprune-packable: 0\ngarbage: 0\nsize-garbage: 0\n";
+    let counts = parse_count_objects(output);
+    assert_eq!(counts.loose_objects, 42);
+    assert_eq!(counts.packs, 3);
+}
+
+#[test]
+fn parse_count_objects_defaults_missing_fields_to_zero() {
+    assert_eq!(parse_count_objects(""), ObjectCounts::default());
+    let counts = parse_count_objects("count: 7\n");
+    assert_eq!(counts.loose_objects, 7);
+    assert_eq!(counts.packs, 0);
+}
+
+#[test]
+fn parse_count_objects_ignores_in_pack_lookalike() {
+    // `in-pack:` and `size-pack:` must not be mistaken for `packs:`.
+    let counts = parse_count_objects("in-pack: 999\nsize-pack: 12\npacks: 2\n");
+    assert_eq!(counts.packs, 2);
+    assert_eq!(counts.loose_objects, 0);
+}

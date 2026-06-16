@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 mod backend;
 mod gix_backend;
@@ -31,6 +31,10 @@ pub struct Git {
     upstream_auth_env: Option<GitAuthEnv>,
     process_semaphore: Arc<Semaphore>,
     local_backend: Arc<dyn LocalGitBackend>,
+    /// Optional launcher prefix (e.g. `nice -n 19 ionice -c 3`) prepended
+    /// before the git binary so background maintenance yields CPU/IO to
+    /// concurrent serving. Empty means git runs at normal priority.
+    launch_prefix: Vec<OsString>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +60,14 @@ impl GitOutput {
             GitCacheError::UpstreamUnavailable(format!("{command} returned non-utf8: {err}"))
         })
     }
+}
+
+/// Loose-object and pack counts reported by `git count-objects -v`, used to
+/// decide whether a serving repack is worth running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ObjectCounts {
+    pub loose_objects: u64,
+    pub packs: u64,
 }
 
 /// Optional flags shared by upstream fetch helpers. All fields are validated
@@ -126,6 +138,7 @@ impl Git {
             upstream_auth_env: None,
             process_semaphore: Arc::new(Semaphore::new(effective)),
             local_backend: Arc::new(GixBackend),
+            launch_prefix: Vec::new(),
         }
     }
 
@@ -170,6 +183,27 @@ impl Git {
 
     pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.extra_env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Run git subprocesses at low CPU/IO priority by prefixing the spawn with
+    /// `nice`/`ionice` when they are available on `PATH`. Used for background
+    /// serving maintenance so concurrent cache-miss fetches and HIT serves keep
+    /// their IO/CPU. Best-effort: any launcher missing from `PATH` is skipped,
+    /// and if none are found git runs at normal priority.
+    pub fn with_low_priority(mut self) -> Self {
+        let mut prefix: Vec<OsString> = Vec::new();
+        if let Some(nice) = find_executable_in_path("nice") {
+            prefix.push(nice.into_os_string());
+            prefix.push(OsString::from("-n"));
+            prefix.push(OsString::from("19"));
+        }
+        if let Some(ionice) = find_executable_in_path("ionice") {
+            prefix.push(ionice.into_os_string());
+            prefix.push(OsString::from("-c"));
+            prefix.push(OsString::from("3"));
+        }
+        self.launch_prefix = prefix;
         self
     }
 
@@ -575,20 +609,84 @@ impl Git {
         Ok(output.stdout_utf8("symbolic-ref")?.trim().to_string())
     }
 
+    /// Parsed `(major, minor)` version of the configured git binary, or
+    /// `None` when `git --version` cannot be run or parsed.
+    async fn git_version(&self) -> Option<(u32, u32)> {
+        let output = self.run(None, ["--version"]).await.ok()?;
+        parse_git_version(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// Whether the git binary supports the incremental serving-maintenance
+    /// shape (`repack --geometric`/`--write-midx` and split commit-graph),
+    /// which require git >= 2.32. Falls back to the conservative full-rewrite
+    /// path when the version cannot be determined.
+    async fn supports_incremental_maintenance(&self) -> bool {
+        match self.git_version().await {
+            Some(version) => version >= (2, 32),
+            None => {
+                warn!("could not determine git version; using full repack for serving maintenance");
+                false
+            }
+        }
+    }
+
+    /// Compact a served bare repo for fast read-only serving.
+    ///
+    /// On git >= 2.32 this is an incremental geometric repack: it rolls up only
+    /// the small/new packs (cost proportional to newly fetched data, not repo
+    /// size) and writes a multi-pack-index so `upload-pack` reads one logical
+    /// index. `repack.writeBitmaps=false` because direct upload-pack disables
+    /// bitmap traversal, and `pack.threads=1` bounds CPU so concurrent serves
+    /// keep their cores. Older git falls back to a full `repack -a -d` rewrite.
     pub async fn repack_for_serving(&self, repo_dir: &Path) -> Result<GitOutput> {
-        self.run(
-            Some(repo_dir),
-            ["-c", "repack.writeBitmaps=false", "repack", "-a", "-d"],
-        )
-        .await
+        if self.supports_incremental_maintenance().await {
+            self.run(
+                Some(repo_dir),
+                [
+                    "-c",
+                    "repack.writeBitmaps=false",
+                    "-c",
+                    "pack.threads=1",
+                    "repack",
+                    "--geometric=2",
+                    "-d",
+                    "--write-midx",
+                ],
+            )
+            .await
+        } else {
+            self.run(
+                Some(repo_dir),
+                ["-c", "repack.writeBitmaps=false", "repack", "-a", "-d"],
+            )
+            .await
+        }
     }
 
     /// Write a commit-graph covering all reachable commits so server-side
     /// `pack-objects` and reachability walks on large repos avoid parsing
-    /// every commit object.
+    /// every commit object. On git >= 2.32 the `--split` form appends a layer
+    /// for only the newly fetched commits instead of rewriting the whole graph;
+    /// older git rewrites the single-file graph.
     pub async fn commit_graph_write(&self, repo_dir: &Path) -> Result<GitOutput> {
-        self.run(Some(repo_dir), ["commit-graph", "write", "--reachable"])
+        if self.supports_incremental_maintenance().await {
+            self.run(
+                Some(repo_dir),
+                ["commit-graph", "write", "--reachable", "--split"],
+            )
             .await
+        } else {
+            self.run(Some(repo_dir), ["commit-graph", "write", "--reachable"])
+                .await
+        }
+    }
+
+    /// Read loose-object and pack counts via `git count-objects -v`. Cheap and
+    /// read-only; callers use it to skip serving maintenance on already-tidy
+    /// repos.
+    pub async fn count_objects(&self, repo_dir: &Path) -> Result<ObjectCounts> {
+        let output = self.run(Some(repo_dir), ["count-objects", "-v"]).await?;
+        Ok(parse_count_objects(&output.stdout_utf8("count-objects")?))
     }
 
     /// Run `git ls-remote --symref <remote> HEAD refs/heads/*` and return a map of
@@ -1072,7 +1170,14 @@ impl Git {
         stderr: Stdio,
         apply_upstream_auth: bool,
     ) -> Command {
-        let mut command = Command::new(&self.binary);
+        let mut command = match self.launch_prefix.split_first() {
+            Some((launcher, prefix_args)) => {
+                let mut command = Command::new(launcher);
+                command.args(prefix_args).arg(&self.binary);
+                command
+            }
+            None => Command::new(&self.binary),
+        };
         command
             .args(args)
             .env_clear()
@@ -1385,6 +1490,44 @@ fn parse_commit_tree_batch(
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| GitCacheError::Validation(format!("path is not utf-8: {}", path.display())))
+}
+
+/// Resolve an executable name against `PATH`, returning the first existing
+/// regular file. Used to build best-effort launcher prefixes (`nice`,
+/// `ionice`) without failing when a tool is absent.
+fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Parse `(major, minor)` from `git --version` output such as
+/// "git version 2.54.0" or "git version 2.39.5 (Apple Git-154)".
+fn parse_git_version(output: &str) -> Option<(u32, u32)> {
+    let version = output.split_whitespace().nth(2)?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Parse the `count:` (loose objects) and `packs:` fields from
+/// `git count-objects -v` output. Missing fields default to 0.
+fn parse_count_objects(output: &str) -> ObjectCounts {
+    let mut counts = ObjectCounts::default();
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("count:") {
+            if let Ok(value) = value.trim().parse() {
+                counts.loose_objects = value;
+            }
+        } else if let Some(value) = line.strip_prefix("packs:") {
+            if let Ok(value) = value.trim().parse() {
+                counts.packs = value;
+            }
+        }
+    }
+    counts
 }
 
 fn reject_ref_arg(value: &str, kind: &str) -> Result<()> {
