@@ -16,6 +16,12 @@ source "$SCRIPT_DIR/common.sh"
 # failure). To measure the cache itself, point BASE_URL at the ALB origin, e.g.
 #   BASE_URL=http://<name-prefix>-ec2-alb-<id>.<region>.elb.amazonaws.com
 #
+# For a no-cache baseline, point the matrix straight at the upstream and turn
+# off the cache-only steps (the proxy-on-miss header is meaningless to GitHub):
+#   REMOTE_URL=https://github.com/torvalds/linux.git MODES=default \
+#   RUN_METRICS=false AWS_INSPECT=false AWS_LOG_TAIL=false \
+#   scripts/aws/test-prod-linux-cache-depths.sh
+#
 # Exit status is non-zero if any clone/deepen fails or any HTTP 5xx is seen.
 
 BASE_URL="${BASE_URL:-https://gitcache.sh}"
@@ -36,6 +42,7 @@ MODES="${MODES:-default proxy-off}"
 RUN_DEPTH_MATRIX="${RUN_DEPTH_MATRIX:-true}"
 RUN_DEEPEN_MATRIX="${RUN_DEEPEN_MATRIX:-true}"
 RUN_REPEATS="${RUN_REPEATS:-true}"
+RUN_METRICS="${RUN_METRICS:-true}"
 AWS_INSPECT="${AWS_INSPECT:-true}"
 AWS_LOG_TAIL="${AWS_LOG_TAIL:-true}"
 KEEP_WORKDIR="${KEEP_WORKDIR:-false}"
@@ -69,6 +76,7 @@ printf 'DEEPEN_STEPS=%s (base depth %s)\n' "$DEEPEN_STEPS" "$DEEPEN_BASE_DEPTH"
 printf 'MODES=%s\n' "$MODES"
 
 metrics() {
+  [[ "$RUN_METRICS" == "true" ]] || return 0
   local label="$1"
   printf '%s\n' "$label"
   curl -fsS "$METRICS_URL" || printf '(metrics unavailable)\n'
