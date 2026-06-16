@@ -4,10 +4,37 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
+# Exercises the direct-Git shallow/blobless depth + deepen paths against a live
+# deployment (prod by default) and inspects the hot cache afterwards. Covers the
+# PR #123 depth matrix and the PR #126 stale-`shallow.lock` deepen regression:
+# heavy proxy-off `git fetch --deepen=N` over an existing shallow boundary used
+# to poison the repo with an orphaned `shallow.lock` and return persistent 503s.
+#
+# Heavy cold deepens of a huge repo (linux at depth 40/80) take minutes of
+# cache-side work. Through the public Cloudflare front door that can exceed the
+# ~100s origin timeout and surface as HTTP 524 (a CDN timeout, not a cache
+# failure). To measure the cache itself, point BASE_URL at the ALB origin, e.g.
+#   BASE_URL=http://<name-prefix>-ec2-alb-<id>.<region>.elb.amazonaws.com
+#
+# Exit status is non-zero if any clone/deepen fails or any HTTP 5xx is seen.
+
 BASE_URL="${BASE_URL:-https://gitcache.sh}"
 GIT_REPO_PATH="${GIT_REPO_PATH:-github.com/torvalds/linux}"
-DEPTHS="${DEPTHS:-1 10 50}"
+# `|`-separated list of independent-clone depth orders. Order matters: it
+# changes whether each clone hits an already-deep cache or forces a deepen.
+DEPTH_ORDERS="${DEPTH_ORDERS:-${DEPTHS:-1 10 50|50 10 1|10 1 50|1 50 10}}"
+# Ascending `git fetch --deepen=N` increments applied over one shallow clone.
+# These are RELATIVE and accumulate, so `1 9 40` walks the boundary to ~depth
+# 51 (the exact range that 503'd on 0.0.8). Keep the total modest: on a huge
+# merge-heavy repo like linux, deepening past ~depth 50 fans out across
+# subsystem-merge parents into hundreds of thousands of commits and minutes of
+# cache-side work per step (proxy-off does that work in the cache, not upstream).
+DEEPEN_STEPS="${DEEPEN_STEPS:-1 9 40}"
+# Initial clone depth before the ascending deepen sequence.
+DEEPEN_BASE_DEPTH="${DEEPEN_BASE_DEPTH:-1}"
 MODES="${MODES:-default proxy-off}"
+RUN_DEPTH_MATRIX="${RUN_DEPTH_MATRIX:-true}"
+RUN_DEEPEN_MATRIX="${RUN_DEEPEN_MATRIX:-true}"
 RUN_REPEATS="${RUN_REPEATS:-true}"
 AWS_INSPECT="${AWS_INSPECT:-true}"
 AWS_LOG_TAIL="${AWS_LOG_TAIL:-true}"
@@ -23,6 +50,8 @@ ECS_LOG_GROUP="${ECS_LOG_GROUP:-/ecs/$NAME_PREFIX/ec2-api}"
 METRICS_URL="${METRICS_URL:-${BASE_URL%/}/metrics}"
 REMOTE_URL="${REMOTE_URL:-${BASE_URL%/}/git/${GIT_REPO_PATH}.git}"
 
+FAILURES=0
+
 cleanup() {
   if [[ "$KEEP_WORKDIR" != "true" ]]; then
     rm -rf "$WORKDIR"
@@ -35,73 +64,146 @@ require_cmd curl
 
 printf 'WORKDIR=%s\n' "$WORKDIR"
 printf 'REMOTE_URL=%s\n' "$REMOTE_URL"
-printf 'DEPTHS=%s\n' "$DEPTHS"
+printf 'DEPTH_ORDERS=%s\n' "$DEPTH_ORDERS"
+printf 'DEEPEN_STEPS=%s (base depth %s)\n' "$DEEPEN_STEPS" "$DEEPEN_BASE_DEPTH"
 printf 'MODES=%s\n' "$MODES"
 
 metrics() {
   local label="$1"
   printf '%s\n' "$label"
-  curl -fsS "$METRICS_URL"
+  curl -fsS "$METRICS_URL" || printf '(metrics unavailable)\n'
   printf '\n'
 }
 
+# Common per-request git config for one mode. proxy-off forces the local
+# read-through (cache-fill) path instead of the cold-miss upstream proxy.
+mode_git_args() {
+  local mode="$1"
+  case "$mode" in
+    proxy-off) printf '%s\n' '-c' 'http.extraHeader=git-cache-use-proxy-on-miss: false' ;;
+    default) ;;
+    *) printf 'invalid mode: %s\n' "$mode" >&2; exit 2 ;;
+  esac
+}
+
+# Note a 5xx in captured stderr and bump the failure counter.
+note_failure() {
+  local label="$1" err="$2"
+  FAILURES=$((FAILURES + 1))
+  printf '\nSTDERR label=%s\n' "$label"
+  tail -40 "$err" || true
+  if grep -qiE 'HTTP 5[0-9][0-9]' "$err"; then
+    printf 'NOTE label=%s saw HTTP 5xx (524=Cloudflare timeout on heavy deepen; 503=stale-lock regression)\n' "$label"
+  fi
+}
+
+report_repo() {
+  local dir="$1"
+  printf ' head=%s shallow=%s commits=%s pack_size=%s\n' \
+    "$(git -C "$dir" rev-parse --short=12 HEAD 2>/dev/null || echo '?')" \
+    "$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null || echo '?')" \
+    "$(git -C "$dir" rev-list --count HEAD 2>/dev/null || echo '?')" \
+    "$(git -C "$dir" count-objects -vH 2>/dev/null | awk -F': ' '/size-pack/ {print $2}')"
+}
+
 clone_one() {
-  local label="$1"
-  local mode="$2"
-  local depth="$3"
+  local label="$1" mode="$2" depth="$3"
   local dir="$WORKDIR/$label"
   local err="$WORKDIR/$label.stderr"
-  local started finished elapsed exit_code
+  local started finished exit_code
+  local mode_args=()
+  while IFS= read -r a; do mode_args+=("$a"); done < <(mode_git_args "$mode")
 
   rm -rf "$dir"
   started="$(date +%s)"
   set +e
-  case "$mode" in
-    proxy-off)
-      git \
-        -c protocol.version=2 \
-        -c 'http.extraHeader=git-cache-use-proxy-on-miss: false' \
-        clone --quiet --single-branch --no-tags --filter=blob:none \
-        --no-checkout --depth "$depth" "$REMOTE_URL" "$dir" 2>"$err"
-      ;;
-    default)
-      git \
-        -c protocol.version=2 \
-        clone --quiet --single-branch --no-tags --filter=blob:none \
-        --no-checkout --depth "$depth" "$REMOTE_URL" "$dir" 2>"$err"
-      ;;
-    *)
-      printf 'invalid mode: %s\n' "$mode" >&2
-      exit 2
-      ;;
-  esac
+  git -c protocol.version=2 ${mode_args[@]+"${mode_args[@]}"} \
+    clone --quiet --single-branch --no-tags --filter=blob:none \
+    --no-checkout --depth "$depth" "$REMOTE_URL" "$dir" 2>"$err"
   exit_code=$?
   set -e
   finished="$(date +%s)"
-  elapsed=$((finished - started))
 
-  printf 'RESULT label=%s mode=%s depth=%s exit=%s elapsed_s=%s' \
-    "$label" "$mode" "$depth" "$exit_code" "$elapsed"
+  printf 'CLONE label=%s mode=%s depth=%s exit=%s elapsed_s=%s' \
+    "$label" "$mode" "$depth" "$exit_code" "$((finished - started))"
   if [[ "$exit_code" -eq 0 ]]; then
-    printf ' head=%s shallow=%s commits=%s pack_size=%s\n' \
-      "$(git -C "$dir" rev-parse --short=12 HEAD)" \
-      "$(git -C "$dir" rev-parse --is-shallow-repository)" \
-      "$(git -C "$dir" rev-list --count HEAD)" \
-      "$(git -C "$dir" count-objects -vH | awk -F': ' '/size-pack/ {print $2}')"
+    report_repo "$dir"
   else
-    printf '\nSTDERR label=%s\n' "$label"
-    tail -80 "$err" || true
+    note_failure "$label" "$err"
   fi
 }
 
-run_matrix() {
+# Deepen an existing shallow clone in place by N commits.
+deepen_one() {
+  local dir="$1" mode="$2" n="$3" label="$4"
+  local err="$WORKDIR/$label.stderr"
+  local started finished exit_code
+  local mode_args=()
+  while IFS= read -r a; do mode_args+=("$a"); done < <(mode_git_args "$mode")
+
+  started="$(date +%s)"
+  set +e
+  git -C "$dir" -c protocol.version=2 ${mode_args[@]+"${mode_args[@]}"} \
+    fetch --quiet --filter=blob:none --deepen "$n" origin 2>"$err"
+  exit_code=$?
+  set -e
+  finished="$(date +%s)"
+
+  printf '  DEEPEN label=%s mode=%s by=%s exit=%s elapsed_s=%s' \
+    "$label" "$mode" "$n" "$exit_code" "$((finished - started))"
+  if [[ "$exit_code" -eq 0 ]]; then
+    report_repo "$dir"
+  else
+    note_failure "$label" "$err"
+  fi
+}
+
+run_depth_matrix() {
+  [[ "$RUN_DEPTH_MATRIX" == "true" ]] || return 0
   local phase="$1"
-  local depth mode mode_label
-  for depth in $DEPTHS; do
-    for mode in $MODES; do
-      mode_label="${mode//-/_}"
-      clone_one "${phase}_${mode_label}_depth${depth}" "$mode" "$depth"
+  local order depth mode mode_label order_label
+  local orders=()
+  # Split the `|`-separated order list; inner loops keep the default IFS so the
+  # space-separated depths within each order split correctly.
+  IFS='|' read -r -a orders <<< "$DEPTH_ORDERS"
+  for order in "${orders[@]}"; do
+    order_label="${order// /_}"
+    printf -- '-- depth order [%s] --\n' "$order"
+    for depth in $order; do
+      for mode in $MODES; do
+        mode_label="${mode//-/_}"
+        clone_one "${phase}_${order_label}_${mode_label}_d${depth}" "$mode" "$depth"
+      done
     done
+  done
+}
+
+run_deepen_matrix() {
+  [[ "$RUN_DEEPEN_MATRIX" == "true" ]] || return 0
+  local phase="$1"
+  local mode mode_label dir label n max=0
+  for n in $DEEPEN_STEPS; do [[ "$n" -gt "$max" ]] && max="$n"; done
+  for mode in $MODES; do
+    mode_label="${mode//-/_}"
+
+    # Ascending: one shallow clone, then deepen by each step in turn. This is
+    # the path that re-poisoned prod on 0.0.8 (repeated boundary rewrites).
+    label="${phase}_${mode_label}_asc"
+    dir="$WORKDIR/$label"
+    printf -- '-- deepen ascending [%s] mode=%s base=%s --\n' "$DEEPEN_STEPS" "$mode" "$DEEPEN_BASE_DEPTH"
+    clone_one "$label" "$mode" "$DEEPEN_BASE_DEPTH"
+    if [[ -d "$dir" ]]; then
+      for n in $DEEPEN_STEPS; do deepen_one "$dir" "$mode" "$n" "${label}_by${n}"; done
+    fi
+
+    # Jump: fresh depth-1 clone straight to the largest deepen in one request.
+    label="${phase}_${mode_label}_jump${max}"
+    dir="$WORKDIR/$label"
+    printf -- '-- deepen jump-to-%s mode=%s --\n' "$max" "$mode"
+    clone_one "$label" "$mode" 1
+    if [[ -d "$dir" ]]; then
+      deepen_one "$dir" "$mode" "$max" "${label}_by${max}"
+    fi
   done
 }
 
@@ -188,6 +290,18 @@ git --git-dir="$repo_dir" count-objects -vH || true
 echo PACKS
 find "$repo_dir/objects/pack" -maxdepth 1 -type f \( -name "*.pack" -o -name "*.idx" -o -name "*.promisor" \) \
   -printf "%TY-%Tm-%Td %TH:%TM %s %f\n" | sort | tail -40 || true
+# Lingering repo-global lock files are the stale-`shallow.lock` regression
+# signal (PR #126): if any of these persist with no git child holding them,
+# the repo is poisoned and boundary-rewriting deepens will 503.
+echo STALE_LOCKS
+found_lock=0
+for lk in shallow.lock objects/info/commit-graph.lock packed-refs.lock; do
+  if [ -e "$repo_dir/$lk" ]; then
+    found_lock=1
+    ls -l "$repo_dir/$lk"
+  fi
+done
+[ "$found_lock" -eq 0 ] && echo NO_STALE_LOCKS
 if [ -f "$repo_dir/git-cache-partial-hydration" ]; then
   echo PARTIAL_MARKER
   cat "$repo_dir/git-cache-partial-hydration"
@@ -235,11 +349,21 @@ tail_api_logs() {
 }
 
 metrics METRICS_BEFORE
-run_matrix initial
+printf '\n=== DEPTH MATRIX (independent clones) ===\n'
+run_depth_matrix initial
 if [[ "$RUN_REPEATS" == "true" ]]; then
-  run_matrix repeat
+  run_depth_matrix repeat
 fi
+printf '\n=== DEEPEN MATRIX (shallow clone then fetch --deepen) ===\n'
+run_deepen_matrix deepen
 metrics METRICS_AFTER
 inspect_hot_cache
 tail_api_logs
 printf 'WORKDIR=%s\n' "$WORKDIR"
+
+printf '\n=== SUMMARY failures=%s ===\n' "$FAILURES"
+if [[ "$FAILURES" -ne 0 ]]; then
+  printf 'FAILED: %s clone/deepen operation(s) returned non-zero\n' "$FAILURES"
+  exit 1
+fi
+printf 'OK: all clone/deepen operations succeeded\n'
