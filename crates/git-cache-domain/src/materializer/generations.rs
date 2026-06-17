@@ -828,8 +828,7 @@ impl Materializer {
         }
 
         let repo_dir = self.ensure_repo_dir(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
-        let _mutation_lock = self.lock_repo_mutation(repo).await?;
+        let _locks = self.lock_repo_for_mutation(repo).await?;
         Box::pin(self.hydrate_generation(repo, &repo_dir, head.generation)).await?;
         self.state.git.repack_for_serving(&repo_dir).await?;
 
