@@ -2,6 +2,21 @@ use super::*;
 
 const REPO_MUTATION_LOCK_GC_THRESHOLD: usize = 4096;
 
+/// Both per-repo locks held together for one mutation, acquired in the canonical
+/// order by [`Materializer::lock_repo_for_mutation`]: the disk-eviction guard
+/// (`lock_repo`) first, then the per-repo mutation guard (`lock_repo_mutation`).
+/// Routing every co-acquisition through one helper keeps the acquisition order
+/// identical at all sites, so the pair can't be taken in opposite orders and
+/// deadlock. The fields exist only for their RAII drop and are declared
+/// mutation-first so the inner mutation guard releases before the outer
+/// eviction lock.
+#[must_use = "dropping the guard immediately releases both repo locks"]
+#[allow(dead_code)] // held for Drop; never read
+pub(super) struct RepoMutationLocks {
+    _mutation: OwnedMutexGuard<()>,
+    _repo: RepoLock,
+}
+
 impl Materializer {
     pub(super) fn upstream_git(&self, remote_url: &str) -> CoreResult<git_cache_git::Git> {
         self.state
@@ -528,8 +543,7 @@ impl Materializer {
     }
 
     pub async fn fetch_all_refs(&self, repo: &RepoKey, repo_dir: &FsPath) -> CoreResult<()> {
-        let _repo_lock = self.lock_repo(repo).await?;
-        let _mutation_lock = self.lock_repo_mutation(repo).await?;
+        let _locks = self.lock_repo_for_mutation(repo).await?;
         let remote = self.upstream_url(repo)?;
         self.upstream_git(&remote)?
             .fetch_all_heads(repo_dir, &remote, git_cache_git::FetchOptions::default())
@@ -617,6 +631,28 @@ impl Materializer {
         // until a human removes the file.
         self.clear_stale_repo_locks(repo).await;
         Ok(guard)
+    }
+
+    /// Acquire both per-repo locks for a mutation in the canonical order:
+    /// `lock_repo` (disk-eviction guard) then `lock_repo_mutation` (per-repo
+    /// mutation guard). The returned [`RepoMutationLocks`] holds both for the
+    /// caller's scope. Every site that takes both locks at once must go through
+    /// this helper so the order is identical everywhere; acquiring them in
+    /// opposite orders at different sites can deadlock. Sites that hold
+    /// `lock_repo` across other work and take the mutation lock later acquire
+    /// them separately (still repo-then-mutation). As with `lock_repo_mutation`,
+    /// create/validate the repo dir first, since cold `ensure_repo_dir` also
+    /// takes the mutation lock.
+    pub(super) async fn lock_repo_for_mutation(
+        &self,
+        repo: &RepoKey,
+    ) -> CoreResult<RepoMutationLocks> {
+        let repo_lock = self.lock_repo(repo).await?;
+        let mutation_lock = self.lock_repo_mutation(repo).await?;
+        Ok(RepoMutationLocks {
+            _mutation: mutation_lock,
+            _repo: repo_lock,
+        })
     }
 
     /// Best-effort removal of orphaned repo-global Git lock files.
