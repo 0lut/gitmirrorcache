@@ -528,8 +528,8 @@ impl Materializer {
     }
 
     pub async fn fetch_all_refs(&self, repo: &RepoKey, repo_dir: &FsPath) -> CoreResult<()> {
-        let _mutation_lock = self.lock_repo_mutation(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
+        let _mutation_lock = self.lock_repo_mutation(repo).await?;
         let remote = self.upstream_url(repo)?;
         self.upstream_git(&remote)?
             .fetch_all_heads(repo_dir, &remote, git_cache_git::FetchOptions::default())
