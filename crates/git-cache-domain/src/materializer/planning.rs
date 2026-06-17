@@ -754,7 +754,7 @@ impl Materializer {
             // `branch_tip_closure_attested` keeps it honest — only short-circuit
             // when the generation's packs are actually present locally.
             let attested = self
-                .branch_tip_closure_attested(repo, &repo_dir, upstream_commit)
+                .branch_tip_closure_attested(repo, upstream_commit)
                 .await?;
             if attested {
                 info!(
@@ -1004,16 +1004,24 @@ impl Materializer {
     }
 
     /// Whether a published generation already attests this commit's full
-    /// closure is present and verified, letting the O(history) completeness
-    /// walk be skipped. True only when a `complete` commit manifest exists for
-    /// the commit *and* every pack of its generation is present locally — so we
-    /// never declare a branch served from an evicted or partially-hydrated repo.
-    /// A missing/incomplete manifest or a swept generation returns false,
-    /// falling back to the full walk.
+    /// closure is complete + verified, letting the O(history) completeness walk
+    /// be skipped. True when a `complete` commit manifest exists for the commit
+    /// and the generation it names still exists in the object store with at
+    /// least one pack (i.e. has not been swept by retention, and is not a
+    /// legacy/empty manifest). Completeness was proven at publish time and
+    /// objects are immutable, so the durable generation — not the disposable
+    /// local repo — is the source of truth; any local gap is recovered by the
+    /// serving hydrate path. A missing/incomplete manifest or a swept generation
+    /// returns false, falling back to the full walk.
+    ///
+    /// Note: this intentionally does not probe local pack files. The local repo
+    /// names packs by git's own hash, not the manifest's content-addressed
+    /// sha256, so a filename match only happens for hydrated (not freshly
+    /// published/fetched) packs — making such a check both wrong and unable to
+    /// fire. Local serveability is the serving path's concern, not materialize's.
     async fn branch_tip_closure_attested(
         &self,
         repo: &RepoKey,
-        repo_dir: &Path,
         commit: &CommitSha,
     ) -> CoreResult<bool> {
         let Some(manifest) = self.get_commit_manifest(repo, commit).await? else {
@@ -1022,20 +1030,13 @@ impl Materializer {
         if !manifest.complete {
             return Ok(false);
         }
-        let Some(generation) = self
+        // Require the attesting generation to still exist and carry packs: a
+        // `#[serde(default)]` legacy manifest missing its `packs` field would
+        // otherwise vacuously attest completeness with no backing objects.
+        Ok(self
             .get_generation_manifest(repo, manifest.generation)
             .await?
-        else {
-            return Ok(false);
-        };
-        let pack_dir = repo_dir.join("objects").join("pack");
-        for pack in &generation.packs {
-            let idx = pack_dir.join(format!("pack-{}.idx", pack.sha256));
-            if !fs::try_exists(&idx).await? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+            .is_some_and(|generation| !generation.packs.is_empty()))
     }
 
     /// Record durable branch manifests for a commit the local repo can
