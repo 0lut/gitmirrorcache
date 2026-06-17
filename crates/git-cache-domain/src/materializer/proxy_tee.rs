@@ -260,8 +260,7 @@ impl Materializer {
         let blobless = intent.filter == Some(UploadPackFilter::BlobNone);
 
         let repo_dir = self.ensure_repo_dir(repo).await?;
-        let _mutation_lock = self.lock_repo_mutation(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
+        let _locks = self.lock_repo_for_mutation(repo).await?;
 
         // A full-object pack cannot safely clear an existing blobless
         // marker (other refs may still be partial); decline so the warm

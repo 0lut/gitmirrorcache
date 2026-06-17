@@ -742,9 +742,32 @@ impl Materializer {
             .commit_ready_for_serving_no_lazy(&repo_dir, upstream_commit)
             .await;
         if local_tip_ready {
-            if self
-                .commit_history_complete_no_lazy(&repo_dir, upstream_commit)
-                .await?
+            // The full-history closure check below
+            // (`commit_history_complete_no_lazy` → `git rev-list --objects
+            // --missing=print` over the whole reachable graph) is O(repo
+            // history) — ~90s on torvalds/linux, right against the front-door
+            // timeout even for a warm no-op materialize. Skip it when a
+            // published generation already attests this commit's closure is
+            // complete: completeness was proven at publish time, objects are
+            // immutable, and the durable generation (not the disposable local
+            // repo) is the source of truth. The pack-presence guard inside
+            // `branch_tip_closure_attested` keeps it honest — only short-circuit
+            // when the generation's packs are actually present locally.
+            let attested = self
+                .branch_tip_closure_attested(repo, upstream_commit)
+                .await?;
+            if attested {
+                info!(
+                    %repo,
+                    %branch,
+                    upstream_commit = %upstream_commit,
+                    "branch tip closure attested by complete generation manifest; skipping full-history completeness walk"
+                );
+            }
+            if attested
+                || self
+                    .commit_history_complete_no_lazy(&repo_dir, upstream_commit)
+                    .await?
             {
                 self.record_verified_branch_refs(
                     repo,
@@ -980,6 +1003,42 @@ impl Materializer {
         Ok(commit)
     }
 
+    /// Whether a published generation already attests this commit's full
+    /// closure is complete + verified, letting the O(history) completeness walk
+    /// be skipped. True when a `complete` commit manifest exists for the commit
+    /// and the generation it names still exists in the object store with at
+    /// least one pack (i.e. has not been swept by retention, and is not a
+    /// legacy/empty manifest). Completeness was proven at publish time and
+    /// objects are immutable, so the durable generation — not the disposable
+    /// local repo — is the source of truth; any local gap is recovered by the
+    /// serving hydrate path. A missing/incomplete manifest or a swept generation
+    /// returns false, falling back to the full walk.
+    ///
+    /// Note: this intentionally does not probe local pack files. The local repo
+    /// names packs by git's own hash, not the manifest's content-addressed
+    /// sha256, so a filename match only happens for hydrated (not freshly
+    /// published/fetched) packs — making such a check both wrong and unable to
+    /// fire. Local serveability is the serving path's concern, not materialize's.
+    async fn branch_tip_closure_attested(
+        &self,
+        repo: &RepoKey,
+        commit: &CommitSha,
+    ) -> CoreResult<bool> {
+        let Some(manifest) = self.get_commit_manifest(repo, commit).await? else {
+            return Ok(false);
+        };
+        if !manifest.complete {
+            return Ok(false);
+        }
+        // Require the attesting generation to still exist and carry packs: a
+        // `#[serde(default)]` legacy manifest missing its `packs` field would
+        // otherwise vacuously attest completeness with no backing objects.
+        Ok(self
+            .get_generation_manifest(repo, manifest.generation)
+            .await?
+            .is_some_and(|generation| !generation.packs.is_empty()))
+    }
+
     /// Record durable branch manifests for a commit the local repo can
     /// already serve. When the commit has a complete cached manifest this
     /// only writes the ref (and default) manifests; otherwise it publishes a
@@ -1033,8 +1092,7 @@ impl Materializer {
         commit: &CommitSha,
         default_branch: bool,
     ) -> CoreResult<()> {
-        let _mutation_lock = self.lock_repo_mutation(repo).await?;
-        let _repo_lock = self.lock_repo(repo).await?;
+        let _locks = self.lock_repo_for_mutation(repo).await?;
         self.state
             .git
             .update_ref(
