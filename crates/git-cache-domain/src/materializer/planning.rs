@@ -1092,8 +1092,8 @@ impl Materializer {
         commit: &CommitSha,
         default_branch: bool,
     ) -> CoreResult<()> {
-        let _mutation_lock = self.lock_repo_mutation(repo).await?;
         let _repo_lock = self.lock_repo(repo).await?;
+        let _mutation_lock = self.lock_repo_mutation(repo).await?;
         self.state
             .git
             .update_ref(
