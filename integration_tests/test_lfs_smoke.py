@@ -434,10 +434,13 @@ enabled = true
         self.assertEqual(data1, data2, "cache hit should return identical content")
         self.assertEqual(len(data1), size)
 
-        # Verify the object exists in the local object store
-        oid_dir = self.object_root
+        # Verify the object exists in the local object store.
+        # The domain layer appends a schema version suffix (e.g. "-v3") to the
+        # configured object store root, so search the actual versioned directory.
+        versioned_root = self.object_root.parent / (self.object_root.name + "-v3")
+        search_root = versioned_root if versioned_root.is_dir() else self.object_root
         found = False
-        for path in oid_dir.rglob("*"):
+        for path in search_root.rglob("*"):
             if path.is_file() and oid in path.name:
                 found = True
                 break

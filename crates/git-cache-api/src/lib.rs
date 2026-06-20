@@ -2198,7 +2198,7 @@ fn validate_lfs_oid(oid: &str) -> bool {
 }
 
 async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
-    let request_id = state.next_request_id();
+    let request_id = request.request_id;
     let repo = match repo_from_git_path(&request.repo_path) {
         Ok(repo) => repo,
         Err(error) => return ApiError::from(error).into_response(),
@@ -2441,7 +2441,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(_bytes) => {
                         info!(
                             request_id,
                             repo = %repo,
@@ -2515,7 +2515,7 @@ fn extract_lfs_oid_from_path(path: &str) -> Option<&str> {
 }
 
 async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
-    let request_id = state.next_request_id();
+    let request_id = request.request_id;
     let path = request.uri.path().to_string();
     let repo = match repo_from_git_path(&request.repo_path) {
         Ok(repo) => repo,
@@ -2667,30 +2667,17 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
     let max_object_bytes = state.domain.config.lfs.max_object_bytes;
 
     // Fetch from upstream, cache, and serve.
-    match fetch_and_cache_lfs_object(
+    let fetched = fetch_and_cache_lfs_object(
         &state.upstream_http,
         href,
         store.as_ref(),
         &obj_key,
         max_object_bytes,
     )
-    .await
-    {
-        Ok(()) => {}
-        Err(error) => {
-            warn!(
-                request_id,
-                repo = %repo,
-                oid = %oid,
-                error = %error,
-                "LFS object cache-fill on download failed"
-            );
-        }
-    }
+    .await;
 
-    // Serve from cache (should now exist after the fetch).
-    match store.get(&obj_key).await {
-        Ok(Some(data)) => {
+    match fetched {
+        Ok(data) => {
             info!(
                 request_id,
                 repo = %repo,
@@ -2704,20 +2691,32 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
                 .body(Body::from(data))
                 .expect("LFS download response")
         }
-        _ => ApiError::from(GitCacheError::UpstreamUnavailable(format!(
-            "LFS object {oid} could not be retrieved"
-        )))
-        .into_response(),
+        Err(error) => {
+            warn!(
+                request_id,
+                repo = %repo,
+                oid = %oid,
+                error = %error,
+                "LFS object fetch failed"
+            );
+            ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+                "LFS object {oid} could not be retrieved"
+            )))
+            .into_response()
+        }
     }
 }
 
+/// Fetches an LFS object from upstream, stores it in the object store, and
+/// returns the downloaded bytes. The caller can serve the bytes directly even
+/// if the cache write fails (best-effort caching).
 async fn fetch_and_cache_lfs_object(
     http: &reqwest::Client,
     href: &str,
     store: &dyn git_cache_objectstore::ObjectStore,
     obj_key: &str,
     max_bytes: u64,
-) -> CoreResult<()> {
+) -> CoreResult<Bytes> {
     let response = http
         .get(href)
         .send()
@@ -2750,10 +2749,12 @@ async fn fetch_and_cache_lfs_object(
         )));
     }
 
-    store
-        .put_if_absent(obj_key, Bytes::from(body.to_vec()))
-        .await?;
-    Ok(())
+    let data: Bytes = body;
+    // Best-effort cache write; log but don't fail if store is unavailable.
+    if let Err(e) = store.put_if_absent(obj_key, data.clone()).await {
+        tracing::warn!(obj_key, error = %e, "LFS cache write failed (best-effort)");
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
