@@ -2476,9 +2476,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
             oid,
             size,
             actions: Some(LfsBatchActions {
-                download: LfsBatchAction {
-                    href: download_url,
-                },
+                download: LfsBatchAction { href: download_url },
             }),
             error: None,
         });
