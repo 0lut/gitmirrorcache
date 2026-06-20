@@ -124,7 +124,7 @@ returns 405, and the upstream-URL workaround lets `git lfs pull` succeed.
 Optional overrides:
 
 ```sh
-GIT_CACHE_LFS_TEST_REPO=github.com/git-lfs/test-assets \
+GIT_CACHE_LFS_TEST_REPO=github.com/charmbracelet/vhs \
 RUN_GITHUB_INTEGRATION=1 \
 python3 -m unittest -v integration_tests.test_lfs_smoke
 ```

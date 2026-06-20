@@ -28,7 +28,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_LFS_TEST_REPO = "github.com/git-lfs/test-assets"
+DEFAULT_LFS_TEST_REPO = "github.com/charmbracelet/vhs"
 LFS_TEST_REPO = os.environ.get("GIT_CACHE_LFS_TEST_REPO", DEFAULT_LFS_TEST_REPO)
 
 LFS_POINTER_RE = re.compile(
@@ -259,23 +259,38 @@ commit_read_through = true
         if result.returncode != 0:
             print(f"clone exited {result.returncode} (acceptable for some git-lfs versions)")
 
-        stderr_lower = (result.stderr or "").lower()
+        stderr_combined = (result.stdout or "") + (result.stderr or "")
+        stderr_lower = stderr_combined.lower()
         has_lfs_errors = any(
             marker in stderr_lower
             for marker in ["batch response", "405", "smudge filter", "smudge error", "lfs"]
         )
-        if has_lfs_errors:
-            print("LFS stderr messages detected (expected):")
-            for line in (result.stderr or "").splitlines():
-                if any(m in line.lower() for m in ["lfs", "smudge", "batch", "405"]):
-                    print(f"  {line}")
+        self.assertTrue(
+            has_lfs_errors,
+            "expected LFS-related error messages in clone output",
+        )
+        print("LFS error messages detected (expected):")
+        for line in stderr_combined.splitlines():
+            if any(m in line.lower() for m in ["lfs", "smudge", "batch", "405"]):
+                print(f"  {line}")
 
         self.assertTrue(
             clone_dir.exists() and any(clone_dir.iterdir()),
             "clone directory should exist and be non-empty",
         )
 
+        # Some git-lfs versions make the checkout fail entirely; recover the
+        # working tree with GIT_LFS_SKIP_SMUDGE=1 so we can verify pointers.
         pointers = _find_lfs_pointer_files(clone_dir)
+        if not pointers and (clone_dir / ".git").is_dir():
+            _run(
+                ["git", "restore", "--source=HEAD", ":/"],
+                cwd=clone_dir,
+                env=self._clone_env(skip_smudge=True),
+                check=False,
+            )
+            pointers = _find_lfs_pointer_files(clone_dir)
+
         self.assertTrue(
             len(pointers) > 0,
             "expected LFS-tracked files to remain as pointers (not real content)",
