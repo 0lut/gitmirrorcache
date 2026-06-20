@@ -20,6 +20,7 @@ use git_cache_domain::{
     UpstreamRefComparison,
 };
 use git_cache_git::UploadPackProcess;
+use git_cache_objectstore::lfs_object_key;
 use http::{header, HeaderMap, Method, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -767,6 +768,24 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
             ))
             .into_response();
         }
+        GitRequestType::LfsBatch => {
+            if !state.domain.config.lfs.enabled {
+                return ApiError::from(GitCacheError::Unsupported(
+                    "LFS batch API is not enabled".into(),
+                ))
+                .into_response();
+            }
+            return lfs_batch_handler(state, request).await;
+        }
+        GitRequestType::LfsDownload => {
+            if !state.domain.config.lfs.enabled {
+                return ApiError::from(GitCacheError::Unsupported(
+                    "LFS object download is not enabled".into(),
+                ))
+                .into_response();
+            }
+            return lfs_download_handler(state, request).await;
+        }
         GitRequestType::Unsupported => {
             return ApiError::from(GitCacheError::Unsupported(format!(
                 "unsupported git request: {} {path}",
@@ -786,10 +805,9 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
     match request_type {
         GitRequestType::UploadPackRefs => git_repo_get(state, request, started, auth).await,
         GitRequestType::UploadPack => git_repo_post(state, request, started, auth).await,
-        GitRequestType::ReceivePack => ApiError::from(GitCacheError::Unsupported(
-            "git-receive-pack is disabled".into(),
-        ))
-        .into_response(),
+        GitRequestType::ReceivePack | GitRequestType::LfsBatch | GitRequestType::LfsDownload => {
+            unreachable!("handled above")
+        }
         GitRequestType::Unsupported => ApiError::from(GitCacheError::Unsupported(format!(
             "unsupported git request: {} {path}",
             request.method
@@ -803,6 +821,8 @@ enum GitRequestType {
     UploadPackRefs,
     UploadPack,
     ReceivePack,
+    LfsBatch,
+    LfsDownload,
     Unsupported,
 }
 
@@ -816,6 +836,14 @@ fn git_request_type(request: &GitRepoRequest) -> GitRequestType {
             .is_some_and(|s| s == "git-receive-pack")
     {
         return GitRequestType::ReceivePack;
+    }
+
+    if request.method == Method::POST && path.contains("/info/lfs/objects/batch") {
+        return GitRequestType::LfsBatch;
+    }
+
+    if request.method == Method::GET && path.contains("/info/lfs/objects/") {
+        return GitRequestType::LfsDownload;
     }
 
     if request.method == Method::GET
@@ -2110,6 +2138,624 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
             other => other,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// LFS batch + object download handlers
+// ---------------------------------------------------------------------------
+
+const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
+/// Bounded request body for LFS batch POSTs (1 MiB).
+const LFS_BATCH_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct LfsBatchRequest {
+    operation: String,
+    #[serde(default)]
+    objects: Vec<LfsBatchObject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LfsBatchObject {
+    oid: String,
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct LfsBatchResponse {
+    transfer: &'static str,
+    objects: Vec<LfsBatchObjectResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct LfsBatchObjectResponse {
+    oid: String,
+    size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actions: Option<LfsBatchActions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<LfsBatchError>,
+}
+
+#[derive(Debug, Serialize)]
+struct LfsBatchActions {
+    download: LfsBatchAction,
+}
+
+#[derive(Debug, Serialize)]
+struct LfsBatchAction {
+    href: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LfsBatchError {
+    code: u16,
+    message: String,
+}
+
+fn validate_lfs_oid(oid: &str) -> bool {
+    oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
+    let request_id = state.next_request_id();
+    let repo = match repo_from_git_path(&request.repo_path) {
+        Ok(repo) => repo,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+
+    let materializer = Materializer::new(Arc::clone(&state.domain));
+    if let Err(error) = materializer.validate_host(&repo) {
+        return ApiError::from(error).into_response();
+    }
+
+    if request.body.len() > LFS_BATCH_MAX_BODY_BYTES {
+        return ApiError::from(GitCacheError::Validation(format!(
+            "LFS batch request body exceeds {} byte limit",
+            LFS_BATCH_MAX_BODY_BYTES
+        )))
+        .into_response();
+    }
+
+    let batch: LfsBatchRequest = match serde_json::from_slice(&request.body) {
+        Ok(batch) => batch,
+        Err(error) => {
+            return ApiError::from(GitCacheError::Validation(format!(
+                "invalid LFS batch request body: {error}"
+            )))
+            .into_response();
+        }
+    };
+
+    if batch.operation == "upload" {
+        return ApiError::from(GitCacheError::Unsupported(
+            "LFS upload is not supported; cache is read-only".into(),
+        ))
+        .into_response();
+    }
+
+    if batch.operation != "download" {
+        return ApiError::from(GitCacheError::Validation(format!(
+            "unsupported LFS batch operation `{}`",
+            batch.operation
+        )))
+        .into_response();
+    }
+
+    let max_object_bytes = state.domain.config.lfs.max_object_bytes;
+    let auth = match direct_git_upstream_auth(&request.headers) {
+        Ok(auth) => auth,
+        Err(error) => return error.into_response(),
+    };
+
+    info!(
+        request_id,
+        repo = %repo,
+        objects = batch.objects.len(),
+        "LFS batch download request"
+    );
+
+    let upstream_url = match materializer.upstream_url(&repo) {
+        Ok(url) => url,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let upstream_lfs_batch_url = format!(
+        "{}/info/lfs/objects/batch",
+        upstream_url.trim_end_matches('/')
+    );
+
+    // Proxy the batch request to upstream to get signed download URLs for
+    // objects we don't have cached yet.
+    let mut upstream_req = state
+        .upstream_http
+        .post(&upstream_lfs_batch_url)
+        .header(header::CONTENT_TYPE.as_str(), LFS_CONTENT_TYPE)
+        .header(header::ACCEPT.as_str(), LFS_CONTENT_TYPE);
+    if let Some(raw_auth) = auth.raw_header() {
+        upstream_req = upstream_req.header(header::AUTHORIZATION.as_str(), raw_auth);
+    }
+    let upstream_body = serde_json::json!({
+        "operation": "download",
+        "transfers": ["basic"],
+        "objects": batch.objects.iter().map(|o| {
+            serde_json::json!({"oid": o.oid, "size": o.size})
+        }).collect::<Vec<_>>()
+    });
+    upstream_req = upstream_req.json(&upstream_body);
+
+    let upstream_resp = match upstream_req.send().await {
+        Ok(resp) => resp,
+        Err(error) => {
+            warn!(
+                request_id,
+                repo = %repo,
+                error = %error,
+                "LFS batch upstream request failed"
+            );
+            return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+                "LFS batch upstream request failed: {error}"
+            )))
+            .into_response();
+        }
+    };
+
+    if !upstream_resp.status().is_success() {
+        let status = upstream_resp.status().as_u16();
+        warn!(
+            request_id,
+            repo = %repo,
+            upstream_status = status,
+            "LFS batch upstream returned error"
+        );
+        return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+            "LFS batch upstream returned HTTP {status}"
+        )))
+        .into_response();
+    }
+
+    let upstream_bytes = match upstream_resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+                "failed to read LFS batch upstream response: {error}"
+            )))
+            .into_response();
+        }
+    };
+
+    // Parse upstream batch response to extract download URLs.
+    let upstream_batch: serde_json::Value = match serde_json::from_slice(&upstream_bytes) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+                "invalid upstream LFS batch response: {error}"
+            )))
+            .into_response();
+        }
+    };
+
+    let base_url = format!("http://{}", state.domain.config.bind_addr);
+    // Build the response, mapping each object to either a cache download URL
+    // or an error.
+    let upstream_objects = upstream_batch["objects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let store = &state.domain.store;
+    let mut response_objects = Vec::with_capacity(batch.objects.len());
+    for upstream_obj in &upstream_objects {
+        let oid = upstream_obj["oid"].as_str().unwrap_or_default().to_string();
+        let size = upstream_obj["size"].as_u64().unwrap_or(0);
+
+        if !validate_lfs_oid(&oid) {
+            response_objects.push(LfsBatchObjectResponse {
+                oid: oid.clone(),
+                size,
+                actions: None,
+                error: Some(LfsBatchError {
+                    code: 422,
+                    message: "invalid LFS OID".into(),
+                }),
+            });
+            continue;
+        }
+
+        if size > max_object_bytes {
+            response_objects.push(LfsBatchObjectResponse {
+                oid: oid.clone(),
+                size,
+                actions: None,
+                error: Some(LfsBatchError {
+                    code: 422,
+                    message: format!("object exceeds {max_object_bytes} byte limit"),
+                }),
+            });
+            continue;
+        }
+
+        // Check if the upstream returned an error for this object.
+        if let Some(err) = upstream_obj.get("error") {
+            response_objects.push(LfsBatchObjectResponse {
+                oid: oid.clone(),
+                size,
+                actions: None,
+                error: Some(LfsBatchError {
+                    code: err["code"].as_u64().unwrap_or(404) as u16,
+                    message: err["message"]
+                        .as_str()
+                        .unwrap_or("upstream error")
+                        .to_string(),
+                }),
+            });
+            continue;
+        }
+
+        // Check cache. On miss, fetch from upstream and store.
+        let obj_key = match lfs_object_key(&repo, &oid) {
+            Ok(key) => key,
+            Err(error) => {
+                response_objects.push(LfsBatchObjectResponse {
+                    oid: oid.clone(),
+                    size,
+                    actions: None,
+                    error: Some(LfsBatchError {
+                        code: 500,
+                        message: error.to_string(),
+                    }),
+                });
+                continue;
+            }
+        };
+
+        let cached = match store.exists(&obj_key).await {
+            Ok(exists) => exists,
+            Err(error) => {
+                warn!(
+                    request_id,
+                    repo = %repo,
+                    oid = %oid,
+                    error = %error,
+                    "LFS cache check failed"
+                );
+                false
+            }
+        };
+
+        if !cached {
+            // Extract the upstream download URL.
+            let upstream_href = upstream_obj
+                .get("actions")
+                .and_then(|a| a.get("download"))
+                .and_then(|d| d.get("href"))
+                .and_then(|h| h.as_str());
+
+            if let Some(href) = upstream_href {
+                // Fetch from upstream and store (proxy-tee).
+                match fetch_and_cache_lfs_object(
+                    &state.upstream_http,
+                    href,
+                    store.as_ref(),
+                    &obj_key,
+                    max_object_bytes,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        info!(
+                            request_id,
+                            repo = %repo,
+                            oid = %oid,
+                            size,
+                            "LFS object cached from upstream"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            request_id,
+                            repo = %repo,
+                            oid = %oid,
+                            error = %error,
+                            "LFS object cache-fill failed; serving upstream URL directly"
+                        );
+                        // Fall through — serve the cache download URL anyway;
+                        // the download handler will proxy on miss.
+                    }
+                }
+            }
+        }
+
+        let download_url = format!(
+            "{}/git/{}.git/info/lfs/objects/{}",
+            base_url,
+            repo.as_str(),
+            oid
+        );
+
+        response_objects.push(LfsBatchObjectResponse {
+            oid,
+            size,
+            actions: Some(LfsBatchActions {
+                download: LfsBatchAction {
+                    href: download_url,
+                },
+            }),
+            error: None,
+        });
+    }
+
+    info!(
+        request_id,
+        repo = %repo,
+        objects = response_objects.len(),
+        "LFS batch download response"
+    );
+
+    let resp = LfsBatchResponse {
+        transfer: "basic",
+        objects: response_objects,
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, LFS_CONTENT_TYPE)
+        .body(Body::from(serde_json::to_vec(&resp).unwrap_or_default()))
+        .expect("LFS batch response")
+}
+
+fn extract_lfs_oid_from_path(path: &str) -> Option<&str> {
+    let idx = path.find("/info/lfs/objects/")?;
+    let after = &path[idx + "/info/lfs/objects/".len()..];
+    // Reject anything after the OID (e.g. trailing slashes or extra segments).
+    let oid = after.split('/').next()?;
+    if oid.is_empty() {
+        return None;
+    }
+    // Strip .git suffix if present.
+    let oid = oid.strip_suffix(".git").unwrap_or(oid);
+    Some(oid)
+}
+
+async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
+    let request_id = state.next_request_id();
+    let path = request.uri.path().to_string();
+    let repo = match repo_from_git_path(&request.repo_path) {
+        Ok(repo) => repo,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+
+    let materializer = Materializer::new(Arc::clone(&state.domain));
+    if let Err(error) = materializer.validate_host(&repo) {
+        return ApiError::from(error).into_response();
+    }
+
+    let oid = match extract_lfs_oid_from_path(&path) {
+        Some(oid) if validate_lfs_oid(oid) => oid.to_string(),
+        _ => {
+            return ApiError::from(GitCacheError::Validation(
+                "invalid or missing LFS OID in download path".into(),
+            ))
+            .into_response();
+        }
+    };
+
+    let obj_key = match lfs_object_key(&repo, &oid) {
+        Ok(key) => key,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+
+    let store = &state.domain.store;
+
+    // Try serving from cache.
+    match store.get(&obj_key).await {
+        Ok(Some(data)) => {
+            info!(
+                request_id,
+                repo = %repo,
+                oid = %oid,
+                size = data.len(),
+                "LFS object served from cache"
+            );
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(data))
+                .expect("LFS download response");
+        }
+        Ok(None) => {
+            info!(
+                request_id,
+                repo = %repo,
+                oid = %oid,
+                "LFS object not in cache; proxying from upstream"
+            );
+        }
+        Err(error) => {
+            warn!(
+                request_id,
+                repo = %repo,
+                oid = %oid,
+                error = %error,
+                "LFS cache read failed; proxying from upstream"
+            );
+        }
+    }
+
+    // Cache miss — proxy from upstream LFS server.
+    let auth = match direct_git_upstream_auth(&request.headers) {
+        Ok(auth) => auth,
+        Err(error) => return error.into_response(),
+    };
+
+    let upstream_url = match materializer.upstream_url(&repo) {
+        Ok(url) => url,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+
+    // Resolve upstream download URL via a batch request.
+    let upstream_lfs_batch_url = format!(
+        "{}/info/lfs/objects/batch",
+        upstream_url.trim_end_matches('/')
+    );
+
+    let mut upstream_req = state
+        .upstream_http
+        .post(&upstream_lfs_batch_url)
+        .header(header::CONTENT_TYPE.as_str(), LFS_CONTENT_TYPE)
+        .header(header::ACCEPT.as_str(), LFS_CONTENT_TYPE);
+    if let Some(raw_auth) = auth.raw_header() {
+        upstream_req = upstream_req.header(header::AUTHORIZATION.as_str(), raw_auth);
+    }
+    let upstream_body = serde_json::json!({
+        "operation": "download",
+        "transfers": ["basic"],
+        "objects": [{"oid": oid, "size": 0}]
+    });
+    upstream_req = upstream_req.json(&upstream_body);
+
+    let upstream_resp = match upstream_req.send().await {
+        Ok(resp) => resp,
+        Err(error) => {
+            return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+                "LFS upstream batch request failed: {error}"
+            )))
+            .into_response();
+        }
+    };
+
+    if !upstream_resp.status().is_success() {
+        return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+            "LFS upstream batch returned HTTP {}",
+            upstream_resp.status()
+        )))
+        .into_response();
+    }
+
+    let upstream_bytes = match upstream_resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+                "failed to read LFS upstream batch response: {error}"
+            )))
+            .into_response();
+        }
+    };
+
+    let upstream_batch: serde_json::Value = match serde_json::from_slice(&upstream_bytes) {
+        Ok(v) => v,
+        Err(error) => {
+            return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+                "invalid upstream LFS batch response: {error}"
+            )))
+            .into_response();
+        }
+    };
+
+    let upstream_href = upstream_batch["objects"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|obj| obj.get("actions"))
+        .and_then(|a| a.get("download"))
+        .and_then(|d| d.get("href"))
+        .and_then(|h| h.as_str());
+
+    let Some(href) = upstream_href else {
+        return ApiError::from(GitCacheError::NotFound(format!(
+            "LFS object {oid} not found upstream"
+        )))
+        .into_response();
+    };
+
+    let max_object_bytes = state.domain.config.lfs.max_object_bytes;
+
+    // Fetch from upstream, cache, and serve.
+    match fetch_and_cache_lfs_object(
+        &state.upstream_http,
+        href,
+        store.as_ref(),
+        &obj_key,
+        max_object_bytes,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(error) => {
+            warn!(
+                request_id,
+                repo = %repo,
+                oid = %oid,
+                error = %error,
+                "LFS object cache-fill on download failed"
+            );
+        }
+    }
+
+    // Serve from cache (should now exist after the fetch).
+    match store.get(&obj_key).await {
+        Ok(Some(data)) => {
+            info!(
+                request_id,
+                repo = %repo,
+                oid = %oid,
+                size = data.len(),
+                "LFS object served after proxy-tee"
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(data))
+                .expect("LFS download response")
+        }
+        _ => ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+            "LFS object {oid} could not be retrieved"
+        )))
+        .into_response(),
+    }
+}
+
+async fn fetch_and_cache_lfs_object(
+    http: &reqwest::Client,
+    href: &str,
+    store: &dyn git_cache_objectstore::ObjectStore,
+    obj_key: &str,
+    max_bytes: u64,
+) -> CoreResult<()> {
+    let response = http
+        .get(href)
+        .send()
+        .await
+        .map_err(|e| GitCacheError::UpstreamUnavailable(format!("LFS download failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(GitCacheError::UpstreamUnavailable(format!(
+            "LFS download returned HTTP {}",
+            response.status()
+        )));
+    }
+
+    let content_length = response.content_length().unwrap_or(0);
+    if content_length > max_bytes {
+        return Err(GitCacheError::Validation(format!(
+            "LFS object exceeds {max_bytes} byte limit (content-length: {content_length})"
+        )));
+    }
+
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| GitCacheError::UpstreamUnavailable(format!("LFS download body: {e}")))?;
+
+    if body.len() as u64 > max_bytes {
+        return Err(GitCacheError::Validation(format!(
+            "LFS object exceeds {max_bytes} byte limit ({} bytes)",
+            body.len()
+        )));
+    }
+
+    store
+        .put_if_absent(obj_key, Bytes::from(body.to_vec()))
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

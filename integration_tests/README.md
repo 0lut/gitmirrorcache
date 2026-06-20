@@ -111,6 +111,29 @@ HEAD plus a bounded history walk, and also runs a blobless full checkout for
 `uv` and `ruff`. Add `GIT_CACHE_AWS_DEV_DIRECT_HEAVY_BASELINE=1` to also
 measure the same heavy shapes directly from GitHub for comparison.
 
+## LFS smoke tests (`test_lfs_smoke`)
+
+```sh
+RUN_GITHUB_INTEGRATION=1 python3 -m unittest -v integration_tests.test_lfs_smoke
+```
+
+Tests Git LFS caching through the cache: verifies the git protocol layer
+works for LFS repos (pointer files clone correctly), the LFS batch API
+proxies upstream and returns download URLs, LFS objects are cached in the
+object store after first access, and the upstream-URL workaround lets
+`git lfs pull` succeed.
+
+Optional overrides:
+
+```sh
+GIT_CACHE_LFS_TEST_REPO=github.com/charmbracelet/vhs \
+RUN_GITHUB_INTEGRATION=1 \
+python3 -m unittest -v integration_tests.test_lfs_smoke
+```
+
+Requires `git-lfs` installed (`git lfs install`). The test class is
+automatically skipped if `git-lfs` is not available.
+
 ## Docker / MinIO object-store tests
 
 These tests use Docker Compose to run MinIO locally and exercise the S3-compatible

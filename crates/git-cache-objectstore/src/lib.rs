@@ -12,14 +12,14 @@ use std::path::{Component, Path};
 
 pub use local::LocalObjectStore;
 pub use manifests::{
-    commit_manifest_key, generation_manifest_key, generation_manifest_prefix, pack_key,
-    pack_prefix, read_commit_manifest, read_generation_manifest, read_json, read_ref_manifest,
-    read_repo_generation_head, read_repo_generation_head_versioned, ref_manifest_key,
-    repo_generation_head_key, write_commit_manifest, write_commit_manifest_if_absent_or_matches,
-    write_generation_manifest, write_generation_manifest_if_absent_or_matches, write_json,
-    write_json_if_absent, write_json_if_absent_or_matches, write_ref_manifest,
-    write_repo_generation_head, write_repo_generation_head_if_version_matches, GenerationPublish,
-    PublishManifests,
+    commit_manifest_key, generation_manifest_key, generation_manifest_prefix, lfs_object_key,
+    pack_key, pack_prefix, read_commit_manifest, read_generation_manifest, read_json,
+    read_ref_manifest, read_repo_generation_head, read_repo_generation_head_versioned,
+    ref_manifest_key, repo_generation_head_key, write_commit_manifest,
+    write_commit_manifest_if_absent_or_matches, write_generation_manifest,
+    write_generation_manifest_if_absent_or_matches, write_json, write_json_if_absent,
+    write_json_if_absent_or_matches, write_ref_manifest, write_repo_generation_head,
+    write_repo_generation_head_if_version_matches, GenerationPublish, PublishManifests,
 };
 
 #[cfg(feature = "s3")]

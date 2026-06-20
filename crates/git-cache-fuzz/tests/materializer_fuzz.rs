@@ -54,6 +54,7 @@ impl Fixture {
             },
             git_remote: Default::default(),
             compaction: Default::default(),
+            lfs: Default::default(),
             shutdown: Default::default(),
             max_concurrent_git_processes: 4,
             async_materialize_concurrency: 2,

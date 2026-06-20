@@ -29,6 +29,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
+    pub lfs: LfsConfig,
+    #[serde(default)]
     pub shutdown: ShutdownConfig,
     #[serde(default = "default_max_concurrent_git_processes")]
     pub max_concurrent_git_processes: usize,
@@ -110,6 +112,13 @@ impl AppConfig {
                     true,
                 )?,
                 proxy_tee_import: parse_bool_env("GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT", true)?,
+            },
+            lfs: LfsConfig {
+                enabled: parse_bool_env("GIT_CACHE_LFS_ENABLED", false)?,
+                max_object_bytes: parse_env(
+                    "GIT_CACHE_LFS_MAX_OBJECT_BYTES",
+                    default_lfs_max_object_bytes(),
+                )?,
             },
             compaction: CompactionConfig {
                 chain_depth_threshold: parse_env(
@@ -286,6 +295,28 @@ impl Default for GitRemoteConfig {
             proxy_tee_import: true,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LfsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_lfs_max_object_bytes")]
+    pub max_object_bytes: u64,
+}
+
+impl Default for LfsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_object_bytes: default_lfs_max_object_bytes(),
+        }
+    }
+}
+
+fn default_lfs_max_object_bytes() -> u64 {
+    // 2 GiB
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_true() -> bool {

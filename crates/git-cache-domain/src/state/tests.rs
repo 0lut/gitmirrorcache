@@ -64,6 +64,7 @@ fn test_config(cache_root: PathBuf, object_root: PathBuf) -> AppConfig {
         },
         git_remote: Default::default(),
         compaction: Default::default(),
+        lfs: Default::default(),
         shutdown: Default::default(),
         max_concurrent_git_processes: 1,
         async_materialize_concurrency: 2,
