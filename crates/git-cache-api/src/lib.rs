@@ -2456,35 +2456,49 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
                 .and_then(|d| d.get("href"))
                 .and_then(|h| h.as_str());
 
-            if let Some(href) = upstream_href {
-                // Fetch from upstream and store (proxy-tee).
-                match fetch_and_cache_lfs_object(
-                    &state.upstream_http,
-                    href,
-                    store.as_ref(),
-                    &obj_key,
-                    max_object_bytes,
-                )
-                .await
-                {
-                    Ok(_content_length) => {
-                        info!(
-                            request_id,
-                            repo = %repo,
-                            oid = %oid,
-                            size,
-                            "LFS object cached from upstream"
-                        );
+            match upstream_href {
+                Some(href) => {
+                    // Fetch from upstream and store (proxy-tee).
+                    match fetch_and_cache_lfs_object(
+                        &state.upstream_http,
+                        href,
+                        store.as_ref(),
+                        &obj_key,
+                        max_object_bytes,
+                    )
+                    .await
+                    {
+                        Ok(_content_length) => {
+                            info!(
+                                request_id,
+                                repo = %repo,
+                                oid = %oid,
+                                size,
+                                "LFS object cached from upstream"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                request_id,
+                                repo = %repo,
+                                oid = %oid,
+                                error = %error,
+                                "LFS object cache-fill failed"
+                            );
+                        }
                     }
-                    Err(error) => {
-                        warn!(
-                            request_id,
-                            repo = %repo,
-                            oid = %oid,
-                            error = %error,
-                            "LFS object cache-fill failed"
-                        );
-                    }
+                }
+                None => {
+                    response_objects.push(LfsBatchObjectResponse {
+                        oid,
+                        size,
+                        actions: None,
+                        error: Some(LfsBatchError {
+                            code: 404,
+                            message: "object not available upstream".into(),
+                        }),
+                    });
+                    continue;
                 }
             }
         }
