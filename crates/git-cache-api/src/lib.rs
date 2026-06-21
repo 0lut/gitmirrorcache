@@ -2746,19 +2746,28 @@ async fn fetch_and_cache_lfs_object(
         )));
     }
 
-    let body = response
-        .bytes()
+    // Stream the body with a running byte counter to enforce the size limit
+    // even when Content-Length is absent (chunked transfer encoding).
+    let mut buf = Vec::with_capacity(
+        content_length.min(max_bytes).min(64 * 1024 * 1024) as usize,
+    );
+    let mut total: u64 = 0;
+    let mut stream = response;
+    while let Some(chunk) = stream
+        .chunk()
         .await
-        .map_err(|e| GitCacheError::UpstreamUnavailable(format!("LFS download body: {e}")))?;
-
-    if body.len() as u64 > max_bytes {
-        return Err(GitCacheError::Validation(format!(
-            "LFS object exceeds {max_bytes} byte limit ({} bytes)",
-            body.len()
-        )));
+        .map_err(|e| GitCacheError::UpstreamUnavailable(format!("LFS download body: {e}")))?
+    {
+        total += chunk.len() as u64;
+        if total > max_bytes {
+            return Err(GitCacheError::Validation(format!(
+                "LFS object exceeds {max_bytes} byte limit ({total} bytes streamed)"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
     }
 
-    let data: Bytes = body;
+    let data = Bytes::from(buf);
     // Best-effort cache write; log but don't fail if store is unavailable.
     if let Err(e) = store.put_if_absent(obj_key, data.clone()).await {
         tracing::warn!(obj_key, error = %e, "LFS cache write failed (best-effort)");
