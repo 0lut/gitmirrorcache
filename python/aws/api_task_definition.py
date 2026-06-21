@@ -11,6 +11,7 @@ env = [
     {"name": "GIT_CACHE_DISK_QUOTA_BYTES", "value": os.environ["GIT_CACHE_DISK_QUOTA_BYTES"]},
     {"name": "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "value": os.environ.get("GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD", "10")},
     {"name": "GIT_CACHE_COMPACTION_INLINE", "value": os.environ.get("GIT_CACHE_COMPACTION_INLINE", "false")},
+    {"name": "GIT_CACHE_LFS_ENABLED", "value": os.environ.get("GIT_CACHE_LFS_ENABLED", "false")},
     {"name": "GIT_CACHE_GIT_TIMEOUT_SECONDS", "value": os.environ.get("GIT_CACHE_GIT_TIMEOUT_SECONDS", "3600")},
     {"name": "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "value": os.environ.get("GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES", "8")},
     {"name": "GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "value": os.environ.get("GIT_CACHE_MAX_GIT_OUTPUT_BYTES", "8589934592")},
