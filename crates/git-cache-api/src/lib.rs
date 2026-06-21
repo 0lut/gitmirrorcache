@@ -2366,20 +2366,25 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         &state.domain.config.bind_addr,
         &state.domain.config.public_path_prefix,
     );
-    // Build the response, mapping each object to either a cache download URL
-    // or an error.
+    // Index upstream response objects by OID for O(1) lookup.
     let upstream_objects = upstream_batch["objects"]
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let upstream_by_oid: std::collections::HashMap<&str, &serde_json::Value> = upstream_objects
+        .iter()
+        .filter_map(|obj| obj["oid"].as_str().map(|oid| (oid, obj)))
+        .collect();
 
+    // Iterate the client's requested objects so every request gets a response
+    // entry, even if the upstream omitted it.
     let store = &state.domain.store;
     let mut response_objects = Vec::with_capacity(batch.objects.len());
-    for upstream_obj in &upstream_objects {
-        let oid = upstream_obj["oid"].as_str().unwrap_or_default().to_string();
-        let size = upstream_obj["size"].as_u64().unwrap_or(0);
+    for req_obj in &batch.objects {
+        let oid = &req_obj.oid;
+        let size = req_obj.size;
 
-        if !validate_lfs_oid(&oid) {
+        if !validate_lfs_oid(oid) {
             response_objects.push(LfsBatchObjectResponse {
                 oid: oid.clone(),
                 size,
@@ -2405,6 +2410,22 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
             continue;
         }
 
+        let upstream_obj = match upstream_by_oid.get(oid.as_str()) {
+            Some(obj) => *obj,
+            None => {
+                response_objects.push(LfsBatchObjectResponse {
+                    oid: oid.clone(),
+                    size,
+                    actions: None,
+                    error: Some(LfsBatchError {
+                        code: 404,
+                        message: "object not found in upstream response".into(),
+                    }),
+                });
+                continue;
+            }
+        };
+
         // Check if the upstream returned an error for this object.
         if let Some(err) = upstream_obj.get("error") {
             response_objects.push(LfsBatchObjectResponse {
@@ -2423,7 +2444,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         }
 
         // Check cache. On miss, fetch from upstream and store.
-        let obj_key = match lfs_object_key(&repo, &oid) {
+        let obj_key = match lfs_object_key(&repo, oid) {
             Ok(key) => key,
             Err(error) => {
                 response_objects.push(LfsBatchObjectResponse {
@@ -2491,7 +2512,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
                                 "LFS object cache-fill failed"
                             );
                             response_objects.push(LfsBatchObjectResponse {
-                                oid,
+                                oid: oid.clone(),
                                 size,
                                 actions: None,
                                 error: Some(LfsBatchError {
@@ -2505,7 +2526,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
                 }
                 None => {
                     response_objects.push(LfsBatchObjectResponse {
-                        oid,
+                        oid: oid.clone(),
                         size,
                         actions: None,
                         error: Some(LfsBatchError {
@@ -2526,7 +2547,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         );
 
         response_objects.push(LfsBatchObjectResponse {
-            oid,
+            oid: oid.clone(),
             size,
             actions: Some(LfsBatchActions {
                 download: LfsBatchAction { href: download_url },
