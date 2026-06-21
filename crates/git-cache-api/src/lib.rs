@@ -2456,10 +2456,8 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
                             repo = %repo,
                             oid = %oid,
                             error = %error,
-                            "LFS object cache-fill failed; serving upstream URL directly"
+                            "LFS object cache-fill failed"
                         );
-                        // Fall through — serve the cache download URL anyway;
-                        // the download handler will proxy on miss.
                     }
                 }
             }

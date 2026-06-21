@@ -164,12 +164,12 @@ enabled = true
         env["RUST_LOG"] = "info"
         env["GIT_CACHE_CONFIG"] = str(config_path)
         env["TMPDIR"] = str(git_tmp)
+        cls._server_log = open(cls.tmp / "server.log", "w")
         cls.server = subprocess.Popen(
             [str(REPO_ROOT / "target/debug/git-cache-api")],
             cwd=REPO_ROOT,
             env=env,
-            text=True,
-            stdout=subprocess.PIPE,
+            stdout=cls._server_log,
             stderr=subprocess.STDOUT,
         )
         cls._wait_for_healthz()
@@ -184,11 +184,14 @@ enabled = true
             except subprocess.TimeoutExpired:
                 server.kill()
                 server.wait(timeout=10)
-            if server.stdout is not None:
-                tail = server.stdout.read()
-                if tail.strip():
-                    for line in tail.strip().splitlines()[-30:]:
-                        print(line)
+        log_fh = getattr(cls, "_server_log", None)
+        if log_fh is not None:
+            log_fh.close()
+            log_path = cls.tmp / "server.log"
+            if log_path.exists():
+                tail = log_path.read_text().strip().splitlines()[-30:]
+                for line in tail:
+                    print(line)
 
         tmp = getattr(cls, "tmp", None)
         if tmp is not None:
@@ -502,41 +505,56 @@ enabled = true
         )
 
     def test_lfs_clone_through_cache_resolves_pointers(self) -> None:
-        """Clone without skip-smudge with LFS enabled: pointers should resolve."""
+        """Batch+download a single LFS object through the cache and verify content."""
         clone_dir = self.tmp / "clone-lfs-through-cache"
-        result = _run(
+        _run(
             [
                 "git", "clone", "--depth", "1",
                 self._git_url(), str(clone_dir),
             ],
-            env=self._clone_env(skip_smudge=False),
+            env=self._clone_env(skip_smudge=True),
             check=False,
         )
-        # With LFS cache enabled, the clone should succeed and the smudge
-        # filter should resolve LFS pointers via our batch API.
-        if result.returncode != 0:
-            print(f"clone exited {result.returncode}")
-            # If the clone failed checkout, try to recover
-            if (clone_dir / ".git").is_dir():
-                _run(
-                    ["git", "checkout", "-f", "HEAD"],
-                    cwd=clone_dir,
-                    check=False,
-                )
 
         pointers = _find_lfs_pointer_files(clone_dir)
-        entries = list(p for p in clone_dir.rglob("*")
-                       if p.is_file() and ".git" not in p.parts)
-        non_pointer_files = len(entries) - len(pointers)
-        print(f"Total files: {len(entries)}, pointers remaining: {len(pointers)}, "
-              f"resolved: {non_pointer_files}")
+        self.assertTrue(len(pointers) > 0, "need at least one LFS pointer")
 
-        # If the smudge filter worked through our cache, at least some files
-        # should be resolved (not pointers). But git-lfs 3.0.2 may still fail
-        # on some setups, so we log rather than hard-fail if all remain pointers.
-        if len(pointers) > 0 and non_pointer_files == 0:
-            print("WARNING: all LFS files remain as pointers; "
-                  "smudge filter may not have resolved through cache")
+        # Pick a pointer, send a batch request through the cache, then download.
+        target = pointers[0]
+        ptr_text = target.read_text(errors="replace")
+        oid = _extract_oid_from_pointer(ptr_text)
+        self.assertIsNotNone(oid)
+        size_match = re.search(r"size (\d+)", ptr_text)
+        size = int(size_match.group(1)) if size_match else 0
+
+        batch_url = f"{self._git_url()}/info/lfs/objects/batch"
+        batch_body = json.dumps({
+            "operation": "download",
+            "transfers": ["basic"],
+            "objects": [{"oid": oid, "size": size}],
+        }).encode()
+
+        req = urllib.request.Request(
+            batch_url, data=batch_body, method="POST",
+            headers={"Content-Type": "application/vnd.git-lfs+json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            batch_resp = json.loads(resp.read().decode())
+
+        href = batch_resp["objects"][0]["actions"]["download"]["href"]
+        with urllib.request.urlopen(href, timeout=60) as dl_resp:
+            data = dl_resp.read()
+
+        self.assertEqual(len(data), size, f"expected {size} bytes, got {len(data)}")
+        # Verify it's real content, not a pointer
+        try:
+            text = data.decode("utf-8")
+            self.assertFalse(
+                _is_lfs_pointer(text),
+                "downloaded content should be real data, not a pointer",
+            )
+        except UnicodeDecodeError:
+            pass  # binary content is definitely not a pointer
 
 
 if __name__ == "__main__":
