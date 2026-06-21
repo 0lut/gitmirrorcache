@@ -5,10 +5,11 @@ use chrono::{DateTime, Utc};
 use git_cache_core::{GitCacheError, Result};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 
 #[derive(Debug, Clone)]
 pub struct LocalObjectStore {
@@ -202,6 +203,47 @@ impl ObjectStore for LocalObjectStore {
         let tmp_file = fs::File::open(&tmp_path).await?;
         tmp_file.sync_all().await?;
         drop(tmp_file);
+        match fs::rename(&tmp_path, &dest).await {
+            Ok(()) => {
+                sync_directory(parent)?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                Err(err.into())
+            }
+        }
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<Option<(Pin<Box<dyn AsyncRead + Send>>, u64)>> {
+        let path = self.object_path(key)?;
+        match fs::metadata(&path).await {
+            Ok(metadata) if metadata.is_file() => {
+                let file = fs::File::open(&path).await?;
+                Ok(Some((Box::pin(file), metadata.len())))
+            }
+            Ok(_) => Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        reader: Pin<Box<dyn AsyncRead + Send>>,
+        _content_length: u64,
+    ) -> Result<()> {
+        let dest = self.object_path(key)?;
+        let parent = parent_dir(&dest)?;
+        fs::create_dir_all(parent).await?;
+
+        let tmp_path = allocate_temp_path(parent, &dest)?;
+        let mut file = fs::File::create(&tmp_path).await?;
+        let mut reader = reader;
+        tokio::io::copy(&mut reader, &mut file).await?;
+        file.sync_all().await?;
+        drop(file);
         match fs::rename(&tmp_path, &dest).await {
             Ok(()) => {
                 sync_directory(parent)?;

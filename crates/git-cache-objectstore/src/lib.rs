@@ -9,6 +9,8 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use git_cache_core::{GitCacheError, Result};
 use std::path::{Component, Path};
+use std::pin::Pin;
+use tokio::io::AsyncRead;
 
 pub use local::LocalObjectStore;
 pub use manifests::{
@@ -88,6 +90,31 @@ pub trait ObjectStore: Send + Sync {
     async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
         let data = tokio::fs::read(path).await?;
         self.put(key, Bytes::from(data)).await
+    }
+
+    /// Stream an object's bytes without loading the entire object into memory.
+    /// Returns `None` if the key does not exist.
+    async fn get_stream(&self, key: &str) -> Result<Option<(Pin<Box<dyn AsyncRead + Send>>, u64)>> {
+        let Some(data) = self.get(key).await? else {
+            return Ok(None);
+        };
+        let len = data.len() as u64;
+        Ok(Some((Box::pin(std::io::Cursor::new(data)), len)))
+    }
+
+    /// Write an object from a streaming reader without accumulating the full
+    /// body in memory.  `content_length` is the expected total size.
+    async fn put_stream(
+        &self,
+        key: &str,
+        reader: Pin<Box<dyn AsyncRead + Send>>,
+        content_length: u64,
+    ) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut reader = reader;
+        let mut buf = Vec::with_capacity(content_length.min(64 * 1024 * 1024) as usize);
+        reader.read_to_end(&mut buf).await?;
+        self.put(key, Bytes::from(buf)).await
     }
 }
 

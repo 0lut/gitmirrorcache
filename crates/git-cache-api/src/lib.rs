@@ -3,7 +3,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use git_cache_core::{
     AppConfig, BranchName, CommitSha, GitCacheError, MaterializeRequest, RepoKey,
     Result as CoreResult, Selector, UpstreamAuth, UpstreamAuthorizationMode,
@@ -31,8 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
@@ -2465,7 +2464,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
                 )
                 .await
                 {
-                    Ok(_bytes) => {
+                    Ok(_content_length) => {
                         info!(
                             request_id,
                             repo = %repo,
@@ -2566,20 +2565,22 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
 
     let store = &state.domain.store;
 
-    // Try serving from cache.
-    match store.get(&obj_key).await {
-        Ok(Some(data)) => {
+    // Try streaming from cache.
+    match store.get_stream(&obj_key).await {
+        Ok(Some((reader, len))) => {
             info!(
                 request_id,
                 repo = %repo,
                 oid = %oid,
-                size = data.len(),
-                "LFS object served from cache"
+                size = len,
+                "LFS object served from cache (streaming)"
             );
+            let stream = ReaderStream::new(reader);
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/octet-stream")
-                .body(Body::from(data))
+                .header(header::CONTENT_LENGTH, len)
+                .body(Body::from_stream(stream))
                 .expect("LFS download response");
         }
         Ok(None) => {
@@ -2688,7 +2689,7 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
 
     let max_object_bytes = state.domain.config.lfs.max_object_bytes;
 
-    // Fetch from upstream, cache, and serve.
+    // Fetch from upstream, cache (streaming), and serve.
     let fetched = fetch_and_cache_lfs_object(
         &state.upstream_http,
         href,
@@ -2699,19 +2700,38 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
     .await;
 
     match fetched {
-        Ok(data) => {
-            info!(
-                request_id,
-                repo = %repo,
-                oid = %oid,
-                size = data.len(),
-                "LFS object served after proxy-tee"
-            );
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .body(Body::from(data))
-                .expect("LFS download response")
+        Ok(content_length) => {
+            // Object is now cached — stream it back from the store.
+            match store.get_stream(&obj_key).await {
+                Ok(Some((reader, len))) => {
+                    info!(
+                        request_id,
+                        repo = %repo,
+                        oid = %oid,
+                        size = len,
+                        "LFS object served after proxy-tee (streaming)"
+                    );
+                    let stream = ReaderStream::new(reader);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .header(header::CONTENT_LENGTH, len)
+                        .body(Body::from_stream(stream))
+                        .expect("LFS download response")
+                }
+                _ => {
+                    warn!(
+                        request_id,
+                        repo = %repo,
+                        oid = %oid,
+                        "LFS cache read-back failed after proxy-tee ({content_length} bytes cached)"
+                    );
+                    ApiError::from(GitCacheError::UpstreamUnavailable(format!(
+                        "LFS object {oid} cached but read-back failed"
+                    )))
+                    .into_response()
+                }
+            }
         }
         Err(error) => {
             warn!(
@@ -2729,16 +2749,16 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
     }
 }
 
-/// Fetches an LFS object from upstream, stores it in the object store, and
-/// returns the downloaded bytes. The caller can serve the bytes directly even
-/// if the cache write fails (best-effort caching).
+/// Fetches an LFS object from upstream and streams it into the object store
+/// without buffering the full body in memory.  Returns the number of bytes
+/// cached on success.
 async fn fetch_and_cache_lfs_object(
     http: &reqwest::Client,
     href: &str,
     store: &dyn git_cache_objectstore::ObjectStore,
     obj_key: &str,
     max_bytes: u64,
-) -> CoreResult<Bytes> {
+) -> CoreResult<u64> {
     let response = http
         .get(href)
         .send()
@@ -2759,31 +2779,22 @@ async fn fetch_and_cache_lfs_object(
         )));
     }
 
-    // Stream the body with a running byte counter to enforce the size limit
-    // even when Content-Length is absent (chunked transfer encoding).
-    let mut buf = Vec::with_capacity(content_length.min(max_bytes).min(64 * 1024 * 1024) as usize);
-    let mut total: u64 = 0;
-    let mut stream = response;
-    while let Some(chunk) = stream
-        .chunk()
-        .await
-        .map_err(|e| GitCacheError::UpstreamUnavailable(format!("LFS download body: {e}")))?
-    {
-        total += chunk.len() as u64;
-        if total > max_bytes {
-            return Err(GitCacheError::Validation(format!(
-                "LFS object exceeds {max_bytes} byte limit ({total} bytes streamed)"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
+    // Wrap the response body as an AsyncRead with a byte-limit guard so the
+    // store never ingests more than max_bytes.
+    let body_stream = response.bytes_stream();
+    let reader = tokio_util::io::StreamReader::new(
+        body_stream.map(|result| result.map_err(std::io::Error::other)),
+    );
+    let reader = tokio::io::BufReader::new(reader.take(max_bytes));
 
-    let data = Bytes::from(buf);
-    // Best-effort cache write; log but don't fail if store is unavailable.
-    if let Err(e) = store.put_if_absent(obj_key, data.clone()).await {
+    if let Err(e) = store
+        .put_stream(obj_key, Box::pin(reader), content_length)
+        .await
+    {
         tracing::warn!(obj_key, error = %e, "LFS cache write failed (best-effort)");
     }
-    Ok(data)
+
+    Ok(content_length)
 }
 
 #[cfg(test)]
