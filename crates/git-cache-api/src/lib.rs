@@ -2137,6 +2137,8 @@ impl<R: AsyncRead + Unpin> Stream for ChildGuardStream<R> {
 const LFS_CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 /// Bounded request body for LFS batch POSTs (1 MiB).
 const LFS_BATCH_MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Upper bound for upstream LFS batch JSON responses (16 MiB).
+const LFS_BATCH_MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct LfsBatchRequest {
@@ -2323,7 +2325,22 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         .into_response();
     }
 
+    if upstream_resp.content_length().unwrap_or(0) > LFS_BATCH_MAX_RESPONSE_BYTES {
+        return ApiError::from(GitCacheError::Validation(format!(
+            "upstream LFS batch response exceeds {} byte limit",
+            LFS_BATCH_MAX_RESPONSE_BYTES
+        )))
+        .into_response();
+    }
+
     let upstream_bytes = match upstream_resp.bytes().await {
+        Ok(bytes) if bytes.len() as u64 > LFS_BATCH_MAX_RESPONSE_BYTES => {
+            return ApiError::from(GitCacheError::Validation(format!(
+                "upstream LFS batch response exceeds {} byte limit",
+                LFS_BATCH_MAX_RESPONSE_BYTES
+            )))
+            .into_response();
+        }
         Ok(bytes) => bytes,
         Err(error) => {
             return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
@@ -2667,7 +2684,22 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
         .into_response();
     }
 
+    if upstream_resp.content_length().unwrap_or(0) > LFS_BATCH_MAX_RESPONSE_BYTES {
+        return ApiError::from(GitCacheError::Validation(format!(
+            "upstream LFS batch response exceeds {} byte limit",
+            LFS_BATCH_MAX_RESPONSE_BYTES
+        )))
+        .into_response();
+    }
+
     let upstream_bytes = match upstream_resp.bytes().await {
+        Ok(bytes) if bytes.len() as u64 > LFS_BATCH_MAX_RESPONSE_BYTES => {
+            return ApiError::from(GitCacheError::Validation(format!(
+                "upstream LFS batch response exceeds {} byte limit",
+                LFS_BATCH_MAX_RESPONSE_BYTES
+            )))
+            .into_response();
+        }
         Ok(bytes) => bytes,
         Err(error) => {
             return ApiError::from(GitCacheError::UpstreamUnavailable(format!(
@@ -2802,12 +2834,10 @@ async fn fetch_and_cache_lfs_object(
     );
     let reader = tokio::io::BufReader::new(reader.take(max_bytes));
 
-    if let Err(e) = store
+    store
         .put_stream(obj_key, Box::pin(reader), content_length)
         .await
-    {
-        tracing::warn!(obj_key, error = %e, "LFS cache write failed (best-effort)");
-    }
+        .map_err(|e| GitCacheError::Internal(format!("LFS cache write failed: {e}")))?;
 
     Ok(content_length)
 }
