@@ -2473,6 +2473,16 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
                                 error = %error,
                                 "LFS object cache-fill failed"
                             );
+                            response_objects.push(LfsBatchObjectResponse {
+                                oid,
+                                size,
+                                actions: None,
+                                error: Some(LfsBatchError {
+                                    code: 502,
+                                    message: format!("cache-fill failed: {error}"),
+                                }),
+                            });
+                            continue;
                         }
                     }
                 }
