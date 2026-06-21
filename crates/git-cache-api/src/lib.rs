@@ -2197,6 +2197,17 @@ fn validate_lfs_oid(oid: &str) -> bool {
     oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn lfs_base_url(headers: &HeaderMap, bind_addr: &std::net::SocketAddr) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        Some(host) => format!("{scheme}://{host}"),
+        None => format!("{scheme}://{bind_addr}"),
+    }
+}
+
 async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Response {
     let request_id = request.request_id;
     let repo = match repo_from_git_path(&request.repo_path) {
@@ -2334,7 +2345,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         }
     };
 
-    let base_url = format!("http://{}", state.domain.config.bind_addr);
+    let base_url = lfs_base_url(&request.headers, &state.domain.config.bind_addr);
     // Build the response, mapping each object to either a cache download URL
     // or an error.
     let upstream_objects = upstream_batch["objects"]
