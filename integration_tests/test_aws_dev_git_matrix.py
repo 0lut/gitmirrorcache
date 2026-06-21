@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +38,13 @@ DEFAULT_REPOS = [
     ("github.com/llvm/llvm-project", "main"),
 ]
 SMALL_REPOS = {"github.com/astral-sh/uv", "github.com/astral-sh/ruff"}
+LFS_REPOS = {"github.com/charmbracelet/vhs"}
+LFS_CONTENT_TYPE = "application/vnd.git-lfs+json"
+LFS_POINTER_RE = re.compile(
+    r"^version https://git-lfs\.github\.com/spec/v1\n"
+    r"oid sha256:[0-9a-f]{64}\n"
+    r"size \d+\n\Z",
+)
 
 
 @dataclass(frozen=True)
@@ -170,7 +178,14 @@ class AwsDevGitMatrix(unittest.TestCase):
         cls.direct_heavy_baseline = env_bool("GIT_CACHE_AWS_DEV_DIRECT_HEAVY_BASELINE", False)
         cls.reset_local_cache = env_bool("GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE", False)
         cls.require_auth = env_bool("GIT_CACHE_AWS_DEV_REQUIRE_AUTH", False)
+        cls.skip_lfs = env_bool("GIT_CACHE_AWS_DEV_SKIP_LFS", False)
         cls.repos = parse_repos()
+        # Append LFS repos unless explicitly skipped or already present.
+        if not cls.skip_lfs:
+            existing = {rc.repo for rc in cls.repos}
+            for lfs_repo in sorted(LFS_REPOS):
+                if lfs_repo not in existing:
+                    cls.repos.append(RepoCase(lfs_repo, "main"))
         cls.basic_auth_header = basic_auth_header_from_env()
         if cls.require_auth and not cls.basic_auth_header:
             raise RuntimeError("auth is required but no Basic auth token/header is configured")
@@ -303,6 +318,8 @@ class AwsDevGitMatrix(unittest.TestCase):
 
         if repo_case.repo in SMALL_REPOS and not self.skip_standard:
             self.blobless_then_full_depth1_transition(repo_case, upstream_head)
+        if repo_case.repo in LFS_REPOS and not self.skip_lfs:
+            self.run_lfs_matrix(repo_case)
         if self.tier == "heavy":
             if self.direct_heavy_baseline:
                 self.heavy_github_direct_baseline(repo_case, upstream_head)
@@ -805,6 +822,258 @@ class AwsDevGitMatrix(unittest.TestCase):
                 "status": "passed",
             }
         )
+
+    # ── LFS matrix ─────────────────────────────────────────────────────
+
+    def run_lfs_matrix(self, repo_case: RepoCase) -> None:
+        """LFS cache correctness and performance sub-matrix."""
+        # 1. Clone with skip-smudge to discover pointer files
+        clone_dir = self.tmp / safe_name(f"lfs-clone-{repo_case.repo}")
+        shutil.rmtree(clone_dir, ignore_errors=True)
+        env = git_env()
+        env["GIT_LFS_SKIP_SMUDGE"] = "1"
+        t0 = time.monotonic()
+        clone_result = run_command(
+            ["git", "clone", "--depth", "1", self.git_url(repo_case.repo), str(clone_dir)],
+            env=env, timeout=self.command_timeout,
+        )
+        clone_elapsed = time.monotonic() - t0
+        self.record({
+            "case": "lfs_clone_skip_smudge",
+            "repo": repo_case.repo,
+            "branch": repo_case.branch,
+            "duration_s": round(clone_elapsed, 3),
+            "returncode": clone_result.returncode,
+            "status": "passed" if clone_result.returncode == 0 else "failed",
+        })
+        if clone_result.returncode != 0:
+            self.failures.append(f"LFS skip-smudge clone failed for {repo_case.repo}")
+            return
+
+        # Find pointer files
+        pointers = self._find_lfs_pointer_files(clone_dir)
+        self.record({
+            "case": "lfs_pointer_discovery",
+            "repo": repo_case.repo,
+            "pointer_count": len(pointers),
+            "status": "passed" if pointers else "failed",
+        })
+        if not pointers:
+            self.failures.append(f"no LFS pointer files found in {repo_case.repo}")
+            return
+
+        # Extract OID/size from first pointer
+        ptr_text = pointers[0].read_text(errors="replace")
+        oid = self._extract_oid(ptr_text)
+        size_m = re.search(r"size (\d+)", ptr_text)
+        size = int(size_m.group(1)) if size_m else 0
+        if not oid:
+            self.failures.append(f"failed to extract OID from pointer in {repo_case.repo}")
+            return
+
+        # 2. LFS batch API — cold (first request, cache miss)
+        cold_batch = self._lfs_batch_timed(repo_case, [{"oid": oid, "size": size}], "lfs_batch_cold")
+        if not cold_batch:
+            return
+
+        cold_href = cold_batch.get("href")
+
+        # 3. LFS object download — cold
+        if cold_href:
+            self._lfs_download_timed(repo_case, cold_href, oid, size, "lfs_download_cold")
+
+        # 4. LFS batch API — warm (second request, cache hit)
+        warm_batch = self._lfs_batch_timed(repo_case, [{"oid": oid, "size": size}], "lfs_batch_warm")
+
+        # 5. LFS object download — warm
+        warm_href = warm_batch.get("href") if warm_batch else cold_href
+        if warm_href:
+            self._lfs_download_timed(repo_case, warm_href, oid, size, "lfs_download_warm")
+
+        # 6. Multi-object batch
+        multi_objects = []
+        for p in pointers[:3]:
+            text = p.read_text(errors="replace")
+            o = self._extract_oid(text)
+            sm = re.search(r"size (\d+)", text)
+            if o and sm:
+                multi_objects.append({"oid": o, "size": int(sm.group(1))})
+        if len(multi_objects) > 1:
+            self._lfs_batch_timed(repo_case, multi_objects, "lfs_batch_multi", expect_count=len(multi_objects))
+
+        # 7. Upload rejected
+        self._lfs_upload_rejected(repo_case)
+
+        # 8. Invalid OID rejected
+        self._lfs_invalid_oid(repo_case)
+
+    def _lfs_batch_url(self, repo: str) -> str:
+        return f"{self.git_url(repo)}/info/lfs/objects/batch"
+
+    def _lfs_batch_timed(
+        self,
+        repo_case: RepoCase,
+        objects: list[dict[str, Any]],
+        label: str,
+        *,
+        expect_count: int = 1,
+    ) -> dict[str, Any] | None:
+        body = json.dumps({
+            "operation": "download",
+            "transfers": ["basic"],
+            "objects": objects,
+        }).encode()
+        req = urllib.request.Request(
+            self._lfs_batch_url(repo_case.repo),
+            data=body, method="POST",
+            headers={"Content-Type": LFS_CONTENT_TYPE},
+        )
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            self.record({
+                "case": label, "repo": repo_case.repo,
+                "duration_s": round(elapsed, 3),
+                "status": "failed", "error": str(exc),
+            })
+            self.failures.append(f"{label} failed for {repo_case.repo}: {exc}")
+            return None
+        elapsed = time.monotonic() - t0
+
+        objs = data.get("objects", [])
+        all_have_actions = all("actions" in o for o in objs)
+        passed = len(objs) == expect_count and all_have_actions
+        self.record({
+            "case": label,
+            "repo": repo_case.repo,
+            "branch": repo_case.branch,
+            "duration_s": round(elapsed, 3),
+            "object_count": len(objs),
+            "all_have_actions": all_have_actions,
+            "status": "passed" if passed else "failed",
+        })
+        if not passed:
+            self.failures.append(f"{label} failed for {repo_case.repo}")
+            return None
+
+        first = objs[0]
+        href = first.get("actions", {}).get("download", {}).get("href")
+        return {"href": href, "oid": first.get("oid"), "size": first.get("size")}
+
+    def _lfs_download_timed(
+        self,
+        repo_case: RepoCase,
+        href: str,
+        oid: str,
+        expected_size: int,
+        label: str,
+    ) -> None:
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(href, timeout=60) as resp:
+                data = resp.read()
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            self.record({
+                "case": label, "repo": repo_case.repo,
+                "oid": oid, "duration_s": round(elapsed, 3),
+                "status": "failed", "error": str(exc),
+            })
+            self.failures.append(f"{label} failed for {repo_case.repo}: {exc}")
+            return
+        elapsed = time.monotonic() - t0
+        passed = len(data) == expected_size
+        self.record({
+            "case": label,
+            "repo": repo_case.repo,
+            "oid": oid,
+            "expected_size": expected_size,
+            "actual_size": len(data),
+            "duration_s": round(elapsed, 3),
+            "throughput_mbps": round(len(data) / elapsed / 1_000_000, 2) if elapsed > 0 else None,
+            "status": "passed" if passed else "failed",
+        })
+        if not passed:
+            self.failures.append(f"{label} size mismatch for {repo_case.repo}: {len(data)} != {expected_size}")
+
+    def _lfs_upload_rejected(self, repo_case: RepoCase) -> None:
+        body = json.dumps({
+            "operation": "upload",
+            "transfers": ["basic"],
+            "objects": [{"oid": "a" * 64, "size": 100}],
+        }).encode()
+        req = urllib.request.Request(
+            self._lfs_batch_url(repo_case.repo),
+            data=body, method="POST",
+            headers={"Content-Type": LFS_CONTENT_TYPE},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        passed = status == 405
+        self.record({
+            "case": "lfs_upload_rejected",
+            "repo": repo_case.repo,
+            "http_status": status,
+            "status": "passed" if passed else "failed",
+        })
+        if not passed:
+            self.failures.append(f"LFS upload not rejected for {repo_case.repo}: HTTP {status}")
+
+    def _lfs_invalid_oid(self, repo_case: RepoCase) -> None:
+        body = json.dumps({
+            "operation": "download",
+            "transfers": ["basic"],
+            "objects": [{"oid": "not-a-valid-oid", "size": 100}],
+        }).encode()
+        req = urllib.request.Request(
+            self._lfs_batch_url(repo_case.repo),
+            data=body, method="POST",
+            headers={"Content-Type": LFS_CONTENT_TYPE},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError:
+            self.record({"case": "lfs_invalid_oid", "repo": repo_case.repo, "status": "passed"})
+            return
+        obj = data.get("objects", [{}])[0]
+        has_error = "error" in obj
+        self.record({
+            "case": "lfs_invalid_oid",
+            "repo": repo_case.repo,
+            "has_error": has_error,
+            "error": obj.get("error"),
+            "status": "passed" if has_error else "failed",
+        })
+        if not has_error:
+            self.failures.append(f"LFS invalid OID not rejected for {repo_case.repo}")
+
+    @staticmethod
+    def _find_lfs_pointer_files(tree: Path) -> list[Path]:
+        pointers: list[Path] = []
+        for path in tree.rglob("*"):
+            if not path.is_file() or ".git" in path.parts:
+                continue
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            if LFS_POINTER_RE.match(text):
+                pointers.append(path)
+        return pointers
+
+    @staticmethod
+    def _extract_oid(content: str) -> str | None:
+        m = re.search(r"oid sha256:([0-9a-f]{64})", content)
+        return m.group(1) if m else None
+
+    # ── infrastructure helpers ─────────────────────────────────────────
 
     def assert_receive_pack_rejected(self) -> None:
         url = (

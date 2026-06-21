@@ -85,6 +85,8 @@ By default it covers `astral-sh/uv`, `astral-sh/ruff`, `torvalds/linux`, and
   `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` is available
 - blobless-to-full depth-1 transition checks for `uv` and `ruff`
 - `git-receive-pack` rejection
+- LFS batch API cold/warm latency, object download cold/warm with throughput,
+  multi-object batch, upload rejection, invalid OID rejection (for LFS repos)
 
 `GIT_CACHE_AWS_DEV_RESET_LOCAL_CACHE=1` uses
 `scripts/aws/remove-cache-repo.sh` to delete only the local EBS hot-cache repo
