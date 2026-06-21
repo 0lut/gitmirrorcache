@@ -36,6 +36,8 @@ pub struct AppConfig {
     pub max_concurrent_git_processes: usize,
     #[serde(default = "default_async_materialize_concurrency")]
     pub async_materialize_concurrency: usize,
+    #[serde(default)]
+    pub public_path_prefix: String,
     /// Use in-process gitoxide for local read-only Git operations instead of
     /// spawning the `git` binary. Acts as a kill switch when disabled.
     #[serde(default = "default_use_gitoxide")]
@@ -141,6 +143,7 @@ impl AppConfig {
                     default_shutdown_drain_timeout_seconds(),
                 )?,
             },
+            public_path_prefix: env::var("GIT_CACHE_PUBLIC_PATH_PREFIX").unwrap_or_default(),
             max_concurrent_git_processes: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
                 default_max_concurrent_git_processes(),

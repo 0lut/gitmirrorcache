@@ -142,6 +142,7 @@ impl GitFixture {
             shutdown: Default::default(),
             max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
             async_materialize_concurrency: 2,
+            public_path_prefix: String::new(),
             use_gitoxide: true,
         }
     }

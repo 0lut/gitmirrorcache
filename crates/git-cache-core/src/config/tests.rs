@@ -36,6 +36,7 @@ const ENV_KEYS: &[&str] = &[
     "GIT_CACHE_USE_GITOXIDE",
     "GIT_CACHE_LFS_ENABLED",
     "GIT_CACHE_LFS_MAX_OBJECT_BYTES",
+    "GIT_CACHE_PUBLIC_PATH_PREFIX",
 ];
 
 struct EnvGuard {

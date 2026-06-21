@@ -2197,14 +2197,23 @@ fn validate_lfs_oid(oid: &str) -> bool {
     oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn lfs_base_url(headers: &HeaderMap, bind_addr: &std::net::SocketAddr) -> String {
+fn lfs_base_url(
+    headers: &HeaderMap,
+    bind_addr: &std::net::SocketAddr,
+    public_path_prefix: &str,
+) -> String {
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("http");
-    match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+    let origin = match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
         Some(host) => format!("{scheme}://{host}"),
         None => format!("{scheme}://{bind_addr}"),
+    };
+    if public_path_prefix.is_empty() {
+        origin
+    } else {
+        format!("{origin}{public_path_prefix}")
     }
 }
 
@@ -2345,7 +2354,11 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         }
     };
 
-    let base_url = lfs_base_url(&request.headers, &state.domain.config.bind_addr);
+    let base_url = lfs_base_url(
+        &request.headers,
+        &state.domain.config.bind_addr,
+        &state.domain.config.public_path_prefix,
+    );
     // Build the response, mapping each object to either a cache download URL
     // or an error.
     let upstream_objects = upstream_batch["objects"]
