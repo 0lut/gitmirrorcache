@@ -841,7 +841,10 @@ fn git_request_type(request: &GitRepoRequest) -> GitRequestType {
         return GitRequestType::LfsBatch;
     }
 
-    if request.method == Method::GET && path.contains("/info/lfs/objects/") {
+    if request.method == Method::GET
+        && path.contains("/info/lfs/objects/")
+        && !path.contains("/info/lfs/objects/batch")
+    {
         return GitRequestType::LfsDownload;
     }
 

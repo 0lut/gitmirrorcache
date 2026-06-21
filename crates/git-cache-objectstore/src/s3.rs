@@ -598,8 +598,11 @@ impl ObjectStore for S3ObjectStore {
         let s3_key = self.s3_key(key)?;
         let mut reader = reader;
 
-        // Small objects: single PutObject with in-memory buffer.
-        if content_length <= S3_MIN_MULTIPART_PART_BYTES {
+        // Small objects with known size: single PutObject with in-memory buffer.
+        // When content_length is 0 the size is unknown (e.g. chunked upstream
+        // response) so we must use the multipart path to avoid buffering an
+        // arbitrarily large body.
+        if content_length > 0 && content_length <= S3_MIN_MULTIPART_PART_BYTES {
             let mut buf = Vec::with_capacity(content_length as usize);
             reader.read_to_end(&mut buf).await?;
             let body = ByteStream::new(buf.into());
@@ -614,8 +617,13 @@ impl ObjectStore for S3ObjectStore {
             return Ok(());
         }
 
-        // Large objects: multipart upload streaming from reader.
-        let part_size = multipart_part_size(content_length)? as usize;
+        // Large objects (or unknown size): multipart upload streaming from reader.
+        let effective_length = if content_length == 0 {
+            S3_DEFAULT_MULTIPART_PART_BYTES * 2
+        } else {
+            content_length
+        };
+        let part_size = multipart_part_size(effective_length)? as usize;
         let create = self
             .client
             .create_multipart_upload()
