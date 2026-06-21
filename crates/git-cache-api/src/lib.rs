@@ -2748,9 +2748,7 @@ async fn fetch_and_cache_lfs_object(
 
     // Stream the body with a running byte counter to enforce the size limit
     // even when Content-Length is absent (chunked transfer encoding).
-    let mut buf = Vec::with_capacity(
-        content_length.min(max_bytes).min(64 * 1024 * 1024) as usize,
-    );
+    let mut buf = Vec::with_capacity(content_length.min(max_bytes).min(64 * 1024 * 1024) as usize);
     let mut total: u64 = 0;
     let mut stream = response;
     while let Some(chunk) = stream
