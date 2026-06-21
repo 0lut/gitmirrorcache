@@ -116,7 +116,6 @@ impl AppConfig {
                 proxy_tee_import: parse_bool_env("GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT", true)?,
             },
             lfs: LfsConfig {
-                enabled: parse_bool_env("GIT_CACHE_LFS_ENABLED", false)?,
                 max_object_bytes: parse_env(
                     "GIT_CACHE_LFS_MAX_OBJECT_BYTES",
                     default_lfs_max_object_bytes(),
@@ -302,8 +301,6 @@ impl Default for GitRemoteConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LfsConfig {
-    #[serde(default)]
-    pub enabled: bool,
     #[serde(default = "default_lfs_max_object_bytes")]
     pub max_object_bytes: u64,
 }
@@ -311,7 +308,6 @@ pub struct LfsConfig {
 impl Default for LfsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             max_object_bytes: default_lfs_max_object_bytes(),
         }
     }

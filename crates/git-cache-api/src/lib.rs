@@ -768,21 +768,9 @@ async fn git_repo_inner(state: Arc<ApiState>, request: GitRepoRequest) -> Respon
             .into_response();
         }
         GitRequestType::LfsBatch => {
-            if !state.domain.config.lfs.enabled {
-                return ApiError::from(GitCacheError::Unsupported(
-                    "LFS batch API is not enabled".into(),
-                ))
-                .into_response();
-            }
             return lfs_batch_handler(state, request).await;
         }
         GitRequestType::LfsDownload => {
-            if !state.domain.config.lfs.enabled {
-                return ApiError::from(GitCacheError::Unsupported(
-                    "LFS object download is not enabled".into(),
-                ))
-                .into_response();
-            }
             return lfs_download_handler(state, request).await;
         }
         GitRequestType::Unsupported => {
