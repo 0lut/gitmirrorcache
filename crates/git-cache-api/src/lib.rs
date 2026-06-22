@@ -2519,7 +2519,11 @@ fn lfs_batch_url(upstream_url: &str) -> Option<String> {
     if !(upstream_url.starts_with("https://") || upstream_url.starts_with("http://")) {
         return None;
     }
-    Some(format!("{}{}", upstream_url.trim_end_matches('/'), LFS_BATCH_PATH))
+    Some(format!(
+        "{}{}",
+        upstream_url.trim_end_matches('/'),
+        LFS_BATCH_PATH
+    ))
 }
 
 /// Sends a download batch request to the upstream LFS server and returns the
@@ -2536,7 +2540,8 @@ async fn lfs_upstream_batch(
         Some(url) => url,
         None => {
             return Err(ApiError::from(GitCacheError::Unsupported(
-                "LFS requires an HTTP(S) upstream; local filesystem upstreams do not support LFS".into(),
+                "LFS requires an HTTP(S) upstream; local filesystem upstreams do not support LFS"
+                    .into(),
             ))
             .into_response());
         }
