@@ -29,11 +29,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
+    pub lfs: LfsConfig,
+    #[serde(default)]
     pub shutdown: ShutdownConfig,
     #[serde(default = "default_max_concurrent_git_processes")]
     pub max_concurrent_git_processes: usize,
     #[serde(default = "default_async_materialize_concurrency")]
     pub async_materialize_concurrency: usize,
+    #[serde(default)]
+    pub public_path_prefix: String,
     /// Use in-process gitoxide for local read-only Git operations instead of
     /// spawning the `git` binary. Acts as a kill switch when disabled.
     #[serde(default = "default_use_gitoxide")]
@@ -111,6 +115,12 @@ impl AppConfig {
                 )?,
                 proxy_tee_import: parse_bool_env("GIT_CACHE_GIT_REMOTE_PROXY_TEE_IMPORT", true)?,
             },
+            lfs: LfsConfig {
+                max_object_bytes: parse_env(
+                    "GIT_CACHE_LFS_MAX_OBJECT_BYTES",
+                    default_lfs_max_object_bytes(),
+                )?,
+            },
             compaction: CompactionConfig {
                 chain_depth_threshold: parse_env(
                     "GIT_CACHE_COMPACTION_CHAIN_DEPTH_THRESHOLD",
@@ -132,6 +142,7 @@ impl AppConfig {
                     default_shutdown_drain_timeout_seconds(),
                 )?,
             },
+            public_path_prefix: env::var("GIT_CACHE_PUBLIC_PATH_PREFIX").unwrap_or_default(),
             max_concurrent_git_processes: parse_env(
                 "GIT_CACHE_MAX_CONCURRENT_GIT_PROCESSES",
                 default_max_concurrent_git_processes(),
@@ -286,6 +297,25 @@ impl Default for GitRemoteConfig {
             proxy_tee_import: true,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LfsConfig {
+    #[serde(default = "default_lfs_max_object_bytes")]
+    pub max_object_bytes: u64,
+}
+
+impl Default for LfsConfig {
+    fn default() -> Self {
+        Self {
+            max_object_bytes: default_lfs_max_object_bytes(),
+        }
+    }
+}
+
+fn default_lfs_max_object_bytes() -> u64 {
+    // 2 GiB
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_true() -> bool {

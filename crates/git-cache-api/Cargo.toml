@@ -16,9 +16,11 @@ git-cache-core = { path = "../git-cache-core" }
 git-cache-disk = { path = "../git-cache-disk" }
 git-cache-domain = { path = "../git-cache-domain" }
 git-cache-git = { path = "../git-cache-git" }
+git-cache-objectstore = { path = "../git-cache-objectstore" }
 http.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -30,5 +32,4 @@ default = []
 s3 = ["git-cache-domain/s3"]
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true

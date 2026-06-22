@@ -258,9 +258,11 @@ async fn proxy_warm_task_queues_async_generation_materialize() {
         },
         git_remote: Default::default(),
         compaction: Default::default(),
+        lfs: Default::default(),
         shutdown: Default::default(),
         max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
         async_materialize_concurrency: 1,
+        public_path_prefix: String::new(),
         use_gitoxide: true,
     };
     let state = Arc::new(ApiState::try_new(config).unwrap());
@@ -386,9 +388,11 @@ async fn proxy_warm_task_publishes_served_commit_when_branch_moves() {
         },
         git_remote: Default::default(),
         compaction: Default::default(),
+        lfs: Default::default(),
         shutdown: Default::default(),
         max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
         async_materialize_concurrency: 1,
+        public_path_prefix: String::new(),
         use_gitoxide: true,
     };
     let state = Arc::new(ApiState::try_new(config).unwrap());
@@ -476,9 +480,11 @@ async fn authenticated_resolve_is_rate_limited_before_upstream_work() {
         },
         git_remote: Default::default(),
         compaction: Default::default(),
+        lfs: Default::default(),
         shutdown: Default::default(),
         max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
         async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
+        public_path_prefix: String::new(),
         use_gitoxide: true,
     };
     let state = Arc::new(ApiState::try_new(config).unwrap());
@@ -524,9 +530,11 @@ async fn healthz_fails_after_shutdown_begins() {
         },
         git_remote: Default::default(),
         compaction: Default::default(),
+        lfs: Default::default(),
         shutdown: Default::default(),
         max_concurrent_git_processes: git_cache_core::default_max_concurrent_git_processes(),
         async_materialize_concurrency: git_cache_core::default_async_materialize_concurrency(),
+        public_path_prefix: String::new(),
         use_gitoxide: true,
     };
     let state = Arc::new(ApiState::try_new(config).unwrap());

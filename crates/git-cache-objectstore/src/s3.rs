@@ -12,7 +12,8 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use git_cache_core::{GitCacheError, Result};
 use std::path::Path;
-use tokio::io::AsyncWriteExt;
+use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 const S3_SINGLE_PUT_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const S3_MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
@@ -205,6 +206,97 @@ impl S3ObjectStore {
             .send()
             .await
             .map_err(|err| s3_error("abort_multipart_upload", s3_key, err))?;
+        Ok(())
+    }
+
+    async fn put_stream_multipart_inner(
+        &self,
+        s3_key: &str,
+        reader: &mut (dyn AsyncRead + Send + Unpin),
+        part_size: usize,
+        upload_id: &str,
+    ) -> Result<()> {
+        let mut parts = Vec::new();
+        let mut part_number: i32 = 1;
+
+        loop {
+            let mut buf = vec![0u8; part_size];
+            let mut filled = 0;
+            // Fill the buffer up to part_size before uploading.
+            while filled < part_size {
+                match reader.read(&mut buf[filled..]).await? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            buf.truncate(filled);
+
+            let body = ByteStream::new(Bytes::from(buf).into());
+            let output = self
+                .client
+                .upload_part()
+                .bucket(&self.bucket)
+                .key(s3_key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .content_length(filled as i64)
+                .body(body)
+                .send()
+                .await
+                .map_err(|err| s3_error("upload_part", s3_key, err))?;
+            let e_tag = output
+                .e_tag()
+                .ok_or_else(|| {
+                    GitCacheError::UpstreamUnavailable(format!(
+                        "s3 upload_part `{s3_key}` part {part_number} returned no etag"
+                    ))
+                })?
+                .to_string();
+            parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(e_tag)
+                    .build(),
+            );
+            part_number += 1;
+
+            if filled < part_size {
+                // Last chunk was smaller than part_size → EOF.
+                break;
+            }
+        }
+
+        if parts.is_empty() {
+            // Empty stream — upload a zero-length object instead.
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(s3_key)
+                .body(ByteStream::new(Bytes::new().into()))
+                .send()
+                .await
+                .map_err(|err| s3_error("put_stream empty", s3_key, err))?;
+            // Abort the unused multipart upload.
+            let _ = self.abort_multipart_upload(s3_key, upload_id).await;
+            return Ok(());
+        }
+
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(s3_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|err| s3_error("complete_multipart_upload", s3_key, err))?;
         Ok(())
     }
 }
@@ -474,6 +566,94 @@ impl ObjectStore for S3ObjectStore {
             .send()
             .await
             .map_err(|err| s3_error("put_file", &s3_key, err))?;
+        Ok(())
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<Option<(Pin<Box<dyn AsyncRead + Send>>, u64)>> {
+        let s3_key = self.s3_key(key)?;
+        let output = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(s3_error("get_stream", &s3_key, err)),
+        };
+
+        let len = output.content_length().unwrap_or(0) as u64;
+        let reader = output.body.into_async_read();
+        Ok(Some((Box::pin(reader), len)))
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        reader: Pin<Box<dyn AsyncRead + Send>>,
+        content_length: u64,
+    ) -> Result<()> {
+        let s3_key = self.s3_key(key)?;
+        let mut reader = reader;
+
+        // Small objects with known size: single PutObject with in-memory buffer.
+        // When content_length is 0 the size is unknown (e.g. chunked upstream
+        // response) so we must use the multipart path to avoid buffering an
+        // arbitrarily large body.
+        if content_length > 0 && content_length <= S3_MIN_MULTIPART_PART_BYTES {
+            let mut buf = Vec::with_capacity(content_length as usize);
+            reader.read_to_end(&mut buf).await?;
+            let body = ByteStream::new(buf.into());
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&s3_key)
+                .body(body)
+                .send()
+                .await
+                .map_err(|err| s3_error("put_stream", &s3_key, err))?;
+            return Ok(());
+        }
+
+        // Large objects (or unknown size): multipart upload streaming from reader.
+        let effective_length = if content_length == 0 {
+            S3_DEFAULT_MULTIPART_PART_BYTES * 2
+        } else {
+            content_length
+        };
+        let part_size = multipart_part_size(effective_length)? as usize;
+        let create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&s3_key)
+            .send()
+            .await
+            .map_err(|err| s3_error("create_multipart_upload", &s3_key, err))?;
+        let upload_id = create
+            .upload_id()
+            .ok_or_else(|| {
+                GitCacheError::UpstreamUnavailable(format!(
+                    "s3 create_multipart_upload `{s3_key}` returned no upload id"
+                ))
+            })?
+            .to_string();
+
+        let result = self
+            .put_stream_multipart_inner(&s3_key, &mut reader, part_size, &upload_id)
+            .await;
+
+        if let Err(err) = result {
+            return match self.abort_multipart_upload(&s3_key, &upload_id).await {
+                Ok(()) => Err(err),
+                Err(abort_err) => Err(GitCacheError::UpstreamUnavailable(format!(
+                    "{err}; additionally failed to abort multipart upload `{s3_key}`: {abort_err}"
+                ))),
+            };
+        }
+
         Ok(())
     }
 }

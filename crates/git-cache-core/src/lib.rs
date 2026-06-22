@@ -20,7 +20,7 @@ pub const GIT_UPLOAD_PACK_RESULT_CONTENT_TYPE: &str = "application/x-git-upload-
 pub use auth::{SecretString, UpstreamAuth, UpstreamAuthorizationMode};
 pub use config::{
     default_async_materialize_concurrency, default_max_concurrent_git_processes, AppConfig,
-    CompactionConfig, DiskConfig, GitRemoteConfig, ObjectStoreConfig, ShutdownConfig,
+    CompactionConfig, DiskConfig, GitRemoteConfig, LfsConfig, ObjectStoreConfig, ShutdownConfig,
 };
 pub use error::{GitCacheError, Result};
 pub use manifest::{

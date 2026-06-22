@@ -119,6 +119,25 @@ pub fn generation_manifest_prefix(repo: &RepoKey) -> String {
     format!("repos/{repo}/generations/")
 }
 
+pub fn lfs_object_key(repo: &RepoKey, oid: &str) -> Result<String> {
+    validate_lfs_oid(oid)?;
+    Ok(format!(
+        "repos/{repo}/lfs/{}/{}/{}",
+        &oid[..2],
+        &oid[2..4],
+        oid
+    ))
+}
+
+fn validate_lfs_oid(value: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(GitCacheError::Validation(format!(
+            "invalid LFS OID `{value}`"
+        )));
+    }
+    Ok(())
+}
+
 pub fn pack_prefix(repo: &RepoKey) -> String {
     format!("repos/{repo}/packs/")
 }
