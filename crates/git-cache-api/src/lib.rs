@@ -2514,8 +2514,12 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
 }
 
 /// Constructs the upstream LFS batch URL from an upstream repo URL.
-fn lfs_batch_url(upstream_url: &str) -> String {
-    format!("{}{}", upstream_url.trim_end_matches('/'), LFS_BATCH_PATH)
+/// Returns `None` for non-HTTP(S) upstreams (e.g. local filesystem).
+fn lfs_batch_url(upstream_url: &str) -> Option<String> {
+    if !(upstream_url.starts_with("https://") || upstream_url.starts_with("http://")) {
+        return None;
+    }
+    Some(format!("{}{}", upstream_url.trim_end_matches('/'), LFS_BATCH_PATH))
 }
 
 /// Sends a download batch request to the upstream LFS server and returns the
@@ -2528,7 +2532,15 @@ async fn lfs_upstream_batch(
     request_id: u64,
     repo: &git_cache_core::RepoKey,
 ) -> Result<serde_json::Value, Response> {
-    let url = lfs_batch_url(upstream_url);
+    let url = match lfs_batch_url(upstream_url) {
+        Some(url) => url,
+        None => {
+            return Err(ApiError::from(GitCacheError::Unsupported(
+                "LFS requires an HTTP(S) upstream; local filesystem upstreams do not support LFS".into(),
+            ))
+            .into_response());
+        }
+    };
     let mut req = http
         .post(&url)
         .header(header::CONTENT_TYPE.as_str(), LFS_CONTENT_TYPE)
@@ -2832,7 +2844,13 @@ async fn fetch_and_cache_lfs_object(
         .await
         .map_err(|e| GitCacheError::Internal(format!("LFS cache write failed: {e}")))?;
 
-    Ok(content_length)
+    // Return the actual stored size rather than the declared Content-Length,
+    // which may be 0 for chunked transfers.
+    let stored_size = match store.head(obj_key).await {
+        Ok(Some(meta)) => meta.len,
+        _ => content_length,
+    };
+    Ok(stored_size)
 }
 
 #[cfg(test)]
