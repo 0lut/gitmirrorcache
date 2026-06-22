@@ -38,7 +38,7 @@ DEFAULT_REPOS = [
     ("github.com/llvm/llvm-project", "main"),
 ]
 SMALL_REPOS = {"github.com/astral-sh/uv", "github.com/astral-sh/ruff"}
-LFS_REPOS = {"github.com/charmbracelet/vhs"}
+LFS_REPOS = {"github.com/charmbracelet/vhs", "github.com/SixLabors/ImageSharp"}
 LFS_CONTENT_TYPE = "application/vnd.git-lfs+json"
 LFS_POINTER_RE = re.compile(
     r"^version https://git-lfs\.github\.com/spec/v1\n"
@@ -862,11 +862,15 @@ class AwsDevGitMatrix(unittest.TestCase):
             self.failures.append(f"no LFS pointer files found in {repo_case.repo}")
             return
 
-        # Extract OID/size from first pointer
-        ptr_text = pointers[0].read_text(errors="replace")
-        oid = self._extract_oid(ptr_text)
-        size_m = re.search(r"size (\d+)", ptr_text)
-        size = int(size_m.group(1)) if size_m else 0
+        # Pick the largest pointer for the single-object test to exercise streaming.
+        best_ptr, oid, size = None, None, 0
+        for p in pointers:
+            text = p.read_text(errors="replace")
+            o = self._extract_oid(text)
+            sm = re.search(r"size (\d+)", text)
+            s = int(sm.group(1)) if sm else 0
+            if o and s > size:
+                best_ptr, oid, size = p, o, s
         if not oid:
             self.failures.append(f"failed to extract OID from pointer in {repo_case.repo}")
             return
@@ -899,7 +903,8 @@ class AwsDevGitMatrix(unittest.TestCase):
             if o and sm:
                 multi_objects.append({"oid": o, "size": int(sm.group(1))})
         if len(multi_objects) > 1:
-            self._lfs_batch_timed(repo_case, multi_objects, "lfs_batch_multi", expect_count=len(multi_objects))
+            self._lfs_batch_timed(repo_case, multi_objects, "lfs_batch_multi_cold", expect_count=len(multi_objects))
+            self._lfs_batch_timed(repo_case, multi_objects, "lfs_batch_multi_warm", expect_count=len(multi_objects))
 
         # 7. Upload rejected
         self._lfs_upload_rejected(repo_case)
