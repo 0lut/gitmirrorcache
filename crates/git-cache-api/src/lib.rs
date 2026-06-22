@@ -2314,35 +2314,39 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         .collect();
 
     // Skip upstream call when all objects failed pre-validation.
-    let upstream_by_oid: std::collections::HashMap<&str, &serde_json::Value>;
-    let upstream_objects: Vec<serde_json::Value>;
     if valid_objects.is_empty() {
-        upstream_objects = Vec::new();
-        // Empty HashMap — no upstream objects to index.
-        upstream_by_oid = std::collections::HashMap::new();
-    } else {
-        let upstream_batch = match lfs_upstream_batch(
-            &state.upstream_http,
-            &upstream_url,
-            &auth,
-            &objects_json,
-            request_id,
-            &repo,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(resp) => return resp,
+        let resp = LfsBatchResponse {
+            transfer: "basic",
+            objects: early_errors,
         };
-        upstream_objects = upstream_batch["objects"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        upstream_by_oid = upstream_objects
-            .iter()
-            .filter_map(|obj| obj["oid"].as_str().map(|oid| (oid, obj)))
-            .collect();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, LFS_CONTENT_TYPE)
+            .body(Body::from(serde_json::to_vec(&resp).unwrap_or_default()))
+            .expect("LFS batch response");
     }
+
+    let upstream_batch = match lfs_upstream_batch(
+        &state.upstream_http,
+        &upstream_url,
+        &auth,
+        &objects_json,
+        request_id,
+        &repo,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let upstream_objects: Vec<serde_json::Value> = upstream_batch["objects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let upstream_by_oid: std::collections::HashMap<&str, &serde_json::Value> = upstream_objects
+        .iter()
+        .filter_map(|obj| obj["oid"].as_str().map(|oid| (oid, obj)))
+        .collect();
 
     let base_url = lfs_base_url(
         &request.headers,
