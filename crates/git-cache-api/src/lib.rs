@@ -2427,12 +2427,12 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         };
 
         if !cached {
-            // Extract the upstream download URL.
-            let upstream_href = upstream_obj
-                .get("actions")
-                .and_then(|a| a.get("download"))
+            // Extract the upstream download action.
+            let download_action = upstream_obj.get("actions").and_then(|a| a.get("download"));
+            let upstream_href = download_action
                 .and_then(|d| d.get("href"))
                 .and_then(|h| h.as_str());
+            let action_headers = extract_lfs_action_headers(download_action);
 
             match upstream_href {
                 Some(href) => {
@@ -2440,6 +2440,7 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
                     match fetch_and_cache_lfs_object(
                         &state.upstream_http,
                         href,
+                        &action_headers,
                         store.as_ref(),
                         &obj_key,
                         max_object_bytes,
@@ -2756,13 +2757,15 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
         Err(resp) => return resp,
     };
 
-    let upstream_href = upstream_batch["objects"]
+    let download_action = upstream_batch["objects"]
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|obj| obj.get("actions"))
-        .and_then(|a| a.get("download"))
+        .and_then(|a| a.get("download"));
+    let upstream_href = download_action
         .and_then(|d| d.get("href"))
         .and_then(|h| h.as_str());
+    let action_headers = extract_lfs_action_headers(download_action);
 
     let Some(href) = upstream_href else {
         return ApiError::from(GitCacheError::NotFound(format!(
@@ -2775,6 +2778,7 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
     let fetched = fetch_and_cache_lfs_object(
         &state.upstream_http,
         href,
+        &action_headers,
         store.as_ref(),
         &obj_key,
         max_object_bytes,
@@ -2835,15 +2839,33 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
 /// Fetches an LFS object from upstream and streams it into the object store
 /// without buffering the full body in memory.  Returns the number of bytes
 /// cached on success.
+/// Extracts the optional `header` map from an LFS download action JSON object.
+fn extract_lfs_action_headers(action: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    let Some(header_obj) = action
+        .and_then(|a| a.get("header"))
+        .and_then(|h| h.as_object())
+    else {
+        return Vec::new();
+    };
+    header_obj
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+        .collect()
+}
+
 async fn fetch_and_cache_lfs_object(
     http: &reqwest::Client,
     href: &str,
+    action_headers: &[(String, String)],
     store: &dyn git_cache_objectstore::ObjectStore,
     obj_key: &str,
     max_bytes: u64,
 ) -> CoreResult<u64> {
-    let response = http
-        .get(href)
+    let mut req = http.get(href);
+    for (key, value) in action_headers {
+        req = req.header(key.as_str(), value.as_str());
+    }
+    let response = req
         .send()
         .await
         .map_err(|e| GitCacheError::UpstreamUnavailable(format!("LFS download failed: {e}")))?;
