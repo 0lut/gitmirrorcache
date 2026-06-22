@@ -2278,31 +2278,28 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         Err(error) => return ApiError::from(error).into_response(),
     };
 
-    // Pre-validate objects: separate valid from invalid before sending to upstream
-    // so a single bad OID doesn't cause upstream to reject the whole batch.
-    let mut early_errors: Vec<LfsBatchObjectResponse> = Vec::new();
+    // Pre-validate objects: collect valid ones for the upstream batch while
+    // recording which indices failed so the final response preserves request order.
     let mut valid_objects: Vec<&LfsBatchObject> = Vec::new();
-    for obj in &batch.objects {
+    let mut pre_validation_errors: std::collections::HashMap<usize, LfsBatchError> =
+        std::collections::HashMap::new();
+    for (i, obj) in batch.objects.iter().enumerate() {
         if !validate_lfs_oid(&obj.oid) {
-            early_errors.push(LfsBatchObjectResponse {
-                oid: obj.oid.clone(),
-                size: obj.size,
-                actions: None,
-                error: Some(LfsBatchError {
+            pre_validation_errors.insert(
+                i,
+                LfsBatchError {
                     code: 422,
                     message: "invalid LFS OID".into(),
-                }),
-            });
+                },
+            );
         } else if obj.size > max_object_bytes {
-            early_errors.push(LfsBatchObjectResponse {
-                oid: obj.oid.clone(),
-                size: obj.size,
-                actions: None,
-                error: Some(LfsBatchError {
+            pre_validation_errors.insert(
+                i,
+                LfsBatchError {
                     code: 422,
                     message: format!("object exceeds {max_object_bytes} byte limit"),
-                }),
-            });
+                },
+            );
         } else {
             valid_objects.push(obj);
         }
@@ -2315,9 +2312,20 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
 
     // Skip upstream call when all objects failed pre-validation.
     if valid_objects.is_empty() {
+        let objects: Vec<LfsBatchObjectResponse> = batch
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(i, obj)| LfsBatchObjectResponse {
+                oid: obj.oid.clone(),
+                size: obj.size,
+                actions: None,
+                error: pre_validation_errors.remove(&i),
+            })
+            .collect();
         let resp = LfsBatchResponse {
             transfer: "basic",
-            objects: early_errors,
+            objects,
         };
         return Response::builder()
             .status(StatusCode::OK)
@@ -2354,13 +2362,23 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         &state.domain.config.public_path_prefix,
     );
 
-    // Start with pre-validated error entries, then process valid objects.
+    // Build response in request order so positional correspondence is preserved.
     let store = &state.domain.store;
     let mut response_objects = Vec::with_capacity(batch.objects.len());
-    response_objects.extend(early_errors);
-    for req_obj in &valid_objects {
+    for (i, req_obj) in batch.objects.iter().enumerate() {
         let oid = &req_obj.oid;
         let size = req_obj.size;
+
+        // Pre-validation failure — emit error and continue.
+        if let Some(error) = pre_validation_errors.remove(&i) {
+            response_objects.push(LfsBatchObjectResponse {
+                oid: oid.clone(),
+                size,
+                actions: None,
+                error: Some(error),
+            });
+            continue;
+        }
 
         let upstream_obj = match upstream_by_oid.get(oid.as_str()) {
             Some(obj) => *obj,
