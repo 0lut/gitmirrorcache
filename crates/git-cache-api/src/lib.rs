@@ -2278,8 +2278,37 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         Err(error) => return ApiError::from(error).into_response(),
     };
 
-    let objects_json: Vec<serde_json::Value> = batch
-        .objects
+    // Pre-validate objects: separate valid from invalid before sending to upstream
+    // so a single bad OID doesn't cause upstream to reject the whole batch.
+    let mut early_errors: Vec<LfsBatchObjectResponse> = Vec::new();
+    let mut valid_objects: Vec<&LfsBatchObject> = Vec::new();
+    for obj in &batch.objects {
+        if !validate_lfs_oid(&obj.oid) {
+            early_errors.push(LfsBatchObjectResponse {
+                oid: obj.oid.clone(),
+                size: obj.size,
+                actions: None,
+                error: Some(LfsBatchError {
+                    code: 422,
+                    message: "invalid LFS OID".into(),
+                }),
+            });
+        } else if obj.size > max_object_bytes {
+            early_errors.push(LfsBatchObjectResponse {
+                oid: obj.oid.clone(),
+                size: obj.size,
+                actions: None,
+                error: Some(LfsBatchError {
+                    code: 422,
+                    message: format!("object exceeds {max_object_bytes} byte limit"),
+                }),
+            });
+        } else {
+            valid_objects.push(obj);
+        }
+    }
+
+    let objects_json: Vec<serde_json::Value> = valid_objects
         .iter()
         .map(|o| serde_json::json!({"oid": o.oid, "size": o.size}))
         .collect();
@@ -2313,39 +2342,13 @@ async fn lfs_batch_handler(state: Arc<ApiState>, request: GitRepoRequest) -> Res
         .filter_map(|obj| obj["oid"].as_str().map(|oid| (oid, obj)))
         .collect();
 
-    // Iterate the client's requested objects so every request gets a response
-    // entry, even if the upstream omitted it.
+    // Start with pre-validated error entries, then process valid objects.
     let store = &state.domain.store;
     let mut response_objects = Vec::with_capacity(batch.objects.len());
-    for req_obj in &batch.objects {
+    response_objects.extend(early_errors);
+    for req_obj in &valid_objects {
         let oid = &req_obj.oid;
         let size = req_obj.size;
-
-        if !validate_lfs_oid(oid) {
-            response_objects.push(LfsBatchObjectResponse {
-                oid: oid.clone(),
-                size,
-                actions: None,
-                error: Some(LfsBatchError {
-                    code: 422,
-                    message: "invalid LFS OID".into(),
-                }),
-            });
-            continue;
-        }
-
-        if size > max_object_bytes {
-            response_objects.push(LfsBatchObjectResponse {
-                oid: oid.clone(),
-                size,
-                actions: None,
-                error: Some(LfsBatchError {
-                    code: 422,
-                    message: format!("object exceeds {max_object_bytes} byte limit"),
-                }),
-            });
-            continue;
-        }
 
         let upstream_obj = match upstream_by_oid.get(oid.as_str()) {
             Some(obj) => *obj,
@@ -2686,11 +2689,12 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
                 size = len,
                 "LFS object served from cache (streaming)"
             );
+            let capped_len = len.min(max_object_bytes);
             let stream = ReaderStream::new(reader.take(max_object_bytes));
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/octet-stream")
-                .header(header::CONTENT_LENGTH, len)
+                .header(header::CONTENT_LENGTH, capped_len)
                 .body(Body::from_stream(stream))
                 .expect("LFS download response");
         }
@@ -2777,11 +2781,12 @@ async fn lfs_download_handler(state: Arc<ApiState>, request: GitRepoRequest) -> 
                         size = len,
                         "LFS object served after proxy-tee (streaming)"
                     );
+                    let capped_len = len.min(max_object_bytes);
                     let stream = ReaderStream::new(reader.take(max_object_bytes));
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(header::CONTENT_LENGTH, len)
+                        .header(header::CONTENT_LENGTH, capped_len)
                         .body(Body::from_stream(stream))
                         .expect("LFS download response")
                 }
