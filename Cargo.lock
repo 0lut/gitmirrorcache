@@ -1295,7 +1295,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fastrand",
- "futures",
  "git-cache-core",
  "git-cache-disk",
  "git-cache-domain",
