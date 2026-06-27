@@ -1,7 +1,7 @@
 use super::*;
 use git_cache_core::GIT_UPLOAD_PACK_SERVICE;
 
-const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v4";
+const SERVED_REPO_CONFIG_MARKER: &str = "git-cache-serving-config-v5";
 /// Marker recording that the bare repo was hydrated with a filtered
 /// (blobless) fetch and therefore cannot serve full-object clone shapes
 /// until an unfiltered `--refetch` completes.
@@ -23,6 +23,7 @@ pub(super) const SERVED_REPO_CONFIG: &[(&str, &str)] = &[
     ("transfer.hideRefs", "refs/cache"),
     ("pack.useBitmaps", "false"),
     ("repack.writeBitmaps", "false"),
+    ("core.multiPackIndex", "true"),
     ("pack.writeReverseIndex", "true"),
     ("pack.threads", "0"),
     ("pack.deltaCacheSize", "256m"),
@@ -41,6 +42,13 @@ const DIRECT_FSCK_DELAY: StdDuration = StdDuration::from_secs(30);
 const SERVING_MAINTENANCE_DELAY: StdDuration = StdDuration::from_millis(20);
 #[cfg(not(test))]
 const SERVING_MAINTENANCE_DELAY: StdDuration = StdDuration::from_secs(60);
+
+/// Skip the serving repack when the repo is already tidy. A geometric repack
+/// keeps the pack count small, so more packs than this means new data has
+/// accumulated; many loose objects likewise warrant a roll-up. `count-objects`
+/// is read-only, so this gate is evaluated before taking the mutation lock.
+const SERVING_MAINTENANCE_PACK_THRESHOLD: u64 = 3;
+const SERVING_MAINTENANCE_LOOSE_THRESHOLD: u64 = 1000;
 
 pub(super) enum DirectFetchedWantKind {
     Commit,
@@ -910,12 +918,14 @@ impl Materializer {
         });
     }
 
-    /// Debounced background maintenance that keeps served repos compact: a
-    /// full `git repack -a -d` plus a commit-graph rewrite after hydration.
-    /// Direct upload-pack disables bitmap traversal for correctness, so
-    /// maintenance skips bitmap generation while still collapsing incremental
-    /// fetch packs into one local pack and writing reverse indexes for
-    /// efficient reads.
+    /// Debounced background maintenance that keeps served repos compact. On
+    /// git >= 2.32 it runs an incremental geometric `repack` (writes a
+    /// multi-pack-index; cost proportional to newly fetched data) plus a
+    /// `--split` commit-graph update, both at low CPU/IO priority so concurrent
+    /// serves and read-through fetches are unaffected. The repack is skipped
+    /// entirely when `count-objects` shows the repo is already tidy (checked
+    /// before taking the mutation lock). Direct upload-pack disables bitmap
+    /// traversal for correctness, so maintenance never writes bitmap indexes.
     /// At most one maintenance run per repo is queued or running at a time.
     pub(super) fn enqueue_serving_maintenance(&self, repo: RepoKey, repo_dir: PathBuf) {
         {
@@ -936,16 +946,32 @@ impl Materializer {
         tokio::spawn(async move {
             tokio::time::sleep(SERVING_MAINTENANCE_DELAY).await;
             let started = Instant::now();
+            // Background maintenance yields CPU/IO to concurrent serves.
+            let maintenance_git = materializer.state.git.clone().with_low_priority();
             let result = async {
+                // Decide whether a repack is worthwhile before taking the
+                // mutation lock: `count-objects` is read-only, so this never
+                // blocks concurrent read-through fetches. Default to repacking
+                // when the count cannot be read.
+                let needs_repack = match maintenance_git.count_objects(&repo_dir).await {
+                    Ok(counts) => {
+                        counts.packs > SERVING_MAINTENANCE_PACK_THRESHOLD
+                            || counts.loose_objects > SERVING_MAINTENANCE_LOOSE_THRESHOLD
+                    }
+                    Err(_) => true,
+                };
                 let _mutation_lock = materializer.lock_repo_mutation(&repo).await?;
-                materializer.state.git.repack_for_serving(&repo_dir).await?;
-                materializer.state.git.commit_graph_write(&repo_dir).await?;
-                CoreResult::Ok(())
+                if needs_repack {
+                    maintenance_git.repack_for_serving(&repo_dir).await?;
+                }
+                maintenance_git.commit_graph_write(&repo_dir).await?;
+                CoreResult::Ok(needs_repack)
             }
             .await;
             match result {
-                Ok(()) => info!(
+                Ok(repacked) => info!(
                     %repo,
+                    repacked,
                     elapsed_ms = elapsed_ms(started),
                     "direct git serving maintenance finished"
                 ),

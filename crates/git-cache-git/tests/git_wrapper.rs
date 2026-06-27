@@ -57,6 +57,90 @@ mod tests {
             !pack_dir_has_bitmap(&cache_repo),
             "serving repack should avoid bitmap indexes because upload-pack disables bitmap traversal"
         );
+        assert!(
+            cache_repo.join("objects/pack/multi-pack-index").exists(),
+            "geometric serving repack should write a multi-pack-index"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_objects_reports_loose_then_pack_counts() {
+        let temp = TempTree::new("count-objects");
+        let (source_repo, _) = create_source_repo(&temp.path);
+        let cache_repo = temp.path.join("cache.git");
+        let git = test_git();
+
+        git.init_bare(&cache_repo).await.expect("init cache repo");
+        git.fetch_ref(
+            &cache_repo,
+            path_arg(&source_repo),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions::default(),
+        )
+        .await
+        .expect("fetch main into cache repo");
+
+        // A small fetch lands as loose objects (default unpack limit), so the
+        // cache starts with loose objects and no pack.
+        let before = git
+            .count_objects(&cache_repo)
+            .await
+            .expect("count objects before repack");
+        assert!(
+            before.loose_objects > 0,
+            "fetch should leave loose objects, got {before:?}"
+        );
+        assert_eq!(before.packs, 0, "no pack before repack, got {before:?}");
+
+        git.repack_for_serving(&cache_repo)
+            .await
+            .expect("repack repo for serving");
+
+        // After the serving repack the loose objects are rolled into one pack.
+        let after = git
+            .count_objects(&cache_repo)
+            .await
+            .expect("count objects after repack");
+        assert_eq!(
+            after.loose_objects, 0,
+            "repack should pack loose objects, got {after:?}"
+        );
+        assert!(
+            after.packs >= 1,
+            "repack should produce a pack, got {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_graph_write_creates_split_chain() {
+        let temp = TempTree::new("commit-graph-split");
+        let (source_repo, _) = create_source_repo(&temp.path);
+        commit_source(&source_repo, "second");
+        let cache_repo = temp.path.join("cache.git");
+        let git = test_git();
+
+        git.init_bare(&cache_repo).await.expect("init cache repo");
+        git.fetch_ref(
+            &cache_repo,
+            path_arg(&source_repo),
+            "refs/heads/main",
+            "refs/cache/main",
+            FetchOptions::default(),
+        )
+        .await
+        .expect("fetch main into cache repo");
+
+        git.commit_graph_write(&cache_repo)
+            .await
+            .expect("write split commit-graph");
+
+        assert!(
+            cache_repo
+                .join("objects/info/commit-graphs/commit-graph-chain")
+                .exists(),
+            "split commit-graph should write a commit-graph-chain"
+        );
     }
 
     #[tokio::test]
